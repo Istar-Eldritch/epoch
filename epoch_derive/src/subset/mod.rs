@@ -28,16 +28,20 @@ pub fn subset_enum_impl(
     attr: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    let item_tokens: proc_macro2::TokenStream = item.into();
-    let attr_tokens: proc_macro2::TokenStream = attr.into();
+    subset_enum_impl_internal(attr.into(), item.into()).into()
+}
 
-    let input_enum = match syn::parse2::<ItemEnum>(item_tokens) {
+fn subset_enum_impl_internal(
+    attr: proc_macro2::TokenStream,
+    item: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let input_enum = match syn::parse2::<ItemEnum>(item) {
         Ok(tree) => tree,
-        Err(e) => return e.to_compile_error().into(),
+        Err(e) => return e.to_compile_error(),
     };
-    let parsed_attr = match syn::parse2::<SubsetEnumAttr>(attr_tokens) {
+    let parsed_attr = match syn::parse2::<SubsetEnumAttr>(attr) {
         Ok(tree) => tree,
-        Err(e) => return e.to_compile_error().into(),
+        Err(e) => return e.to_compile_error(),
     };
 
     let subset_enum_name = parsed_attr.subset_enum_name;
@@ -46,6 +50,10 @@ pub fn subset_enum_impl(
     let original_enum_name = &input_enum.ident;
     let original_variants = &input_enum.variants;
     let original_enum_attrs = &input_enum.attrs;
+
+    let forwarded_attrs = original_enum_attrs
+        .iter()
+        .filter(|attr| !attr.path().is_ident("subset_enum"));
 
     let mut new_variants = quote! {};
     let mut from_impls = quote! {};
@@ -127,17 +135,17 @@ pub fn subset_enum_impl(
             match fields {
                 syn::Fields::Unit => {
                     quote! {
-                        #original_enum_name::#variant_name => Err(#original_enum_name::#variant_name),
+                        #original_enum_name::#variant_name => Err(value),
                     }
                 }
                 syn::Fields::Unnamed(_) => {
                     quote! {
-                        v @ #original_enum_name::#variant_name(..) => Err(v),
+                        #original_enum_name::#variant_name(..) => Err(value),
                     }
                 }
                 syn::Fields::Named(_) => {
                     quote! {
-                        v @ #original_enum_name::#variant_name { .. } => Err(v),
+                        #original_enum_name::#variant_name { .. } => Err(value),
                     }
                 }
             }
@@ -159,7 +167,7 @@ pub fn subset_enum_impl(
     });
 
     let expanded = quote! {
-        #( #[ #original_enum_attrs ] )*
+        #( #forwarded_attrs )*
         pub enum #subset_enum_name {
             #new_variants
         }
@@ -171,5 +179,235 @@ pub fn subset_enum_impl(
         #input_enum
     };
 
-    expanded.into()
+    expanded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::quote;
+
+    fn test_subset_enum(
+        attr: proc_macro2::TokenStream,
+        item: proc_macro2::TokenStream,
+        expected: proc_macro2::TokenStream,
+    ) {
+        let actual = subset_enum_impl_internal(attr, item);
+        let actual_str = actual.to_string();
+        let expected_str = expected.to_string();
+
+        let actual_file = syn::parse_file(&actual_str).expect("Failed to parse actual tokens");
+        let expected_file =
+            syn::parse_file(&expected_str).expect("Failed to parse expected tokens");
+
+        assert_eq!(
+            prettyplease::unparse(&actual_file),
+            prettyplease::unparse(&expected_file)
+        );
+    }
+
+    #[test]
+    fn test_empty_included_variants() {
+        let attr = quote! { MySubsetEnum };
+        let item = quote! {
+            enum OriginalEnum {
+                VariantA,
+                VariantB(i32),
+                VariantC { field: String },
+            }
+        };
+        let expected = quote! {
+            pub enum MySubsetEnum {
+                VariantA,
+                VariantB(i32),
+                VariantC { field: String },
+            }
+
+            impl From<MySubsetEnum> for OriginalEnum {
+                fn from(value: MySubsetEnum) -> Self {
+                    match value {
+                        MySubsetEnum::VariantA => OriginalEnum::VariantA,
+                        MySubsetEnum::VariantB(__field0) => OriginalEnum::VariantB(__field0),
+                        MySubsetEnum::VariantC { field } => OriginalEnum::VariantC { field },
+                    }
+                }
+            }
+
+            use std::convert::TryFrom;
+
+            impl TryFrom<OriginalEnum> for MySubsetEnum {
+                type Error = OriginalEnum;
+
+                fn try_from(value: OriginalEnum) -> Result<Self, Self::Error> {
+                    match value {
+                        OriginalEnum::VariantA => Ok(MySubsetEnum::VariantA),
+                        OriginalEnum::VariantB(__field0) => Ok(MySubsetEnum::VariantB(__field0)),
+                        OriginalEnum::VariantC { field } => Ok(MySubsetEnum::VariantC { field }),
+                    }
+                }
+            }
+
+            enum OriginalEnum {
+                VariantA,
+                VariantB(i32),
+                VariantC { field: String },
+            }
+        };
+        test_subset_enum(attr, item, expected);
+    }
+
+    #[test]
+    fn test_specific_included_variants() {
+        let attr = quote! { MySubsetEnum, VariantA, VariantC };
+        let item = quote! {
+            enum OriginalEnum {
+                VariantA,
+                VariantB(i32),
+                VariantC { field: String },
+                VariantD,
+            }
+        };
+        let expected = quote! {
+            pub enum MySubsetEnum {
+                VariantA,
+                VariantC { field: String },
+            }
+
+            impl From<MySubsetEnum> for OriginalEnum {
+                fn from(value: MySubsetEnum) -> Self {
+                    match value {
+                        MySubsetEnum::VariantA => OriginalEnum::VariantA,
+                        MySubsetEnum::VariantC { field } => OriginalEnum::VariantC { field },
+                    }
+                }
+            }
+
+            use std::convert::TryFrom;
+
+            impl TryFrom<OriginalEnum> for MySubsetEnum {
+                type Error = OriginalEnum;
+
+                fn try_from(value: OriginalEnum) -> Result<Self, Self::Error> {
+                    match value {
+                        OriginalEnum::VariantA => Ok(MySubsetEnum::VariantA),
+                        OriginalEnum::VariantB(..) => Err(value),
+                        OriginalEnum::VariantC { field } => Ok(MySubsetEnum::VariantC { field }),
+                        OriginalEnum::VariantD => Err(value),
+                    }
+                }
+            }
+
+            enum OriginalEnum {
+                VariantA,
+                VariantB(i32),
+                VariantC { field: String },
+                VariantD,
+            }
+        };
+        test_subset_enum(attr, item, expected);
+    }
+
+    #[test]
+    fn test_mixed_variant_types() {
+        let attr = quote! { MySubsetEnum, UnitVariant, TupleVariant, StructVariant };
+        let item = quote! {
+            enum OriginalEnum {
+                UnitVariant,
+                TupleVariant(u32, bool),
+                StructVariant { name: String, id: u64 },
+                AnotherUnit,
+            }
+        };
+        let expected = quote! {
+            pub enum MySubsetEnum {
+                UnitVariant,
+                TupleVariant(u32, bool),
+                StructVariant { name: String, id: u64 },
+            }
+
+            impl From<MySubsetEnum> for OriginalEnum {
+                fn from(value: MySubsetEnum) -> Self {
+                    match value {
+                        MySubsetEnum::UnitVariant => OriginalEnum::UnitVariant,
+                        MySubsetEnum::TupleVariant(__field0, __field1) => OriginalEnum::TupleVariant(__field0, __field1),
+                        MySubsetEnum::StructVariant { name, id } => OriginalEnum::StructVariant { name, id },
+                    }
+                }
+            }
+
+            use std::convert::TryFrom;
+
+            impl TryFrom<OriginalEnum> for MySubsetEnum {
+                type Error = OriginalEnum;
+
+                fn try_from(value: OriginalEnum) -> Result<Self, Self::Error> {
+                    match value {
+                        OriginalEnum::UnitVariant => Ok(MySubsetEnum::UnitVariant),
+                        OriginalEnum::TupleVariant(__field0, __field1) => Ok(MySubsetEnum::TupleVariant(__field0, __field1)),
+                        OriginalEnum::StructVariant { name, id } => Ok(MySubsetEnum::StructVariant { name, id }),
+                        OriginalEnum::AnotherUnit => Err(value),
+                    }
+                }
+            }
+
+            enum OriginalEnum {
+                UnitVariant,
+                TupleVariant(u32, bool),
+                StructVariant { name: String, id: u64 },
+                AnotherUnit,
+            }
+        };
+        test_subset_enum(attr, item, expected);
+    }
+
+    #[test]
+    fn test_attribute_forwarding() {
+        let attr = quote! { MySubsetEnum };
+        let item = quote! {
+            #[derive(Debug, Clone)]
+            #[allow(dead_code)]
+            enum OriginalEnum {
+                VariantA,
+                VariantB(i32),
+            }
+        };
+        let expected = quote! {
+            #[derive(Debug, Clone)]
+            #[allow(dead_code)]
+            pub enum MySubsetEnum {
+                VariantA,
+                VariantB(i32),
+            }
+
+            impl From<MySubsetEnum> for OriginalEnum {
+                fn from(value: MySubsetEnum) -> Self {
+                    match value {
+                        MySubsetEnum::VariantA => OriginalEnum::VariantA,
+                        MySubsetEnum::VariantB(__field0) => OriginalEnum::VariantB(__field0),
+                    }
+                }
+            }
+
+            use std::convert::TryFrom;
+
+            impl TryFrom<OriginalEnum> for MySubsetEnum {
+                type Error = OriginalEnum;
+
+                fn try_from(value: OriginalEnum) -> Result<Self, Self::Error> {
+                    match value {
+                        OriginalEnum::VariantA => Ok(MySubsetEnum::VariantA),
+                        OriginalEnum::VariantB(__field0) => Ok(MySubsetEnum::VariantB(__field0)),
+                    }
+                }
+            }
+
+            #[derive(Debug, Clone)]
+            #[allow(dead_code)]
+            enum OriginalEnum {
+                VariantA,
+                VariantB(i32),
+            }
+        };
+        test_subset_enum(attr, item, expected);
+    }
 }

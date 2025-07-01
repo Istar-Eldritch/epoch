@@ -13,8 +13,7 @@ struct User {
     name: String,
 }
 
-#[derive(serde::Serialize, Clone, EventData)]
-#[subset_enum(UserEvent, UserCreated, UserNameUpdated)]
+#[derive(Debug, Clone, serde::Serialize, EventData)]
 enum ApplicationEvent {
     UserCreated { id: Uuid, name: String },
     UserNameUpdated { id: Uuid, name: String },
@@ -118,7 +117,10 @@ impl<E: EventData + Clone + Send + Sync> Stream for VirtualEventStoreStream<E> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = VirtualEventStore::new();
-    let mut stream = store.fetch_stream::<UserEvent>(Uuid::new_v4()).await?;
+    let mut stream = store
+        .fetch_stream::<ApplicationEvent>(Uuid::new_v4())
+        .await?;
+
     println!("Hello, from examples!");
 
     Ok(())

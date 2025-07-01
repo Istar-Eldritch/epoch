@@ -1,4 +1,4 @@
-use epoch_derives::subset_enum;
+use epoch_derive::subset_enum;
 
 #[derive(Debug, PartialEq)]
 #[subset_enum(UserEvent, UserCreated, UserNameUpdated)]
