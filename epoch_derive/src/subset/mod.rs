@@ -45,9 +45,11 @@ pub fn subset_enum_impl(
 
     let original_enum_name = &input_enum.ident;
     let original_variants = &input_enum.variants;
+    let original_enum_attrs = &input_enum.attrs;
 
     let mut new_variants = quote! {};
     let mut from_impls = quote! {};
+    let mut try_from_impls = quote! {};
 
     let filtered_variants = original_variants
         .iter()
@@ -79,7 +81,7 @@ pub fn subset_enum_impl(
                 }
             }
             syn::Fields::Named(fields) => {
-                let field_names: Vec<&Ident> = fields.named.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+                let field_names: Vec<_> = fields.named.iter().map(|f| f.ident.as_ref().unwrap()).collect();
                 quote! {
                     #subset_enum_name::#variant_name { #(#field_names),* } => #original_enum_name::#variant_name { #(#field_names),* },
                 }
@@ -97,17 +99,77 @@ pub fn subset_enum_impl(
         }
     });
 
+    let try_from_matches = original_variants.iter().map(|variant| {
+        let variant_name = &variant.ident;
+        let fields = &variant.fields;
+        if included_variants.is_empty() || included_variants.contains(&variant_name) {
+            match fields {
+                syn::Fields::Unit => {
+                    quote! {
+                        #original_enum_name::#variant_name => Ok(#subset_enum_name::#variant_name),
+                    }
+                }
+                syn::Fields::Unnamed(fields) => {
+                    let num_fields = fields.unnamed.len();
+                    let var_names: Vec<Ident> = (0..num_fields).map(|i| Ident::new(&format!("__field{}", i), proc_macro2::Span::call_site())).collect();
+                    quote! {
+                        #original_enum_name::#variant_name(#(#var_names),*) => Ok(#subset_enum_name::#variant_name(#(#var_names),*)),
+                    }
+                }
+                syn::Fields::Named(fields) => {
+                    let field_names: Vec<_> = fields.named.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+                    quote! {
+                        #original_enum_name::#variant_name { #(#field_names),* } => Ok(#subset_enum_name::#variant_name { #(#field_names),* }),
+                    }
+                }
+            }
+        } else {
+            match fields {
+                syn::Fields::Unit => {
+                    quote! {
+                        #original_enum_name::#variant_name => Err(#original_enum_name::#variant_name),
+                    }
+                }
+                syn::Fields::Unnamed(_) => {
+                    quote! {
+                        v @ #original_enum_name::#variant_name(..) => Err(v),
+                    }
+                }
+                syn::Fields::Named(_) => {
+                    quote! {
+                        v @ #original_enum_name::#variant_name { .. } => Err(v),
+                    }
+                }
+            }
+        }
+    });
+
+    try_from_impls.extend(quote! {
+        use std::convert::TryFrom;
+
+        impl TryFrom<#original_enum_name> for #subset_enum_name {
+            type Error = #original_enum_name;
+
+            fn try_from(value: #original_enum_name) -> Result<Self, Self::Error> {
+                match value {
+                    #(#try_from_matches)*
+                }
+            }
+        }
+    });
+
     let expanded = quote! {
-        #[derive(Debug, PartialEq, Clone)]
+        #( #[ #original_enum_attrs ] )*
         pub enum #subset_enum_name {
             #new_variants
         }
 
         #from_impls
 
+        #try_from_impls
+
         #input_enum
     };
 
     expanded.into()
 }
-

@@ -1,5 +1,5 @@
 [package]
-name = "epoch"
+name = "epoch_core"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -9,10 +9,6 @@ categories.workspace = true
 
 
 [dependencies]
-epoch_core = { path = "../epoch_core/", version = "0.1.0" }
-epoch_derive = { path = "../epoch_derive", optional = true, version = "0.1.0" }
-
-[dev-dependencies]
 async-trait = "0.1"
 chrono = { version = "0.4.41", features = ["serde"] }
 futures-core = "0.3.31"
@@ -23,10 +19,3 @@ tokio-stream = "0.1.17"
 uuid = { version = "1.17.0", features = ["serde", "v4"] }
 
 
-[features]
-default = ["derive"]
-derive = ["epoch_derive"]
-
-[[examples]]
-name = "hello-world"
-path = "core/examples/hello-world.rs"

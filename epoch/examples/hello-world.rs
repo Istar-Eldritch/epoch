@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use epoch::prelude::*;
+use epoch_derive::EventData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use epoch::derive::subset_enum;
 use futures_core::Stream;
 use uuid::Uuid;
 
@@ -13,20 +13,11 @@ struct User {
     name: String,
 }
 
-#[derive(serde::Serialize, Clone)]
+#[derive(serde::Serialize, Clone, EventData)]
 #[subset_enum(UserEvent, UserCreated, UserNameUpdated)]
 enum ApplicationEvent {
-    UserCreated { name: String },
-    UserNameUpdated { name: String },
-}
-
-impl EventData for ApplicationEvent {
-    fn event_type(&self) -> &'static str {
-        match self {
-            ApplicationEvent::UserCreated { .. } => "UserCreated",
-            ApplicationEvent::UserNameUpdated { .. } => "UserNameUpdated",
-        }
-    }
+    UserCreated { id: Uuid, name: String },
+    UserNameUpdated { id: Uuid, name: String },
 }
 
 struct VirtualEventStore {
@@ -74,7 +65,7 @@ impl EventStoreBackend for VirtualEventStore {
                     })
                     .collect::<Vec<_>>()
             })
-            .ok_or(EventStreamFetchError::NotFound)?;
+            .unwrap_or_default();
 
         Ok(VirtualEventStoreStream {
             events,
@@ -127,9 +118,7 @@ impl<E: EventData + Clone + Send + Sync> Stream for VirtualEventStoreStream<E> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = VirtualEventStore::new();
-    let mut stream = store
-        .fetch_stream::<ApplicationEvent>(Uuid::new_v4())
-        .await?;
+    let mut stream = store.fetch_stream::<UserEvent>(Uuid::new_v4()).await?;
     println!("Hello, from examples!");
 
     Ok(())

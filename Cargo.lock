@@ -124,7 +124,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
- "epoch_derives",
+ "epoch_core",
+ "epoch_derive",
  "futures-core",
  "serde",
  "thiserror",
@@ -134,9 +135,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "epoch_derives"
+name = "epoch_core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "chrono",
+ "futures-core",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "uuid",
+]
+
+[[package]]
+name = "epoch_derive"
+version = "0.1.0"
+dependencies = [
+ "epoch_core",
  "proc-macro2",
  "quote",
  "syn",

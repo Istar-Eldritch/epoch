@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "epoch",
-    "epoch_derives",
+    "epoch_core",
+    "epoch_derive",
 ]
 
 [workspace.package]
