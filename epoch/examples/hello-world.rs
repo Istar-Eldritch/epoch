@@ -4,6 +4,7 @@ use epoch::prelude::*;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use epoch::derive::subset_enum;
 use futures_core::Stream;
 use uuid::Uuid;
 
@@ -13,6 +14,7 @@ struct User {
 }
 
 #[derive(serde::Serialize, Clone)]
+#[subset_enum(UserEvent, UserCreated, UserNameUpdated)]
 enum ApplicationEvent {
     UserCreated { name: String },
     UserNameUpdated { name: String },

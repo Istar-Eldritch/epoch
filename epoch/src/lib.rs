@@ -10,6 +10,13 @@ use std::fmt::Debug;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+#[cfg(feature = "derive")]
+#[allow(missing_docs)]
+pub mod derive {
+    //! Derive macros for the `epoch` crate.
+    pub use epoch_derives::subset_enum;
+}
+
 pub mod prelude {
     //! The prelude module for the `epoch` crate.
     pub use super::{

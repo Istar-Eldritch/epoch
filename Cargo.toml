@@ -1,18 +1,14 @@
-[package]
-name = "epoch"
+[workspace]
+members = [
+    "epoch",
+    "epoch_derives",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]
-async-trait = "0.1"
-chrono = { version = "0.4.41", features = ["serde"] }
-futures-core = "0.3.31"
-serde = { version = "1.0.219", features=["derive"] }
-thiserror = "1.0"
-tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1.17"
-uuid = { version = "1.17.0", features = ["serde", "v4"] }
-
-[[examples]]
-name = "hello-world"
-path = "examples/hello-world.rs"
+authors = ["Ruben Paz <me@ruben.io>"]
+keywords = ["event-sourcing", "event", "sourcing"]
+license = "LGPL-3.0-or-later"
+# https://crates.io/category_slugs
+categories = [ "data-structures", "web-programming" ]
