@@ -14,8 +14,9 @@ struct User {
     name: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, EventData)]
 #[subset_enum(UserEvent, UserCreated, UserNameUpdated)]
+#[subset_enum(UserEvento, UserCreated, UserNameUpdated)]
+#[derive(Debug, Clone, serde::Serialize, EventData)]
 enum ApplicationEvent {
     UserCreated { id: Uuid, name: String },
     UserNameUpdated { id: Uuid, name: String },
@@ -108,6 +109,31 @@ impl<'a, P: EventData + Send + Sync + From<D>, D: EventData + Send + Sync + TryF
     type Item = Event<D>;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // We need to use unsafe to get a mutable reference to the fields of the `!Unpin` struct.
+        // This is safe because we are not moving the `VirtualEventStoreStream` itself.
+        let this = unsafe { self.get_unchecked_mut() };
+        let stream_events = this.store.stream_events.get(&this.id);
+
+        if let Some(event_ids) = stream_events {
+            if this.current_index < event_ids.len() {
+                let event_id = event_ids[this.current_index];
+                this.current_index += 1;
+
+                // Find the actual event in the store's main events vector
+                let event = this.store.events.iter().find(|e| e.id == event_id);
+
+                if let Some(event) = event {
+                    // Convert event P to D if possible
+                    if let Some(data_p) = &event.data {
+                        if let Ok(data_d) = D::try_from(data_p.clone()) {
+                            let converted_event = data_d.into_event(event.clone());
+
+                            return Poll::Ready(Some(converted_event));
+                        }
+                    }
+                }
+            }
+        }
         Poll::Ready(None)
     }
 }
@@ -115,9 +141,18 @@ impl<'a, P: EventData + Send + Sync + From<D>, D: EventData + Send + Sync + TryF
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = VirtualEventStore::<ApplicationEvent>::new();
-    let _stream = store
-        .fetch_stream::<ApplicationEvent>(Uuid::new_v4())
-        .await?;
+    let mut stream = store.fetch_stream::<UserEvent>(Uuid::new_v4()).await?;
+
+    stream.append_to_stream(&vec![]).await?;
+
+    // Explicitly call event_type to ensure EventData is implemented
+    // let _event_type = UserEvent::UserCreated { id: Uuid::new_v4(), name: "Test".to_string() }.event_type();
+
+    let user_event_instance = UserEvent::UserCreated {
+        id: Uuid::new_v4(),
+        name: "Debug Test".to_string(),
+    };
+    println!("Debug output of UserEvent: {:?}", user_event_instance);
 
     println!("Hello, from examples!");
 
