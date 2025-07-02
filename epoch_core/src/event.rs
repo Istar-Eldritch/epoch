@@ -42,7 +42,7 @@ where
 }
 
 /// An event's data payload
-pub trait EventData: Serialize + Sized {
+pub trait EventData: Serialize + Sized + Clone {
     /// Get the event type/identifier in PascalCase like `UserCreated` or `PasswordChanged`
     fn event_type(&self) -> &'static str;
 
@@ -58,6 +58,18 @@ pub trait EventData: Serialize + Sized {
             created_at: e.created_at,
             sequence_number: e.sequence_number,
         }
+    }
+}
+
+/// Error returned when an event cannot be converted from one type to another.
+#[derive(Debug, thiserror::Error)]
+#[error("Can't convert enum variant {0} into subset-enum {1}")]
+pub struct EnumConversionError(String, String);
+
+impl EnumConversionError {
+    /// Constructor for a new EnumConversionError.
+    pub fn new(origina_enum_variant: String, subenum: String) -> Self {
+        EnumConversionError(origina_enum_variant, subenum)
     }
 }
 

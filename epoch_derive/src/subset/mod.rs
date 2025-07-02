@@ -132,20 +132,25 @@ fn subset_enum_impl_internal(
                 }
             }
         } else {
+            let original_enum_name_str = original_enum_name.to_string();
+            let original_enum_variant_str = format!("{}::{}", original_enum_name_str, variant_name.to_string());
+            let subset_enum_name_str = subset_enum_name.to_string();
+            let error = quote!(epoch_core::EnumConversionError::new(#original_enum_variant_str.to_string(), #subset_enum_name_str.to_string()));
+
             match fields {
                 syn::Fields::Unit => {
                     quote! {
-                        #original_enum_name::#variant_name => Err(value),
+                        #original_enum_name::#variant_name => Err(#error),
                     }
                 }
                 syn::Fields::Unnamed(_) => {
                     quote! {
-                        #original_enum_name::#variant_name(..) => Err(value),
+                        #original_enum_name::#variant_name(..) => Err(#error),
                     }
                 }
                 syn::Fields::Named(_) => {
                     quote! {
-                        #original_enum_name::#variant_name { .. } => Err(value),
+                        #original_enum_name::#variant_name { .. } => Err(#error),
                     }
                 }
             }
@@ -156,7 +161,7 @@ fn subset_enum_impl_internal(
         use std::convert::TryFrom;
 
         impl TryFrom<#original_enum_name> for #subset_enum_name {
-            type Error = #original_enum_name;
+            type Error = epoch_core::EnumConversionError;
 
             fn try_from(value: #original_enum_name) -> Result<Self, Self::Error> {
                 match value {
