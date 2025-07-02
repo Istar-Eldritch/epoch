@@ -20,7 +20,7 @@ pub mod prelude {
 
 /// A trait that defines the behavior of an event stream.
 #[async_trait::async_trait]
-pub trait EventStream<D: EventData, E>: Stream<Item = Result<Event<D>, E>> {
+pub trait EventStream<D: EventData>: Stream<Item = Event<D>> {
     /// Appends events to a stream.
     async fn append_to_stream(&mut self, events: &[Event<D>])
     -> Result<(), EventStreamAppendError>;
@@ -57,7 +57,9 @@ pub trait EventStoreBackend {
     async fn fetch_stream<E: TryFrom<Self::EventType> + EventData + Send + Sync>(
         &self,
         stream_id: Uuid,
-    ) -> Result<impl EventStream<E, E::Error>, EventStreamFetchError>;
+    ) -> Result<impl EventStream<E>, EventStreamFetchError>
+    where
+        Self::EventType: From<E>;
 }
 
 /// A trait that defines the behavior of a projection.
