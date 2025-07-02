@@ -69,11 +69,16 @@ impl<'a, P: EventData + From<D> + Send + Sync, D: EventData + Send + Sync + TryF
         events: &[Event<D>],
     ) -> Result<(), EventStreamAppendError> {
         let events: Vec<Event<P>> = events
-            .into_iter()
+            .iter()
             .map(|e| {
                 let data: D = e.data.clone().unwrap();
                 let data: P = data.into();
-                let e: Event<P> = data.into_event(e.clone());
+                let e: Event<P> = e
+                    .clone()
+                    .into_builder()
+                    .data(data)
+                    .build()
+                    .expect("Event to be buildable");
                 e
             })
             .collect();
@@ -126,7 +131,12 @@ impl<'a, P: EventData + Send + Sync + From<D>, D: EventData + Send + Sync + TryF
                     // Convert event P to D if possible
                     if let Some(data_p) = &event.data {
                         if let Ok(data_d) = D::try_from(data_p.clone()) {
-                            let converted_event = data_d.into_event(event.clone());
+                            let converted_event = event
+                                .clone()
+                                .into_builder()
+                                .data(data_d)
+                                .build()
+                                .expect("Event to be buildable");
 
                             return Poll::Ready(Some(converted_event));
                         }
