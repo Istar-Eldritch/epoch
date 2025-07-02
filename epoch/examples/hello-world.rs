@@ -33,50 +33,28 @@ impl<D: EventData> VirtualEventStore<D> {
             stream_events: HashMap::new(),
         }
     }
+
+    fn append_events(&mut self, stream_id: Uuid, events: Vec<Event<D>>) {
+        self.events.extend_from_slice(&events);
+        self.stream_events
+            .entry(stream_id)
+            .or_insert_with(Vec::new)
+            .extend(events.iter().map(|e| e.id));
+    }
 }
 
 #[async_trait::async_trait]
 impl<P: EventData + Send + Sync> EventStoreBackend for VirtualEventStore<P> {
     type EventType = P;
     async fn fetch_stream<D: EventData + Send + Sync + TryFrom<Self::EventType>>(
-        &self,
+        &mut self,
         stream_id: Uuid,
     ) -> Result<impl EventStream<D>, EventStreamFetchError>
     where
         P: From<D>,
     {
-        let events: Vec<Event<D>> = self
-            .stream_events
-            .get(&stream_id)
-            .map(|event_ids| {
-                event_ids
-                    .iter()
-                    .filter_map(|event_id| {
-                        self.events
-                            .iter()
-                            .find(|event| event.id == *event_id)
-                            .cloned()
-                            .map(|event| {
-                                let data = todo!();
-                                //event.data.map(|d| d.try_into()).transpose().expect("boom");
-                                Event {
-                                    id: event.id,
-                                    created_at: event.created_at,
-                                    purged_at: event.purged_at,
-                                    sequence_number: event.sequence_number,
-                                    event_type: event.event_type,
-                                    actor_id: event.actor_id,
-                                    purger_id: event.purger_id,
-                                    data,
-                                }
-                            })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
         Ok(VirtualEventStoreStream::<'_, Self::EventType, D>::new(
-            &self,
+            self, stream_id,
         ))
     }
 }
@@ -98,25 +76,26 @@ impl<'a, P: EventData + From<D> + Send + Sync, D: EventData + Send + Sync + TryF
                 e
             })
             .collect();
-        // TODO: Use interior mutability
-        // self.store.events.extend_from_slice(&events);
+        self.store.append_events(self.id, events);
         Ok(())
     }
 }
 
 struct VirtualEventStoreStream<'a, P: EventData + From<D>, D: EventData + Send + Sync + TryFrom<P>>
 {
-    store: &'a VirtualEventStore<P>,
+    store: &'a mut VirtualEventStore<P>,
     _phantom: PhantomData<D>,
+    id: Uuid,
     current_index: usize,
 }
 
 impl<'a, P: EventData + From<D>, D: EventData + Send + Sync + TryFrom<P>>
     VirtualEventStoreStream<'a, P, D>
 {
-    fn new(store: &'a VirtualEventStore<P>) -> Self {
+    fn new(store: &'a mut VirtualEventStore<P>, id: Uuid) -> Self {
         Self {
             store,
+            id,
             _phantom: PhantomData,
             current_index: 0,
         }
@@ -135,8 +114,8 @@ impl<'a, P: EventData + Send + Sync + From<D>, D: EventData + Send + Sync + TryF
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = VirtualEventStore::<ApplicationEvent>::new();
-    let mut stream = store
+    let mut store = VirtualEventStore::<ApplicationEvent>::new();
+    let _stream = store
         .fetch_stream::<ApplicationEvent>(Uuid::new_v4())
         .await?;
 

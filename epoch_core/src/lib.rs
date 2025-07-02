@@ -55,7 +55,7 @@ pub trait EventStoreBackend {
     type EventType: EventData;
     /// Fetches a stream from the storage backend.
     async fn fetch_stream<E: TryFrom<Self::EventType> + EventData + Send + Sync>(
-        &self,
+        &mut self,
         stream_id: Uuid,
     ) -> Result<impl EventStream<E>, EventStreamFetchError>
     where
