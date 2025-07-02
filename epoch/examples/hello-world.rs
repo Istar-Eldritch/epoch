@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures_core::Stream;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 struct User {
@@ -151,20 +152,40 @@ impl<'a, P: EventData + Send + Sync + From<D>, D: EventData + Send + Sync + TryF
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = VirtualEventStore::<ApplicationEvent>::new();
-    let mut stream = store.fetch_stream::<UserEvent>(Uuid::new_v4()).await?;
-
-    stream.append_to_stream(&vec![]).await?;
 
     // Explicitly call event_type to ensure EventData is implemented
     // let _event_type = UserEvent::UserCreated { id: Uuid::new_v4(), name: "Test".to_string() }.event_type();
 
-    let user_event_instance = UserEvent::UserCreated {
-        id: Uuid::new_v4(),
+    let user_id = Uuid::new_v4();
+    let user_created_event: Event<UserEvent> = UserEvent::UserCreated {
+        id: user_id,
         name: "Debug Test".to_string(),
-    };
-    println!("Debug output of UserEvent: {:?}", user_event_instance);
+    }
+    .into_builder()
+    .sequence_number(0)
+    .id(Uuid::new_v4())
+    .build()?;
 
-    println!("Hello, from examples!");
+    let user_name_udpated_event: Event<UserEvent> = UserEvent::UserNameUpdated {
+        id: user_id,
+        name: "Debug Testo".to_string(),
+    }
+    .into_builder()
+    .sequence_number(0)
+    .id(Uuid::new_v4())
+    .build()?;
+
+    let mut stream = store.fetch_stream::<UserEvent>(user_id).await?;
+
+    stream
+        .append_to_stream(&vec![user_created_event, user_name_udpated_event])
+        .await?;
+
+    while let Some(event) = stream.next().await {
+        println!("Debug output of UserEvent: {:?}", event);
+    }
+
+    println!("Done!");
 
     Ok(())
 }

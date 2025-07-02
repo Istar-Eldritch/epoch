@@ -74,19 +74,40 @@ where
     }
 }
 
+impl<D> From<D> for EventBuilder<D>
+where
+    D: EventData,
+{
+    fn from(data: D) -> Self {
+        Self {
+            data: Some(data.clone()),
+            event_type: Some(data.event_type().to_string()),
+            ..EventBuilder::new()
+        }
+    }
+}
+
 /// Builder for `Event`
 #[derive(Debug)]
 pub struct EventBuilder<D>
 where
     D: EventData,
 {
+    /// The event ID.
     pub id: Option<Uuid>,
+    /// The sequence number of the event.
     pub sequence_number: Option<u64>,
+    /// The event type.
     pub event_type: Option<String>,
+    /// The ID of the creator of this event.
     pub actor_id: Option<Uuid>,
+    /// The ID of the purger of this event.
     pub purger_id: Option<Uuid>,
+    /// The event data.
     pub data: Option<D>,
+    /// The time at which this event was created.
     pub created_at: Option<DateTime<Utc>>,
+    /// The time at which this event was purged, if any.
     pub purged_at: Option<DateTime<Utc>>,
 }
 
@@ -179,7 +200,7 @@ where
             actor_id: self.actor_id,
             purger_id: self.purger_id,
             data: self.data,
-            created_at: self.created_at.ok_or(EventBuilderError::CreatedAtMissing)?,
+            created_at: self.created_at.unwrap_or(Utc::now()),
             purged_at: self.purged_at,
         })
     }
@@ -189,6 +210,14 @@ where
 pub trait EventData: Serialize + Sized + Clone {
     /// Get the event type/identifier in PascalCase like `UserCreated` or `PasswordChanged`
     fn event_type(&self) -> &'static str;
+
+    /// Converts `self` into an `EventBuilder`.
+    fn into_builder(self) -> EventBuilder<Self>
+    where
+        Self: Sized,
+    {
+        self.into()
+    }
 }
 
 /// Error returned when an event cannot be converted from one type to another.
@@ -211,14 +240,13 @@ impl EnumConversionError {
 /// Errors that can occur when building an `Event`.
 #[derive(Debug, thiserror::Error)]
 pub enum EventBuilderError {
+    /// The event ID is missing.
     #[error("Event ID is required")]
     IdMissing,
+    /// The sequence number is missing.
     #[error("Sequence number is required")]
     SequenceNumberMissing,
+    /// The event type is missing.
     #[error("Event type is required")]
     EventTypeMissing,
-    #[error("Creation timestamp is required")]
-    CreatedAtMissing,
 }
-
-// EOF

@@ -4,7 +4,7 @@
 
 mod event;
 
-pub use event::{EnumConversionError, Event, EventData};
+pub use event::{EnumConversionError, Event, EventBuilder, EventBuilderError, EventData};
 use futures_core::Stream;
 use std::fmt::Debug;
 use tokio_stream::StreamExt;
@@ -13,8 +13,8 @@ use uuid::Uuid;
 pub mod prelude {
     //! The prelude module for the `epoch` crate.
     pub use super::{
-        EnumConversionError, Event, EventData, EventStoreBackend, EventStream,
-        EventStreamAppendError, EventStreamFetchError, Projection, Projector,
+        EnumConversionError, Event, EventBuilder, EventBuilderError, EventData, EventStoreBackend,
+        EventStream, EventStreamAppendError, EventStreamFetchError, Projection, Projector,
     };
 }
 
