@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "Debug Test".to_string(),
     }
     .into_builder()
-    .sequence_number(0)
+    .stream_id(user_id)
     .id(Uuid::new_v4())
     .build()?;
 
@@ -81,21 +81,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "Debug Testo".to_string(),
     }
     .into_builder()
-    .sequence_number(0)
+    .stream_id(user_id)
     .id(Uuid::new_v4())
     .build()?;
 
-    let mut stream = store.fetch_stream::<UserEvent>(user_id).await?;
+    store.store_event(user_created_event).await?;
 
-    stream.append_to_stream(&vec![user_created_event]).await?;
+    let mut stream = store.read_events::<UserEvent>(user_id).await?;
 
     let user: User = Projector::project(&mut stream).await?.unwrap();
 
     println!("Created: {:?}", user);
 
-    stream
-        .append_to_stream(&vec![user_name_udpated_event])
-        .await?;
+    store.store_event(user_name_udpated_event).await?;
 
     let user: User = Projector::project_on_snapshot(user, &mut stream).await?;
 

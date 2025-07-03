@@ -11,6 +11,9 @@ where
     /// Event ID
     pub id: Uuid,
 
+    /// The id of the entity this event aggregates to
+    pub stream_id: Uuid,
+
     /// The sequence number of the envent. Used to check for sync issues
     pub sequence_number: u64,
 
@@ -63,6 +66,7 @@ where
     fn from(event: Event<D>) -> Self {
         Self {
             id: Some(event.id),
+            stream_id: Some(event.stream_id),
             sequence_number: Some(event.sequence_number),
             event_type: Some(event.event_type),
             actor_id: event.actor_id,
@@ -95,6 +99,8 @@ where
 {
     /// The event ID.
     pub id: Option<Uuid>,
+    /// The stream ID
+    pub stream_id: Option<Uuid>,
     /// The sequence number of the event.
     pub sequence_number: Option<u64>,
     /// The event type.
@@ -119,6 +125,7 @@ where
     pub fn new() -> Self {
         EventBuilder {
             id: None,
+            stream_id: None,
             sequence_number: None,
             event_type: None,
             actor_id: None,
@@ -132,6 +139,12 @@ where
     /// Sets the ID for the event.
     pub fn id(mut self, id: Uuid) -> Self {
         self.id = Some(id);
+        self
+    }
+
+    /// Sets the stream ID for the event.
+    pub fn stream_id(mut self, stream_id: Uuid) -> Self {
+        self.stream_id = Some(stream_id);
         self
     }
 
@@ -160,14 +173,15 @@ where
     }
 
     /// Sets the data payload for the event.
-    pub fn data<P: EventData>(self, data: P) -> EventBuilder<P> {
+    pub fn data<P: EventData>(self, data: Option<P>) -> EventBuilder<P> {
         EventBuilder {
             id: self.id,
+            stream_id: self.stream_id,
             sequence_number: self.sequence_number,
             event_type: self.event_type,
             actor_id: self.actor_id,
             purger_id: self.purger_id,
-            data: Some(data),
+            data,
             created_at: self.created_at,
             purged_at: self.purged_at,
         }
@@ -192,10 +206,9 @@ where
     /// Returns an error if `id`, `sequence_number`, `event_type`, or `created_at` are not set.
     pub fn build(self) -> Result<Event<D>, EventBuilderError> {
         Ok(Event {
-            id: self.id.ok_or(EventBuilderError::IdMissing)?,
-            sequence_number: self
-                .sequence_number
-                .ok_or(EventBuilderError::SequenceNumberMissing)?,
+            id: self.id.unwrap_or_else(|| Uuid::new_v4()),
+            stream_id: self.stream_id.ok_or(EventBuilderError::StreamIdMissing)?,
+            sequence_number: 0,
             event_type: self.event_type.ok_or(EventBuilderError::EventTypeMissing)?,
             actor_id: self.actor_id,
             purger_id: self.purger_id,
@@ -241,11 +254,8 @@ impl EnumConversionError {
 #[derive(Debug, thiserror::Error)]
 pub enum EventBuilderError {
     /// The event ID is missing.
-    #[error("Event ID is required")]
-    IdMissing,
-    /// The sequence number is missing.
-    #[error("Sequence number is required")]
-    SequenceNumberMissing,
+    #[error("Event Stream ID is required")]
+    StreamIdMissing,
     /// The event type is missing.
     #[error("Event type is required")]
     EventTypeMissing,

@@ -17,12 +17,14 @@ use futures_core::Stream;
 struct DataStore<D: EventData> {
     events: HashMap<Uuid, Event<D>>,
     stream_events: HashMap<Uuid, Vec<Uuid>>,
+    sequence_number: u64,
 }
 
 /// An in-memory event store.
 ///
 /// This event store is useful for testing and development purposes. It is not recommended for
 /// production use, as it does not persist events to any durable storage.
+#[derive(Clone)]
 pub struct MemEventStore<D: EventData> {
     data: Arc<Mutex<DataStore<D>>>,
 }
@@ -33,6 +35,7 @@ impl<D: EventData> Default for MemEventStore<D> {
             data: Arc::new(Mutex::new(DataStore {
                 events: HashMap::new(),
                 stream_events: HashMap::new(),
+                sequence_number: 0,
             })),
         }
     }
@@ -42,19 +45,6 @@ impl<D: EventData> MemEventStore<D> {
     /// Creates a new `MemEventStore`.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    async fn append_events(&self, stream_id: Uuid, events: Vec<Event<D>>) {
-        let mut data = self.data.lock().await;
-        data.stream_events
-            .entry(stream_id)
-            .or_insert_with(Vec::new)
-            .extend(events.iter().map(|e| e.id));
-        for event in events.into_iter() {
-            if !data.events.contains_key(&event.id) {
-                data.events.insert(event.id, event);
-            }
-        }
     }
 }
 
@@ -69,7 +59,8 @@ pub enum EventStreamFetchError {
 #[async_trait::async_trait]
 impl<P: EventData + Send + Sync> EventStoreBackend for MemEventStore<P> {
     type EventType = P;
-    async fn fetch_stream<'a, D: EventData + Send + Sync + TryFrom<Self::EventType>>(
+    type AppendToStreamError = EventStreamAppendError;
+    async fn read_events<'a, D: EventData + Send + Sync + TryFrom<Self::EventType>>(
         &'a self,
         stream_id: Uuid,
     ) -> Result<MemEventStoreStream<'a, P, D>, EventStreamFetchError>
@@ -79,6 +70,34 @@ impl<P: EventData + Send + Sync> EventStoreBackend for MemEventStore<P> {
         Ok(MemEventStoreStream::<'_, Self::EventType, D>::new(
             self, stream_id,
         ))
+    }
+
+    async fn store_event<D>(
+        &self,
+        event: Event<D>,
+    ) -> Result<Event<Self::EventType>, Self::AppendToStreamError>
+    where
+        D: EventData + Send + Sync,
+        Self::EventType: From<D>,
+    {
+        let mut data = self.data.lock().await;
+        let event_data = event.data.clone();
+        data.sequence_number += 1;
+
+        let event: Event<Self::EventType> = event
+            .into_builder()
+            .data(event_data.map(|d| d.into()))
+            .sequence_number(data.sequence_number)
+            .build()
+            .expect("To build event from existing one");
+        let stream_id = event.stream_id;
+        let event_id = event.id;
+        data.events.insert(event_id, event.clone());
+        data.stream_events
+            .entry(stream_id)
+            .or_insert_with(Vec::new)
+            .extend(&[event_id]);
+        Ok(event)
     }
 }
 
@@ -94,26 +113,6 @@ pub enum EventStreamAppendError {
 impl<'a, P: EventData + From<D> + Send + Sync, D: EventData + Send + Sync + TryFrom<P>>
     EventStream<D> for MemEventStoreStream<'a, P, D>
 {
-    type AppendToStreamError = EventStreamAppendError;
-
-    async fn append_to_stream(&self, events: &[Event<D>]) -> Result<(), Self::AppendToStreamError> {
-        let events: Vec<Event<P>> = events
-            .iter()
-            .map(|e| {
-                let data: D = e.data.clone().unwrap();
-                let data: P = data.into();
-                let e: Event<P> = e
-                    .clone()
-                    .into_builder()
-                    .data(data)
-                    .build()
-                    .expect("Event to be buildable");
-                e
-            })
-            .collect();
-        self.store.append_events(self.id, events).await;
-        Ok(())
-    }
 }
 
 /// An in--memory event store stream.
@@ -169,7 +168,7 @@ impl<'a, P: EventData + Send + Sync + From<D>, D: EventData + Send + Sync + TryF
                             let converted_event = event
                                 .clone()
                                 .into_builder()
-                                .data(data_d)
+                                .data(Some(data_d))
                                 .build()
                                 .expect("Event to be buildable");
 
