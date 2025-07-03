@@ -42,9 +42,13 @@ pub trait EventStoreBackend {
 
 /// A trait that defines the behavior of a projection.
 /// A projection is a read-model that is built from a stream of events.
-pub trait Projection<E: EventData>: Default {
+pub trait Projection<E: EventData>: Sized {
+    /// If the event can't be applied, this error is returned
+    type ProjectionError;
+    /// Creates a new projection from an event
+    fn new(event: &E) -> Result<Self, Self::ProjectionError>;
     /// Updates the projection with a single event.
-    fn apply(self, event: &E) -> Self;
+    fn apply(self, event: &E) -> Result<Self, Self::ProjectionError>;
 }
 
 /// A projector is responsible for applying events to a projection.
@@ -52,18 +56,52 @@ pub struct Projector;
 
 impl Projector {
     /// Projects a stream of events onto a projection.
-    pub async fn project<E, P, S>(stream: &mut S) -> P
+    async fn project_impl<D, P, S>(
+        snapshot: Option<P>,
+        mut stream: S,
+    ) -> Result<Option<P>, P::ProjectionError>
     where
-        E: EventData,
-        P: Projection<E>,
-        S: futures_core::stream::Stream<Item = Event<E>> + Unpin,
+        D: EventData,
+        P: Projection<D>,
+        S: futures_core::stream::Stream<Item = Event<D>> + Unpin,
     {
-        let mut projection = P::default();
-        while let Some(event) = stream.next().await {
-            if let Some(data) = &event.data {
-                projection = projection.apply(data);
+        let mut projection: Option<P> = snapshot;
+        if projection.is_none() {
+            if let Some(event) = stream.next().await {
+                if let Some(data) = event.data {
+                    projection = Some(P::new(&data)?);
+                }
             }
         }
-        projection
+        while let Some(event) = stream.next().await {
+            if let Some(data) = &event.data {
+                projection = projection.map(|p: P| p.apply(data)).transpose()?;
+            }
+        }
+        Ok(projection)
+    }
+    /// Projects a stream of events onto a projection.
+    pub async fn project<D, P, S>(stream: S) -> Result<Option<P>, P::ProjectionError>
+    where
+        D: EventData,
+        P: Projection<D>,
+        S: futures_core::stream::Stream<Item = Event<D>> + Unpin,
+    {
+        Projector::project_impl::<D, P, S>(None, stream).await
+    }
+
+    /// Projects a stream of events onto a projection.
+    pub async fn project_on_snapshot<D, P, S>(
+        snapshot: P,
+        stream: S,
+    ) -> Result<P, P::ProjectionError>
+    where
+        D: EventData,
+        P: Projection<D>,
+        S: futures_core::stream::Stream<Item = Event<D>> + Unpin,
+    {
+        Ok(Projector::project_impl::<D, P, S>(Some(snapshot), stream)
+            .await?
+            .unwrap())
     }
 }

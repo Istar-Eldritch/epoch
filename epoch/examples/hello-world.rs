@@ -12,9 +12,44 @@ use futures_core::Stream;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+#[derive(Debug)]
 struct User {
     id: Uuid,
     name: String,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum UserProjectionError {
+    #[error("Cant hydrate user with event {0}")]
+    UnexpectedEvent(String),
+    #[error("Unexpected error projecting user: {0}")]
+    Unexpected(#[from] Box<dyn std::error::Error>),
+}
+
+impl Projection<UserEvent> for User {
+    type ProjectionError = UserProjectionError;
+    fn apply(self, event: &UserEvent) -> Result<Self, Self::ProjectionError> {
+        match event {
+            UserEvent::UserNameUpdated { id: _, name } => Ok(User {
+                name: name.clone(),
+                ..self
+            }),
+            e => Err(UserProjectionError::UnexpectedEvent(
+                e.event_type().to_string(),
+            )),
+        }
+    }
+    fn new(event: &UserEvent) -> Result<Self, Self::ProjectionError> {
+        match event {
+            UserEvent::UserCreated { id, name } => Ok(User {
+                name: name.clone(),
+                id: id.clone(),
+            }),
+            e => Err(UserProjectionError::UnexpectedEvent(
+                e.event_type().to_string(),
+            )),
+        }
+    }
 }
 
 #[subset_enum(UserEvent, UserCreated, UserNameUpdated)]
@@ -208,15 +243,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut stream = store.fetch_stream::<UserEvent>(user_id).await?;
 
+    stream.append_to_stream(&vec![user_created_event]).await?;
+
+    let user: User = Projector::project(&mut stream).await?.unwrap();
+
+    println!("Created: {:?}", user);
+
     stream
-        .append_to_stream(&vec![user_created_event, user_name_udpated_event])
+        .append_to_stream(&vec![user_name_udpated_event])
         .await?;
 
-    while let Some(event) = stream.next().await {
-        println!("Debug output of UserEvent: {:?}", event);
-    }
+    let user: User = Projector::project_on_snapshot(user, &mut stream).await?;
 
-    println!("Done!");
+    println!("Updated: {:?}", user);
 
     Ok(())
 }
