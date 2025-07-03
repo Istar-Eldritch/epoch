@@ -44,6 +44,7 @@ fn subset_enum_impl_internal(
         Err(e) => return e.to_compile_error(),
     };
 
+    let vis_token = &input_enum.vis;
     let subset_enum_name = parsed_attr.subset_enum_name;
     let included_variants: Vec<Ident> = parsed_attr.included_variants.into_iter().collect();
 
@@ -171,7 +172,7 @@ fn subset_enum_impl_internal(
 
     let expanded = quote! {
         #( #forwarded_attrs )*
-        enum #subset_enum_name {
+        #vis_token enum #subset_enum_name {
             #new_variants
         }
 
@@ -399,6 +400,49 @@ mod tests {
             #[derive(Debug, Clone)]
             #[allow(dead_code)]
             enum OriginalEnum {
+                VariantA,
+                VariantB(i32),
+            }
+        };
+        test_subset_enum(attr, item, expected);
+    }
+
+    #[test]
+    fn test_pub_visibility() {
+        let attr = quote! { MySubsetEnum };
+        let item = quote! {
+            pub enum OriginalEnum {
+                VariantA,
+                VariantB(i32),
+            }
+        };
+        let expected = quote! {
+            pub enum MySubsetEnum {
+                VariantA,
+                VariantB(i32),
+            }
+
+            impl From<MySubsetEnum> for OriginalEnum {
+                fn from(value: MySubsetEnum) -> Self {
+                    match value {
+                        MySubsetEnum::VariantA => OriginalEnum::VariantA,
+                        MySubsetEnum::VariantB(__field0) => OriginalEnum::VariantB(__field0),
+                    }
+                }
+            }
+
+            impl std::convert::TryFrom<OriginalEnum> for MySubsetEnum {
+                type Error = epoch_core::EnumConversionError;
+
+                fn try_from(value: OriginalEnum) -> Result<Self, Self::Error> {
+                    match value {
+                        OriginalEnum::VariantA => Ok(MySubsetEnum::VariantA),
+                        OriginalEnum::VariantB(__field0) => Ok(MySubsetEnum::VariantB(__field0)),
+                    }
+                }
+            }
+
+            pub enum OriginalEnum {
                 VariantA,
                 VariantB(i32),
             }
