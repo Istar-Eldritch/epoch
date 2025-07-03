@@ -3,13 +3,15 @@ use epoch_mem_store::*;
 use uuid::Uuid;
 
 #[subset_enum(UserEvent, UserCreated, UserNameUpdated)]
+#[subset_enum(UserSnapshotEvent, UserSnapshot)]
 #[derive(Debug, Clone, serde::Serialize, EventData)]
 enum ApplicationEvent {
     UserCreated { id: Uuid, name: String },
     UserNameUpdated { id: Uuid, name: String },
+    UserSnapshot(User),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[allow(dead_code)]
 struct User {
     id: Uuid,

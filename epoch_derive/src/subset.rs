@@ -171,7 +171,7 @@ fn subset_enum_impl_internal(
 
     let expanded = quote! {
         #( #forwarded_attrs )*
-        pub enum #subset_enum_name {
+        enum #subset_enum_name {
             #new_variants
         }
 
@@ -220,7 +220,7 @@ mod tests {
             }
         };
         let expected = quote! {
-            pub enum MySubsetEnum {
+            enum MySubsetEnum {
                 VariantA,
                 VariantB(i32),
                 VariantC { field: String },
@@ -269,7 +269,7 @@ mod tests {
             }
         };
         let expected = quote! {
-            pub enum MySubsetEnum {
+            enum MySubsetEnum {
                 VariantA,
                 VariantC { field: String },
             }
@@ -318,7 +318,7 @@ mod tests {
             }
         };
         let expected = quote! {
-            pub enum MySubsetEnum {
+            enum MySubsetEnum {
                 UnitVariant,
                 TupleVariant(u32, bool),
                 StructVariant { name: String, id: u64 },
@@ -371,7 +371,7 @@ mod tests {
         let expected = quote! {
             #[derive(Debug, Clone)]
             #[allow(dead_code)]
-            pub enum MySubsetEnum {
+            enum MySubsetEnum {
                 VariantA,
                 VariantB(i32),
             }
