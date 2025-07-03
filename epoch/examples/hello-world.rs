@@ -45,6 +45,14 @@ impl<D: EventData> VirtualEventStore<D> {
     }
 }
 
+/// An error that can occur when fetching a stream.
+#[derive(Debug, thiserror::Error)]
+pub enum EventStreamFetchError {
+    /// An unexpected error occurred.
+    #[error("unexpected error: {0}")]
+    Unexpected(#[from] Box<dyn std::error::Error>),
+}
+
 #[async_trait::async_trait]
 impl<P: EventData + Send + Sync> EventStoreBackend for VirtualEventStore<P> {
     type EventType = P;

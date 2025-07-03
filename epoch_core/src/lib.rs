@@ -14,7 +14,7 @@ pub mod prelude {
     //! The prelude module for the `epoch` crate.
     pub use super::{
         EnumConversionError, Event, EventBuilder, EventBuilderError, EventData, EventStoreBackend,
-        EventStream, EventStreamAppendError, EventStreamFetchError, Projection, Projector,
+        EventStream, EventStreamAppendError, Projection, Projector,
     };
 }
 
@@ -26,23 +26,9 @@ pub trait EventStream<D: EventData>: Stream<Item = Event<D>> {
     -> Result<(), EventStreamAppendError>;
 }
 
-/// An error that can occur when fetching a stream.
-#[derive(Debug, thiserror::Error)]
-pub enum EventStreamFetchError {
-    /// The stream was not found.
-    #[error("stream not found")]
-    NotFound,
-    /// An unexpected error occurred.
-    #[error("unexpected error: {0}")]
-    Unexpected(#[from] Box<dyn std::error::Error>),
-}
-
 /// An error that can occur when appending to a stream.
 #[derive(Debug, thiserror::Error)]
 pub enum EventStreamAppendError {
-    /// The stream was not found.
-    #[error("optimistic concurrency check failed")]
-    OptimisticConcurrency,
     /// An unexpected error occurred.
     #[error("unexpected error: {0}")]
     Unexpected(#[from] Box<dyn std::error::Error>),
@@ -54,12 +40,12 @@ pub trait EventStoreBackend {
     /// The type of event stored in this store
     type EventType: EventData;
     /// Fetches a stream from the storage backend.
-    async fn fetch_stream<E: TryFrom<Self::EventType> + EventData + Send + Sync>(
+    async fn fetch_stream<D: TryFrom<Self::EventType> + EventData + Send + Sync>(
         &mut self,
         stream_id: Uuid,
-    ) -> Result<impl EventStream<E>, EventStreamFetchError>
+    ) -> Result<impl EventStream<D>, impl std::error::Error>
     where
-        Self::EventType: From<E>;
+        Self::EventType: From<D>;
 }
 
 /// A trait that defines the behavior of a projection.
