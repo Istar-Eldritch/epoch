@@ -6,7 +6,6 @@ mod event;
 
 pub use event::{EnumConversionError, Event, EventBuilder, EventBuilderError, EventData};
 use futures_core::Stream;
-use std::fmt::Debug;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
@@ -14,24 +13,17 @@ pub mod prelude {
     //! The prelude module for the `epoch` crate.
     pub use super::{
         EnumConversionError, Event, EventBuilder, EventBuilderError, EventData, EventStoreBackend,
-        EventStream, EventStreamAppendError, Projection, Projector,
+        EventStream, Projection, Projector,
     };
 }
 
 /// A trait that defines the behavior of an event stream.
 #[async_trait::async_trait]
 pub trait EventStream<D: EventData>: Stream<Item = Event<D>> {
+    /// The error returned by append to stream
+    type AppendToStreamError: std::error::Error;
     /// Appends events to a stream.
-    async fn append_to_stream(&mut self, events: &[Event<D>])
-    -> Result<(), EventStreamAppendError>;
-}
-
-/// An error that can occur when appending to a stream.
-#[derive(Debug, thiserror::Error)]
-pub enum EventStreamAppendError {
-    /// An unexpected error occurred.
-    #[error("unexpected error: {0}")]
-    Unexpected(#[from] Box<dyn std::error::Error>),
+    async fn append_to_stream(&self, events: &[Event<D>]) -> Result<(), Self::AppendToStreamError>;
 }
 
 /// A trait that defines the behavior of a storage backend.
@@ -41,7 +33,7 @@ pub trait EventStoreBackend {
     type EventType: EventData;
     /// Fetches a stream from the storage backend.
     async fn fetch_stream<D: TryFrom<Self::EventType> + EventData + Send + Sync>(
-        &mut self,
+        &self,
         stream_id: Uuid,
     ) -> Result<impl EventStream<D>, impl std::error::Error>
     where

@@ -67,10 +67,10 @@ pub enum EventStreamFetchError {
 #[async_trait::async_trait]
 impl<P: EventData + Send + Sync> EventStoreBackend for VirtualEventStore<P> {
     type EventType = P;
-    async fn fetch_stream<D: EventData + Send + Sync + TryFrom<Self::EventType>>(
-        &mut self,
+    async fn fetch_stream<'a, D: EventData + Send + Sync + TryFrom<Self::EventType>>(
+        &'a self,
         stream_id: Uuid,
-    ) -> Result<impl EventStream<D>, EventStreamFetchError>
+    ) -> Result<VirtualEventStoreStream<'a, P, D>, EventStreamFetchError>
     where
         P: From<D>,
     {
@@ -80,14 +80,21 @@ impl<P: EventData + Send + Sync> EventStoreBackend for VirtualEventStore<P> {
     }
 }
 
+/// An error that can occur when appending to a stream.
+#[derive(Debug, thiserror::Error)]
+pub enum EventStreamAppendError {
+    /// An unexpected error occurred.
+    #[error("unexpected error: {0}")]
+    Unexpected(#[from] Box<dyn std::error::Error>),
+}
+
 #[async_trait::async_trait]
 impl<'a, P: EventData + From<D> + Send + Sync, D: EventData + Send + Sync + TryFrom<P>>
     EventStream<D> for VirtualEventStoreStream<'a, P, D>
 {
-    async fn append_to_stream(
-        &mut self,
-        events: &[Event<D>],
-    ) -> Result<(), EventStreamAppendError> {
+    type AppendToStreamError = EventStreamAppendError;
+
+    async fn append_to_stream(&self, events: &[Event<D>]) -> Result<(), Self::AppendToStreamError> {
         let events: Vec<Event<P>> = events
             .iter()
             .map(|e| {
@@ -109,7 +116,7 @@ impl<'a, P: EventData + From<D> + Send + Sync, D: EventData + Send + Sync + TryF
 
 struct VirtualEventStoreStream<'a, P: EventData + From<D>, D: EventData + Send + Sync + TryFrom<P>>
 {
-    store: &'a mut VirtualEventStore<P>,
+    store: &'a VirtualEventStore<P>,
     _phantom: PhantomData<D>,
     id: Uuid,
     current_index: usize,
@@ -118,7 +125,7 @@ struct VirtualEventStoreStream<'a, P: EventData + From<D>, D: EventData + Send +
 impl<'a, P: EventData + From<D>, D: EventData + Send + Sync + TryFrom<P>>
     VirtualEventStoreStream<'a, P, D>
 {
-    fn new(store: &'a mut VirtualEventStore<P>, id: Uuid) -> Self {
+    fn new(store: &'a VirtualEventStore<P>, id: Uuid) -> Self {
         Self {
             store,
             id,
@@ -175,7 +182,7 @@ impl<'a, P: EventData + Send + Sync + From<D>, D: EventData + Send + Sync + TryF
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut store = VirtualEventStore::<ApplicationEvent>::new();
+    let store = VirtualEventStore::<ApplicationEvent>::new();
 
     // Explicitly call event_type to ensure EventData is implemented
     // let _event_type = UserEvent::UserCreated { id: Uuid::new_v4(), name: "Test".to_string() }.event_type();
