@@ -46,9 +46,9 @@ pub trait Projection<E: EventData>: Sized {
     /// If the event can't be applied, this error is returned
     type ProjectionError;
     /// Creates a new projection from an event
-    fn new(event: &E) -> Result<Self, Self::ProjectionError>;
+    fn new(event: &Event<E>) -> Result<Self, Self::ProjectionError>;
     /// Updates the projection with a single event.
-    fn apply(self, event: &E) -> Result<Self, Self::ProjectionError>;
+    fn apply(self, event: &Event<E>) -> Result<Self, Self::ProjectionError>;
 }
 
 /// A projector is responsible for applying events to a projection.
@@ -68,15 +68,11 @@ impl Projector {
         let mut projection: Option<P> = snapshot;
         if projection.is_none() {
             if let Some(event) = stream.next().await {
-                if let Some(data) = event.data {
-                    projection = Some(P::new(&data)?);
-                }
+                projection = Some(P::new(&event)?);
             }
         }
         while let Some(event) = stream.next().await {
-            if let Some(data) = &event.data {
-                projection = projection.map(|p: P| p.apply(data)).transpose()?;
-            }
+            projection = projection.map(|p: P| p.apply(&event)).transpose()?;
         }
         Ok(projection)
     }

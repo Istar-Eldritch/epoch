@@ -10,6 +10,7 @@ enum ApplicationEvent {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct User {
     id: Uuid,
     name: String,
@@ -21,30 +22,40 @@ pub enum UserProjectionError {
     UnexpectedEvent(String),
     #[error("Unexpected error projecting user: {0}")]
     Unexpected(#[from] Box<dyn std::error::Error>),
+    #[error("The event has no data attached to it")]
+    NoData,
 }
 
 impl Projection<UserEvent> for User {
     type ProjectionError = UserProjectionError;
-    fn apply(self, event: &UserEvent) -> Result<Self, Self::ProjectionError> {
-        match event {
-            UserEvent::UserNameUpdated { id: _, name } => Ok(User {
-                name: name.clone(),
-                ..self
-            }),
-            e => Err(UserProjectionError::UnexpectedEvent(
-                e.event_type().to_string(),
-            )),
+    fn apply(self, event: &Event<UserEvent>) -> Result<Self, Self::ProjectionError> {
+        if let Some(data) = &event.data {
+            match data {
+                UserEvent::UserNameUpdated { id: _, name } => Ok(User {
+                    name: name.clone(),
+                    ..self
+                }),
+                e => Err(UserProjectionError::UnexpectedEvent(
+                    e.event_type().to_string(),
+                )),
+            }
+        } else {
+            Err(UserProjectionError::NoData)
         }
     }
-    fn new(event: &UserEvent) -> Result<Self, Self::ProjectionError> {
-        match event {
-            UserEvent::UserCreated { id, name } => Ok(User {
-                name: name.clone(),
-                id: id.clone(),
-            }),
-            e => Err(UserProjectionError::UnexpectedEvent(
-                e.event_type().to_string(),
-            )),
+    fn new(event: &Event<UserEvent>) -> Result<Self, Self::ProjectionError> {
+        if let Some(data) = &event.data {
+            match data {
+                UserEvent::UserCreated { id, name } => Ok(User {
+                    name: name.clone(),
+                    id: id.clone(),
+                }),
+                e => Err(UserProjectionError::UnexpectedEvent(
+                    e.event_type().to_string(),
+                )),
+            }
+        } else {
+            Err(UserProjectionError::NoData)
         }
     }
 }

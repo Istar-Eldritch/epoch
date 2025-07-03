@@ -51,7 +51,9 @@ impl<D: EventData> MemEventStore<D> {
             .or_insert_with(Vec::new)
             .extend(events.iter().map(|e| e.id));
         for event in events.into_iter() {
-            data.events.insert(event.id, event);
+            if !data.events.contains_key(&event.id) {
+                data.events.insert(event.id, event);
+            }
         }
     }
 }
