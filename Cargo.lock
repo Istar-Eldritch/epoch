@@ -126,6 +126,7 @@ dependencies = [
  "chrono",
  "epoch_core",
  "epoch_derive",
+ "epoch_mem_store",
  "futures-core",
  "serde",
  "thiserror",
@@ -157,6 +158,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "epoch_mem_store"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "epoch_core",
+ "futures-core",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "uuid",
 ]
 
 [[package]]

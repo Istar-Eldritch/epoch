@@ -9,10 +9,19 @@ pub mod derive {
     pub use epoch_derive::subset_enum;
 }
 
+#[cfg(feature = "mem_store")]
+/// Proc-macros for the `epoch` crate.
+pub mod mem_store {
+    //! Contains proc-macros for the `epoch` crate.
+    pub use epoch_mem_store::*;
+}
+
 pub mod prelude {
     //! The prelude module for the `epoch` crate.
     pub use epoch_core::prelude::*;
 
     #[cfg(feature = "derive")]
     pub use super::derive::*;
+    #[cfg(feature = "mem_store")]
+    pub use super::mem_store::*;
 }
