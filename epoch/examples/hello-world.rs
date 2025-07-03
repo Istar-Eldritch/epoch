@@ -1,5 +1,4 @@
 use epoch::prelude::*;
-use epoch_derive::EventData;
 use epoch_mem_store::*;
 use uuid::Uuid;
 

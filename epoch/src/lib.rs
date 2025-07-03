@@ -6,7 +6,7 @@
 /// Proc-macros for the `epoch` crate.
 pub mod derive {
     //! Contains proc-macros for the `epoch` crate.
-    pub use epoch_derive::subset_enum;
+    pub use epoch_derive::*;
 }
 
 #[cfg(feature = "mem_store")]
