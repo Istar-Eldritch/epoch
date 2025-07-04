@@ -89,15 +89,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut stream = store.read_events::<UserEvent>(user_id).await?;
 
-    let user: User = Projector::project(&mut stream).await?.unwrap();
+    // let user: User = Projector::project(&mut stream).await?.unwrap();
 
-    println!("Created: {:?}", user);
+    // println!("Created: {:?}", user);
 
-    store.store_event(user_name_udpated_event).await?;
+    // store.store_event(user_name_udpated_event).await?;
 
-    let user: User = Projector::project_on_snapshot(user, &mut stream).await?;
+    // let user: User = Projector::project_on_snapshot(user, &mut stream).await?;
 
-    println!("Updated: {:?}", user);
+    // println!("Updated: {:?}", user);
 
     Ok(())
 }

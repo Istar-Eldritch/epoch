@@ -14,7 +14,7 @@ use uuid::Uuid;
 use futures_core::Stream;
 
 /// The in-memory data store.
-struct DataStore<D: EventData> {
+struct EventStoreData<D: EventData> {
     events: HashMap<Uuid, Event<D>>,
     stream_events: HashMap<Uuid, Vec<Uuid>>,
     sequence_number: u64,
@@ -26,13 +26,13 @@ struct DataStore<D: EventData> {
 /// production use, as it does not persist events to any durable storage.
 #[derive(Clone)]
 pub struct MemEventStore<D: EventData> {
-    data: Arc<Mutex<DataStore<D>>>,
+    data: Arc<Mutex<EventStoreData<D>>>,
 }
 
 impl<D: EventData> Default for MemEventStore<D> {
     fn default() -> Self {
         Self {
-            data: Arc::new(Mutex::new(DataStore {
+            data: Arc::new(Mutex::new(EventStoreData {
                 events: HashMap::new(),
                 stream_events: HashMap::new(),
                 sequence_number: 0,
