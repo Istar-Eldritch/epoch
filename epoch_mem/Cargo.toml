@@ -1,5 +1,5 @@
 [package]
-name = "epoch_mem_store"
+name = "epoch_mem"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

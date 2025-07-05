@@ -11,7 +11,7 @@ categories.workspace = true
 [dependencies]
 epoch_core = { path = "../epoch_core/", version = "0.1.0" }
 epoch_derive = { path = "../epoch_derive", optional = true, version = "0.1.0" }
-epoch_mem_store = { path = "../epoch_mem_store", optional = true, version = "0.1.0" }
+epoch_mem = { path = "../epoch_mem", optional = true, version = "0.1.0" }
 
 [dev-dependencies]
 async-trait = "0.1"
@@ -22,12 +22,12 @@ thiserror = "1.0"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1.17"
 uuid = { version = "1.17.0", features = ["serde", "v4"] }
-epoch_mem_store = { path = "../epoch_mem_store", version = "0.1.0" }
+epoch_mem = { path = "../epoch_mem", version = "0.1.0" }
 
 [features]
 default = ["derive"]
 derive = ["epoch_derive"]
-mem_store = ["epoch_mem_store"]
+in-memory = ["epoch_mem"]
 
 [[examples]]
 name = "hello-world"

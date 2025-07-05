@@ -184,15 +184,15 @@ impl<P: Sized + Projection + Clone> ProjectionStore for MemProjectionStore<P> {
 }
 
 /// An in-memory projector
-pub struct MemProjector<S: ProjectionStore>(S);
+pub struct StoreProjector<S: ProjectionStore>(S);
 
-impl<S> MemProjector<S>
+impl<S> StoreProjector<S>
 where
     S: ProjectionStore,
 {
     /// Creates a new instance of the projector
     pub fn new(store: S) -> Self {
-        MemProjector(store)
+        StoreProjector(store)
     }
 }
 
@@ -213,7 +213,7 @@ where
     // Unexpected(#[from] Box<dyn std::error::Error + Send>),
 }
 
-impl<S> Projector for MemProjector<S>
+impl<S> Projector for StoreProjector<S>
 where
     S: ProjectionStore,
 {

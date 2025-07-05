@@ -1,8 +1,8 @@
 use std::convert::Infallible;
 
 use epoch::prelude::*;
-use epoch_core::{MemProjectionStore, MemProjector, ProjectionError, ProjectionStore, Projector};
-use epoch_mem_store::*;
+use epoch_core::{MemProjectionStore, ProjectionError, ProjectionStore, Projector, StoreProjector};
+use epoch_mem::*;
 use uuid::Uuid;
 
 #[subset_enum(UserEvent, UserCreated, UserNameUpdated)]
@@ -112,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let user_store = MemProjectionStore::<User>::new();
     let store = user_store.clone();
-    let user_projector = MemProjector::new(user_store);
+    let user_projector = StoreProjector::new(user_store);
 
     user_projector.project(user_created_event).await?;
 

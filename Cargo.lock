@@ -126,7 +126,7 @@ dependencies = [
  "chrono",
  "epoch_core",
  "epoch_derive",
- "epoch_mem_store",
+ "epoch_mem",
  "futures-core",
  "serde",
  "thiserror",
@@ -161,7 +161,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "epoch_mem_store"
+name = "epoch_mem"
 version = "0.1.0"
 dependencies = [
  "async-trait",
