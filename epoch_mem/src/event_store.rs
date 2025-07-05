@@ -212,6 +212,21 @@ where
     projectors: Arc<Mutex<Vec<P>>>,
 }
 
+impl<D, P> InMemoryEventBus<D, P>
+where
+    D: EventData + Send + Sync,
+    P: Projector + Send + Sync,
+    <P::Projection as Projection>::EventType: From<D> + EventData,
+{
+    /// Creates a new in-memory bus
+    pub fn new() -> Self {
+        InMemoryEventBus {
+            _phantom: PhantomData,
+            projectors: Arc::new(Mutex::new(vec![])),
+        }
+    }
+}
+
 impl<D, P> EventBus for InMemoryEventBus<D, P>
 where
     D: EventData + Send + Sync,
