@@ -186,21 +186,20 @@ pub struct InMemoryEventBusPublishError;
 
 /// An implementation of an in-memory event bus
 #[derive(Debug)]
-pub struct InMemoryEventBus<D, S, P>
+pub struct InMemoryEventBus<D, P>
 where
-    S: EventStoreBackend<EventType = D>,
-    P: Projector<Store = S>,
+    D: EventData + Send + Sync,
+    P: Projector + Send + Sync,
     <P::Projection as Projection>::EventType: From<D> + EventData,
 {
-    store: S,
+    _phantom: PhantomData<D>,
     projectors: Arc<Mutex<Vec<P>>>,
 }
 
-impl<D, S, P> EventBus for InMemoryEventBus<D, S, P>
+impl<D, P> EventBus for InMemoryEventBus<D, P>
 where
-    D: EventData,
-    S: EventStoreBackend<EventType = D> + Send + Sync,
-    P: Projector<Store = S> + Send + Sync,
+    D: EventData + Send + Sync,
+    P: Projector + Send + Sync,
     <P::Projection as Projection>::EventType: From<D> + EventData,
 {
     type EventType = D;
