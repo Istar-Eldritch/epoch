@@ -184,8 +184,9 @@ impl<'a, P: EventData + Send + Sync + From<D>, D: EventData + Send + Sync + TryF
 #[error("In memory eventbus publish error")]
 pub struct InMemoryEventBusPublishError;
 
+/// An implementation of an in-memory event bus
 #[derive(Debug)]
-struct InMemoryEventBus<D, S, P>
+pub struct InMemoryEventBus<D, S, P>
 where
     S: EventStoreBackend<EventType = D>,
     P: Projector<Store = S>,
