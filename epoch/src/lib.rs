@@ -9,7 +9,7 @@ pub mod derive {
     pub use epoch_derive::*;
 }
 
-#[cfg(feature = "mem_store")]
+#[cfg(feature = "in-memory")]
 /// Proc-macros for the `epoch` crate.
 pub mod mem_store {
     //! Contains proc-macros for the `epoch` crate.
@@ -22,6 +22,6 @@ pub mod prelude {
 
     #[cfg(feature = "derive")]
     pub use super::derive::*;
-    #[cfg(feature = "mem_store")]
+    #[cfg(feature = "in-memory")]
     pub use super::mem_store::*;
 }

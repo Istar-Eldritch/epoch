@@ -4,7 +4,7 @@
 
 mod event;
 
-use std::{collections::HashMap, convert::Infallible, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 pub use event::{EnumConversionError, Event, EventBuilder, EventBuilderError, EventData};
 use futures_core::Stream;
@@ -66,6 +66,18 @@ pub trait EventStoreBackend {
 /// DOCS
 pub trait ProjectionError: std::error::Error + Send + Sync {}
 
+/// A trait that defines an error from a projector.
+pub trait ProjectorError: std::error::Error + Send + Sync {
+    /// The projection error type.
+    type ProjectionError: ProjectionError;
+    /// The store error type.
+    type StoreError: ProjectionStoreError;
+    /// Creates an error from a projection error.
+    fn from_projection_error(err: Self::ProjectionError) -> Self;
+    /// Creates an error from a store error.
+    fn from_store_error(err: Self::StoreError) -> Self;
+}
+
 /// A trait that defines the behavior of a projection.
 /// A projection is a read-model that is built from a stream of events.
 pub trait Projection: Sized + Send + Sync {
@@ -87,7 +99,10 @@ pub trait Projection: Sized + Send + Sync {
 /// A projector is responsible for creating and updating projections from events.
 pub trait Projector {
     /// DOCS
-    type Error;
+    type Error: ProjectorError<
+            ProjectionError = <Self::Projection as Projection>::Error,
+            StoreError = <Self::Store as ProjectionStore>::Error,
+        >;
     /// DOCS
     type Projection: Projection + Send;
     /// DOCS
@@ -102,33 +117,44 @@ pub trait Projector {
         event: Event<<<Self as Projector>::Projection as Projection>::EventType>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
-        <Self as Projector>::Error: From<<<Self as Projector>::Projection as Projection>::Error>,
-        <Self as Projector>::Error: From<<<Self as Projector>::Store as ProjectionStore>::Error>,
         Self: Send + Sync,
     {
         async {
             let id = Self::Projection::get_id_from_event(&event);
             let projection = match id {
                 Some(id) => {
-                    let snapshot = self.get_store().fetch_by_id(&id).await?;
+                    let snapshot = self
+                        .get_store()
+                        .fetch_by_id(&id)
+                        .await
+                        .map_err(Self::Error::from_store_error)?;
                     match snapshot {
-                        Some(snapshot) => snapshot.apply(event)?,
-                        None => Self::Projection::new(event)?,
+                        Some(snapshot) => snapshot
+                            .apply(event)
+                            .map_err(Self::Error::from_projection_error)?,
+                        None => Self::Projection::new(event)
+                            .map_err(Self::Error::from_projection_error)?,
                     }
                 }
-                None => Self::Projection::new(event)?,
+                None => Self::Projection::new(event).map_err(Self::Error::from_projection_error)?,
             };
 
-            self.get_store().store(projection).await?;
+            self.get_store()
+                .store(projection)
+                .await
+                .map_err(Self::Error::from_store_error)?;
             Ok(())
         }
     }
 }
 
+/// Error thrown by a projection store
+pub trait ProjectionStoreError: std::error::Error + Send + Sync {}
+
 /// A trait defining the behavior of a projection store
 pub trait ProjectionStore: Send {
     /// The errors returned by this store
-    type Error;
+    type Error: ProjectionStoreError;
     /// The entity type to store on the store
     type Entity: Projection;
     /// Finds a projection in the store by its id
@@ -161,8 +187,15 @@ where
     }
 }
 
+/// The error of the in-memory store
+#[derive(Debug, thiserror::Error)]
+#[error("MemProjectionStoreInfallibleError")]
+pub struct MemProjectionStoreInfallibleError;
+
+impl ProjectionStoreError for MemProjectionStoreInfallibleError {}
+
 impl<P: Sized + Projection + Clone> ProjectionStore for MemProjectionStore<P> {
-    type Error = Infallible;
+    type Error = MemProjectionStoreInfallibleError;
     type Entity = P;
     fn store(&self, projection: P) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async {
@@ -183,7 +216,7 @@ impl<P: Sized + Projection + Clone> ProjectionStore for MemProjectionStore<P> {
     }
 }
 
-/// An in-memory projector
+/// A projector that uses a `ProjectionStore` to store projections.
 pub struct StoreProjector<S: ProjectionStore>(S);
 
 impl<S> StoreProjector<S>
@@ -198,27 +231,46 @@ where
 
 /// Errors that may happen when working with the in-memory projector
 #[derive(Debug, thiserror::Error)]
-pub enum MemoryProjectorError<P>
+pub enum MemoryProjectorError<P, S>
 where
     P: ProjectionError,
+    S: ProjectionStoreError,
 {
     /// An error originating from the Projection
     #[error("Projection error: {0}")]
-    Projection(#[from] P),
-    /// An error that never happends
-    #[error("This error should never happen: {0}")]
-    Infallible(#[from] Infallible),
-    // /// An error of unknown origin that was not handled specifically
-    // #[error("Unexpected memory projector error: {0}")]
-    // Unexpected(#[from] Box<dyn std::error::Error + Send>),
+    Projection(P),
+    /// An error originated from the projeciton store
+    #[error("Projection store error: {0}")]
+    Store(S),
+}
+
+impl<P, S> ProjectorError for MemoryProjectorError<P, S>
+where
+    P: ProjectionError,
+    S: ProjectionStoreError,
+{
+    type ProjectionError = P;
+    type StoreError = S;
+
+    fn from_projection_error(err: Self::ProjectionError) -> Self {
+        Self::Projection(err)
+    }
+
+    fn from_store_error(err: Self::StoreError) -> Self {
+        Self::Store(err)
+    }
 }
 
 impl<S> Projector for StoreProjector<S>
 where
     S: ProjectionStore,
+    <S as ProjectionStore>::Entity: Projection,
 {
-    type Projection = <<Self as Projector>::Store as ProjectionStore>::Entity;
-    type Error = MemoryProjectorError<<<Self as Projector>::Projection as Projection>::Error>;
+    type Projection = S::Entity;
+    type Error = MemoryProjectorError<
+        <<Self as Projector>::Projection as Projection>::Error,
+        <<Self as Projector>::Store as ProjectionStore>::Error,
+    >;
     type Store = S;
     fn get_store(&self) -> &Self::Store {
         &self.0
