@@ -4,12 +4,11 @@
 
 mod event;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
-use async_trait::async_trait;
 pub use event::{EnumConversionError, Event, EventBuilder, EventBuilderError, EventData};
 use futures_core::Stream;
-use tokio_stream::StreamExt;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 pub mod prelude {
@@ -64,83 +63,153 @@ pub trait EventStoreBackend {
         Self::EventType: From<D>;
 }
 
+/// DOCS
+pub trait ProjectionError: std::error::Error + Send + Sync {}
+
 /// A trait that defines the behavior of a projection.
 /// A projection is a read-model that is built from a stream of events.
-pub trait Projection<E: EventData>: Sized {
+pub trait Projection: Sized + Send + Sync {
+    /// DOCS
+    type EventType: EventData + Send;
     /// If the event can't be applied, this error is returned
-    type ProjectionError: std::error::Error;
+    type Error: ProjectionError;
     /// Creates a new projection from an event
-    fn new(event: Event<E>) -> Result<Self, impl std::error::Error>;
+    fn new(event: Event<Self::EventType>) -> Result<Self, Self::Error>;
     /// Updates the projection with a single event.
-    fn apply(self, event: Event<E>) -> Result<Self, impl std::error::Error>;
+    fn apply(self, event: Event<Self::EventType>) -> Result<Self, Self::Error>;
     /// Retrieves the projection id from the event.
-    fn get_projection_id(event: &Event<E>) -> Option<Uuid>;
+    fn get_id_from_event(event: &Event<Self::EventType>) -> Option<Uuid>;
+    /// Get the id of the projection
+    fn get_id(&self) -> &Uuid;
 }
 
-/// A trait that wraps a Projection and handles persistance, cache and other related logic
-// #[async_trait::async_trait]
-// pub trait Projector<D: EventData, P: Projection<D>> {
-//     async fn get_snapshot(&self, event: &Event<D>) -> Option<P>;
-//
-//     /// Projects a stream of events onto a projection.
-//     async fn project<'a>(&'a self, event: Event<D>) -> Result<P, P::ProjectionError>
-//     where
-//         D: EventData + Send + Sync + 'a,
-//         P: Projection<D>,
-//     {
-//         if let Some(snapshot) = self.get_snapshot(&event).await {
-//             snapshot.apply(&event)
-//         } else {
-//             P::new(&event)
-//         }
-//     }
-// }
+/// DOS
+#[derive(Debug, thiserror::Error)]
+pub enum ProjectorError {
+    /// DOCS
+    #[error("An unexpected eror happened: {0}")]
+    Unexpected(#[from] Box<dyn std::error::Error + Send + Sync>),
+    /// DOCS
+    #[error("A projection error happened: {0}")]
+    Projection(Box<dyn ProjectionError>),
+    /// DOCS
+    #[error("A storage error happened: {0}")]
+    Storage(Box<dyn ProjectionStorageError>),
+}
+
+impl<PE: ProjectionError + 'static> From<PE> for ProjectorError {
+    fn from(error: PE) -> Self {
+        ProjectorError::Projection(Box::new(error))
+    }
+}
 
 /// A trait that defines the behavior of a projector.
 /// A projector is responsible for creating and updating projections from events.
-#[async_trait]
 pub trait Projector {
-    /// The type of event that this projector can handle.
-    type EventType: EventData + Send;
-    /// The type of projection that this projector creates and updates.
-    type ProjectionType: Projection<Self::EventType>;
-    /// Retrieves a snapshot of the projection for a given event.
-    /// This is used to optimize projection by starting from a known state.
-    async fn get_snapshot(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<Self::ProjectionType>, impl std::error::Error>;
-    /// Persist snapshot
-    async fn persist_snapshot(
-        &self,
-        id: Uuid,
-        snapshot: Self::ProjectionType,
-    ) -> Result<(), impl std::error::Error>;
+    /// DOCS
+    type Error;
+    /// DOCS
+    type Projection: Projection + Send;
+    /// DOCS
+    type Store: ProjectionStore<Entity = Self::Projection> + Send;
+    /// Store
+    fn get_store(&self) -> &Self::Store;
     /// Projects a single event onto a projection.
     /// If a snapshot is available, it will be used as the starting point.
     /// Otherwise, a new projection will be created.
-    async fn project<'a>(
-        &'a self,
-        event: Event<Self::EventType>,
-    ) -> Result<Self::ProjectionType, Box<dyn std::error::Error + 'a>> {
-        if let Some(id) = Self::ProjectionType::get_projection_id(&event) {
-            if let Some(snapshot) = self.get_snapshot(id).await? {
-                Ok(snapshot.apply(event)?)
-            } else {
-                Ok(Self::ProjectionType::new(event)?)
-            }
-        } else {
-            Ok(Self::ProjectionType::new(event)?)
+    fn project(
+        &self,
+        event: Event<<<Self as Projector>::Projection as Projection>::EventType>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        <<Self as Projector>::Store as ProjectionStore>::Error: ProjectionError + 'static,
+        <<Self as Projector>::Projection as Projection>::Error: 'static,
+        <Self as Projector>::Error: From<<<Self as Projector>::Projection as Projection>::Error>,
+        <Self as Projector>::Error: From<<<Self as Projector>::Store as ProjectionStore>::Error>,
+        Self: Send + Sync,
+    {
+        async {
+            let id = Self::Projection::get_id_from_event(&event);
+            let projection = match id {
+                Some(id) => {
+                    let snapshot = self.get_store().fetch_by_id(&id).await?;
+                    match snapshot {
+                        Some(snapshot) => snapshot.apply(event)?,
+                        None => Self::Projection::new(event)?,
+                    }
+                }
+                None => Self::Projection::new(event)?,
+            };
+
+            self.get_store().store(projection).await?;
+            Ok(())
         }
     }
 }
 
-struct MemProjector<P: Sized> {
-    entities: HashMap<Uuid, P>,
+/// Errors from the projection store
+pub trait ProjectionStorageError: std::error::Error + Send + Sync {}
+
+/// A trait defining the behavior of a projection store
+pub trait ProjectionStore: Send {
+    /// The errors returned by this store
+    type Error: ProjectionStorageError;
+    /// The entity type to store on the store
+    type Entity: Projection;
+    /// Finds a projection in the store by its id
+    fn fetch_by_id(
+        &self,
+        id: &Uuid,
+    ) -> impl Future<Output = Result<Option<Self::Entity>, Self::Error>> + Send;
+    /// Stores a projection in the store
+    fn store(
+        &self,
+        projection: Self::Entity,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-// impl<D: EventData, P: Projection<D>> Projector<D, P> for MemProjector<P> {
-//     fn get_snapshot(&self, event: &Event<D>) -> Option<P> {
-//         todo!()
+struct MemProjectionStore<P: Sized + Send> {
+    entities: Arc<Mutex<HashMap<Uuid, P>>>,
+}
+
+#[derive(thiserror::Error, Debug)]
+#[error("Infalible error")]
+struct MemStorageError;
+
+impl ProjectionStorageError for MemStorageError {}
+
+impl<P: Sized + Projection + Clone> ProjectionStore for MemProjectionStore<P> {
+    type Error = MemStorageError;
+    type Entity = P;
+    fn store(&self, projection: P) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async {
+            let mut entities = self.entities.lock().await;
+            entities.insert(projection.get_id().clone(), projection);
+            Ok(())
+        }
+    }
+    fn fetch_by_id(
+        &self,
+        id: &Uuid,
+    ) -> impl Future<Output = Result<Option<P>, Self::Error>> + Send {
+        async {
+            let entities = self.entities.lock().await;
+            let entity: Option<P> = entities.get(id).map(|d| d.clone());
+            Ok(entity)
+        }
+    }
+}
+
+struct MemProjector<P: Projection>(MemProjectionStore<P>);
+
+// impl<P> Projector for MemProjector<P>
+// where
+//     P: Projection + Clone,
+// {
+//     type Error = ProjectorError;
+//     type Projection = P;
+//     type Store = MemProjectionStore<Self::Projection>;
+//     fn get_store(&self) -> &Self::Store {
+//         &self.0
 //     }
 // }

@@ -1,4 +1,5 @@
 use epoch::prelude::*;
+use epoch_core::ProjectionError;
 use epoch_mem_store::*;
 use uuid::Uuid;
 
@@ -23,14 +24,18 @@ pub enum UserProjectionError {
     #[error("Cant hydrate user with event {0}")]
     UnexpectedEvent(String),
     #[error("Unexpected error projecting user: {0}")]
-    Unexpected(#[from] Box<dyn std::error::Error>),
+    Unexpected(#[from] Box<dyn std::error::Error + Send + Sync>),
     #[error("The event has no data attached to it")]
     NoData,
 }
 
-impl Projection<UserEvent> for User {
-    type ProjectionError = UserProjectionError;
-    fn apply(self, event: &Event<UserEvent>) -> Result<Self, Self::ProjectionError> {
+impl ProjectionError for UserProjectionError {}
+
+impl Projection for User {
+    type Error = UserProjectionError;
+    type EventType = UserEvent;
+
+    fn apply(self, event: Event<Self::EventType>) -> Result<Self, Self::Error> {
         if let Some(data) = &event.data {
             match data {
                 UserEvent::UserNameUpdated { id: _, name } => Ok(User {
@@ -45,7 +50,7 @@ impl Projection<UserEvent> for User {
             Err(UserProjectionError::NoData)
         }
     }
-    fn new(event: &Event<UserEvent>) -> Result<Self, Self::ProjectionError> {
+    fn new(event: Event<Self::EventType>) -> Result<Self, Self::Error> {
         if let Some(data) = &event.data {
             match data {
                 UserEvent::UserCreated { id, name } => Ok(User {
@@ -58,6 +63,18 @@ impl Projection<UserEvent> for User {
             }
         } else {
             Err(UserProjectionError::NoData)
+        }
+    }
+    fn get_id(&self) -> &Uuid {
+        &self.id
+    }
+    fn get_id_from_event(event: &Event<UserEvent>) -> Option<Uuid> {
+        match &event.data {
+            Some(d) => match d {
+                UserEvent::UserCreated { id, name: _ } => Some(id.clone()),
+                UserEvent::UserNameUpdated { id, name: _ } => Some(id.clone()),
+            },
+            _ => None,
         }
     }
 }
