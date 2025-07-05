@@ -22,26 +22,27 @@ struct EventStoreData<D: EventData> {
 /// This event store is useful for testing and development purposes. It is not recommended for
 /// production use, as it does not persist events to any durable storage.
 #[derive(Clone)]
-pub struct MemEventStore<D: EventData> {
-    data: Arc<Mutex<EventStoreData<D>>>,
+pub struct MemEventStore<B: EventBus> {
+    data: Arc<Mutex<EventStoreData<B::EventType>>>,
+    bus: B,
 }
 
-impl<D: EventData> Default for MemEventStore<D> {
-    fn default() -> Self {
+impl<B: EventBus> MemEventStore<B> {
+    /// Creates a new `MemEventStore`.
+    pub fn new(bus: B) -> Self {
         Self {
             data: Arc::new(Mutex::new(EventStoreData {
                 events: HashMap::new(),
                 stream_events: HashMap::new(),
                 sequence_number: 0,
             })),
+            bus,
         }
     }
-}
 
-impl<D: EventData> MemEventStore<D> {
-    /// Creates a new `MemEventStore`.
-    pub fn new() -> Self {
-        Self::default()
+    /// Exposes the event store bus
+    pub fn bus(&self) -> &B {
+        &self.bus
     }
 }
 
@@ -54,19 +55,21 @@ pub enum EventStreamFetchError {
 }
 
 #[async_trait::async_trait]
-impl<P: EventData + Send + Sync> EventStoreBackend for MemEventStore<P> {
-    type EventType = P;
+impl<B> EventStoreBackend for MemEventStore<B>
+where
+    B: EventBus + Send + Sync,
+    B::EventType: EventData + Send + Sync,
+{
+    type EventType = B::EventType;
     type AppendToStreamError = EventStreamAppendError;
     async fn read_events<'a, D: EventData + Send + Sync + TryFrom<Self::EventType>>(
         &'a self,
         stream_id: Uuid,
-    ) -> Result<MemEventStoreStream<'a, P, D>, EventStreamFetchError>
+    ) -> Result<MemEventStoreStream<'a, B, D>, EventStreamFetchError>
     where
-        P: From<D>,
+        B::EventType: From<D>,
     {
-        Ok(MemEventStoreStream::<'_, Self::EventType, D>::new(
-            self, stream_id,
-        ))
+        Ok(MemEventStoreStream::<'_, B, D>::new(self, stream_id))
     }
 
     async fn store_event<D>(
@@ -106,25 +109,35 @@ pub enum EventStreamAppendError {
     Unexpected(#[from] Box<dyn std::error::Error>),
 }
 
-#[async_trait::async_trait]
-impl<'a, P: EventData + From<D> + Send + Sync, D: EventData + Send + Sync + TryFrom<P>>
-    EventStream<D> for MemEventStoreStream<'a, P, D>
-{
-}
-
 /// An in--memory event store stream.
-pub struct MemEventStoreStream<'a, P: EventData + From<D>, D: EventData + Send + Sync + TryFrom<P>>
+pub struct MemEventStoreStream<'a, B, D>
+where
+    B: EventBus,
+    B::EventType: EventData + From<D>,
+    D: EventData + Send + Sync + TryFrom<B::EventType>,
 {
-    store: &'a MemEventStore<P>,
+    store: &'a MemEventStore<B>,
     _phantom: PhantomData<D>,
     id: Uuid,
     current_index: usize,
 }
 
-impl<'a, P: EventData + From<D>, D: EventData + Send + Sync + TryFrom<P>>
-    MemEventStoreStream<'a, P, D>
+#[async_trait::async_trait]
+impl<'a, B, D> EventStream<D> for MemEventStoreStream<'a, B, D>
+where
+    B: EventBus,
+    B::EventType: EventData + Send + Sync + From<D>,
+    D: EventData + Send + Sync + TryFrom<B::EventType>,
 {
-    fn new(store: &'a MemEventStore<P>, id: Uuid) -> Self {
+}
+
+impl<'a, B, D> MemEventStoreStream<'a, B, D>
+where
+    B: EventBus,
+    B::EventType: EventData + From<D>,
+    D: EventData + Send + Sync + TryFrom<B::EventType>,
+{
+    fn new(store: &'a MemEventStore<B>, id: Uuid) -> Self {
         Self {
             store,
             id,
@@ -134,8 +147,11 @@ impl<'a, P: EventData + From<D>, D: EventData + Send + Sync + TryFrom<P>>
     }
 }
 
-impl<'a, P: EventData + Send + Sync + From<D>, D: EventData + Send + Sync + TryFrom<P>> Stream
-    for MemEventStoreStream<'a, P, D>
+impl<'a, B, D> Stream for MemEventStoreStream<'a, B, D>
+where
+    B: EventBus,
+    B::EventType: EventData + Send + Sync + From<D>,
+    D: EventData + Send + Sync + TryFrom<B::EventType>,
 {
     type Item = Event<D>;
 
