@@ -1,5 +1,7 @@
+use std::convert::Infallible;
+
 use epoch::prelude::*;
-use epoch_core::ProjectionError;
+use epoch_core::{MemProjectionStore, MemProjector, ProjectionError, ProjectionStore, Projector};
 use epoch_mem_store::*;
 use uuid::Uuid;
 
@@ -27,6 +29,8 @@ pub enum UserProjectionError {
     Unexpected(#[from] Box<dyn std::error::Error + Send + Sync>),
     #[error("The event has no data attached to it")]
     NoData,
+    #[error("This error should never happen: {0}")]
+    Infallible(#[from] Infallible),
 }
 
 impl ProjectionError for UserProjectionError {}
@@ -102,9 +106,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .id(Uuid::new_v4())
     .build()?;
 
-    store.store_event(user_created_event).await?;
+    // store.store_event(user_created_event).await?;
 
     let mut stream = store.read_events::<UserEvent>(user_id).await?;
+
+    let user_store = MemProjectionStore::<User>::new();
+    let store = user_store.clone();
+    let user_projector = MemProjector::new(user_store);
+
+    user_projector.project(user_created_event).await?;
+
+    println!("User in store: {:?}", store.fetch_by_id(&user_id).await?);
+
+    user_projector.project(user_name_udpated_event).await?;
+
+    println!("User in store: {:?}", store.fetch_by_id(&user_id).await?);
 
     // let user: User = Projector::project(&mut stream).await?.unwrap();
 

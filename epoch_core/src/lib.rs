@@ -143,8 +143,22 @@ pub trait ProjectionStore: Send {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-struct MemProjectionStore<P: Sized + Send> {
+/// An in-memory store for Projections
+#[derive(Clone, Debug)]
+pub struct MemProjectionStore<P: Sized + Send> {
     entities: Arc<Mutex<HashMap<Uuid, P>>>,
+}
+
+impl<P> MemProjectionStore<P>
+where
+    P: Sized + Send,
+{
+    /// Create a new instance of a MemProjectionStore
+    pub fn new() -> Self {
+        MemProjectionStore {
+            entities: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 impl<P: Sized + Projection + Clone> ProjectionStore for MemProjectionStore<P> {
@@ -169,29 +183,43 @@ impl<P: Sized + Projection + Clone> ProjectionStore for MemProjectionStore<P> {
     }
 }
 
-struct MemProjector<P: Projection>(MemProjectionStore<P>);
+/// An in-memory projector
+pub struct MemProjector<S: ProjectionStore>(S);
+
+impl<S> MemProjector<S>
+where
+    S: ProjectionStore,
+{
+    /// Creates a new instance of the projector
+    pub fn new(store: S) -> Self {
+        MemProjector(store)
+    }
+}
 
 /// Errors that may happen when working with the in-memory projector
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryProjectorError<P>
 where
-    P: std::error::Error + Send,
+    P: ProjectionError,
 {
     /// An error originating from the Projection
     #[error("Projection error: {0}")]
     Projection(#[from] P),
+    /// An error that never happends
+    #[error("This error should never happen: {0}")]
+    Infallible(#[from] Infallible),
     // /// An error of unknown origin that was not handled specifically
     // #[error("Unexpected memory projector error: {0}")]
     // Unexpected(#[from] Box<dyn std::error::Error + Send>),
 }
 
-impl<P> Projector for MemProjector<P>
+impl<S> Projector for MemProjector<S>
 where
-    P: Projection + Clone,
+    S: ProjectionStore,
 {
+    type Projection = <<Self as Projector>::Store as ProjectionStore>::Entity;
     type Error = MemoryProjectorError<<<Self as Projector>::Projection as Projection>::Error>;
-    type Projection = P;
-    type Store = MemProjectionStore<Self::Projection>;
+    type Store = S;
     fn get_store(&self) -> &Self::Store {
         &self.0
     }
