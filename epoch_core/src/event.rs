@@ -1,3 +1,7 @@
+//! This module defines the `Event` struct and its associated `EventBuilder` for creating new events.
+//! It also provides the `EventData` trait, which must be implemented by any data structure used as an
+//! event's payload, and error types for event creation and conversion.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

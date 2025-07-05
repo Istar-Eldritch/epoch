@@ -1,4 +1,10 @@
+//! This module defines the `EventStoreBackend` trait, which provides an interface for interacting
+//! with an event store. It includes methods for reading events from a stream and appending new
+//! events to a stream. This module also defines the `EventBus` trait, which allows for publishing
+//! and subscribing to events.
+
 use crate::event::{Event, EventData};
+use crate::projection::Projector;
 use futures_core::Stream;
 use uuid::Uuid;
 
@@ -30,4 +36,18 @@ pub trait EventStoreBackend {
     where
         D: EventData + Send + Sync,
         Self::EventType: From<D>;
+}
+
+/// A trait that defines the behavior of an event bus.
+#[async_trait::async_trait]
+pub trait EventBus {
+    /// The type of event that can be published to this event bus.
+    type EventType: EventData;
+    /// The error returned by publish
+    type PublishError: std::error::Error;
+    /// Publishes events to the event bus.
+    async fn publish(&self, event: Event<Self::EventType>) -> Result<(), Self::PublishError>;
+
+    /// Allows to subscribe to events
+    fn subscribe(&self, projector: impl Projector) -> ();
 }

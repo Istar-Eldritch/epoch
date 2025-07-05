@@ -1,4 +1,10 @@
+//! This module defines traits for `Projection`, `Projector`, and `ProjectionStore`.
+//! A `Projection` is a read-model built from a stream of events. A `Projector` is responsible
+//! for creating and updating projections, often utilizing a `ProjectionStore` for persistence.
+//! This module also includes error types related to projections and projectors.
+
 use crate::event::{Event, EventData};
+use std::future::Future;
 use uuid::Uuid;
 
 /// The error a projection can throw

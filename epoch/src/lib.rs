@@ -13,7 +13,7 @@ pub mod derive {
 /// Proc-macros for the `epoch` crate.
 pub mod mem_store {
     //! Contains proc-macros for the `epoch` crate.
-    pub use epoch_mem_store::*;
+    pub use epoch_mem::*;
 }
 
 pub mod prelude {

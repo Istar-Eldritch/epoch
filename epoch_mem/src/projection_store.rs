@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use epoch_core::{Projection, ProjectionStore, ProjectionStoreError};
+use epoch_core::projection::{Projection, ProjectionStore, ProjectionStoreError};
 use futures_core::Future;
 use tokio::sync::Mutex;
 use uuid::Uuid;
