@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 
 use epoch::prelude::*;
-use epoch_core::{MemProjectionStore, ProjectionError, ProjectionStore, Projector, StoreProjector};
+use epoch_core::*;
 use epoch_mem::*;
 use uuid::Uuid;
 
