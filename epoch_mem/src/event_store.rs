@@ -178,3 +178,60 @@ impl<'a, P: EventData + Send + Sync + From<D>, D: EventData + Send + Sync + TryF
         Poll::Ready(None)
     }
 }
+
+/// The error for the InMemoryEventBus event publication
+#[derive(Debug, thiserror::Error)]
+#[error("In memory eventbus publish error")]
+pub struct InMemoryEventBusPublishError;
+
+#[derive(Debug)]
+struct InMemoryEventBus<D, S, P>
+where
+    S: EventStoreBackend<EventType = D>,
+    P: Projector<Store = S>,
+    <P::Projection as Projection>::EventType: From<D> + EventData,
+{
+    store: S,
+    projectors: Arc<Mutex<Vec<P>>>,
+}
+
+impl<D, S, P> EventBus for InMemoryEventBus<D, S, P>
+where
+    D: EventData,
+    S: EventStoreBackend<EventType = D> + Send + Sync,
+    P: Projector<Store = S> + Send + Sync,
+    <P::Projection as Projection>::EventType: From<D> + EventData,
+{
+    type EventType = D;
+    type PublishError = InMemoryEventBusPublishError;
+    type ProjectorType = P;
+
+    fn subscribe<'a>(&'a self, projector: Self::ProjectorType) -> impl Future<Output = ()> + Send {
+        async {
+            let mut projectors = self.projectors.lock().await;
+            projectors.push(projector);
+        }
+    }
+
+    fn publish<'a, E>(
+        &'a self,
+        event: Event<E>,
+    ) -> impl Future<Output = Result<(), Self::PublishError>> + Send
+    where
+        E: EventData + 'a + Send + Sync + Into<D>,
+    {
+        async move {
+            let projectors = self.projectors.lock().await;
+            for projector in projectors.iter() {
+                let event_for_projection = event
+                    .clone()
+                    .into_builder()
+                    .data(event.data.clone().map(|d| d.into().into()))
+                    .build()
+                    .unwrap();
+                projector.project(event_for_projection).await.unwrap();
+            }
+            Ok(())
+        }
+    }
+}

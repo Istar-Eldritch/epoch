@@ -224,7 +224,7 @@ where
 }
 
 /// An event's data payload
-pub trait EventData: Serialize + Sized + Clone + Sized {
+pub trait EventData: Serialize + Sized + Clone + Send {
     /// Get the event type/identifier in PascalCase like `UserCreated` or `PasswordChanged`
     fn event_type(&self) -> &'static str;
 
