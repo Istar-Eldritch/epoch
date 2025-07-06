@@ -11,6 +11,7 @@ use futures_core::Stream;
 use epoch_core::prelude::*;
 
 /// The in-memory data store.
+#[derive(Debug)]
 struct EventStoreData<D: EventData> {
     events: HashMap<Uuid, Event<D>>,
     stream_events: HashMap<Uuid, Vec<Uuid>>,
@@ -21,7 +22,7 @@ struct EventStoreData<D: EventData> {
 ///
 /// This event store is useful for testing and development purposes. It is not recommended for
 /// production use, as it does not persist events to any durable storage.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct InMemoryEventStore<B: EventBus + Clone> {
     data: Arc<Mutex<EventStoreData<B::EventType>>>,
     bus: B,
@@ -48,11 +49,16 @@ impl<B: EventBus + Clone> InMemoryEventStore<B> {
 
 /// Errors returned by the InMemoryEventBus
 #[derive(Debug, thiserror::Error)]
-pub enum InMemoryEventStoreBackendError {}
+pub enum InMemoryEventStoreBackendError {
+    /// Error publishing event to bus
+    #[error("Error publishing event to bus")]
+    PublishEvent,
+}
 
 impl<B> EventStoreBackend for InMemoryEventStore<B>
 where
     B: EventBus + Send + Sync + Clone,
+    B::Error: 'static,
 {
     type Error = InMemoryEventStoreBackendError;
     type EventType = B::EventType;
@@ -95,6 +101,11 @@ where
                 .entry(stream_id)
                 .or_insert_with(Vec::new)
                 .extend(&[event_id]);
+            self.bus()
+                .publish(event.clone())
+                .await
+                // TODO: Deal with this error acordingly
+                .map_err(|_e| InMemoryEventStoreBackendError::PublishEvent)?;
             Ok(event)
         }
     }
@@ -232,19 +243,14 @@ where
     type Error = InMemoryEventBusError;
     type EventType = D;
     type ProjectorType = P;
-    fn publish<ED>(&self, event: Event<ED>) -> impl Future<Output = Result<(), Self::Error>> + Send
-    where
-        ED: EventData + Send + Sync,
-        <<Self::ProjectorType as Projector>::Projection as Projection>::EventType: From<ED>,
-        Self::EventType: From<ED>,
-    {
+    fn publish(
+        &self,
+        event: Event<Self::EventType>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
             let projectors = self.projectors.lock().await;
             for projector in projectors.iter() {
-                let data = event
-                    .data
-                    .clone()
-                    .map(|d| <ED as Into<Self::EventType>>::into(d).try_into().unwrap());
+                let data = event.data.clone().map(|d| d.try_into().unwrap());
                 let event_for_projection = event.clone().into_builder().data(data).build().unwrap();
                 projector.project(event_for_projection).await.unwrap();
             }
