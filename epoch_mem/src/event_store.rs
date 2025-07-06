@@ -22,12 +22,12 @@ struct EventStoreData<D: EventData> {
 /// This event store is useful for testing and development purposes. It is not recommended for
 /// production use, as it does not persist events to any durable storage.
 #[derive(Clone)]
-pub struct MemEventStore<B: EventBus> {
+pub struct InMemoryEventStore<B: EventBus + Clone> {
     data: Arc<Mutex<EventStoreData<B::EventType>>>,
     bus: B,
 }
 
-impl<B: EventBus> MemEventStore<B> {
+impl<B: EventBus + Clone> InMemoryEventStore<B> {
     /// Creates a new `MemEventStore`.
     pub fn new(bus: B) -> Self {
         Self {
@@ -46,98 +46,80 @@ impl<B: EventBus> MemEventStore<B> {
     }
 }
 
-/// An error that can occur when fetching a stream.
+/// Errors returned by the InMemoryEventBus
 #[derive(Debug, thiserror::Error)]
-pub enum EventStreamFetchError {
-    /// An unexpected error occurred.
-    #[error("unexpected error: {0}")]
-    Unexpected(#[from] Box<dyn std::error::Error>),
-}
+pub enum InMemoryEventBusError {}
 
-#[async_trait::async_trait]
-impl<B> EventStoreBackend for MemEventStore<B>
+impl<B> EventStoreBackend for InMemoryEventStore<B>
 where
-    B: EventBus + Send + Sync,
-    B::EventType: EventData + Send + Sync,
+    B: EventBus + Send + Sync + Clone,
 {
+    type Error = InMemoryEventBusError;
     type EventType = B::EventType;
-    type AppendToStreamError = EventStreamAppendError;
-    async fn read_events<'a, D: EventData + Send + Sync + TryFrom<Self::EventType>>(
-        &'a self,
-        stream_id: Uuid,
-    ) -> Result<MemEventStoreStream<'a, B, D>, EventStreamFetchError>
-    where
-        B::EventType: From<D>,
-    {
-        Ok(MemEventStoreStream::<'_, B, D>::new(self, stream_id))
-    }
-
-    async fn store_event<D>(
+    #[allow(refining_impl_trait)]
+    fn read_events<D>(
         &self,
-        event: Event<D>,
-    ) -> Result<Event<Self::EventType>, Self::AppendToStreamError>
+        stream_id: Uuid,
+    ) -> impl Future<Output = Result<InMemoryEventStoreStream<B, D>, Self::Error>> + Send
     where
-        D: EventData + Send + Sync,
+        D: TryFrom<Self::EventType> + EventData + Send + Sync,
         Self::EventType: From<D>,
     {
-        let mut data = self.data.lock().await;
-        let event_data = event.data.clone();
-        data.sequence_number += 1;
-
-        let event: Event<Self::EventType> = event
-            .into_builder()
-            .data(event_data.map(|d| d.into()))
-            .sequence_number(data.sequence_number)
-            .build()
-            .expect("To build event from existing one");
-        let stream_id = event.stream_id;
-        let event_id = event.id;
-        data.events.insert(event_id, event.clone());
-        data.stream_events
-            .entry(stream_id)
-            .or_insert_with(Vec::new)
-            .extend(&[event_id]);
-        Ok(event)
+        let store = self.clone();
+        async move { Ok(InMemoryEventStoreStream::<B, D>::new(store, stream_id)) }
     }
-}
 
-/// An error that can occur when appending to a stream.
-#[derive(Debug, thiserror::Error)]
-pub enum EventStreamAppendError {
-    /// An unexpected error occurred.
-    #[error("unexpected error: {0}")]
-    Unexpected(#[from] Box<dyn std::error::Error>),
+    fn store_event<D>(
+        &self,
+        event: Event<D>,
+    ) -> impl Future<Output = Result<Event<Self::EventType>, Self::Error>> + Send
+    where
+        D: TryFrom<Self::EventType> + EventData + Send + Sync,
+        Self::EventType: From<D>,
+    {
+        async move {
+            let mut data = self.data.lock().await;
+            let event_data = event.data.clone();
+            data.sequence_number += 1;
+
+            let event: Event<Self::EventType> = event
+                .into_builder()
+                .data(event_data.map(|d| d.try_into().unwrap()))
+                .sequence_number(data.sequence_number)
+                .build()
+                .expect("To build event from existing one");
+            let stream_id = event.stream_id;
+            let event_id = event.id;
+            data.events.insert(event_id, event.clone());
+            data.stream_events
+                .entry(stream_id)
+                .or_insert_with(Vec::new)
+                .extend(&[event_id]);
+            Ok(event)
+        }
+    }
 }
 
 /// An in--memory event store stream.
-pub struct MemEventStoreStream<'a, B, D>
+pub struct InMemoryEventStoreStream<B, D>
 where
-    B: EventBus,
-    B::EventType: EventData + From<D>,
+    B: EventBus + Clone,
+    B::EventType: From<D>,
     D: EventData + Send + Sync + TryFrom<B::EventType>,
 {
-    store: &'a MemEventStore<B>,
+    store: InMemoryEventStore<B>,
     _phantom: PhantomData<D>,
     id: Uuid,
     current_index: usize,
 }
 
-#[async_trait::async_trait]
-impl<'a, B, D> EventStream<D> for MemEventStoreStream<'a, B, D>
+impl<B, D> InMemoryEventStoreStream<B, D>
 where
-    B: EventBus,
-    B::EventType: EventData + Send + Sync + From<D>,
+    B: EventBus + Clone,
+    B::EventType: From<D>,
     D: EventData + Send + Sync + TryFrom<B::EventType>,
 {
-}
-
-impl<'a, B, D> MemEventStoreStream<'a, B, D>
-where
-    B: EventBus,
-    B::EventType: EventData + From<D>,
-    D: EventData + Send + Sync + TryFrom<B::EventType>,
-{
-    fn new(store: &'a MemEventStore<B>, id: Uuid) -> Self {
+    fn new(store: InMemoryEventStore<B>, id: Uuid) -> Self {
         Self {
             store,
             id,
@@ -147,13 +129,21 @@ where
     }
 }
 
-impl<'a, B, D> Stream for MemEventStoreStream<'a, B, D>
+impl<'a, B, D> EventStream<D, B::EventType> for InMemoryEventStoreStream<B, D>
 where
-    B: EventBus,
-    B::EventType: EventData + Send + Sync + From<D>,
+    B: EventBus + Clone,
+    B::EventType: From<D>,
     D: EventData + Send + Sync + TryFrom<B::EventType>,
 {
-    type Item = Event<D>;
+}
+
+impl<'a, B, D> Stream for InMemoryEventStoreStream<B, D>
+where
+    B: EventBus + Clone,
+    B::EventType: From<D>,
+    D: EventData + Send + Sync + TryFrom<B::EventType>,
+{
+    type Item = Result<Event<D>, D::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // We need to use unsafe to get a mutable reference to the fields of the `!Unpin` struct.
@@ -177,92 +167,105 @@ where
                 if let Some(event) = data.events.get(&event_id) {
                     // Convert event P to D if possible
                     if let Some(data_p) = &event.data {
-                        if let Ok(data_d) = D::try_from(data_p.clone()) {
-                            let converted_event = event
-                                .clone()
+                        let res = D::try_from(data_p.clone());
+                        return Poll::Ready(Some(res.map(|event| {
+                            let data_d = event.clone();
+                            event
                                 .into_builder()
                                 .data(Some(data_d))
                                 .build()
-                                .expect("Event to be buildable");
-
-                            return Poll::Ready(Some(converted_event));
-                        }
+                                .expect("Event to be buildable")
+                        })));
                     }
                 }
             }
         }
+
         Poll::Ready(None)
     }
 }
 
-/// The error for the InMemoryEventBus event publication
-#[derive(Debug, thiserror::Error)]
-#[error("In memory eventbus publish error")]
-pub struct InMemoryEventBusPublishError;
-
-/// An implementation of an in-memory event bus
-#[derive(Debug)]
-pub struct InMemoryEventBus<D, P>
-where
-    D: EventData + Send + Sync,
-    P: Projector + Send + Sync,
-    <P::Projection as Projection>::EventType: From<D> + EventData,
-{
-    _phantom: PhantomData<D>,
-    projectors: Arc<Mutex<Vec<P>>>,
-}
-
-impl<D, P> InMemoryEventBus<D, P>
-where
-    D: EventData + Send + Sync,
-    P: Projector + Send + Sync,
-    <P::Projection as Projection>::EventType: From<D> + EventData,
-{
-    /// Creates a new in-memory bus
-    pub fn new() -> Self {
-        InMemoryEventBus {
-            _phantom: PhantomData,
-            projectors: Arc::new(Mutex::new(vec![])),
-        }
-    }
-}
-
-impl<D, P> EventBus for InMemoryEventBus<D, P>
-where
-    D: EventData + Send + Sync,
-    P: Projector + Send + Sync,
-    <P::Projection as Projection>::EventType: From<D> + EventData,
-{
-    type EventType = D;
-    type PublishError = InMemoryEventBusPublishError;
-    type ProjectorType = P;
-
-    fn subscribe<'a>(&'a self, projector: Self::ProjectorType) -> impl Future<Output = ()> + Send {
-        async {
-            let mut projectors = self.projectors.lock().await;
-            projectors.push(projector);
-        }
-    }
-
-    fn publish<'a, E>(
-        &'a self,
-        event: Event<E>,
-    ) -> impl Future<Output = Result<(), Self::PublishError>> + Send
-    where
-        E: EventData + 'a + Send + Sync + Into<D>,
-    {
-        async move {
-            let projectors = self.projectors.lock().await;
-            for projector in projectors.iter() {
-                let event_for_projection = event
-                    .clone()
-                    .into_builder()
-                    .data(event.data.clone().map(|d| d.into().into()))
-                    .build()
-                    .unwrap();
-                projector.project(event_for_projection).await.unwrap();
-            }
-            Ok(())
-        }
-    }
-}
+//
+// /// The error for the InMemoryEventBus event publication
+// #[derive(Debug, thiserror::Error)]
+// #[error("In memory eventbus publish error")]
+// pub struct InMemoryEventBusPublishError;
+//
+// /// An implementation of an in-memory event bus
+// #[derive(Debug)]
+// pub struct InMemoryEventBus<D, P>
+// where
+//     D: EventData + Send + Sync,
+//     P: Projector + Send + Sync,
+//     <P::Projection as Projection>::EventType: From<D> + EventData,
+// {
+//     _phantom: PhantomData<D>,
+//     projectors: Arc<Mutex<Vec<P>>>,
+// }
+//
+// impl<D, P> InMemoryEventBus<D, P>
+// where
+//     D: EventData + Send + Sync,
+//     P: Projector + Send + Sync,
+//     <P::Projection as Projection>::EventType: From<D> + EventData,
+// {
+//     /// Creates a new in-memory bus
+//     pub fn new() -> Self {
+//         InMemoryEventBus {
+//             _phantom: PhantomData,
+//             projectors: Arc::new(Mutex::new(vec![])),
+//         }
+//     }
+// }
+//
+// impl<D, P> EventBus for InMemoryEventBus<D, P>
+// where
+//     D: EventData + Send + Sync,
+//     P: Projector + Send + Sync,
+//     <P::Projection as Projection>::EventType: From<D> + EventData,
+// {
+//     type EventType = D;
+//     type PublishError = InMemoryEventBusPublishError;
+//     type ProjectorType = P;
+//
+//     fn subscribe<'a>(&'a self, projector: Self::ProjectorType) -> impl Future<Output = ()> + Send {
+//         async {
+//             let mut projectors = self.projectors.lock().await;
+//             projectors.push(projector);
+//         }
+//     }
+//
+//     fn publish<'a, E>(
+//         &'a self,
+//         event: Event<E>,
+//     ) -> impl Future<Output = Result<(), Self::PublishError>> + Send
+//     where
+//         E: TryInto<Self::EventType> + From<Self::EventType> + EventData + Send + Sync + 'a,
+//         E::Error: std::error::Error,
+//     {
+//         todo!()
+//     }
+//
+//     // fn publish<'a, E>(
+//     //     &'a self,
+//     //     event: Event<E>,
+//     // ) -> impl Future<Output = Result<(), Self::PublishError>> + Send
+//     // where
+//     //     E: EventData + 'a + Send + Sync + TryInto<Self::EventType> + From<Self::EventType>,
+//     //     E::Error: std::error::Error,
+//     // {
+//     //     async move {
+//     //         let projectors = self.projectors.lock().await;
+//     //         for projector in projectors.iter() {
+//     //             let event_for_projection = event
+//     //                 .clone()
+//     //                 .into_builder()
+//     //                 .data(event.data.clone().map(|d| d.into().try_into().unwrap()))
+//     //                 .build()
+//     //                 .unwrap();
+//     //             projector.project(event_for_projection).await.unwrap();
+//     //         }
+//     //         Ok(())
+//     //     }
+//     // }
+// }
