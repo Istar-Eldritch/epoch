@@ -114,6 +114,7 @@ pub trait ProjectionStore: Send {
 }
 
 /// A projector that uses a `ProjectionStore` to store projections.
+#[derive(Clone)]
 pub struct StoreProjector<S: ProjectionStore>(S);
 
 impl<S> StoreProjector<S>

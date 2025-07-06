@@ -84,7 +84,12 @@ impl Projection for User {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = MemEventStore::<ApplicationEvent>::new();
+    let bus: InMemoryEventBus<ApplicationEvent, StoreProjector<MemProjectionStore<User>>> =
+        InMemoryEventBus::new();
+    let event_store = InMemoryEventStore::new(bus);
+    let user_store = MemProjectionStore::<User>::new();
+    let user_projector = StoreProjector::new(user_store.clone());
+    event_store.bus().subscribe(user_projector).await?;
 
     let user_id = Uuid::new_v4();
     let user_created_event: Event<UserEvent> = UserEvent::UserCreated {
@@ -105,21 +110,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .id(Uuid::new_v4())
     .build()?;
 
-    // store.store_event(user_created_event).await?;
+    event_store.store_event(user_created_event).await?;
 
-    let mut stream = store.read_events::<UserEvent>(user_id).await?;
+    println!(
+        "User in store: {:?}",
+        user_store.fetch_by_id(&user_id).await?
+    );
 
-    let user_store = MemProjectionStore::<User>::new();
-    let store = user_store.clone();
-    let user_projector = StoreProjector::new(user_store);
+    event_store.store_event(user_name_udpated_event).await?;
 
-    user_projector.project(user_created_event).await?;
-
-    println!("User in store: {:?}", store.fetch_by_id(&user_id).await?);
-
-    user_projector.project(user_name_udpated_event).await?;
-
-    println!("User in store: {:?}", store.fetch_by_id(&user_id).await?);
+    println!(
+        "User in store: {:?}",
+        user_store.fetch_by_id(&user_id).await?
+    );
 
     // let user: User = Projector::project(&mut stream).await?.unwrap();
 
