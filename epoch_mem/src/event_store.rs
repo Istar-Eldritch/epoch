@@ -48,13 +48,13 @@ impl<B: EventBus + Clone> InMemoryEventStore<B> {
 
 /// Errors returned by the InMemoryEventBus
 #[derive(Debug, thiserror::Error)]
-pub enum InMemoryEventBusError {}
+pub enum InMemoryEventStoreBackendError {}
 
 impl<B> EventStoreBackend for InMemoryEventStore<B>
 where
     B: EventBus + Send + Sync + Clone,
 {
-    type Error = InMemoryEventBusError;
+    type Error = InMemoryEventStoreBackendError;
     type EventType = B::EventType;
     #[allow(refining_impl_trait)]
     fn read_events<D>(
@@ -191,81 +191,79 @@ where
 // #[error("In memory eventbus publish error")]
 // pub struct InMemoryEventBusPublishError;
 //
-// /// An implementation of an in-memory event bus
-// #[derive(Debug)]
-// pub struct InMemoryEventBus<D, P>
-// where
-//     D: EventData + Send + Sync,
-//     P: Projector + Send + Sync,
-//     <P::Projection as Projection>::EventType: From<D> + EventData,
-// {
-//     _phantom: PhantomData<D>,
-//     projectors: Arc<Mutex<Vec<P>>>,
-// }
-//
-// impl<D, P> InMemoryEventBus<D, P>
-// where
-//     D: EventData + Send + Sync,
-//     P: Projector + Send + Sync,
-//     <P::Projection as Projection>::EventType: From<D> + EventData,
-// {
-//     /// Creates a new in-memory bus
-//     pub fn new() -> Self {
-//         InMemoryEventBus {
-//             _phantom: PhantomData,
-//             projectors: Arc::new(Mutex::new(vec![])),
-//         }
-//     }
-// }
-//
-// impl<D, P> EventBus for InMemoryEventBus<D, P>
-// where
-//     D: EventData + Send + Sync,
-//     P: Projector + Send + Sync,
-//     <P::Projection as Projection>::EventType: From<D> + EventData,
-// {
-//     type EventType = D;
-//     type PublishError = InMemoryEventBusPublishError;
-//     type ProjectorType = P;
-//
-//     fn subscribe<'a>(&'a self, projector: Self::ProjectorType) -> impl Future<Output = ()> + Send {
-//         async {
-//             let mut projectors = self.projectors.lock().await;
-//             projectors.push(projector);
-//         }
-//     }
-//
-//     fn publish<'a, E>(
-//         &'a self,
-//         event: Event<E>,
-//     ) -> impl Future<Output = Result<(), Self::PublishError>> + Send
-//     where
-//         E: TryInto<Self::EventType> + From<Self::EventType> + EventData + Send + Sync + 'a,
-//         E::Error: std::error::Error,
-//     {
-//         todo!()
-//     }
-//
-//     // fn publish<'a, E>(
-//     //     &'a self,
-//     //     event: Event<E>,
-//     // ) -> impl Future<Output = Result<(), Self::PublishError>> + Send
-//     // where
-//     //     E: EventData + 'a + Send + Sync + TryInto<Self::EventType> + From<Self::EventType>,
-//     //     E::Error: std::error::Error,
-//     // {
-//     //     async move {
-//     //         let projectors = self.projectors.lock().await;
-//     //         for projector in projectors.iter() {
-//     //             let event_for_projection = event
-//     //                 .clone()
-//     //                 .into_builder()
-//     //                 .data(event.data.clone().map(|d| d.into().try_into().unwrap()))
-//     //                 .build()
-//     //                 .unwrap();
-//     //             projector.project(event_for_projection).await.unwrap();
-//     //         }
-//     //         Ok(())
-//     //     }
-//     // }
-// }
+/// An implementation of an in-memory event bus
+#[derive(Debug, Clone)]
+pub struct InMemoryEventBus<D, P>
+where
+    D: EventData + Send + Sync,
+    P: Projector + Send + Sync,
+    <P::Projection as Projection>::EventType: TryFrom<D> + EventData + Send + Sync,
+{
+    _phantom: PhantomData<D>,
+    projectors: Arc<Mutex<Vec<P>>>,
+}
+
+impl<D, P> InMemoryEventBus<D, P>
+where
+    D: EventData + Send + Sync,
+    P: Projector + Send + Sync,
+    <P::Projection as Projection>::EventType: TryFrom<D> + EventData + Send + Sync,
+{
+    /// Creates a new in-memory bus
+    pub fn new() -> Self {
+        InMemoryEventBus {
+            _phantom: PhantomData,
+            projectors: Arc::new(Mutex::new(vec![])),
+        }
+    }
+}
+
+/// Errors for the InMemoryEventBus
+#[derive(Debug, thiserror::Error)]
+pub enum InMemoryEventBusError {}
+
+impl<D, P> EventBus for InMemoryEventBus<D, P>
+where
+    D: EventData + Send + Sync,
+    P: Projector + Send + Sync,
+    <P::Projection as Projection>::EventType: TryFrom<D> + EventData + Send + Sync,
+    <<P::Projection as Projection>::EventType as TryFrom<D>>::Error: std::error::Error,
+{
+    type Error = InMemoryEventBusError;
+    type EventType = D;
+    type ProjectorType = P;
+    fn publish<ED>(&self, event: Event<ED>) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        ED: EventData + Send + Sync,
+        <<Self::ProjectorType as Projector>::Projection as Projection>::EventType: From<ED>,
+        Self::EventType: From<ED>,
+    {
+        async move {
+            let projectors = self.projectors.lock().await;
+            for projector in projectors.iter() {
+                let data = event
+                    .data
+                    .clone()
+                    .map(|d| <ED as Into<Self::EventType>>::into(d).try_into().unwrap());
+                let event_for_projection = event.clone().into_builder().data(data).build().unwrap();
+                projector.project(event_for_projection).await.unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    fn subscribe(
+        &self,
+        projector: Self::ProjectorType,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        <<Self::ProjectorType as Projector>::Projection as Projection>::EventType:
+            TryFrom<Self::EventType>,
+    {
+        async {
+            let mut projectors = self.projectors.lock().await;
+            projectors.push(projector);
+            Ok(())
+        }
+    }
+}

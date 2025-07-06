@@ -58,6 +58,7 @@ pub trait EventBus {
     fn publish<D>(&self, event: Event<D>) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         D: EventData + Send + Sync,
+        <<Self::ProjectorType as Projector>::Projection as Projection>::EventType: From<D>,
         Self::EventType: From<D>;
 
     /// Allows to subscribe to events
