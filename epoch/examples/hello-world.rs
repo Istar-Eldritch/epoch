@@ -4,13 +4,14 @@ use epoch::prelude::*;
 use epoch_mem::*;
 use uuid::Uuid;
 
-#[subset_enum(UserEvent, UserCreated, UserNameUpdated)]
-#[subset_enum(UserSnapshotEvent, UserSnapshot)]
+#[subset_enum(UserEvent, UserCreated, UserNameUpdated, UserDeleted)]
+#[subset_enum(UserActivityEvent, UserCreated, UserDeleted)]
 #[derive(Debug, Clone, serde::Serialize, EventData)]
 enum ApplicationEvent {
     UserCreated { id: Uuid, name: String },
     UserNameUpdated { id: Uuid, name: String },
-    UserSnapshot(User),
+    UserEmailUpdated { id: Uuid, email: String },
+    UserDeleted { id: Uuid },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -18,6 +19,30 @@ enum ApplicationEvent {
 struct User {
     id: Uuid,
     name: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[allow(dead_code)]
+struct UserActivity {
+    active_user_ids: std::collections::HashSet<Uuid>,
+    created_count: u64,
+    deleted_count: u64,
+}
+
+impl UserActivity {
+    const ID: Uuid = uuid::uuid!("51a2160a-f4d6-48a2-a171-4d38109f7963");
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum UserActivityProjectionError {
+    #[error("Cant hydrate user activity with event {0}")]
+    UnexpectedEvent(String),
+    #[error("Unexpected error projecting user activity: {0}")]
+    Unexpected(#[from] Box<dyn std::error::Error + Send + Sync>),
+    #[error("The event has no data attached to it")]
+    NoData,
+    #[error("This error should never happen: {0}")]
+    Infallible(#[from] Infallible),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -45,8 +70,11 @@ impl Projection for User {
                     name: name.clone(),
                     ..self
                 }),
-                e => Err(UserProjectionError::UnexpectedEvent(
-                    e.event_type().to_string(),
+                UserEvent::UserDeleted { id: _ } => Err(UserProjectionError::UnexpectedEvent(
+                    "UserDeleted should not be projected to a user".to_string(),
+                )),
+                _ => Err(UserProjectionError::UnexpectedEvent(
+                    "Unexpected event for User projection".to_string(),
                 )),
             }
         } else {
@@ -60,8 +88,8 @@ impl Projection for User {
                     name: name.clone(),
                     id: id.clone(),
                 }),
-                e => Err(UserProjectionError::UnexpectedEvent(
-                    e.event_type().to_string(),
+                _ => Err(UserProjectionError::UnexpectedEvent(
+                    "Unexpected event for User projection".to_string(),
                 )),
             }
         } else {
@@ -76,6 +104,68 @@ impl Projection for User {
             Some(d) => match d {
                 UserEvent::UserCreated { id, name: _ } => Some(id.clone()),
                 UserEvent::UserNameUpdated { id, name: _ } => Some(id.clone()),
+                UserEvent::UserDeleted { id } => Some(id.clone()),
+            },
+            _ => None,
+        }
+    }
+}
+
+impl ProjectionError for UserActivityProjectionError {}
+
+impl Projection for UserActivity {
+    type Error = UserActivityProjectionError;
+    type EventType = UserActivityEvent;
+
+    fn apply(mut self, event: Event<Self::EventType>) -> Result<Self, Self::Error> {
+        if let Some(data) = &event.data {
+            match data {
+                UserActivityEvent::UserCreated { id, name: _ } => {
+                    self.active_user_ids.insert(id.clone());
+                    self.created_count += 1;
+                    Ok(self)
+                }
+                UserActivityEvent::UserDeleted { id } => {
+                    self.active_user_ids.remove(id);
+                    self.deleted_count += 1;
+                    Ok(self)
+                }
+            }
+        } else {
+            Err(UserActivityProjectionError::NoData)
+        }
+    }
+
+    fn new(event: Event<Self::EventType>) -> Result<Self, Self::Error> {
+        if let Some(data) = &event.data {
+            match data {
+                UserActivityEvent::UserCreated { id, name: _ } => {
+                    let mut active_user_ids = std::collections::HashSet::new();
+                    active_user_ids.insert(id.clone());
+                    Ok(UserActivity {
+                        active_user_ids,
+                        created_count: 1,
+                        deleted_count: 0,
+                    })
+                }
+                e => Err(UserActivityProjectionError::UnexpectedEvent(
+                    e.event_type().to_string(),
+                )),
+            }
+        } else {
+            Err(UserActivityProjectionError::NoData)
+        }
+    }
+
+    fn get_id(&self) -> &Uuid {
+        &Self::ID
+    }
+
+    fn get_id_from_event(event: &Event<UserActivityEvent>) -> Option<Uuid> {
+        match &event.data {
+            Some(d) => match d {
+                UserActivityEvent::UserCreated { id, name: _ } => Some(id.clone()),
+                UserActivityEvent::UserDeleted { id } => Some(id.clone()),
             },
             _ => None,
         }
@@ -84,12 +174,18 @@ impl Projection for User {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bus: InMemoryEventBus<ApplicationEvent, StoreProjector<MemProjectionStore<User>>> =
-        InMemoryEventBus::new();
+    let bus: InMemoryEventBus<ApplicationEvent> = InMemoryEventBus::new();
     let event_store = InMemoryEventStore::new(bus);
     let user_store = MemProjectionStore::<User>::new();
     let user_projector = StoreProjector::new(user_store.clone());
-    event_store.bus().subscribe(user_projector).await?;
+
+    // let user_activity_store = MemProjectionStore::<UserActivity>::new();
+    // let user_activity_projector = StoreProjector::new(user_activity_store.clone());
+
+    event_store
+        .bus()
+        .subscribe(Box::new(user_projector))
+        .await?;
 
     let user_id = Uuid::new_v4();
     let user_created_event: Event<UserEvent> = UserEvent::UserCreated {
@@ -110,12 +206,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .id(Uuid::new_v4())
     .build()?;
 
+    let user_deleted_event: Event<UserEvent> = UserEvent::UserDeleted { id: user_id }
+        .into_builder()
+        .stream_id(user_id)
+        .id(Uuid::new_v4())
+        .build()?;
+
     event_store.store_event(user_created_event).await?;
 
     println!(
         "User in store: {:?}",
         user_store.fetch_by_id(&user_id).await?
     );
+    // println!(
+    //     "UserActivity after creation: {:?}",
+    //     user_activity_store.fetch_by_id(&Uuid::nil()).await?
+    // );
 
     event_store.store_event(user_name_udpated_event).await?;
 
@@ -123,16 +229,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "User in store: {:?}",
         user_store.fetch_by_id(&user_id).await?
     );
+    // println!(
+    //     "UserActivity after name update: {:?}",
+    //     user_activity_store.fetch_by_id(&Uuid::nil()).await?
+    // );
 
-    // let user: User = Projector::project(&mut stream).await?.unwrap();
+    event_store.store_event(user_deleted_event).await?;
 
-    // println!("Created: {:?}", user);
-
-    // store.store_event(user_name_udpated_event).await?;
-
-    // let user: User = Projector::project_on_snapshot(user, &mut stream).await?;
-
-    // println!("Updated: {:?}", user);
+    println!(
+        "User in store after deletion: {:?}",
+        user_store.fetch_by_id(&user_id).await?
+    );
+    // println!(
+    //     "UserActivity after deletion: {:?}",
+    //     user_activity_store.fetch_by_id(&Uuid::nil()).await?
+    // );
 
     Ok(())
 }

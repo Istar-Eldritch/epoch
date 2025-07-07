@@ -111,7 +111,7 @@ where
     }
 }
 
-/// An in--memory event store stream.
+/// An in-memory event store stream.
 pub struct InMemoryEventStoreStream<B, D>
 where
     B: EventBus + Clone,
@@ -203,29 +203,34 @@ where
 // pub struct InMemoryEventBusPublishError;
 //
 /// An implementation of an in-memory event bus
-#[derive(Debug, Clone)]
-pub struct InMemoryEventBus<D, P>
+#[derive(Clone)]
+pub struct InMemoryEventBus<D>
 where
     D: EventData + Send + Sync,
-    P: Projector + Send + Sync,
-    <P::Projection as Projection>::EventType: TryFrom<D> + EventData + Send + Sync,
 {
     _phantom: PhantomData<D>,
-    projectors: Arc<Mutex<Vec<P>>>,
+    projectors: Arc<Mutex<Vec<Box<dyn DynProjector<D>>>>>,
 }
 
-impl<D, P> InMemoryEventBus<D, P>
+impl<D> InMemoryEventBus<D>
 where
     D: EventData + Send + Sync,
-    P: Projector + Send + Sync,
-    <P::Projection as Projection>::EventType: TryFrom<D> + EventData + Send + Sync,
 {
     /// Creates a new in-memory bus
     pub fn new() -> Self {
-        InMemoryEventBus {
+        Self {
             _phantom: PhantomData,
             projectors: Arc::new(Mutex::new(vec![])),
         }
+    }
+}
+
+impl<D> std::fmt::Debug for InMemoryEventBus<D>
+where
+    D: EventData + Send + Sync,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryEventBus").finish()
     }
 }
 
@@ -233,43 +238,44 @@ where
 #[derive(Debug, thiserror::Error)]
 pub enum InMemoryEventBusError {}
 
-impl<D, P> EventBus for InMemoryEventBus<D, P>
+impl<D> EventBus for InMemoryEventBus<D>
 where
     D: EventData + Send + Sync,
-    P: Projector + Send + Sync,
-    <P::Projection as Projection>::EventType: TryFrom<D> + EventData + Send + Sync,
-    <<P::Projection as Projection>::EventType as TryFrom<D>>::Error: std::error::Error,
 {
     type Error = InMemoryEventBusError;
     type EventType = D;
-    type ProjectorType = P;
-    fn publish(
-        &self,
+    fn publish<'a>(
+        &'a self,
         event: Event<Self::EventType>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        async move {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        Box::pin(async move {
             let projectors = self.projectors.lock().await;
             for projector in projectors.iter() {
-                let data = event.data.clone().map(|d| d.try_into().unwrap());
-                let event_for_projection = event.clone().into_builder().data(data).build().unwrap();
-                projector.project(event_for_projection).await.unwrap();
+                projector.project(&event).await.unwrap();
             }
             Ok(())
-        }
+        })
     }
 
     fn subscribe(
-        &self,
-        projector: Self::ProjectorType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send
-    where
-        <<Self::ProjectorType as Projector>::Projection as Projection>::EventType:
-            TryFrom<Self::EventType>,
-    {
-        async {
+        &'static self,
+        projector: Box<dyn DynProjector<Self::EventType> + 'static>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'static>> {
+        Box::pin(async {
             let mut projectors = self.projectors.lock().await;
             projectors.push(projector);
             Ok(())
-        }
+        })
     }
+
+    // fn subscribe(
+    //     &self,
+    //     projector: Box<dyn DynProjector<Self::EventType>>,
+    // ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    //     async {
+    //         let mut projectors = self.projectors.lock().await;
+    //         projectors.push(projector);
+    //         Ok(())
+    //     }
+    // }
 }

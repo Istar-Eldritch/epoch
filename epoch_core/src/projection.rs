@@ -5,6 +5,7 @@
 
 use crate::event::{Event, EventData};
 use std::future::Future;
+use std::pin::Pin;
 use uuid::Uuid;
 
 /// The error a projection can throw
@@ -56,40 +57,12 @@ pub trait Projector {
     /// Projects a single event onto a projection.
     /// If a snapshot is available, it will be used as the starting point.
     /// Otherwise, a new projection will be created.
-    fn project(
-        &self,
+    fn project<'a>(
+        &'a self,
         event: Event<<<Self as Projector>::Projection as Projection>::EventType>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>
     where
-        Self: Send + Sync,
-    {
-        async {
-            let id = Self::Projection::get_id_from_event(&event);
-            let projection = match id {
-                Some(id) => {
-                    let snapshot = self
-                        .get_store()
-                        .fetch_by_id(&id)
-                        .await
-                        .map_err(Self::Error::from_store_error)?;
-                    match snapshot {
-                        Some(snapshot) => snapshot
-                            .apply(event)
-                            .map_err(Self::Error::from_projection_error)?,
-                        None => Self::Projection::new(event)
-                            .map_err(Self::Error::from_projection_error)?,
-                    }
-                }
-                None => Self::Projection::new(event).map_err(Self::Error::from_projection_error)?,
-            };
-
-            self.get_store()
-                .store(projection)
-                .await
-                .map_err(Self::Error::from_store_error)?;
-            Ok(())
-        }
-    }
+        Self: Send + Sync;
 }
 
 /// Error thrown by a projection store
@@ -161,7 +134,7 @@ where
 
 impl<S> Projector for StoreProjector<S>
 where
-    S: ProjectionStore,
+    S: ProjectionStore + Sync,
     <S as ProjectionStore>::Entity: Projection,
 {
     type Projection = S::Entity;
@@ -172,5 +145,37 @@ where
     type Store = S;
     fn get_store(&self) -> &Self::Store {
         &self.0
+    }
+
+    fn project<'a>(
+        &'a self,
+        event: Event<<Self::Projection as Projection>::EventType>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let id = Self::Projection::get_id_from_event(&event);
+            let projection = match id {
+                Some(id) => {
+                    let snapshot = self
+                        .get_store()
+                        .fetch_by_id(&id)
+                        .await
+                        .map_err(Self::Error::from_store_error)?;
+                    match snapshot {
+                        Some(snapshot) => snapshot
+                            .apply(event)
+                            .map_err(Self::Error::from_projection_error)?,
+                        None => Self::Projection::new(event)
+                            .map_err(Self::Error::from_projection_error)?,
+                    }
+                }
+                None => Self::Projection::new(event).map_err(Self::Error::from_projection_error)?,
+            };
+
+            self.get_store()
+                .store(projection)
+                .await
+                .map_err(Self::Error::from_store_error)?;
+            Ok(())
+        })
     }
 }
