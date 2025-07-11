@@ -9,6 +9,7 @@ use crate::projection::Projector;
 use futures_core::Stream;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// A trait that defines the behavior of an event stream.
@@ -115,7 +116,7 @@ pub trait EventBus {
 
     /// Allows to subscribe to events
     fn subscribe(
-        &'static self,
-        projector: Box<dyn DynProjector<Self::EventType>>,
+        &self,
+        projector: Arc<dyn DynProjector<Self::EventType>>,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>>;
 }

@@ -1,4 +1,4 @@
-use std::convert::Infallible;
+use std::{convert::Infallible, sync::Arc};
 
 use epoch::prelude::*;
 use epoch_mem::*;
@@ -179,12 +179,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let user_store = MemProjectionStore::<User>::new();
     let user_projector = StoreProjector::new(user_store.clone());
 
-    // let user_activity_store = MemProjectionStore::<UserActivity>::new();
-    // let user_activity_projector = StoreProjector::new(user_activity_store.clone());
-
     event_store
         .bus()
-        .subscribe(Box::new(user_projector))
+        .subscribe(Arc::new(user_projector))
         .await?;
 
     let user_id = Uuid::new_v4();

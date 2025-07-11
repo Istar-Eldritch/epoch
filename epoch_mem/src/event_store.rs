@@ -209,7 +209,7 @@ where
     D: EventData + Send + Sync,
 {
     _phantom: PhantomData<D>,
-    projectors: Arc<Mutex<Vec<Box<dyn DynProjector<D>>>>>,
+    projectors: Arc<Mutex<Vec<Arc<dyn DynProjector<D>>>>>,
 }
 
 impl<D> InMemoryEventBus<D>
@@ -240,7 +240,7 @@ pub enum InMemoryEventBusError {}
 
 impl<D> EventBus for InMemoryEventBus<D>
 where
-    D: EventData + Send + Sync,
+    D: EventData + Send + Sync + 'static,
 {
     type Error = InMemoryEventBusError;
     type EventType = D;
@@ -258,11 +258,12 @@ where
     }
 
     fn subscribe(
-        &'static self,
-        projector: Box<dyn DynProjector<Self::EventType> + 'static>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'static>> {
-        Box::pin(async {
-            let mut projectors = self.projectors.lock().await;
+        &self,
+        projector: Arc<dyn DynProjector<Self::EventType>>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
+        let projectors = self.projectors.clone();
+        Box::pin(async move {
+            let mut projectors = projectors.lock().await;
             projectors.push(projector);
             Ok(())
         })
