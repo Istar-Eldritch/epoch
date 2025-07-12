@@ -209,7 +209,7 @@ where
     D: EventData + Send + Sync,
 {
     _phantom: PhantomData<D>,
-    projectors: Arc<Mutex<Vec<Arc<dyn DynProjector<D>>>>>,
+    projectors: Arc<Mutex<Vec<Arc<Mutex<dyn Projection<D>>>>>>,
 }
 
 impl<D> InMemoryEventBus<D>
@@ -251,7 +251,8 @@ where
         Box::pin(async move {
             let projectors = self.projectors.lock().await;
             for projector in projectors.iter() {
-                projector.project(&event).await.unwrap();
+                let mut projector = projector.lock().await;
+                projector.apply(&event).await.unwrap();
             }
             Ok(())
         })
@@ -259,7 +260,7 @@ where
 
     fn subscribe(
         &self,
-        projector: Arc<dyn DynProjector<Self::EventType>>,
+        projector: Arc<Mutex<dyn Projection<Self::EventType>>>,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
         let projectors = self.projectors.clone();
         Box::pin(async move {
@@ -268,15 +269,4 @@ where
             Ok(())
         })
     }
-
-    // fn subscribe(
-    //     &self,
-    //     projector: Box<dyn DynProjector<Self::EventType>>,
-    // ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-    //     async {
-    //         let mut projectors = self.projectors.lock().await;
-    //         projectors.push(projector);
-    //         Ok(())
-    //     }
-    // }
 }
