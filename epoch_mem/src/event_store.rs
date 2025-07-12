@@ -31,6 +31,7 @@ pub struct InMemoryEventStore<B: EventBus + Clone> {
 impl<B: EventBus + Clone> InMemoryEventStore<B> {
     /// Creates a new `MemEventStore`.
     pub fn new(bus: B) -> Self {
+        log::debug!("Creating a new InMemoryEventStore");
         Self {
             data: Arc::new(Mutex::new(EventStoreData {
                 events: HashMap::new(),
@@ -70,6 +71,7 @@ where
         &self,
         stream_id: Uuid,
     ) -> impl Future<Output = Result<InMemoryEventStoreStream<B>, Self::Error>> + Send {
+        log::debug!("Reading events for stream_id: {}", stream_id);
         let store = self.clone();
         async move { Ok(InMemoryEventStoreStream::<B>::new(store, stream_id)) }
     }
@@ -85,11 +87,22 @@ where
             let mut version: u64 = *data.stream_version.get(&stream_id).unwrap_or(&0);
 
             if event.stream_version != version {
+                log::debug!(
+                    "Event version mismatch for stream_id: {}. Expected: {}, Got: {}",
+                    stream_id,
+                    version,
+                    event.stream_version
+                );
                 Err(InMemoryEventStoreBackendError::VersionMismatch(
                     event.stream_version,
                     version,
                 ))?;
             }
+            log::debug!(
+                "Event version check passed for stream_id: {}. Version: {}",
+                stream_id,
+                version
+            );
 
             version += 1;
 
@@ -101,6 +114,11 @@ where
                 .entry(stream_id)
                 .or_insert_with(Vec::new)
                 .extend(&[event_id]);
+            log::debug!(
+                "Event stored successfully for stream_id: {}, event_id: {}",
+                stream_id,
+                event_id
+            );
             self.bus()
                 .publish(event.clone())
                 .await
@@ -147,23 +165,39 @@ where
         let this = unsafe { self.get_unchecked_mut() };
 
         let data = match this.store.data.try_lock() {
-            Ok(guard) => guard,
+            Ok(guard) => {
+                log::debug!("InMemoryEventStoreStream: poll_next - Acquired lock");
+                guard
+            },
             Err(_) => {
+                log::debug!("InMemoryEventStoreStream: poll_next - Lock contention, returning Poll::Pending");
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
         };
 
         if let Some(event_ids) = data.stream_events.get(&this.id) {
+            log::debug!(
+                "InMemoryEventStoreStream: poll_next - Found {} events for stream_id: {}",
+                event_ids.len(),
+                this.id
+            );
             while this.current_index < event_ids.len() {
                 let event_id = event_ids[this.current_index];
                 this.current_index += 1;
 
                 // Find the actual event in the store's main events vector
                 if let Some(event) = data.events.get(&event_id) {
+                    log::debug!(
+                        "InMemoryEventStoreStream: poll_next - Returning event_id: {}",
+                        event_id
+                    );
                     return Poll::Ready(Some(Ok(event.clone())));
                 }
             }
+            log::debug!("InMemoryEventStoreStream: poll_next - No more events in stream, returning Poll::Ready(None)");
+        } else {
+            log::debug!("InMemoryEventStoreStream: poll_next - No events found for stream_id: {}", this.id);
         }
 
         Poll::Ready(None)
@@ -192,6 +226,7 @@ where
 {
     /// Creates a new in-memory bus
     pub fn new() -> Self {
+        log::debug!("Creating a new InMemoryEventBus");
         Self {
             _phantom: PhantomData,
             projections: Arc::new(Mutex::new(vec![])),
@@ -223,6 +258,7 @@ where
         event: Event<Self::EventType>,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
         Box::pin(async move {
+            log::debug!("Publishing event with id: {}", event.id);
             let projections = self.projections.lock().await;
             for projection in projections.iter() {
                 let mut projection = projection.lock().await;
@@ -239,6 +275,7 @@ where
         &self,
         projector: Arc<Mutex<dyn Projection<Self::EventType>>>,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
+        log::debug!("Subscribing projector to InMemoryEventBus");
         let projectors = self.projections.clone();
         Box::pin(async move {
             let mut projectors = projectors.lock().await;
