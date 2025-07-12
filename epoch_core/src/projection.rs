@@ -1,7 +1,5 @@
-//! This module defines traits for `Projection`, `Projector`, and `ProjectionStore`.
-//! A `Projection` is a read-model built from a stream of events. A `Projector` is responsible
-//! for creating and updating projections, often utilizing a `ProjectionStore` for persistence.
-//! This module also includes error types related to projections and projectors.
+//! This module defines traits for `Projection`
+//! A `Projection` is a read-model built from a stream of events.
 
 use std::pin::Pin;
 

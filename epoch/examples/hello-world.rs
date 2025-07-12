@@ -17,6 +17,7 @@ enum ApplicationEvent {
 struct User {
     id: Uuid,
     name: String,
+    version: u64,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -54,7 +55,14 @@ impl Projection<ApplicationEvent> for UserProjection {
                 match data {
                     ApplicationEvent::UserCreated { id, name } => {
                         let mut users = users.lock().await;
-                        users.insert(id.clone(), User { id, name });
+                        users.insert(
+                            id.clone(),
+                            User {
+                                id,
+                                name,
+                                version: event.stream_version,
+                            },
+                        );
                         Ok(())
                     }
                     ApplicationEvent::UserNameUpdated { id, name } => {
@@ -62,6 +70,7 @@ impl Projection<ApplicationEvent> for UserProjection {
                         match users.get_mut(&id) {
                             Some(u) => {
                                 u.name = name;
+                                u.version = event.stream_version;
                                 Ok(())
                             }
                             None => Err(UserProjectionError::UserDoesNotExist(id))?,
@@ -95,6 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     .into_builder()
     .stream_id(user_id)
+    .stream_version(0)
     .id(Uuid::new_v4())
     .build()?;
 
@@ -104,12 +114,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     .into_builder()
     .stream_id(user_id)
+    .stream_version(1)
     .id(Uuid::new_v4())
     .build()?;
 
     let user_deleted_event = ApplicationEvent::UserDeleted { id: user_id }
         .into_builder()
         .stream_id(user_id)
+        .stream_version(2)
         .id(Uuid::new_v4())
         .build()?;
 

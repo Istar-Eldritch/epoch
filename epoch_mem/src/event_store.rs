@@ -15,7 +15,7 @@ use epoch_core::prelude::*;
 struct EventStoreData<D: EventData> {
     events: HashMap<Uuid, Event<D>>,
     stream_events: HashMap<Uuid, Vec<Uuid>>,
-    sequence_number: u64,
+    stream_version: HashMap<Uuid, u64>,
 }
 
 /// An in-memory event store.
@@ -35,7 +35,7 @@ impl<B: EventBus + Clone> InMemoryEventStore<B> {
             data: Arc::new(Mutex::new(EventStoreData {
                 events: HashMap::new(),
                 stream_events: HashMap::new(),
-                sequence_number: 0,
+                stream_version: HashMap::new(),
             })),
             bus,
         }
@@ -50,6 +50,9 @@ impl<B: EventBus + Clone> InMemoryEventStore<B> {
 /// Errors returned by the InMemoryEventBus
 #[derive(Debug, thiserror::Error)]
 pub enum InMemoryEventStoreBackendError {
+    ///
+    #[error("Event version ({0}) doesn't match stream version ({0})")]
+    VersionMismatch(u64, u64),
     /// Error publishing event to bus
     #[error("Error publishing event to bus")]
     PublishEvent,
@@ -75,26 +78,27 @@ where
         async move { Ok(InMemoryEventStoreStream::<B, D>::new(store, stream_id)) }
     }
 
-    fn store_event<D>(
+    fn store_event(
         &self,
-        event: Event<D>,
-    ) -> impl Future<Output = Result<Event<Self::EventType>, Self::Error>> + Send
-    where
-        D: TryFrom<Self::EventType> + EventData + Send + Sync,
-        Self::EventType: From<D>,
-    {
+        event: Event<Self::EventType>,
+    ) -> impl Future<Output = Result<Event<Self::EventType>, Self::Error>> + Send {
         async move {
             let mut data = self.data.lock().await;
-            let event_data = event.data.clone();
-            data.sequence_number += 1;
-
-            let event: Event<Self::EventType> = event
-                .into_builder()
-                .data(event_data.map(|d| d.try_into().unwrap()))
-                .sequence_number(data.sequence_number)
-                .build()
-                .expect("To build event from existing one");
             let stream_id = event.stream_id;
+
+            let mut version: u64 = *data.stream_version.get(&stream_id).unwrap_or(&0);
+
+            if event.stream_version != version {
+                Err(InMemoryEventStoreBackendError::VersionMismatch(
+                    event.stream_version,
+                    version,
+                ))?;
+            }
+
+            version += 1;
+
+            data.stream_version.insert(stream_id, version);
+
             let event_id = event.id;
             data.events.insert(event_id, event.clone());
             data.stream_events
@@ -104,7 +108,6 @@ where
             self.bus()
                 .publish(event.clone())
                 .await
-                // TODO: Deal with this error acordingly
                 .map_err(|_e| InMemoryEventStoreBackendError::PublishEvent)?;
             Ok(event)
         }
@@ -118,9 +121,9 @@ where
     B::EventType: From<D>,
     D: EventData + Send + Sync + TryFrom<B::EventType>,
 {
+    id: Uuid,
     store: InMemoryEventStore<B>,
     _phantom: PhantomData<D>,
-    id: Uuid,
     current_index: usize,
 }
 

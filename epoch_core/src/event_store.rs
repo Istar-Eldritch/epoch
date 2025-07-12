@@ -37,13 +37,10 @@ pub trait EventStoreBackend {
         Self::EventType: From<D>;
 
     /// Appends events to a stream.
-    fn store_event<D>(
+    fn store_event(
         &self,
-        event: Event<D>,
-    ) -> impl Future<Output = Result<Event<Self::EventType>, Self::Error>> + Send
-    where
-        D: TryFrom<Self::EventType> + EventData + Send + Sync,
-        Self::EventType: From<D>;
+        event: Event<Self::EventType>,
+    ) -> impl Future<Output = Result<Event<Self::EventType>, Self::Error>> + Send;
 }
 
 /// A trait that defines the behavior of an event bus.

@@ -18,8 +18,8 @@ where
     /// The id of the entity this event aggregates to
     pub stream_id: Uuid,
 
-    /// The sequence number of the envent. Used to check for sync issues
-    pub sequence_number: u64,
+    /// The version number of the envent. Used to check for sync issues
+    pub stream_version: u64,
 
     /// Event type
     ///
@@ -71,7 +71,7 @@ where
         Self {
             id: Some(event.id),
             stream_id: Some(event.stream_id),
-            sequence_number: Some(event.sequence_number),
+            stream_version: Some(event.stream_version),
             event_type: Some(event.event_type),
             actor_id: event.actor_id,
             purger_id: event.purger_id,
@@ -106,7 +106,7 @@ where
     /// The stream ID
     pub stream_id: Option<Uuid>,
     /// The sequence number of the event.
-    pub sequence_number: Option<u64>,
+    pub stream_version: Option<u64>,
     /// The event type.
     pub event_type: Option<String>,
     /// The ID of the creator of this event.
@@ -130,7 +130,7 @@ where
         EventBuilder {
             id: None,
             stream_id: None,
-            sequence_number: None,
+            stream_version: None,
             event_type: None,
             actor_id: None,
             purger_id: None,
@@ -153,8 +153,8 @@ where
     }
 
     /// Sets the sequence number for the event.
-    pub fn sequence_number(mut self, sequence_number: u64) -> Self {
-        self.sequence_number = Some(sequence_number);
+    pub fn stream_version(mut self, sequence_number: u64) -> Self {
+        self.stream_version = Some(sequence_number);
         self
     }
 
@@ -181,7 +181,7 @@ where
         EventBuilder {
             id: self.id,
             stream_id: self.stream_id,
-            sequence_number: self.sequence_number,
+            stream_version: self.stream_version,
             event_type: self.event_type,
             actor_id: self.actor_id,
             purger_id: self.purger_id,
@@ -212,7 +212,9 @@ where
         Ok(Event {
             id: self.id.unwrap_or_else(|| Uuid::new_v4()),
             stream_id: self.stream_id.ok_or(EventBuilderError::StreamIdMissing)?,
-            sequence_number: 0,
+            stream_version: self
+                .stream_version
+                .ok_or(EventBuilderError::StreamVersionMissing)?,
             event_type: self.event_type.ok_or(EventBuilderError::EventTypeMissing)?,
             actor_id: self.actor_id,
             purger_id: self.purger_id,
@@ -260,6 +262,9 @@ pub enum EventBuilderError {
     /// The event ID is missing.
     #[error("Event Stream ID is required")]
     StreamIdMissing,
+    /// The stream version is missing.
+    #[error("Event Stream version is required")]
+    StreamVersionMissing,
     /// The event type is missing.
     #[error("Event type is required")]
     EventTypeMissing,
