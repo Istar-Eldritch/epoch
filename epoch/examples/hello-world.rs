@@ -31,6 +31,7 @@ pub enum UserProjectionError {
     Unexpected(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
+// In memory projection for tests
 #[derive(Debug)]
 struct UserProjection(Arc<Mutex<HashMap<Uuid, User>>>);
 
@@ -115,26 +116,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     event_store.store_event(user_created_event).await?;
 
     println!("User in store: {:?}", user_projection);
-    // println!(
-    //     "UserActivity after creation: {:?}",
-    //     user_activity_store.fetch_by_id(&Uuid::nil()).await?
-    // );
 
     event_store.store_event(user_name_udpated_event).await?;
 
     println!("User in store: {:?}", user_projection);
-    // println!(
-    //     "UserActivity after name update: {:?}",
-    //     user_activity_store.fetch_by_id(&Uuid::nil()).await?
-    // );
 
     event_store.store_event(user_deleted_event).await?;
 
     println!("User in store after deletion: {:?}", user_projection);
-    // println!(
-    //     "UserActivity after deletion: {:?}",
-    //     user_activity_store.fetch_by_id(&Uuid::nil()).await?
-    // );
 
     Ok(())
 }
