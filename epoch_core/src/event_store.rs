@@ -13,9 +13,10 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 /// A trait that defines the behavior of an event stream.
-pub trait EventStream<D, P>: Stream<Item = Result<Event<D>, D::Error>>
+pub trait EventStream<D>:
+    Stream<Item = Result<Event<D>, Box<dyn std::error::Error + Send>>>
 where
-    D: EventData + Send + Sync + TryFrom<P>,
+    D: EventData + Send + Sync,
 {
 }
 
@@ -28,13 +29,10 @@ pub trait EventStoreBackend {
     type Error: std::error::Error;
 
     /// Fetches a stream from the storage backend.
-    fn read_events<D>(
+    fn read_events(
         &self,
         stream_id: Uuid,
-    ) -> impl Future<Output = Result<impl EventStream<D, Self::EventType>, Self::Error>> + Send
-    where
-        D: TryFrom<Self::EventType> + EventData + Send + Sync,
-        Self::EventType: From<D>;
+    ) -> impl Future<Output = Result<impl EventStream<Self::EventType>, Self::Error>> + Send;
 
     /// Appends events to a stream.
     fn store_event(

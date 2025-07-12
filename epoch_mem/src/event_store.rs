@@ -66,16 +66,12 @@ where
     type Error = InMemoryEventStoreBackendError;
     type EventType = B::EventType;
     #[allow(refining_impl_trait)]
-    fn read_events<D>(
+    fn read_events(
         &self,
         stream_id: Uuid,
-    ) -> impl Future<Output = Result<InMemoryEventStoreStream<B, D>, Self::Error>> + Send
-    where
-        D: TryFrom<Self::EventType> + EventData + Send + Sync,
-        Self::EventType: From<D>,
-    {
+    ) -> impl Future<Output = Result<InMemoryEventStoreStream<B>, Self::Error>> + Send {
         let store = self.clone();
-        async move { Ok(InMemoryEventStoreStream::<B, D>::new(store, stream_id)) }
+        async move { Ok(InMemoryEventStoreStream::<B>::new(store, stream_id)) }
     }
 
     fn store_event(
@@ -115,49 +111,35 @@ where
 }
 
 /// An in-memory event store stream.
-pub struct InMemoryEventStoreStream<B, D>
+pub struct InMemoryEventStoreStream<B>
 where
     B: EventBus + Clone,
-    B::EventType: From<D>,
-    D: EventData + Send + Sync + TryFrom<B::EventType>,
 {
     id: Uuid,
     store: InMemoryEventStore<B>,
-    _phantom: PhantomData<D>,
     current_index: usize,
 }
 
-impl<B, D> InMemoryEventStoreStream<B, D>
+impl<B> InMemoryEventStoreStream<B>
 where
     B: EventBus + Clone,
-    B::EventType: From<D>,
-    D: EventData + Send + Sync + TryFrom<B::EventType>,
 {
     fn new(store: InMemoryEventStore<B>, id: Uuid) -> Self {
         Self {
             store,
             id,
-            _phantom: PhantomData,
             current_index: 0,
         }
     }
 }
 
-impl<'a, B, D> EventStream<D, B::EventType> for InMemoryEventStoreStream<B, D>
-where
-    B: EventBus + Clone,
-    B::EventType: From<D>,
-    D: EventData + Send + Sync + TryFrom<B::EventType>,
-{
-}
+impl<'a, B> EventStream<B::EventType> for InMemoryEventStoreStream<B> where B: EventBus + Clone {}
 
-impl<'a, B, D> Stream for InMemoryEventStoreStream<B, D>
+impl<'a, B> Stream for InMemoryEventStoreStream<B>
 where
     B: EventBus + Clone,
-    B::EventType: From<D>,
-    D: EventData + Send + Sync + TryFrom<B::EventType>,
 {
-    type Item = Result<Event<D>, D::Error>;
+    type Item = Result<Event<B::EventType>, Box<dyn std::error::Error + Send>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // We need to use unsafe to get a mutable reference to the fields of the `!Unpin` struct.
@@ -179,18 +161,7 @@ where
 
                 // Find the actual event in the store's main events vector
                 if let Some(event) = data.events.get(&event_id) {
-                    // Convert event P to D if possible
-                    if let Some(data_p) = &event.data {
-                        let res = D::try_from(data_p.clone());
-                        return Poll::Ready(Some(res.map(|event| {
-                            let data_d = event.clone();
-                            event
-                                .into_builder()
-                                .data(Some(data_d))
-                                .build()
-                                .expect("Event to be buildable")
-                        })));
-                    }
+                    return Poll::Ready(Some(Ok(event.clone())));
                 }
             }
         }
