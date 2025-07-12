@@ -183,7 +183,7 @@ where
     D: EventData + Send + Sync,
 {
     _phantom: PhantomData<D>,
-    projectors: Arc<Mutex<Vec<Arc<Mutex<dyn Projection<D>>>>>>,
+    projections: Arc<Mutex<Vec<Arc<Mutex<dyn Projection<D>>>>>>,
 }
 
 impl<D> InMemoryEventBus<D>
@@ -194,7 +194,7 @@ where
     pub fn new() -> Self {
         Self {
             _phantom: PhantomData,
-            projectors: Arc::new(Mutex::new(vec![])),
+            projections: Arc::new(Mutex::new(vec![])),
         }
     }
 }
@@ -223,10 +223,13 @@ where
         event: Event<Self::EventType>,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
         Box::pin(async move {
-            let projectors = self.projectors.lock().await;
-            for projector in projectors.iter() {
-                let mut projector = projector.lock().await;
-                projector.apply(&event).await.unwrap();
+            let projections = self.projections.lock().await;
+            for projection in projections.iter() {
+                let mut projection = projection.lock().await;
+                projection.apply(&event).await.unwrap_or_else(|e| {
+                    log::error!("Error applying event: {:?}", e);
+                    //TODO: Retry mechanism and dead letter queue
+                });
             }
             Ok(())
         })
@@ -236,7 +239,7 @@ where
         &self,
         projector: Arc<Mutex<dyn Projection<Self::EventType>>>,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
-        let projectors = self.projectors.clone();
+        let projectors = self.projections.clone();
         Box::pin(async move {
             let mut projectors = projectors.lock().await;
             projectors.push(projector);
