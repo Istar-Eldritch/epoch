@@ -168,9 +168,11 @@ where
             Ok(guard) => {
                 log::debug!("InMemoryEventStoreStream: poll_next - Acquired lock");
                 guard
-            },
+            }
             Err(_) => {
-                log::debug!("InMemoryEventStoreStream: poll_next - Lock contention, returning Poll::Pending");
+                log::debug!(
+                    "InMemoryEventStoreStream: poll_next - Lock contention, returning Poll::Pending"
+                );
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
@@ -195,9 +197,14 @@ where
                     return Poll::Ready(Some(Ok(event.clone())));
                 }
             }
-            log::debug!("InMemoryEventStoreStream: poll_next - No more events in stream, returning Poll::Ready(None)");
+            log::debug!(
+                "InMemoryEventStoreStream: poll_next - No more events in stream, returning Poll::Ready(None)"
+            );
         } else {
-            log::debug!("InMemoryEventStoreStream: poll_next - No events found for stream_id: {}", this.id);
+            log::debug!(
+                "InMemoryEventStoreStream: poll_next - No events found for stream_id: {}",
+                this.id
+            );
         }
 
         Poll::Ready(None)
@@ -282,5 +289,185 @@ where
             projectors.push(projector);
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epoch_core::event::EventData;
+    use tokio_stream::StreamExt;
+    use uuid::Uuid;
+
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct MyEventData {
+        value: String,
+    }
+
+    impl EventData for MyEventData {
+        fn event_type(&self) -> &'static str {
+            "MyEvent"
+        }
+    }
+
+    // Helper function to create a new event
+    fn new_event(stream_id: Uuid, stream_version: u64, value: &str) -> Event<MyEventData> {
+        Event::<MyEventData>::builder()
+            .stream_id(stream_id)
+            .event_type("MyEvent".to_string())
+            .stream_version(stream_version)
+            .data(Some(MyEventData {
+                value: value.to_string(),
+            }))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_store_new() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let store = InMemoryEventStore::new(bus.clone());
+        assert!(store.data.lock().await.events.is_empty());
+        assert!(store.data.lock().await.stream_events.is_empty());
+        assert!(store.data.lock().await.stream_version.is_empty());
+        assert!(store.bus().projections.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_store_store_event() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let store = InMemoryEventStore::new(bus);
+        let stream_id = Uuid::new_v4();
+
+        let event1 = new_event(stream_id, 0, "test1");
+        let stored_event1 = store.store_event(event1.clone()).await.unwrap();
+        assert_eq!(stored_event1, event1);
+
+        let event2 = new_event(stream_id, 1, "test2");
+        let stored_event2 = store.store_event(event2.clone()).await.unwrap();
+        assert_eq!(stored_event2, event2);
+
+        let data = store.data.lock().await;
+        assert_eq!(data.events.len(), 2);
+        assert_eq!(data.stream_events.get(&stream_id).unwrap().len(), 2);
+        assert_eq!(*data.stream_version.get(&stream_id).unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_store_store_event_version_mismatch() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let store = InMemoryEventStore::new(bus);
+        let stream_id = Uuid::new_v4();
+
+        let event1 = new_event(stream_id, 0, "test1");
+        store.store_event(event1.clone()).await.unwrap();
+
+        let event_mismatch = new_event(stream_id, 0, "test_mismatch");
+        let result = store.store_event(event_mismatch).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            InMemoryEventStoreBackendError::VersionMismatch(expected, got) => {
+                assert_eq!(expected, 0);
+                assert_eq!(got, 1);
+            }
+            _ => panic!("Unexpected error type"),
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_store_read_events() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let store = InMemoryEventStore::new(bus);
+        let stream_id = Uuid::new_v4();
+
+        let event1 = new_event(stream_id, 0, "test1");
+        let event2 = new_event(stream_id, 1, "test2");
+        let event3 = new_event(stream_id, 2, "test3");
+
+        store.store_event(event1.clone()).await.unwrap();
+        store.store_event(event2.clone()).await.unwrap();
+        store.store_event(event3.clone()).await.unwrap();
+
+        let mut stream = store.read_events(stream_id).await.unwrap();
+
+        assert_eq!(stream.next().await.unwrap().unwrap(), event1);
+        assert_eq!(stream.next().await.unwrap().unwrap(), event2);
+        assert_eq!(stream.next().await.unwrap().unwrap(), event3);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_bus_new() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        assert!(bus.projections.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_bus_publish() {
+        struct TestProjection {
+            events: Arc<Mutex<Vec<Event<MyEventData>>>>,
+        }
+
+        impl Projection<MyEventData> for TestProjection {
+            fn apply(
+                &mut self,
+                event: &Event<MyEventData>,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
+                        + Send,
+                >,
+            > {
+                let events = self.events.clone();
+                let event = event.clone();
+                Box::pin(async move {
+                    events.lock().await.push(event);
+                    Ok(())
+                })
+            }
+        }
+
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let collected_events = Arc::new(Mutex::new(Vec::new()));
+        let projection = Arc::new(Mutex::new(TestProjection {
+            events: collected_events.clone(),
+        }));
+
+        bus.subscribe(projection.clone()).await.unwrap();
+
+        let stream_id = Uuid::new_v4();
+        let event = new_event(stream_id, 0, "test_publish");
+        bus.publish(event.clone()).await.unwrap();
+
+        let events = collected_events.lock().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], event);
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_bus_subscribe() {
+        struct TestProjection {}
+
+        impl Projection<MyEventData> for TestProjection {
+            fn apply(
+                &mut self,
+                _event: &Event<MyEventData>,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
+                        + Send,
+                >,
+            > {
+                Box::pin(async move { Ok(()) })
+            }
+        }
+
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let projection = Arc::new(Mutex::new(TestProjection {}));
+
+        bus.subscribe(projection.clone()).await.unwrap();
+
+        let projections = bus.projections.lock().await;
+        assert_eq!(projections.len(), 1);
     }
 }
