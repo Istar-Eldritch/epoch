@@ -23,12 +23,30 @@ impl<B: EventBus + Clone> PgEventStore<B> {
         Self { postgres, bus }
     }
 
-    /// Initializes the posgres db
-    pub fn initialize(&self) {}
-
     /// Exposes the event store bus
     pub fn bus(&self) -> &B {
         &self.bus
+    }
+
+    /// Initializes the event store, creating the events table if it does not exist.
+    pub async fn initialize(&self) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS events (
+                id UUID PRIMARY KEY,
+                stream_id UUID NOT NULL,
+                stream_version INT NOT NULL,
+                event_type VARCHAR(255) NOT NULL,
+                data JSONB,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (stream_id, stream_version)
+            );
+            "#,
+        )
+        .execute(&self.postgres)
+        .await?;
+
+        Ok(())
     }
 }
 
