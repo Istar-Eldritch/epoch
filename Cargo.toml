@@ -6,7 +6,7 @@ members = [
     "epoch_core",
     "epoch_derive",
     "epoch_mem",
-    "epoch_sqlx"
+    "epoch_pg"
 ]
 
 [workspace.package]

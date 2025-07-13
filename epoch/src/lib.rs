@@ -16,6 +16,13 @@ pub mod mem_store {
     pub use epoch_mem::*;
 }
 
+#[cfg(feature = "postgres")]
+/// Proc-macros for the `epoch` crate.
+pub mod pg_store {
+    //! Contains proc-macros for the `epoch` crate.
+    pub use epoch_pg::*;
+}
+
 pub mod prelude {
     //! The prelude module for the `epoch` crate.
     pub use epoch_core::prelude::*;
@@ -24,4 +31,6 @@ pub mod prelude {
     pub use super::derive::*;
     #[cfg(feature = "in-memory")]
     pub use super::mem_store::*;
+    #[cfg(feature = "postgres")]
+    pub use super::pg_store::*;
 }
