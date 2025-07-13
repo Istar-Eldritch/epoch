@@ -1,0 +1,11 @@
+[package]
+name = "epoch_sqlx"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+categories.workspace = true
+
+[dependencies]
+
