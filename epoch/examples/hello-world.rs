@@ -2,10 +2,11 @@ use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use epoch::prelude::*;
 use epoch_mem::*;
+use serde::Deserialize;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, serde::Serialize, EventData)]
+#[derive(Debug, Clone, serde::Serialize, EventData, Deserialize)]
 enum ApplicationEvent {
     UserCreated { id: Uuid, name: String },
     UserNameUpdated { id: Uuid, name: String },

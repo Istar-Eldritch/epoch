@@ -3,11 +3,11 @@
 //! event's payload, and error types for event creation and conversion.
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use uuid::Uuid;
 
 /// Event definition
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Event<D>
 where
     D: EventData,
@@ -226,7 +226,7 @@ where
 }
 
 /// An event's data payload
-pub trait EventData: Serialize + Sized + Clone + Send {
+pub trait EventData: Serialize + serde::de::DeserializeOwned + Sized + Clone + Send {
     /// Get the event type/identifier in PascalCase like `UserCreated` or `PasswordChanged`
     fn event_type(&self) -> &'static str;
 

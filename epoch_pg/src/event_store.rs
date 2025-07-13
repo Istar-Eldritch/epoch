@@ -50,14 +50,27 @@ impl<B: EventBus + Clone> PgEventStore<B> {
     }
 }
 
+/// Postgres representation of the event
 #[derive(Debug, FromRow, Serialize, Deserialize)]
-struct PgDBEvent {
-    id: Uuid,
-    stream_id: Uuid,
-    stream_version: i32,
-    event_type: String,
-    data: Option<serde_json::Value>,
-    created_at: chrono::DateTime<chrono::Utc>,
+pub struct PgDBEvent {
+    /// The id of the event
+    pub id: Uuid,
+    /// The steam this event belongs to
+    pub stream_id: Uuid,
+    /// The stream version, used for conflict checks
+    pub stream_version: i32,
+    /// Who created the event
+    pub actor_id: Option<Uuid>,
+    /// The type of the event
+    pub event_type: String,
+    /// The data of the event
+    pub data: Option<serde_json::Value>,
+    /// When the event was created
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// If this event was purged, who purged it.
+    pub purger_id: Option<Uuid>,
+    /// If this event was purged, when it was purged
+    pub purged_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A postgres based event stream.
