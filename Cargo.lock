@@ -139,7 +139,6 @@ dependencies = [
 name = "epoch_core"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "chrono",
  "futures-core",
  "serde",
@@ -164,7 +163,6 @@ dependencies = [
 name = "epoch_mem"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "chrono",
  "epoch_core",
  "futures-core",
@@ -175,6 +173,10 @@ dependencies = [
  "tokio-stream",
  "uuid",
 ]
+
+[[package]]
+name = "epoch_sqlx"
+version = "0.1.0"
 
 [[package]]
 name = "futures-core"
