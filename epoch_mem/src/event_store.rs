@@ -52,39 +52,55 @@ impl<B: EventBus + Clone> InMemoryEventStore<B> {
 #[derive(Debug, thiserror::Error)]
 pub enum InMemoryEventStoreBackendError {
     ///
-    #[error("Event version ({0}) doesn't match stream version ({0})")]
+    #[error("Event version ({0}) doesn't match stream version ({1})")]
     VersionMismatch(u64, u64),
     /// Error publishing event to bus
     #[error("Error publishing event to bus")]
     PublishEvent,
 }
 
-impl<B> EventStoreBackend for InMemoryEventStore<B>
+impl<'a, B> EventStoreBackend<'a> for InMemoryEventStore<B>
 where
-    B: EventBus + Send + Sync + Clone,
-    B::Error: 'static,
+    B: EventBus + Send + Sync + Clone + 'a,
 {
     type Error = InMemoryEventStoreBackendError;
     type EventType = B::EventType;
-    #[allow(refining_impl_trait)]
+
     fn read_events(
         &self,
         stream_id: Uuid,
-    ) -> impl Future<Output = Result<InMemoryEventStoreStream<B>, Self::Error>> + Send {
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Pin<Box<dyn EventStream<Self::EventType> + Send + 'a>>,
+                        Self::Error,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
         log::debug!("Reading events for stream_id: {}", stream_id);
-        let store = self.clone();
-        async move { Ok(InMemoryEventStoreStream::<B>::new(store, stream_id)) }
+        let data = self.data.clone();
+        Box::pin(async move {
+            let stream: Pin<Box<dyn EventStream<Self::EventType> + Send>> =
+                Box::pin(InMemoryEventStoreStream::<B>::new(data, stream_id));
+            Ok(stream)
+        })
     }
 
     fn store_event(
         &self,
         event: Event<Self::EventType>,
-    ) -> impl Future<Output = Result<Event<Self::EventType>, Self::Error>> + Send {
-        async move {
-            let mut data = self.data.lock().await;
+    ) -> Pin<Box<dyn Future<Output = Result<Event<Self::EventType>, Self::Error>> + Send + 'a>>
+    {
+        let data = self.data.clone();
+        let bus = self.bus.clone();
+        Box::pin(async move {
+            let mut data = data.lock().await;
             let stream_id = event.stream_id;
 
-            let mut version: u64 = *data.stream_version.get(&stream_id).unwrap_or(&0);
+            let version: u64 = *data.stream_version.get(&stream_id).unwrap_or(&0);
 
             if event.stream_version != version {
                 log::debug!(
@@ -93,10 +109,10 @@ where
                     version,
                     event.stream_version
                 );
-                Err(InMemoryEventStoreBackendError::VersionMismatch(
+                return Err(InMemoryEventStoreBackendError::VersionMismatch(
                     event.stream_version,
                     version,
-                ))?;
+                ));
             }
             log::debug!(
                 "Event version check passed for stream_id: {}. Version: {}",
@@ -104,27 +120,26 @@ where
                 version
             );
 
-            version += 1;
+            let new_version = version + 1;
 
-            data.stream_version.insert(stream_id, version);
+            data.stream_version.insert(stream_id, new_version);
 
             let event_id = event.id;
             data.events.insert(event_id, event.clone());
             data.stream_events
                 .entry(stream_id)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .extend(&[event_id]);
             log::debug!(
                 "Event stored successfully for stream_id: {}, event_id: {}",
                 stream_id,
                 event_id
             );
-            self.bus()
-                .publish(event.clone())
-                .await
-                .map_err(|_e| InMemoryEventStoreBackendError::PublishEvent)?;
+            if bus.publish(event.clone()).await.is_err() {
+                return Err(InMemoryEventStoreBackendError::PublishEvent);
+            }
             Ok(event)
-        }
+        })
     }
 }
 
@@ -134,37 +149,43 @@ where
     B: EventBus + Clone,
 {
     id: Uuid,
-    store: InMemoryEventStore<B>,
+    data: Arc<Mutex<EventStoreData<B::EventType>>>,
     current_index: usize,
+    _phantom: PhantomData<B>,
 }
 
 impl<B> InMemoryEventStoreStream<B>
 where
     B: EventBus + Clone,
 {
-    fn new(store: InMemoryEventStore<B>, id: Uuid) -> Self {
+    fn new(data: Arc<Mutex<EventStoreData<B::EventType>>>, id: Uuid) -> Self {
         Self {
-            store,
+            data,
             id,
             current_index: 0,
+            _phantom: PhantomData,
         }
     }
 }
 
-impl<'a, B> EventStream<B::EventType> for InMemoryEventStoreStream<B> where B: EventBus + Clone {}
-
-impl<'a, B> Stream for InMemoryEventStoreStream<B>
-where
-    B: EventBus + Clone,
+impl<B> EventStream<B::EventType> for InMemoryEventStoreStream<B> where
+    B: EventBus + Clone + Send + Sync
 {
-    type Item = Result<Event<B::EventType>, Box<dyn std::error::Error + Send>>;
+}
+
+impl<B> Stream for InMemoryEventStoreStream<B>
+where
+    B: EventBus + Clone + Send + Sync,
+    B::EventType: Send + Sync,
+{
+    type Item = Result<Event<B::EventType>, Box<dyn std::error::Error + Send + Sync>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // We need to use unsafe to get a mutable reference to the fields of the `!Unpin` struct.
         // This is safe because we are not moving the `VirtualEventStoreStream` itself.
         let this = unsafe { self.get_unchecked_mut() };
 
-        let data = match this.store.data.try_lock() {
+        let data = match this.data.try_lock() {
             Ok(guard) => {
                 log::debug!("InMemoryEventStoreStream: poll_next - Acquired lock");
                 guard
@@ -366,9 +387,9 @@ mod tests {
         let result = store.store_event(event_mismatch).await;
         assert!(result.is_err());
         match result.unwrap_err() {
-            InMemoryEventStoreBackendError::VersionMismatch(expected, got) => {
-                assert_eq!(expected, 0);
-                assert_eq!(got, 1);
+            InMemoryEventStoreBackendError::VersionMismatch(event_version, stream_version) => {
+                assert_eq!(event_version, 0);
+                assert_eq!(stream_version, 1);
             }
             _ => panic!("Unexpected error type"),
         }

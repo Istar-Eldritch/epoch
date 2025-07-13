@@ -14,31 +14,41 @@ use uuid::Uuid;
 
 /// A trait that defines the behavior of an event stream.
 pub trait EventStream<D>:
-    Stream<Item = Result<Event<D>, Box<dyn std::error::Error + Send>>>
+    Stream<Item = Result<Event<D>, Box<dyn std::error::Error + Send + Sync>>> + Send
 where
     D: EventData + Send + Sync,
 {
 }
 
 /// A trait that defines the behavior of a storage backend.
-pub trait EventStoreBackend {
+pub trait EventStoreBackend<'a>: Send + Sync {
     /// The type of event stored in this store
     type EventType: EventData + Send + Sync;
 
     /// The error when an event store operation fails
-    type Error: std::error::Error;
+    type Error: std::error::Error + Send + Sync + 'a;
 
     /// Fetches a stream from the storage backend.
     fn read_events(
-        &self,
+        &'a self,
         stream_id: Uuid,
-    ) -> impl Future<Output = Result<impl EventStream<Self::EventType>, Self::Error>> + Send;
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Pin<Box<dyn EventStream<Self::EventType> + Send + 'a>>,
+                        Self::Error,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
 
     /// Appends events to a stream.
     fn store_event(
-        &self,
+        &'a self,
         event: Event<Self::EventType>,
-    ) -> impl Future<Output = Result<Event<Self::EventType>, Self::Error>> + Send;
+    ) -> Pin<Box<dyn Future<Output = Result<Event<Self::EventType>, Self::Error>> + Send + 'a>>;
 }
 
 /// A trait that defines the behavior of an event bus.
