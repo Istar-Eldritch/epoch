@@ -73,3 +73,33 @@ A snapshot is an optimization for the **write model**, designed to reduce the ti
 
 Snapshotting logic should be handled by the write model's persistence layer. The appropriate implementation is to introduce an `AggregateRepository` that encapsulates the logic for loading an aggregate. This repository will be responsible for fetching the latest snapshot, replaying subsequent events, and deciding when to create a new snapshot after an aggregate's state has been updated. This maintains a clear separation between write-side and read-side concerns.
 
+## EventBus and EventStoreBackend Interaction
+
+This section discusses the interaction between the `EventBus` and `EventStoreBackend`, particularly concerning event persistence and publication.
+
+### `EventBus::publish` as a No-Op with PostgreSQL Notifications
+
+**Proposal:** To implement `EventBus` for PostgreSQL, the `publish` method would be a no-op. Event persistence would be handled by the `EventStoreBackend` for PostgreSQL, which would then trigger a PostgreSQL notification (`NOTIFY`) to inform subscribers.
+
+**Rationale and Outcomes:**
+
+*   **Transactional Consistency:** This design ensures strong transactional consistency. Events are only "published" (via PostgreSQL `NOTIFY`) after they have been successfully and durably persisted to the event store by the `EventStoreBackend`. This guarantees that only committed events are propagated, which is fundamental for data integrity in event-sourced systems.
+*   **Alignment with Event Sourcing:** The approach reinforces the event store as the single source of truth. Event persistence naturally triggers downstream processing, maintaining a clear flow where the persistence layer is responsible for the initial event emission, and the `EventBus` for event reception and distribution.
+*   **Separation of Concerns (Nuanced):** While `publish` becomes a no-op for the `EventBus`, it still serves its role for subscription and delivery of *persisted* events. The `EventStoreBackend` explicitly handles the persistence. This maintains a clear, albeit nuanced, separation where the `EventBus` is focused on event distribution, and the `EventStoreBackend` on durable storage.
+*   **Simplified `EventBus` Implementation:** The PostgreSQL `EventBus` implementation becomes simpler by offloading the actual event writing to the `EventStoreBackend`.
+*   **Documentation:** Clear documentation is crucial to explain that the `EventBus::publish` method for the PostgreSQL implementation is a no-op, and that event propagation is implicitly handled by the `EventStoreBackend`'s persistence mechanism via database notifications.
+*   **Delivery Guarantees:** PostgreSQL `NOTIFY` provides "at-most-once" delivery for immediate notifications. For robust, "at-least-once" processing and eventual consistency, projections should primarily rely on reading events from the `EventStream` provided by the `EventStoreBackend`. The `EventBus` in this context serves as a low-latency mechanism for notifying subscribers of *newly persisted events*.
+*   **Scalability:** For extremely high-throughput scenarios, `NOTIFY` might become a bottleneck. However, for many typical event-sourcing applications, it's sufficient and offers a simpler operational footprint than dedicated message queues.
+
+### Inverting Store and Bus Responsibilities
+
+**Proposal:** An alternative where the `EventStoreBackend` uses the `EventBus` to persist events (i.e., `PgEventBus` would both store and read events, and `PgEventStore` would use `PgEventBus` for persistence) was considered.
+
+**Rationale and Outcomes (Reasons for Rejection):**
+
+*   **Violation of Separation of Concerns (SoC):** This inversion merges the distinct responsibilities of persistence (`EventStoreBackend`) and event distribution (`EventBus`) into a single component (`PgEventBus`). This goes against the `epoch` project's design principle of SoC, leading to a less maintainable and harder-to-understand codebase.
+*   **Increased Coupling and Inverted Dependencies:** The core persistence component (`EventStoreBackend`) would become dependent on the event distribution component (`EventBus`), creating an inverted and undesirable dependency flow. This increases coupling and reduces system flexibility.
+*   **Compromised Transactional Guarantees:** If the `EventBus` manages persistence, the transactional boundary becomes less clear. The `EventBus` would need to manage database transactions, a responsibility typically belonging to the persistence layer. This could complicate error handling and make it harder to guarantee that events are both persisted and reliably delivered. The current model (persistence first, then notification) provides stronger guarantees.
+*   **Deviation from Event Sourcing Principles:** Event Sourcing establishes the Event Store as the central, immutable source of truth. Delegating the core persistence responsibility of the `EventStoreBackend` to the `EventBus` diminishes the `EventStoreBackend`'s role and makes the `EventBus` the de-facto event store for writes, which deviates from conventional event-sourced system architecture.
+*   **Increased Complexity:** This inversion adds an extra layer of indirection to the write path, making the system harder to reason about and debug.
+
