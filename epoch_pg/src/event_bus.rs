@@ -38,7 +38,7 @@ where
 
 impl<D> PgEventBus<D>
 where
-    D: EventData + Send + Sync + DeserializeOwned,
+    D: EventData + Send + Sync + DeserializeOwned + 'static,
 {
     /// Creates a new `PgEventBus` instance.
     pub fn new(pool: PgPool, channel_name: impl Into<String>) -> Self {
@@ -65,8 +65,10 @@ where
                         'stream_version', NEW.stream_version,
                         'event_type', NEW.event_type,
                         'actor_id', NEW.actor_id,
+                        'purger_id', NEW.purger_id,
                         'data', NEW.data,
                         'created_at', NEW.created_at,
+                        'purged_at', NEW.purged_at,
                     )::text
                 );
                 RETURN NEW;
@@ -97,6 +99,49 @@ where
         )
         .execute(&self.pool)
         .await?;
+
+        let listener_pool = self.pool.clone();
+        let mut listener = PgListener::connect_with(&listener_pool)
+            .await
+            .expect("TO be able to subscribe to postgres event stream");
+
+        listener
+            .listen(&self.channel_name)
+            .await
+            .expect("To be able to start listening to the event stream");
+
+        let projections = self.projections.clone();
+
+        tokio::spawn(async move {
+            loop {
+                while let Some(e) = listener.try_recv().await? {
+                    let mut projections = projections.lock().await;
+                    for projection in projections.iter_mut() {
+                        let mut projection = projection.lock().await;
+                        let db_event: PgDBEvent = serde_json::from_str(e.payload())?;
+                        let data = db_event
+                            .data
+                            .map(|d| serde_json::from_value(d))
+                            .transpose()?;
+                        let event = Event {
+                            id: db_event.id,
+                            actor_id: db_event.actor_id,
+                            stream_id: db_event.stream_id,
+                            purger_id: db_event.purger_id,
+                            event_type: db_event.event_type,
+                            stream_version: db_event.stream_version as u64,
+                            created_at: db_event.created_at,
+                            purged_at: db_event.purged_at,
+                            data,
+                        };
+                        projection.apply(&event);
+                    }
+                }
+                // TODO: If we get here we have lost the connection and ideally we need to tell the
+                // projecitons they will need to pull from the event stream directly before
+                // applying the next event
+            }
+        });
         Ok(())
     }
 }

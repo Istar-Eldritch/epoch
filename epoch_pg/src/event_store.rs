@@ -58,7 +58,7 @@ pub struct PgDBEvent {
     /// The steam this event belongs to
     pub stream_id: Uuid,
     /// The stream version, used for conflict checks
-    pub stream_version: i32,
+    pub stream_version: i64,
     /// Who created the event
     pub actor_id: Option<Uuid>,
     /// The type of the event
