@@ -4,13 +4,14 @@ use crate::event_store::PgDBEvent;
 use epoch_core::event::{Event, EventData};
 use epoch_core::event_store::EventBus;
 use epoch_core::prelude::Projection;
-use futures::StreamExt;
+use log::{error, info};
 use serde::de::DeserializeOwned;
 use sqlx::Error as SqlxError;
 use sqlx::postgres::{PgListener, PgPool};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::time::{Duration, sleep};
 
 /// Errors that can occur when using `PgEventBus`.
 #[derive(Debug, thiserror::Error)]
@@ -101,29 +102,87 @@ where
         .await?;
 
         let listener_pool = self.pool.clone();
-        let mut listener = PgListener::connect_with(&listener_pool)
-            .await
-            .expect("TO be able to subscribe to postgres event stream");
-
-        listener
-            .listen(&self.channel_name)
-            .await
-            .expect("To be able to start listening to the event stream");
-
+        let channel_name = self.channel_name.clone();
         let projections = self.projections.clone();
 
         tokio::spawn(async move {
+            let mut listener_option: Option<PgListener> = None;
+            let mut reconnect_delay = Duration::from_secs(1);
+            const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+
             loop {
-                while let Some(e) = listener.try_recv().await? {
-                    let mut projections = projections.lock().await;
-                    for projection in projections.iter_mut() {
-                        let mut projection = projection.lock().await;
-                        let db_event: PgDBEvent = serde_json::from_str(e.payload())?;
-                        let data = db_event
-                            .data
-                            .map(|d| serde_json::from_value(d))
-                            .transpose()?;
-                        let event = Event {
+                // Ensure listener is connected
+                let listener = match listener_option {
+                    Some(ref mut l) => l,
+                    None => {
+                        info!(
+                            "Attempting to connect to PostgreSQL listener on channel '{}'",
+                            channel_name
+                        );
+                        match PgListener::connect_with(&listener_pool).await {
+                            Ok(mut l) => {
+                                match l.listen(&channel_name).await {
+                                    Ok(_) => {
+                                        info!(
+                                            "Successfully connected and listening on channel '{}'",
+                                            channel_name
+                                        );
+                                        reconnect_delay = Duration::from_secs(1); // Reset delay on successful connection
+                                        listener_option = Some(l);
+                                        listener_option.as_mut().unwrap()
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "Failed to listen on channel '{}': {}",
+                                            channel_name, e
+                                        );
+                                        sleep(reconnect_delay).await;
+                                        reconnect_delay =
+                                            (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to connect to PostgreSQL for listener: {}", e);
+                                sleep(reconnect_delay).await;
+                                reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                match listener.recv().await {
+                    Ok(notification) => {
+                        // Reset reconnect delay on successful message reception
+                        reconnect_delay = Duration::from_secs(1);
+
+                        let payload = notification.payload();
+                        let db_event: PgDBEvent = match serde_json::from_str(payload) {
+                            Ok(event) => event,
+                            Err(e) => {
+                                error!(
+                                    "Failed to deserialize PgDBEvent from payload '{}': {}",
+                                    payload, e
+                                );
+                                continue; // Skip to next notification
+                            }
+                        };
+
+                        let data =
+                            match db_event.data.map(|d| serde_json::from_value(d)).transpose() {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    error!(
+                                        "Failed to deserialize event data from payload '{}': {}",
+                                        payload, e
+                                    );
+                                    continue; // Skip to next notification
+                                }
+                            };
+
+                        let event = Event::<D> {
                             id: db_event.id,
                             actor_id: db_event.actor_id,
                             stream_id: db_event.stream_id,
@@ -134,12 +193,30 @@ where
                             purged_at: db_event.purged_at,
                             data,
                         };
-                        projection.apply(&event);
+
+                        let mut projections_guard = projections.lock().await;
+                        for projection in projections_guard.iter_mut() {
+                            let mut projection_guard = projection.lock().await;
+                            match projection_guard.apply(&event).await {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    error!("Failed applying event to projection: {:?}", e);
+                                    continue;
+                                }
+                            };
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            "Error receiving notification: {}. Attempting to reconnect...",
+                            e
+                        );
+                        // Invalidate the listener to force a reconnection attempt
+                        listener_option = None;
+                        sleep(reconnect_delay).await;
+                        reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
                     }
                 }
-                // TODO: If we get here we have lost the connection and ideally we need to tell the
-                // projecitons they will need to pull from the event stream directly before
-                // applying the next event
             }
         });
         Ok(())
@@ -153,7 +230,7 @@ where
     type EventType = D;
     type Error = PgEventBusError;
 
-    /// This is NOOP. Use the PGEventStore to push events to the events table. Subscribers to this
+    /// This is NO-OP. Use the PGEventStore to push events to the events table. Subscribers to this
     /// bus will receive the notifications
     fn publish<'a>(
         &'a self,
