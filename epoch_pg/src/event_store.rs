@@ -35,10 +35,13 @@ impl<B: EventBus + Clone> PgEventStore<B> {
             CREATE TABLE IF NOT EXISTS events (
                 id UUID PRIMARY KEY,
                 stream_id UUID NOT NULL,
-                stream_version INT NOT NULL,
+                stream_version BIGINT NOT NULL,
                 event_type VARCHAR(255) NOT NULL,
                 data JSONB,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                created_at TIMESTAMPTZ NOT NULL,
+                actor_id UUID,
+                purger_id UUID,
+                purged_at TIMESTAMPTZ,
                 UNIQUE (stream_id, stream_version)
             );
             "#,
@@ -156,7 +159,10 @@ where
                         stream_version,
                         event_type,
                         data,
-                        created_at
+                        created_at,
+                        actor_id,
+                        purger_id,
+                        purged_at
                     FROM events
                     WHERE stream_id = $1
                     ORDER BY stream_version ASC
