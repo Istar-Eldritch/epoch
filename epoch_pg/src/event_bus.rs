@@ -159,6 +159,7 @@ where
                         reconnect_delay = Duration::from_secs(1);
 
                         let payload = notification.payload();
+                        log::debug!("Received notification with payload: {}", payload);
                         let db_event: PgDBEvent = match serde_json::from_str(payload) {
                             Ok(event) => event,
                             Err(e) => {
@@ -197,8 +198,14 @@ where
                         let mut projections_guard = projections.lock().await;
                         for projection in projections_guard.iter_mut() {
                             let mut projection_guard = projection.lock().await;
+                            log::debug!("Applying event to projection: {:?}", event.id);
                             match projection_guard.apply(&event).await {
-                                Ok(_) => (),
+                                Ok(_) => {
+                                    log::debug!(
+                                        "Successfully applied event to projection: {:?}",
+                                        event.id
+                                    );
+                                }
                                 Err(e) => {
                                     error!("Failed applying event to projection: {:?}", e);
                                     continue;
