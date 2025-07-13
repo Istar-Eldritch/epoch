@@ -213,8 +213,8 @@ where
         Box::pin(async move {
             sqlx::query(
                 r#"
-                INSERT INTO events (id, stream_id, stream_version, event_type, data, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                INSERT INTO events (id, stream_id, stream_version, event_type, data, created_at, actor_id, purger_id, purged_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 "#,
             )
             .bind(event.id)
@@ -229,6 +229,9 @@ where
                     .transpose()?,
             )
             .bind(event.created_at)
+            .bind(event.actor_id)
+            .bind(event.purger_id)
+            .bind(event.purged_at)
             .execute(&self.postgres)
             .await?;
 
