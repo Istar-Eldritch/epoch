@@ -22,9 +22,6 @@ pub enum PgEventBusError {
     /// An error occurred during JSON serialization/deserialization.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-    /// An error occurred when the event data is missing during deserialization.
-    #[error("Event data missing in notification payload")]
-    EventDataMissing,
 }
 
 /// PostgreSQL implementation of `EventBus`.
@@ -53,14 +50,16 @@ where
 
     /// Creates the necessary trigger function and trigger for notifications.
     pub async fn initialize(&self) -> Result<(), SqlxError> {
-        // Create the function that will send the NOTIFY
-        sqlx::query(&format!(
+        // Create the function that will send the NOTIFY.
+        // The function is renamed to be more specific and avoid potential conflicts.
+        // It uses TG_ARGV[0] to get the channel name, which is safer than formatting it in.
+        sqlx::query(
             r#"
-            CREATE OR REPLACE FUNCTION notify_event_bus()
+            CREATE OR REPLACE FUNCTION epoch_pg_notify_event()
             RETURNS TRIGGER AS $$
             BEGIN
                 PERFORM pg_notify(
-                    '{}',
+                    TG_ARGV[0],
                     json_build_object(
                         'id', NEW.id,
                         'stream_id', NEW.stream_id,
@@ -77,8 +76,7 @@ where
             END;
             $$ LANGUAGE plpgsql;
             "#,
-            self.channel_name
-        ))
+        )
         .execute(&self.pool)
         .await?;
 
@@ -90,17 +88,21 @@ where
         .execute(&self.pool)
         .await?;
 
-        // Create the trigger that calls the function after an INSERT
-        sqlx::query(
+        // Create the trigger that calls the function after an INSERT.
+        // We escape single quotes in the channel name to prevent SQL injection.
+        let create_trigger_query = format!(
             r#"
             CREATE TRIGGER event_bus_notify_trigger
             AFTER INSERT ON events
             FOR EACH ROW
-            EXECUTE FUNCTION notify_event_bus();
+            EXECUTE FUNCTION epoch_pg_notify_event('{}');
             "#,
-        )
-        .execute(&self.pool)
-        .await?;
+            self.channel_name.replace('\'', "''")
+        );
+
+        sqlx::query(&create_trigger_query)
+            .execute(&self.pool)
+            .await?;
 
         let listener_pool = self.pool.clone();
         let channel_name = self.channel_name.clone();
