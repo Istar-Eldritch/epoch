@@ -28,6 +28,7 @@ pub enum PgEventBusError {
 }
 
 /// PostgreSQL implementation of `EventBus`.
+#[derive(Clone)]
 pub struct PgEventBus<D>
 where
     D: EventData + Send + Sync + DeserializeOwned,
@@ -69,7 +70,7 @@ where
                         'purger_id', NEW.purger_id,
                         'data', NEW.data,
                         'created_at', NEW.created_at,
-                        'purged_at', NEW.purged_at,
+                        'purged_at', NEW.purged_at
                     )::text
                 );
                 RETURN NEW;
