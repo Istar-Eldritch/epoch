@@ -49,6 +49,7 @@ async fn setup() -> (
     PgEventBus<TestEventData>,
     PgEventStore<PgEventBus<TestEventData>>,
 ) {
+    let _ = env_logger::builder().is_test(true).try_init();
     let pool = common::get_pg_pool().await;
     let channel_name = format!("test_channel_{}", Uuid::new_v4().simple());
     let event_bus = PgEventBus::new(pool.clone(), channel_name);
@@ -62,6 +63,7 @@ async fn setup() -> (
         .initialize()
         .await
         .expect("Failed to initialize event bus");
+
     (pool, event_bus, event_store)
 }
 
@@ -100,6 +102,9 @@ async fn test_subscribe_and_event_propagation() {
         }))
         .build()
         .unwrap();
+
+    // Give some time for the notification to be processed
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Store the event using PgEventStore, which should trigger the NOTIFY
     event_store
