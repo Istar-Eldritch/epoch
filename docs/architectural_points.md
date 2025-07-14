@@ -73,6 +73,21 @@ A snapshot is an optimization for the **write model**, designed to reduce the ti
 
 Snapshotting logic should be handled by the write model's persistence layer. The appropriate implementation is to introduce an `AggregateRepository` that encapsulates the logic for loading an aggregate. This repository will be responsible for fetching the latest snapshot, replaying subsequent events, and deciding when to create a new snapshot after an aggregate's state has been updated. This maintains a clear separation between write-side and read-side concerns.
 
+## Projection Snapshotting and Rehydration
+
+While aggregate snapshots are an optimization for the write model, projections, as part of the read model, can also benefit from snapshotting their derived state. This section clarifies the strategy for managing projection snapshots and rehydration, maintaining separation of concerns.
+
+### `ProjectionRepository` Component
+
+To manage the lifecycle and state of projections, the following components and principles are introduced:
+
+*   **`ProjectionRepository`**: This infrastructure component will be responsible for orchestrating the projection's lifecycle, including:
+    *   **Loading Snapshots**: Fetching the latest `Projection state` for a specific projection from a `ProjectionBackend`.
+    *   **Rehydration**: Applying events from the `EventStream` that occurred *after* the loaded snapshot's version to bring the projection's state up-to-date. This ensures that even if events were missed or the projection was offline, it can consistently rebuild its state.
+    *   **Saving Snapshots**: Deciding when to create and persist new snapshots of the projection's read model state to the `ProjectionBackend`.
+
+This approach ensures that the `Projection` trait itself remains focused on applying individual events, while the concerns of persistence, snapshot management, and rehydration for read models are handled by dedicated infrastructure components. This maintains a clear separation between the projection's core logic and its operational management, aligning with the Command Query Responsibility Segregation (CQRS) principles.
+
 ## EventBus and EventStoreBackend Interaction
 
 This section discusses the interaction between the `EventBus` and `EventStoreBackend`, particularly concerning event persistence and publication.

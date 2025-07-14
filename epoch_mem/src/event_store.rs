@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 use futures_core::Stream;
@@ -240,12 +240,23 @@ where
 //
 /// An implementation of an in-memory event bus
 #[derive(Clone)]
-pub struct InMemoryEventBus<D>
+pub struct InMemoryEventBus<ED>
 where
-    D: EventData + Send + Sync,
+    ED: EventData + Send + Sync,
 {
-    _phantom: PhantomData<D>,
-    projections: Arc<Mutex<Vec<Arc<Mutex<dyn Projection<D>>>>>>,
+    _phantom: PhantomData<ED>,
+    projections: Arc<
+        Mutex<
+            Vec<
+                Arc<
+                    Mutex<
+                        dyn ProjectionRepository<Projection = Box<dyn Projection<EventType = ED>>>
+                            + Send,
+                    >,
+                >,
+            >,
+        >,
+    >,
 }
 
 impl<D> InMemoryEventBus<D>
@@ -289,7 +300,10 @@ where
             log::debug!("Publishing event with id: {}", event.id);
             let projections = self.projections.lock().await;
             for projection in projections.iter() {
-                let mut projection = projection.lock().await;
+                let mut projection: MutexGuard<
+                    dyn ProjectionRepository<Projection = Box<dyn Projection<EventType = D>>>
+                        + Send,
+                > = projection.lock().await;
                 projection.apply(&event).await.unwrap_or_else(|e| {
                     log::error!("Error applying event: {:?}", e);
                     //TODO: Retry mechanism and dead letter queue
@@ -301,7 +315,13 @@ where
 
     fn subscribe(
         &self,
-        projector: Arc<Mutex<dyn Projection<Self::EventType>>>,
+        projector: Arc<
+            Mutex<
+                dyn ProjectionRepository<
+                        Projection = Box<dyn Projection<EventType = Self::EventType>>,
+                    > + Send,
+            >,
+        >,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
         log::debug!("Subscribing projector to InMemoryEventBus");
         let projectors = self.projections.clone();

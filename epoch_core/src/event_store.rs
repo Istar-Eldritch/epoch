@@ -4,7 +4,7 @@
 //! and subscribing to events.
 
 use crate::event::{Event, EventData};
-use crate::prelude::Projection;
+use crate::prelude::{Projection, ProjectionRepository};
 use futures_core::Stream;
 use std::future::Future;
 use std::pin::Pin;
@@ -66,6 +66,11 @@ pub trait EventBus {
     /// Allows to subscribe to events
     fn subscribe(
         &self,
-        projector: Arc<Mutex<dyn Projection<Self::EventType>>>,
+        projector: Arc<
+            Mutex<
+                dyn ProjectionRepository<Projection = Box<dyn Projection<EventType = Self::EventType>>>
+                    + Send,
+            >,
+        >,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>>;
 }
