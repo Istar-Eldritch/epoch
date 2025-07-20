@@ -85,9 +85,10 @@ async fn test_initialize() {
 async fn test_subscribe_and_event_propagation() {
     let (pool, event_bus, event_store) = setup().await;
 
-    let projection = Arc::new(Mutex::new(TestProjection::new()));
+    let projection = TestProjection::new();
+    let projection_events = projection.events.clone();
     event_bus
-        .subscribe(projection.clone())
+        .subscribe(Box::new(projection))
         .await
         .expect("Failed to subscribe projection");
 
@@ -115,8 +116,7 @@ async fn test_subscribe_and_event_propagation() {
     // Give some time for the notification to be processed
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    let projection = projection.lock().await;
-    let events_received = projection.events.lock().await;
+    let events_received = projection_events.lock().await;
     assert_eq!(events_received.len(), 1);
     assert_eq!(events_received[0].id, event.id);
     assert_eq!(events_received[0].stream_id, event.stream_id);

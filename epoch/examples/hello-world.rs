@@ -92,11 +92,13 @@ impl Projection<ApplicationEvent> for UserProjection {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bus: InMemoryEventBus<ApplicationEvent> = InMemoryEventBus::new();
-    let event_store = InMemoryEventStore::new(bus);
-    let user_projection = Arc::new(Mutex::new(UserProjection::new()));
+    let user_projection = UserProjection::new();
+    let user_state = user_projection.0.clone();
 
-    event_store.bus().subscribe(user_projection.clone()).await?;
+    let bus: InMemoryEventBus<ApplicationEvent> = InMemoryEventBus::new();
+    bus.subscribe(Box::new(user_projection)).await?;
+
+    let event_store = InMemoryEventStore::new(bus);
 
     let user_id = Uuid::new_v4();
     let user_created_event = ApplicationEvent::UserCreated {
@@ -128,15 +130,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     event_store.store_event(user_created_event).await?;
 
-    println!("User in store: {:?}", user_projection);
+    println!("User in store: {:?}", user_state);
 
     event_store.store_event(user_name_udpated_event).await?;
 
-    println!("User in store: {:?}", user_projection);
+    println!("User in store: {:?}", user_state);
 
     event_store.store_event(user_deleted_event).await?;
 
-    println!("User in store after deletion: {:?}", user_projection);
+    println!("User in store after deletion: {:?}", user_state);
 
     Ok(())
 }

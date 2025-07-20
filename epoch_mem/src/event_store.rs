@@ -245,7 +245,7 @@ where
     D: EventData + Send + Sync,
 {
     _phantom: PhantomData<D>,
-    projections: Arc<Mutex<Vec<Arc<Mutex<dyn Projection<D>>>>>>,
+    projections: Arc<Mutex<Vec<Arc<Mutex<Box<dyn Projection<D>>>>>>>,
 }
 
 impl<D> InMemoryEventBus<D>
@@ -301,13 +301,13 @@ where
 
     fn subscribe(
         &self,
-        projector: Arc<Mutex<dyn Projection<Self::EventType>>>,
+        projector: Box<dyn Projection<Self::EventType>>,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
         log::debug!("Subscribing projector to InMemoryEventBus");
         let projectors = self.projections.clone();
         Box::pin(async move {
             let mut projectors = projectors.lock().await;
-            projectors.push(projector);
+            projectors.push(Arc::new(Mutex::new(projector)));
             Ok(())
         })
     }
@@ -450,11 +450,11 @@ mod tests {
 
         let bus = InMemoryEventBus::<MyEventData>::new();
         let collected_events = Arc::new(Mutex::new(Vec::new()));
-        let projection = Arc::new(Mutex::new(TestProjection {
+        let projection = Box::new(TestProjection {
             events: collected_events.clone(),
-        }));
+        });
 
-        bus.subscribe(projection.clone()).await.unwrap();
+        bus.subscribe(projection).await.unwrap();
 
         let stream_id = Uuid::new_v4();
         let event = new_event(stream_id, 0, "test_publish");
@@ -484,9 +484,9 @@ mod tests {
         }
 
         let bus = InMemoryEventBus::<MyEventData>::new();
-        let projection = Arc::new(Mutex::new(TestProjection {}));
+        let projection = Box::new(TestProjection {});
 
-        bus.subscribe(projection.clone()).await.unwrap();
+        bus.subscribe(projection).await.unwrap();
 
         let projections = bus.projections.lock().await;
         assert_eq!(projections.len(), 1);
