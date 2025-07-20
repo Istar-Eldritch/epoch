@@ -61,6 +61,50 @@ where
     pub fn into_builder(self) -> EventBuilder<D> {
         self.into()
     }
+
+    /// Transforms this event
+    pub fn to_subset_event<ED>(&self) -> Result<Event<ED>, ED::Error>
+    where
+        ED: EventData + TryFrom<D>,
+        ED::Error: Send + Sync,
+    {
+        let data = self
+            .data
+            .as_ref()
+            .map(|d| ED::try_from(d.clone()))
+            .transpose()?;
+        Ok(Event {
+            id: self.id,
+            stream_id: self.stream_id,
+            stream_version: self.stream_version,
+            event_type: self.event_type.clone(),
+            actor_id: self.actor_id,
+            purger_id: self.purger_id,
+            data,
+            created_at: self.created_at,
+            purged_at: self.purged_at,
+        })
+    }
+
+    /// Transforms this event
+    pub fn to_superset_event<ED>(&self) -> Event<ED>
+    where
+        ED: EventData,
+        D: Into<ED>,
+    {
+        let data = self.data.as_ref().map(|d| d.clone().into());
+        Event {
+            id: self.id,
+            stream_id: self.stream_id,
+            stream_version: self.stream_version,
+            event_type: self.event_type.clone(),
+            actor_id: self.actor_id,
+            purger_id: self.purger_id,
+            data,
+            created_at: self.created_at,
+            purged_at: self.purged_at,
+        }
+    }
 }
 
 impl<D> From<Event<D>> for EventBuilder<D>

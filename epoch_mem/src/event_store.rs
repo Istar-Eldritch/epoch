@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -242,10 +243,10 @@ where
 #[derive(Clone)]
 pub struct InMemoryEventBus<D>
 where
-    D: EventData + Send + Sync,
+    D: EventData + Send + Sync + 'static,
 {
     _phantom: PhantomData<D>,
-    projections: Arc<Mutex<Vec<Arc<Mutex<dyn Projection<D>>>>>>,
+    projections: Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>>,
 }
 
 impl<D> InMemoryEventBus<D>
@@ -289,11 +290,14 @@ where
             log::debug!("Publishing event with id: {}", event.id);
             let projections = self.projections.lock().await;
             for projection in projections.iter() {
-                let mut projection = projection.lock().await;
-                projection.apply(&event).await.unwrap_or_else(|e| {
-                    log::error!("Error applying event: {:?}", e);
-                    //TODO: Retry mechanism and dead letter queue
-                });
+                let projection = projection.lock().await;
+                projection
+                    .on_event(event.clone())
+                    .await
+                    .unwrap_or_else(|e| {
+                        log::error!("Error applying event: {:?}", e);
+                        //TODO: Retry mechanism and dead letter queue
+                    });
             }
             Ok(())
         })
@@ -304,7 +308,7 @@ where
         projector: T,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>>
     where
-        T: Projection<Self::EventType> + 'static,
+        T: EventObserver<Self::EventType> + Send + Sync + 'static,
     {
         log::debug!("Subscribing projector to InMemoryEventBus");
         let projectors = self.projections.clone();
@@ -316,9 +320,57 @@ where
     }
 }
 
+/// Implementation of an InMemory State Storage
+#[derive(Clone, Debug)]
+pub struct InMemoryStateStorage<T>(std::sync::Arc<Mutex<HashMap<Uuid, T>>>)
+where
+    T: Clone + std::fmt::Debug;
+
+impl<T> InMemoryStateStorage<T>
+where
+    T: Clone + std::fmt::Debug,
+{
+    /// Creates a new InMemoryStateStorage
+    pub fn new() -> Self {
+        InMemoryStateStorage(Arc::new(Mutex::new(HashMap::new())))
+    }
+}
+
+#[async_trait]
+impl<T> StateStorage<T> for InMemoryStateStorage<T>
+where
+    T: Clone + Send + Sync + std::fmt::Debug,
+{
+    async fn get_state(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<T>, Box<dyn std::error::Error + Send + Sync>> {
+        let data = self.0.lock().await;
+        Ok(data.get(&id).map(|v| v.clone()))
+    }
+    async fn persist_state(
+        &mut self,
+        id: Uuid,
+        state: T,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut data = self.0.lock().await;
+        data.insert(id, state);
+        Ok(())
+    }
+    async fn delete_state(
+        &mut self,
+        id: Uuid,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut data = self.0.lock().await;
+        data.remove(&id);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use epoch_core::event::EventData;
     use tokio_stream::StreamExt;
     use uuid::Uuid;
@@ -345,6 +397,40 @@ mod tests {
             }))
             .build()
             .unwrap()
+    }
+
+    struct TestProjection(InMemoryStateStorage<Vec<Event<MyEventData>>>);
+
+    impl TestProjection {
+        pub fn new() -> Self {
+            TestProjection(InMemoryStateStorage::new())
+        }
+    }
+
+    #[async_trait]
+    impl Projection<MyEventData> for TestProjection {
+        type State = Vec<Event<MyEventData>>;
+        type StateStorage = InMemoryStateStorage<Self::State>;
+        type CreateEvent = MyEventData;
+        type UpdateEvent = MyEventData;
+        type DeleteEvent = MyEventData;
+        fn get_storage(&self) -> Self::StateStorage {
+            self.0.clone()
+        }
+        fn apply_create(
+            &self,
+            event: &Event<Self::CreateEvent>,
+        ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(vec![event.clone()])
+        }
+        fn apply_update(
+            &self,
+            mut state: Self::State,
+            event: &Event<Self::CreateEvent>,
+        ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
+            state.push(event.clone());
+            Ok(state)
+        }
     }
 
     #[tokio::test]
@@ -428,66 +514,25 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_bus_publish() {
-        struct TestProjection {
-            events: Arc<Mutex<Vec<Event<MyEventData>>>>,
-        }
-
-        impl Projection<MyEventData> for TestProjection {
-            fn apply(
-                &mut self,
-                event: &Event<MyEventData>,
-            ) -> Pin<
-                Box<
-                    dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
-                        + Send,
-                >,
-            > {
-                let events = self.events.clone();
-                let event = event.clone();
-                Box::pin(async move {
-                    events.lock().await.push(event);
-                    Ok(())
-                })
-            }
-        }
-
         let bus = InMemoryEventBus::<MyEventData>::new();
-        let collected_events = Arc::new(Mutex::new(Vec::new()));
-        let projection = TestProjection {
-            events: collected_events.clone(),
-        };
-
+        let projection = TestProjection::new();
+        let storage = projection.get_storage().clone();
         bus.subscribe(projection).await.unwrap();
 
         let stream_id = Uuid::new_v4();
         let event = new_event(stream_id, 0, "test_publish");
         bus.publish(event.clone()).await.unwrap();
 
-        let events = collected_events.lock().await;
+        let events: Vec<Event<MyEventData>> = storage.get_state(stream_id).await.unwrap().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0], event);
     }
 
     #[tokio::test]
     async fn in_memory_event_bus_subscribe() {
-        struct TestProjection {}
-
-        impl Projection<MyEventData> for TestProjection {
-            fn apply(
-                &mut self,
-                _event: &Event<MyEventData>,
-            ) -> Pin<
-                Box<
-                    dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
-                        + Send,
-                >,
-            > {
-                Box::pin(async move { Ok(()) })
-            }
-        }
-
         let bus = InMemoryEventBus::<MyEventData>::new();
-        let projection = TestProjection {};
+
+        let projection = TestProjection::new();
 
         bus.subscribe(projection).await.unwrap();
 

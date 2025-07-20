@@ -3,7 +3,7 @@
 use crate::event_store::PgDBEvent;
 use epoch_core::event::{Event, EventData};
 use epoch_core::event_store::EventBus;
-use epoch_core::prelude::Projection;
+use epoch_core::prelude::EventObserver;
 use log::{error, info};
 use serde::de::DeserializeOwned;
 use sqlx::Error as SqlxError;
@@ -32,7 +32,7 @@ where
 {
     pool: PgPool,
     channel_name: String,
-    projections: Arc<Mutex<Vec<Arc<Mutex<dyn Projection<D>>>>>>,
+    projections: Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>>,
 }
 
 impl<D> PgEventBus<D>
@@ -200,9 +200,9 @@ where
 
                         let mut projections_guard = projections.lock().await;
                         for projection in projections_guard.iter_mut() {
-                            let mut projection_guard = projection.lock().await;
+                            let projection_guard = projection.lock().await;
                             log::debug!("Applying event to projection: {:?}", event.id);
-                            match projection_guard.apply(&event).await {
+                            match projection_guard.on_event(event.clone()).await {
                                 Ok(_) => {
                                     log::debug!(
                                         "Successfully applied event to projection: {:?}",
@@ -211,6 +211,7 @@ where
                                 }
                                 Err(e) => {
                                     error!("Failed applying event to projection: {:?}", e);
+                                    // TODO: Send event to DLQ. & Retry
                                     continue;
                                 }
                             };
@@ -255,7 +256,7 @@ where
         projector: T,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send>>
     where
-        T: Projection<Self::EventType> + 'static,
+        T: EventObserver<Self::EventType> + 'static,
     {
         let projections = self.projections.clone();
         Box::pin(async move {

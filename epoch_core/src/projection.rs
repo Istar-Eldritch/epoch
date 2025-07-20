@@ -1,19 +1,124 @@
 //! This module defines traits for `Projection`
 //! A `Projection` is a read-model built from a stream of events.
 
-use std::pin::Pin;
+use crate::{
+    event::{Event, EventData},
+    prelude::EventObserver,
+};
+use async_trait::async_trait;
+use uuid::Uuid;
 
-use crate::event::{Event, EventData};
-
-/// A trait that defines the behavior of a projection.
-/// A projection is a read-model that is built from a stream of events.
-pub trait Projection<ED>: Send + Sync
-where
-    ED: EventData + Send + Sync,
-{
-    /// Updates the projection with a single event.
-    fn apply(
+/// `StateStorage` is a trait that defines the interface for storing and retrieving
+/// the state of a `Projection`.
+#[async_trait]
+pub trait StateStorage<S> {
+    /// Retrieves the state for a given ID.
+    async fn get_state(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<S>, Box<dyn std::error::Error + Send + Sync>>;
+    /// Persists the state for a given ID.
+    async fn persist_state(
         &mut self,
-        event: &Event<ED>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>>;
+        id: Uuid,
+        state: S,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    /// Deletes the state for a given ID.
+    async fn delete_state(
+        &mut self,
+        id: Uuid,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// `Projection` is a trait that defines the interface for a read-model that can be built
+/// from a stream of events.
+#[async_trait]
+pub trait Projection<ED>
+where
+    ED: EventData + Send + Sync + 'static,
+    <Self::CreateEvent as TryFrom<ED>>::Error: Send + Sync,
+    <Self::UpdateEvent as TryFrom<ED>>::Error: Send + Sync,
+    <Self::DeleteEvent as TryFrom<ED>>::Error: Send + Sync,
+{
+    /// The type of the state that this `Projection` manages.
+    type State: Send + Sync;
+    /// The type of `StateStorage` used by this `Projection`.
+    type StateStorage: StateStorage<Self::State> + Send + Sync;
+    /// The type of event that triggers a create operation on the state.
+    type CreateEvent: EventData + TryFrom<ED>;
+    /// The type of event that triggers an update operation on the state.
+    type UpdateEvent: EventData + TryFrom<ED>;
+    /// The type of event that triggers a delete operation on the state.
+    type DeleteEvent: EventData + TryFrom<ED>;
+    /// Applies a create event to produce a new state.
+    fn apply_create(
+        &self,
+        event: &Event<Self::CreateEvent>,
+    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>>;
+    /// Applies an update event to an existing state.
+    fn apply_update(
+        &self,
+        state: Self::State,
+        event: &Event<Self::UpdateEvent>,
+    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>>;
+    /// Applies a delete event to an existing state. By default, this method returns `None`,
+    /// which will result in the state being deleted from storage. If `Some(state)` is returned,
+    /// the state will be persisted instead of deleted.
+    fn apply_delete(
+        &self,
+        _state: Self::State,
+        _event: &Event<Self::DeleteEvent>,
+    ) -> Result<Option<Self::State>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+    /// Returns the `StateStorage` implementation for this `Projection`.
+    fn get_storage(&self) -> Self::StateStorage;
+    /// Applies an event to the projection. This method dispatches the event to the appropriate
+    /// `apply_create`, `apply_update`, or `apply_delete` method based on the event type.
+    async fn apply(
+        &self,
+        event: Event<ED>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let id = self.get_id_from_event(&event);
+        if let Ok(create_event) = event.to_subset_event::<Self::CreateEvent>() {
+            let state = self.apply_create(&create_event)?;
+            let mut storage = self.get_storage();
+            storage.persist_state(id, state).await?;
+        } else if let Ok(update_event) = event.to_subset_event::<Self::UpdateEvent>() {
+            let mut storage = self.get_storage();
+            if let Some(state) = storage.get_state(id).await? {
+                let updated = self.apply_update(state, &update_event)?;
+                storage.persist_state(id, updated).await?;
+            }
+        } else if let Ok(delete_event) = event.to_subset_event::<Self::DeleteEvent>() {
+            let mut storage = self.get_storage();
+            if let Some(state) = storage.get_state(id).await? {
+                if let Some(deleted) = self.apply_delete(state, &delete_event)? {
+                    storage.persist_state(id, deleted).await?;
+                } else {
+                    storage.delete_state(id).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Returns the ID of the stream from the given event.
+    fn get_id_from_event(&self, event: &Event<ED>) -> Uuid {
+        event.stream_id
+    }
+}
+
+#[async_trait]
+impl<ED, T> EventObserver<ED> for T
+where
+    ED: EventData + Send + Sync + 'static,
+    T: Projection<ED> + Send + Sync,
+{
+    async fn on_event(
+        &self,
+        event: Event<ED>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.apply(event).await?;
+        Ok(())
+    }
 }

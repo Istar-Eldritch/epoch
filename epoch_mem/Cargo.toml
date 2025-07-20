@@ -9,6 +9,7 @@ categories.workspace = true
 
 
 [dependencies]
+async-trait = "0.1"
 epoch_core = { path = "../epoch_core" }
 chrono = { version = "0.4.41", features = ["serde"] }
 futures-core = "0.3.31"
@@ -18,5 +19,4 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1.17"
 uuid = { version = "1.17.0", features = ["serde", "v4"] }
 log = "0.4.27"
-
 

@@ -33,4 +33,4 @@ postgres = ["epoch_pg"]
 
 [[examples]]
 name = "hello-world"
-path = "core/examples/hello-world.rs"
+path = "examples/hello-world.rs"

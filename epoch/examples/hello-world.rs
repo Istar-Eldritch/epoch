@@ -1,19 +1,24 @@
-use std::{collections::HashMap, pin::Pin, sync::Arc};
+use std::marker::PhantomData;
 
 use epoch::prelude::*;
 use epoch_mem::*;
 use serde::Deserialize;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[subset_enum(UserCreationEvent, UserCreated)]
+#[subset_enum(UserUpdatedEvent, UserNameUpdated)]
+#[subset_enum(UserDeletionEvent, UserDeleted)]
+#[subset_enum(ProductCreationEvent, ProductCreated)]
+#[subset_enum(ProductUpdateEvent, ProductNameUpdated, ProductPriceUpdated)]
+#[subset_enum(EmptyEvent)]
 #[derive(Debug, Clone, serde::Serialize, EventData, Deserialize)]
 enum ApplicationEvent {
-    UserCreated { id: Uuid, name: String },
-    UserNameUpdated { id: Uuid, name: String },
-    UserDeleted { id: Uuid },
-    ProductCreated { id: Uuid, name: String, price: f64 },
-    ProductNameUpdated { id: Uuid, name: String },
-    ProductPriceUpdated { id: Uuid, price: f64 },
+    UserCreated { name: String },
+    UserNameUpdated { name: String },
+    UserDeleted,
+    ProductCreated { name: String, price: f64 },
+    ProductNameUpdated { name: String },
+    ProductPriceUpdated { price: f64 },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -45,13 +50,59 @@ pub enum UserProjectionError {
     Unexpected(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
-// In memory projection for tests
-#[derive(Debug)]
-struct UserProjection(Arc<Mutex<HashMap<Uuid, User>>>);
+#[derive(Debug, Clone)]
+struct UserProjector<ED>
+where
+    ED: EventData,
+{
+    _phantom: PhantomData<ED>,
+    storage: InMemoryStateStorage<User>,
+}
 
-impl UserProjection {
+impl<ED> UserProjector<ED>
+where
+    ED: EventData,
+{
     pub fn new() -> Self {
-        UserProjection(Arc::new(Mutex::new(HashMap::new())))
+        UserProjector {
+            _phantom: PhantomData,
+            storage: InMemoryStateStorage::new(),
+        }
+    }
+}
+
+impl Projection<ApplicationEvent> for UserProjector<ApplicationEvent> {
+    type State = User;
+    type StateStorage = InMemoryStateStorage<Self::State>;
+    type CreateEvent = UserCreationEvent;
+    type UpdateEvent = UserUpdatedEvent;
+    type DeleteEvent = UserDeletionEvent;
+    fn get_storage(&self) -> Self::StateStorage {
+        self.storage.clone()
+    }
+    fn apply_create(
+        &self,
+        event: &Event<Self::CreateEvent>,
+    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
+        match event.data.as_ref().unwrap() {
+            UserCreationEvent::UserCreated { name } => Ok(User {
+                id: event.stream_id,
+                name: name.clone(),
+                version: 0,
+            }),
+        }
+    }
+    fn apply_update(
+        &self,
+        mut state: Self::State,
+        event: &Event<Self::UpdateEvent>,
+    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
+        match event.data.as_ref().unwrap() {
+            UserUpdatedEvent::UserNameUpdated { name } => {
+                state.name = name.clone();
+                Ok(state)
+            }
+        }
     }
 }
 
@@ -68,127 +119,60 @@ pub enum ProductProjectionError {
 }
 
 #[derive(Debug)]
-struct ProductProjection(Arc<Mutex<HashMap<Uuid, Product>>>);
+struct ProductProjection(InMemoryStateStorage<Product>);
 
 impl ProductProjection {
     pub fn new() -> Self {
-        ProductProjection(Arc::new(Mutex::new(HashMap::new())))
-    }
-}
-
-impl Projection<ApplicationEvent> for UserProjection {
-    fn apply(
-        &mut self,
-        event: &Event<ApplicationEvent>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>>
-    {
-        let event = event.clone();
-        let users = self.0.clone();
-        Box::pin(async move {
-            if let Some(data) = event.data {
-                match data {
-                    ApplicationEvent::UserCreated { id, name } => {
-                        let mut users = users.lock().await;
-                        users.insert(
-                            id.clone(),
-                            User {
-                                id,
-                                name,
-                                version: event.stream_version,
-                            },
-                        );
-                        Ok(())
-                    }
-                    ApplicationEvent::UserNameUpdated { id, name } => {
-                        let mut users = users.lock().await;
-                        match users.get_mut(&id) {
-                            Some(u) => {
-                                u.name = name;
-                                u.version = event.stream_version;
-                                Ok(())
-                            }
-                            None => Err(UserProjectionError::UserDoesNotExist(id))?,
-                        }
-                    }
-                    ApplicationEvent::UserDeleted { id } => {
-                        let mut users = users.lock().await;
-                        users.remove(&id);
-                        Ok(())
-                    }
-                    _ => {
-                        println!("Ignoring event: {:?}", data);
-                        Ok(())
-                    }
-                }
-            } else {
-                Ok(())
-            }
-        })
+        ProductProjection(InMemoryStateStorage::new())
     }
 }
 
 impl Projection<ApplicationEvent> for ProductProjection {
-    fn apply(
-        &mut self,
-        event: &Event<ApplicationEvent>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>>
-    {
-        let event = event.clone();
-        let products = self.0.clone();
-        Box::pin(async move {
-            if let Some(data) = event.data {
-                match data {
-                    ApplicationEvent::ProductCreated { id, name, price } => {
-                        let mut products = products.lock().await;
-                        products.insert(
-                            id.clone(),
-                            Product {
-                                id,
-                                name,
-                                price,
-                                version: event.stream_version,
-                            },
-                        );
-                        Ok(())
-                    }
-                    ApplicationEvent::ProductNameUpdated { id, name } => {
-                        let mut products = products.lock().await;
-                        match products.get_mut(&id) {
-                            Some(p) => {
-                                p.name = name;
-                                p.version = event.stream_version;
-                                Ok(())
-                            }
-                            None => Err(ProductProjectionError::ProductDoesNotExist(id))?,
-                        }
-                    }
-                    ApplicationEvent::ProductPriceUpdated { id, price } => {
-                        let mut products = products.lock().await;
-                        match products.get_mut(&id) {
-                            Some(p) => {
-                                p.price = price;
-                                p.version = event.stream_version;
-                                Ok(())
-                            }
-                            None => Err(ProductProjectionError::ProductDoesNotExist(id))?,
-                        }
-                    }
-                    _ => {
-                        println!("Ignoring event: {:?}", data);
-                        Ok(())
-                    }
-                }
-            } else {
-                Ok(())
+    type State = Product;
+    type StateStorage = InMemoryStateStorage<Self::State>;
+    type CreateEvent = ProductCreationEvent;
+    type UpdateEvent = ProductUpdateEvent;
+    type DeleteEvent = EmptyEvent;
+
+    fn get_storage(&self) -> Self::StateStorage {
+        self.0.clone()
+    }
+
+    fn apply_create(
+        &self,
+        event: &Event<Self::CreateEvent>,
+    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
+        match event.data.as_ref().unwrap().clone() {
+            ProductCreationEvent::ProductCreated { name, price } => Ok(Product {
+                id: event.stream_id,
+                name,
+                price,
+                version: event.stream_version,
+            }),
+        }
+    }
+    fn apply_update(
+        &self,
+        mut state: Self::State,
+        event: &Event<Self::UpdateEvent>,
+    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
+        match event.data.as_ref().unwrap().clone() {
+            ProductUpdateEvent::ProductNameUpdated { name } => {
+                state.name = name;
+                Ok(state)
             }
-        })
+            ProductUpdateEvent::ProductPriceUpdated { price } => {
+                state.price = price;
+                Ok(state)
+            }
+        }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let user_projection = UserProjection::new();
-    let user_state = user_projection.0.clone();
+    let user_projection = UserProjector::new();
+    let user_state = user_projection.get_storage().clone();
 
     let product_projection = ProductProjection::new();
     let _product_state = product_projection.0.clone();
@@ -201,7 +185,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let user_id = Uuid::new_v4();
     let user_created_event = ApplicationEvent::UserCreated {
-        id: user_id,
         name: "Debug Test".to_string(),
     }
     .into_builder()
@@ -211,7 +194,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .build()?;
 
     let user_name_udpated_event = ApplicationEvent::UserNameUpdated {
-        id: user_id,
         name: "Debug Testo".to_string(),
     }
     .into_builder()
@@ -220,7 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .id(Uuid::new_v4())
     .build()?;
 
-    let user_deleted_event = ApplicationEvent::UserDeleted { id: user_id }
+    let user_deleted_event = ApplicationEvent::UserDeleted
         .into_builder()
         .stream_id(user_id)
         .stream_version(2)
