@@ -62,8 +62,10 @@ pub trait EventBus {
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>;
 
     /// Allows to subscribe to events
-    fn subscribe(
+    fn subscribe<T>(
         &self,
-        projector: Box<dyn Projection<Self::EventType>>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>>;
+        projector: T,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>>
+    where
+        T: Projection<Self::EventType> + 'static;
 }

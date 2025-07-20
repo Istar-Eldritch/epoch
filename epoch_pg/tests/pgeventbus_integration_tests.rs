@@ -88,7 +88,7 @@ async fn test_subscribe_and_event_propagation() {
     let projection = TestProjection::new();
     let projection_events = projection.events.clone();
     event_bus
-        .subscribe(Box::new(projection))
+        .subscribe(projection)
         .await
         .expect("Failed to subscribe projection");
 

@@ -11,6 +11,9 @@ enum ApplicationEvent {
     UserCreated { id: Uuid, name: String },
     UserNameUpdated { id: Uuid, name: String },
     UserDeleted { id: Uuid },
+    ProductCreated { id: Uuid, name: String, price: f64 },
+    ProductNameUpdated { id: Uuid, name: String },
+    ProductPriceUpdated { id: Uuid, price: f64 },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -18,6 +21,15 @@ enum ApplicationEvent {
 struct User {
     id: Uuid,
     name: String,
+    version: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[allow(dead_code)]
+struct Product {
+    id: Uuid,
+    name: String,
+    price: f64,
     version: u64,
 }
 
@@ -40,6 +52,27 @@ struct UserProjection(Arc<Mutex<HashMap<Uuid, User>>>);
 impl UserProjection {
     pub fn new() -> Self {
         UserProjection(Arc::new(Mutex::new(HashMap::new())))
+    }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ProductProjectionError {
+    #[error("The product with id {0} already exists")]
+    ProductAlreadyExists(Uuid),
+    #[error("The product with id {0} does not exist")]
+    ProductDoesNotExist(Uuid),
+    #[error("Cannot hydrate product with event {0}")]
+    UnexpectedEvent(String),
+    #[error("Unexpected error projecting product: {0}")]
+    Unexpected(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
+
+#[derive(Debug)]
+struct ProductProjection(Arc<Mutex<HashMap<Uuid, Product>>>);
+
+impl ProductProjection {
+    pub fn new() -> Self {
+        ProductProjection(Arc::new(Mutex::new(HashMap::new())))
     }
 }
 
@@ -82,6 +115,68 @@ impl Projection<ApplicationEvent> for UserProjection {
                         users.remove(&id);
                         Ok(())
                     }
+                    _ => {
+                        println!("Ignoring event: {:?}", data);
+                        Ok(())
+                    }
+                }
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+impl Projection<ApplicationEvent> for ProductProjection {
+    fn apply(
+        &mut self,
+        event: &Event<ApplicationEvent>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>>
+    {
+        let event = event.clone();
+        let products = self.0.clone();
+        Box::pin(async move {
+            if let Some(data) = event.data {
+                match data {
+                    ApplicationEvent::ProductCreated { id, name, price } => {
+                        let mut products = products.lock().await;
+                        products.insert(
+                            id.clone(),
+                            Product {
+                                id,
+                                name,
+                                price,
+                                version: event.stream_version,
+                            },
+                        );
+                        Ok(())
+                    }
+                    ApplicationEvent::ProductNameUpdated { id, name } => {
+                        let mut products = products.lock().await;
+                        match products.get_mut(&id) {
+                            Some(p) => {
+                                p.name = name;
+                                p.version = event.stream_version;
+                                Ok(())
+                            }
+                            None => Err(ProductProjectionError::ProductDoesNotExist(id))?,
+                        }
+                    }
+                    ApplicationEvent::ProductPriceUpdated { id, price } => {
+                        let mut products = products.lock().await;
+                        match products.get_mut(&id) {
+                            Some(p) => {
+                                p.price = price;
+                                p.version = event.stream_version;
+                                Ok(())
+                            }
+                            None => Err(ProductProjectionError::ProductDoesNotExist(id))?,
+                        }
+                    }
+                    _ => {
+                        println!("Ignoring event: {:?}", data);
+                        Ok(())
+                    }
                 }
             } else {
                 Ok(())
@@ -95,8 +190,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let user_projection = UserProjection::new();
     let user_state = user_projection.0.clone();
 
+    let product_projection = ProductProjection::new();
+    let _product_state = product_projection.0.clone();
+
     let bus: InMemoryEventBus<ApplicationEvent> = InMemoryEventBus::new();
-    bus.subscribe(Box::new(user_projection)).await?;
+    bus.subscribe(user_projection).await?;
+    bus.subscribe(product_projection).await?;
 
     let event_store = InMemoryEventStore::new(bus);
 

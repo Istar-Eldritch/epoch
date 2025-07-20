@@ -245,7 +245,7 @@ where
     D: EventData + Send + Sync,
 {
     _phantom: PhantomData<D>,
-    projections: Arc<Mutex<Vec<Arc<Mutex<Box<dyn Projection<D>>>>>>>,
+    projections: Arc<Mutex<Vec<Arc<Mutex<dyn Projection<D>>>>>>,
 }
 
 impl<D> InMemoryEventBus<D>
@@ -299,10 +299,13 @@ where
         })
     }
 
-    fn subscribe(
+    fn subscribe<T>(
         &self,
-        projector: Box<dyn Projection<Self::EventType>>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
+        projector: T,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>>
+    where
+        T: Projection<Self::EventType> + 'static,
+    {
         log::debug!("Subscribing projector to InMemoryEventBus");
         let projectors = self.projections.clone();
         Box::pin(async move {
@@ -450,9 +453,9 @@ mod tests {
 
         let bus = InMemoryEventBus::<MyEventData>::new();
         let collected_events = Arc::new(Mutex::new(Vec::new()));
-        let projection = Box::new(TestProjection {
+        let projection = TestProjection {
             events: collected_events.clone(),
-        });
+        };
 
         bus.subscribe(projection).await.unwrap();
 
@@ -484,7 +487,7 @@ mod tests {
         }
 
         let bus = InMemoryEventBus::<MyEventData>::new();
-        let projection = Box::new(TestProjection {});
+        let projection = TestProjection {};
 
         bus.subscribe(projection).await.unwrap();
 

@@ -32,7 +32,7 @@ where
 {
     pool: PgPool,
     channel_name: String,
-    projections: Arc<Mutex<Vec<Arc<Mutex<Box<dyn Projection<D>>>>>>>,
+    projections: Arc<Mutex<Vec<Arc<Mutex<dyn Projection<D>>>>>>,
 }
 
 impl<D> PgEventBus<D>
@@ -250,10 +250,13 @@ where
         Box::pin(async { Ok(()) })
     }
 
-    fn subscribe(
+    fn subscribe<T>(
         &self,
-        projector: Box<dyn Projection<Self::EventType>>,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send>> {
+        projector: T,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send>>
+    where
+        T: Projection<Self::EventType> + 'static,
+    {
         let projections = self.projections.clone();
         Box::pin(async move {
             let mut projections = projections.lock().await;
