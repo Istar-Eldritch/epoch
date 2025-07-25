@@ -1,11 +1,12 @@
 use async_stream::try_stream;
+use async_trait::async_trait;
 use epoch_core::event::{Event, EventData};
 use epoch_core::prelude::{EventBus, EventStoreBackend, EventStream};
 use futures_util::{Stream, StreamExt};
 use serde::Serialize;
 use serde::{Deserialize, de::DeserializeOwned};
 use sqlx::{FromRow, PgPool};
-use std::{future::Future, pin::Pin, task::Poll};
+use std::{pin::Pin, task::Poll};
 use uuid::Uuid;
 
 /// A postgres based event store.
@@ -126,33 +127,23 @@ where
     BuildEventError(#[from] epoch_core::event::EventBuilderError),
 }
 
-impl<'a, B> EventStoreBackend<'a> for PgEventStore<B>
+#[async_trait]
+impl<B> EventStoreBackend for PgEventStore<B>
 where
-    B: EventBus + Send + Sync + Clone + 'a,
+    B: EventBus + Send + Sync + Clone + 'static,
     B::EventType: Send + Sync + DeserializeOwned + 'static,
     B::Error: Send + Sync + 'static,
 {
     type EventType = B::EventType;
     type Error = PgEventStoreError<B::Error>;
 
-    fn read_events(
-        &'a self,
+    async fn read_events(
+        &self,
         stream_id: Uuid,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Result<
-                        Pin<Box<dyn EventStream<Self::EventType> + Send + 'a>>,
-                        Self::Error,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            let stream = try_stream! {
-                let mut inner_stream = sqlx::query_as::<_, PgDBEvent>(
-                    r#"
+    ) -> Result<Pin<Box<dyn EventStream<Self::EventType> + Send + 'life0>>, Self::Error> {
+        let stream = try_stream! {
+            let mut inner_stream = sqlx::query_as::<_, PgDBEvent>(
+                r#"
                     SELECT
                         id,
                         stream_id,
@@ -167,51 +158,45 @@ where
                     WHERE stream_id = $1
                     ORDER BY stream_version ASC
                     "#,
-                )
-                .bind(stream_id)
-                .fetch(&self.postgres);
+            )
+            .bind(stream_id)
+            .fetch(&self.postgres);
 
-                while let Some(row) = inner_stream.next().await {
-                    let entry: PgDBEvent = row.map_err(PgEventStoreError::DBError::<B::Error>)?;
+            while let Some(row) = inner_stream.next().await {
+                let entry: PgDBEvent = row.map_err(PgEventStoreError::DBError::<B::Error>)?;
 
-                    let data: Option<B::EventType> = entry
-                        .data
-                        .map(|d| serde_json::from_value(d))
-                        .transpose()
-                        .map_err(PgEventStoreError::DeserializeEventError::<B::Error>)?;
+                let data: Option<B::EventType> = entry
+                    .data
+                    .map(|d| serde_json::from_value(d))
+                    .transpose()
+                    .map_err(PgEventStoreError::DeserializeEventError::<B::Error>)?;
 
-                    let event = Event::<B::EventType>::builder()
-                        .id(entry.id)
-                        .stream_id(entry.stream_id)
-                        .stream_version(entry.stream_version.try_into().unwrap())
-                        .event_type(entry.event_type)
-                        .created_at(entry.created_at)
-                        .data(data)
-                        .build()
-                        .map_err(PgEventStoreError::BuildEventError::<B::Error>)?;
-                    yield event;
-                }
-            };
+                let event = Event::<B::EventType>::builder()
+                    .id(entry.id)
+                    .stream_id(entry.stream_id)
+                    .stream_version(entry.stream_version.try_into().unwrap())
+                    .event_type(entry.event_type)
+                    .created_at(entry.created_at)
+                    .data(data)
+                    .build()
+                    .map_err(PgEventStoreError::BuildEventError::<B::Error>)?;
+                yield event;
+            }
+        };
 
-            // let stream =
-            //     stream.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+        // let stream =
+        //     stream.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
 
-            let event_stream: Pin<Box<dyn EventStream<Self::EventType> + Send + 'a>> =
-                Box::pin(PgEventStream {
-                    inner: Box::pin(stream),
-                });
+        let event_stream: Pin<Box<dyn EventStream<Self::EventType> + Send + 'life0>> =
+            Box::pin(PgEventStream {
+                inner: Box::pin(stream),
+            });
 
-            Ok(event_stream)
-        })
+        Ok(event_stream)
     }
 
-    fn store_event(
-        &'a self,
-        event: Event<Self::EventType>,
-    ) -> Pin<Box<dyn Future<Output = Result<Event<Self::EventType>, Self::Error>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            sqlx::query(
+    async fn store_event(&self, event: Event<Self::EventType>) -> Result<(), Self::Error> {
+        sqlx::query(
                 r#"
                 INSERT INTO events (id, stream_id, stream_version, event_type, data, created_at, actor_id, purger_id, purged_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -235,12 +220,11 @@ where
             .execute(&self.postgres)
             .await?;
 
-            self.bus
-                .publish(event.clone())
-                .await
-                .map_err(|e| PgEventStoreError::BUSPublishError(e))?;
+        self.bus
+            .publish(event.clone())
+            .await
+            .map_err(|e| PgEventStoreError::BUSPublishError(e))?;
 
-            Ok(event)
-        })
+        Ok(())
     }
 }

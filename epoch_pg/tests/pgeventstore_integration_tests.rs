@@ -49,13 +49,7 @@ async fn test_store_event() {
         .build()
         .unwrap();
 
-    let stored_event = event_store.store_event(event.clone()).await.unwrap();
-    assert_eq!(stored_event.id, event.id);
-    assert_eq!(stored_event.stream_id, event.stream_id);
-    assert_eq!(stored_event.stream_version, event.stream_version);
-    assert_eq!(stored_event.event_type, event.event_type);
-    assert_eq!(stored_event.data, event.data);
-
+    event_store.store_event(event.clone()).await.unwrap();
     teardown(&pool).await;
 }
 

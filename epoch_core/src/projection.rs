@@ -6,7 +6,19 @@ use crate::{
     prelude::EventObserver,
 };
 use async_trait::async_trait;
+use thiserror::Error;
 use uuid::Uuid;
+
+/// Errors that may happen when re_hydrating a projection
+#[derive(Debug, Error)]
+pub enum HydrationError {
+    /// The state of the projection was not found
+    #[error("State for ID {0} not found after rehydration")]
+    StateNotFound(Uuid),
+    /// Other errors
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
 
 /// `StateStorage` is a trait that defines the interface for storing and retrieving
 /// the state of a `Projection`.
@@ -41,7 +53,7 @@ where
     <Self::DeleteEvent as TryFrom<ED>>::Error: Send + Sync,
 {
     /// The type of the state that this `Projection` manages.
-    type State: Send + Sync;
+    type State: Send + Sync + Clone;
     /// The type of `StateStorage` used by this `Projection`.
     type StateStorage: StateStorage<Self::State> + Send + Sync;
     /// The type of event that triggers a create operation on the state.
@@ -73,6 +85,31 @@ where
     }
     /// Returns the `StateStorage` implementation for this `Projection`.
     fn get_storage(&self) -> Self::StateStorage;
+
+    /// Reconstructs the projection's state from an event stream.
+    async fn re_hydrate(
+        &self,
+        id: Uuid,
+        event_stream: impl Iterator<Item = Event<ED>> + Send + Sync,
+    ) -> Result<Self::State, HydrationError> {
+        let state_storage = self.get_storage();
+        let mut state = state_storage.get_state(id).await?;
+
+        for event in event_stream {
+            if let Ok(create_event) = event.to_subset_event::<Self::CreateEvent>() {
+                state = Some(self.apply_create(&create_event)?);
+            } else if let Some(ref current_state) = state {
+                if let Ok(update_event) = event.to_subset_event::<Self::UpdateEvent>() {
+                    state = Some(self.apply_update(current_state.clone(), &update_event)?);
+                } else if let Ok(delete_event) = event.to_subset_event::<Self::DeleteEvent>() {
+                    state = self.apply_delete(current_state.clone(), &delete_event)?;
+                }
+            }
+        }
+
+        state.ok_or_else(|| HydrationError::StateNotFound(id))
+    }
+
     /// Applies an event to the projection. This method dispatches the event to the appropriate
     /// `apply_create`, `apply_update`, or `apply_delete` method based on the event type.
     async fn apply(

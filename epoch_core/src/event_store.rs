@@ -19,34 +19,22 @@ where
 }
 
 /// A trait that defines the behavior of a storage backend.
-pub trait EventStoreBackend<'a>: Send + Sync {
+#[async_trait]
+pub trait EventStoreBackend: Send + Sync {
     /// The type of event stored in this store
     type EventType: EventData + Send + Sync;
 
     /// The error when an event store operation fails
-    type Error: std::error::Error + Send + Sync + 'a;
+    type Error: std::error::Error + Send + Sync;
 
     /// Fetches a stream from the storage backend.
-    fn read_events(
-        &'a self,
+    async fn read_events(
+        &self,
         stream_id: Uuid,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Result<
-                        Pin<Box<dyn EventStream<Self::EventType> + Send + 'a>>,
-                        Self::Error,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    >;
+    ) -> Result<Pin<Box<dyn EventStream<Self::EventType> + Send + 'life0>>, Self::Error>;
 
     /// Appends events to a stream.
-    fn store_event(
-        &'a self,
-        event: Event<Self::EventType>,
-    ) -> Pin<Box<dyn Future<Output = Result<Event<Self::EventType>, Self::Error>> + Send + 'a>>;
+    async fn store_event(&self, event: Event<Self::EventType>) -> Result<(), Self::Error>;
 }
 
 /// A trait that defines the behavior of an event bus.

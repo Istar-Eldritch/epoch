@@ -411,6 +411,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures-core",
+ "log",
  "serde",
  "thiserror 1.0.69",
  "tokio",

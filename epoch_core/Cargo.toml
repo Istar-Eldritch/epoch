@@ -9,6 +9,7 @@ categories.workspace = true
 
 
 [dependencies]
+log = "0.4"
 async-trait = "0.1"
 chrono = { version = "0.4.41", features = ["serde"] }
 futures-core = "0.3.31"

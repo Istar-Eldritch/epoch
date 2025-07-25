@@ -60,87 +60,70 @@ pub enum InMemoryEventStoreBackendError {
     PublishEvent,
 }
 
-impl<'a, B> EventStoreBackend<'a> for InMemoryEventStore<B>
+#[async_trait]
+impl<B> EventStoreBackend for InMemoryEventStore<B>
 where
-    B: EventBus + Send + Sync + Clone + 'a,
+    B: EventBus + Send + Sync + Clone,
 {
     type Error = InMemoryEventStoreBackendError;
     type EventType = B::EventType;
 
-    fn read_events(
+    async fn read_events(
         &self,
         stream_id: Uuid,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Result<
-                        Pin<Box<dyn EventStream<Self::EventType> + Send + 'a>>,
-                        Self::Error,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
+    ) -> Result<Pin<Box<dyn EventStream<Self::EventType> + Send + 'life0>>, Self::Error> {
         log::debug!("Reading events for stream_id: {}", stream_id);
         let data = self.data.clone();
-        Box::pin(async move {
-            let stream: Pin<Box<dyn EventStream<Self::EventType> + Send>> =
-                Box::pin(InMemoryEventStoreStream::<B>::new(data, stream_id));
-            Ok(stream)
-        })
+        let stream: Pin<Box<dyn EventStream<Self::EventType> + Send>> =
+            Box::pin(InMemoryEventStoreStream::<B>::new(data, stream_id));
+        Ok(stream)
     }
 
-    fn store_event(
-        &self,
-        event: Event<Self::EventType>,
-    ) -> Pin<Box<dyn Future<Output = Result<Event<Self::EventType>, Self::Error>> + Send + 'a>>
-    {
+    async fn store_event(&self, event: Event<Self::EventType>) -> Result<(), Self::Error> {
         let data = self.data.clone();
         let bus = self.bus.clone();
-        Box::pin(async move {
-            let mut data = data.lock().await;
-            let stream_id = event.stream_id;
+        let mut data = data.lock().await;
+        let stream_id = event.stream_id;
 
-            let version: u64 = *data.stream_version.get(&stream_id).unwrap_or(&0);
+        let version: u64 = *data.stream_version.get(&stream_id).unwrap_or(&0);
 
-            if event.stream_version != version {
-                log::debug!(
-                    "Event version mismatch for stream_id: {}. Expected: {}, Got: {}",
-                    stream_id,
-                    version,
-                    event.stream_version
-                );
-                return Err(InMemoryEventStoreBackendError::VersionMismatch(
-                    event.stream_version,
-                    version,
-                ));
-            }
+        if event.stream_version != version {
             log::debug!(
-                "Event version check passed for stream_id: {}. Version: {}",
+                "Event version mismatch for stream_id: {}. Expected: {}, Got: {}",
                 stream_id,
-                version
+                version,
+                event.stream_version
             );
+            return Err(InMemoryEventStoreBackendError::VersionMismatch(
+                event.stream_version,
+                version,
+            ));
+        }
+        log::debug!(
+            "Event version check passed for stream_id: {}. Version: {}",
+            stream_id,
+            version
+        );
 
-            let new_version = version + 1;
+        let new_version = version + 1;
 
-            data.stream_version.insert(stream_id, new_version);
+        data.stream_version.insert(stream_id, new_version);
 
-            let event_id = event.id;
-            data.events.insert(event_id, event.clone());
-            data.stream_events
-                .entry(stream_id)
-                .or_default()
-                .extend(&[event_id]);
-            log::debug!(
-                "Event stored successfully for stream_id: {}, event_id: {}",
-                stream_id,
-                event_id
-            );
-            if bus.publish(event.clone()).await.is_err() {
-                return Err(InMemoryEventStoreBackendError::PublishEvent);
-            }
-            Ok(event)
-        })
+        let event_id = event.id;
+        data.events.insert(event_id, event.clone());
+        data.stream_events
+            .entry(stream_id)
+            .or_default()
+            .extend(&[event_id]);
+        log::debug!(
+            "Event stored successfully for stream_id: {}, event_id: {}",
+            stream_id,
+            event_id
+        );
+        if bus.publish(event.clone()).await.is_err() {
+            return Err(InMemoryEventStoreBackendError::PublishEvent);
+        }
+        Ok(())
     }
 }
 
@@ -450,12 +433,10 @@ mod tests {
         let stream_id = Uuid::new_v4();
 
         let event1 = new_event(stream_id, 0, "test1");
-        let stored_event1 = store.store_event(event1.clone()).await.unwrap();
-        assert_eq!(stored_event1, event1);
+        store.store_event(event1.clone()).await.unwrap();
 
         let event2 = new_event(stream_id, 1, "test2");
-        let stored_event2 = store.store_event(event2.clone()).await.unwrap();
-        assert_eq!(stored_event2, event2);
+        store.store_event(event2.clone()).await.unwrap();
 
         let data = store.data.lock().await;
         assert_eq!(data.events.len(), 2);
