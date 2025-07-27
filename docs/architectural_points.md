@@ -33,14 +33,32 @@ Given these distinct responsibilities, aggregates should not be managed by proje
 
 This architecture supports separation of concerns, contributing to the `epoch` project's maintainability, testability, and adaptability for various event-sourcing use cases.
 
+## Relationship Between Aggregate and Projection
+
+In `epoch_core`, an `Aggregate` is a specialized form of `Projection`, unifying the write model's state management with a read model's event-driven updates.
+
+*   **Aggregate (Write Model and Self-Projecting Entity):**
+    *   Receives and processes `Command`s, encapsulating business logic and enforcing invariants.
+    *   Emits `Event`s as a result of state transitions.
+    *   Critically, the `Aggregate` trait is defined as `pub trait Aggregate<ED>: Projection<ED>`, meaning any type implementing `Aggregate` must also implement `Projection`.
+    *   It leverages its `Projection` capabilities (specifically the `re_hydrate` method) to update its *own* internal state from the events it has just generated or retrieved from the `EventStore`. This ensures the aggregate's state is always consistent with its own event stream.
+    *   Responsible for persisting both the emitted events to the `EventStoreBackend` and its current state to the `StateStoreBackend`.
+
+*   **Projection (General Read Model):**
+    *   A broader concept defining how to build and maintain a read-optimized model from any stream of `Event`s.
+    *   Provides methods like `apply_create`, `apply_update`, and `apply_delete` to transform events into a `ProjectionState`.
+    *   While `Aggregates` use `Projection` for their internal state, other independent `Projections` can also exist within the system to create various denormalized views of data for querying purposes (e.g., dashboards, search indexes), without handling commands or emitting events themselves.
+
+This design choice ensures that the `Aggregate` efficiently manages its state consistency by directly applying its own events, while the `Projection` trait provides a flexible foundation for all event-driven state reconstruction within the system.
+
 ### Logical Hierarchy: Aggregate and AggregateRepository
 
-From a logical perspective, the `AggregateRepository` acts as the primary interface for interacting with an `Aggregate`. It is responsible for orchestrating the `Aggregate`'s lifecycle, including:
+From a conceptual perspective, the `AggregateRepository` acts as a primary interface for interacting with an `Aggregate`. This conceptual role encompasses orchestrating the `Aggregate`'s lifecycle, including:
 *   **Loading**: Fetching events (and snapshots) from the `EventStore` and rehydrating the `Aggregate`'s state by applying those events via its `apply` method.
 *   **Command Handling**: Providing the `Aggregate` instance to process commands, which in turn produce new events.
 *   **Saving**: Persisting the newly generated events to the `EventStore` and managing snapshot creation.
 
-Therefore, while the `Aggregate` encapsulates the business logic and state transitions, a dedicated `AggregateRepository` provides the necessary infrastructure for the `Aggregate` to operate within the system.
+Crucially, in this codebase, the responsibilities traditionally associated with a dedicated `AggregateRepository` are distributed and fulfilled by the collaborative interaction of the `Aggregate` trait itself (which orchestrates command handling and interactions with storage) and the generic `EventStoreBackend` and `StateStoreBackend` traits (which provide concrete persistence mechanisms). This design pattern ensures that the `Aggregate` remains focused purely on domain logic, relying on pluggable infrastructure components for its operational needs.
 
 ### Design Rationale: Separation of `Aggregate` and `AggregateRepository`
 
