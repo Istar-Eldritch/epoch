@@ -7,6 +7,7 @@ use std::marker::PhantomData;
 use uuid::Uuid;
 
 /// State store implementation for postgres
+#[derive(Clone)]
 pub struct PgStateStore<T> {
     _phantom: PhantomData<T>,
     pg: PgPool,
