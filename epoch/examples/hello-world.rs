@@ -278,19 +278,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let delete_user = ApplicationCommand::DeleteUser { id: user_id };
 
     user_aggregate
-        .handle_command(Command::new(create_user, (), None))
+        .handle_command(Command::new(create_user, None, None))
         .await?;
 
     println!("User in store: {:?}", user_state);
 
     user_aggregate
-        .handle_command(Command::new(update_user_name, (), None))
+        .handle_command(Command::new(update_user_name, None, None))
         .await?;
 
     println!("User in store: {:?}", user_state);
 
     user_aggregate
-        .handle_command(Command::new(delete_user, (), None))
+        .handle_command(Command::new(delete_user, None, None))
         .await?;
 
     println!("User in store after deletion: {:?}", user_state);

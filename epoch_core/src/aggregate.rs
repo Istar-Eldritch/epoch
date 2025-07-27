@@ -7,28 +7,13 @@ use async_trait::async_trait;
 use log::debug;
 use uuid::Uuid;
 
-/// A trait defining the requirements of command credentials
-pub trait CommandCredentials: Clone + std::fmt::Debug + Send {
-    /// The id of the actor issuing the command
-    fn actor_id(&self) -> Option<Uuid>;
-}
-
-impl CommandCredentials for () {
-    fn actor_id(&self) -> Option<Uuid> {
-        None
-    }
-}
-
 /// The command structure
 #[derive(Debug, Clone)]
-pub struct Command<D, C>
-where
-    C: CommandCredentials,
-{
+pub struct Command<D, C> {
     /// The data used by the command
     pub data: D,
     /// The credentials of the command
-    pub credentials: C,
+    pub credentials: Option<C>,
     /// The expected version of aggregate
     pub aggregate_version: Option<u64>,
 }
@@ -36,10 +21,10 @@ where
 impl<D, C> Command<D, C>
 where
     D: std::fmt::Debug + Clone,
-    C: CommandCredentials + std::fmt::Debug + Clone,
+    C: std::fmt::Debug + Clone,
 {
     /// Create a new Command
-    pub fn new(data: D, credentials: C, aggregate_version: Option<u64>) -> Self {
+    pub fn new(data: D, credentials: Option<C>, aggregate_version: Option<u64>) -> Self {
         Command {
             data,
             credentials,
@@ -125,7 +110,7 @@ where
     /// Commands are instructions to the aggregate to perform an action.
     type CommandData: Clone + std::fmt::Debug;
     /// The type of credentials used by the commands on this application.
-    type CommandCredentials: CommandCredentials;
+    type CommandCredentials: Clone + std::fmt::Debug + Send;
     /// The specific command type used to create a new instance of the aggregate.
     /// This type must be convertible from the general `Command` type.
     type CreateCommand: TryFrom<Self::CommandData> + Send;
