@@ -27,7 +27,19 @@ fn new_event(stream_id: Uuid, stream_version: u64, value: &str) -> Event<TestEve
         .unwrap()
 }
 
-struct TestProjection(InMemoryStateStore<Vec<Event<TestEventData>>>);
+#[derive(Debug, Clone)]
+struct TestState(Vec<Event<TestEventData>>);
+
+impl ProjectionState for TestState {
+    fn get_id(&self) -> Uuid {
+        Uuid::new_v4()
+    }
+    fn get_version(&self) -> u64 {
+        0
+    }
+}
+
+struct TestProjection(InMemoryStateStore<TestState>);
 
 impl TestProjection {
     pub fn new() -> Self {
@@ -37,26 +49,26 @@ impl TestProjection {
 
 #[async_trait]
 impl Projection<TestEventData> for TestProjection {
-    type State = Vec<Event<TestEventData>>;
+    type State = TestState;
     type StateStore = InMemoryStateStore<Self::State>;
     type CreateEvent = TestEventData;
     type UpdateEvent = TestEventData;
     type DeleteEvent = TestEventData;
-    fn get_storage(&self) -> Self::StateStore {
+    fn get_state_store(&self) -> Self::StateStore {
         self.0.clone()
     }
     fn apply_create(
         &self,
         event: &Event<Self::CreateEvent>,
     ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(vec![event.clone()])
+        Ok(TestState(vec![event.clone()]))
     }
     fn apply_update(
         &self,
         mut state: Self::State,
         event: &Event<Self::CreateEvent>,
     ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
-        state.push(event.clone());
+        state.0.push(event.clone());
         Ok(state)
     }
 }
@@ -103,7 +115,7 @@ async fn test_subscribe_and_event_propagation() {
     let (pool, event_bus, event_store) = setup().await;
 
     let projection = TestProjection::new();
-    let projection_events = projection.get_storage().clone();
+    let projection_events = projection.get_state_store().clone();
     event_bus
         .subscribe(projection)
         .await
@@ -129,12 +141,12 @@ async fn test_subscribe_and_event_propagation() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(events_received.len(), 1);
-    assert_eq!(events_received[0].id, event.id);
-    assert_eq!(events_received[0].stream_id, event.stream_id);
-    assert_eq!(events_received[0].stream_version, event.stream_version);
-    assert_eq!(events_received[0].event_type, event.event_type);
-    assert_eq!(events_received[0].data, event.data);
+    assert_eq!(events_received.0.len(), 1);
+    assert_eq!(events_received.0[0].id, event.id);
+    assert_eq!(events_received.0[0].stream_id, event.stream_id);
+    assert_eq!(events_received.0[0].stream_version, event.stream_version);
+    assert_eq!(events_received.0[0].event_type, event.event_type);
+    assert_eq!(events_received.0[0].data, event.data);
 
     teardown(&pool).await;
 }

@@ -382,7 +382,7 @@ mod tests {
             .unwrap()
     }
 
-    struct TestProjection(InMemoryStateStore<Vec<Event<MyEventData>>>);
+    struct TestProjection(InMemoryStateStore<TestState>);
 
     impl TestProjection {
         pub fn new() -> Self {
@@ -390,28 +390,40 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct TestState(Vec<Event<MyEventData>>);
+
+    impl ProjectionState for TestState {
+        fn get_version(&self) -> u64 {
+            0
+        }
+        fn get_id(&self) -> Uuid {
+            Uuid::new_v4()
+        }
+    }
+
     #[async_trait]
     impl Projection<MyEventData> for TestProjection {
-        type State = Vec<Event<MyEventData>>;
+        type State = TestState;
         type StateStore = InMemoryStateStore<Self::State>;
         type CreateEvent = MyEventData;
         type UpdateEvent = MyEventData;
         type DeleteEvent = MyEventData;
-        fn get_storage(&self) -> Self::StateStore {
+        fn get_state_store(&self) -> Self::StateStore {
             self.0.clone()
         }
         fn apply_create(
             &self,
             event: &Event<Self::CreateEvent>,
         ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(vec![event.clone()])
+            Ok(TestState(vec![event.clone()]))
         }
         fn apply_update(
             &self,
             mut state: Self::State,
             event: &Event<Self::CreateEvent>,
         ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
-            state.push(event.clone());
+            state.0.push(event.clone());
             Ok(state)
         }
     }
@@ -497,16 +509,16 @@ mod tests {
     async fn in_memory_event_bus_publish() {
         let bus = InMemoryEventBus::<MyEventData>::new();
         let projection = TestProjection::new();
-        let storage = projection.get_storage().clone();
+        let storage = projection.get_state_store().clone();
         bus.subscribe(projection).await.unwrap();
 
         let stream_id = Uuid::new_v4();
         let event = new_event(stream_id, 0, "test_publish");
         bus.publish(event.clone()).await.unwrap();
 
-        let events: Vec<Event<MyEventData>> = storage.get_state(stream_id).await.unwrap().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0], event);
+        let events: TestState = storage.get_state(stream_id).await.unwrap().unwrap();
+        assert_eq!(events.0.len(), 1);
+        assert_eq!(events.0[0], event);
     }
 
     #[tokio::test]

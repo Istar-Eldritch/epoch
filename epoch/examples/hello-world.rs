@@ -41,7 +41,7 @@ pub struct User {
     version: u64,
 }
 
-impl AggregateState for User {
+impl ProjectionState for User {
     fn get_id(&self) -> Uuid {
         self.id
     }
@@ -68,93 +68,102 @@ impl UserAggregate {
     }
 }
 
-#[async_trait]
-impl Aggregate for UserAggregate {
+impl Projection<ApplicationEvent> for UserAggregate {
     type State = User;
-    type CommandData = ApplicationCommand;
-    type CommandCredentials = ();
-    type CreateCommand = CreateUserCommand;
-    type UpdateCommand = UpdateUserNameCommand;
-    type DeleteCommand = DeleteUserCommand;
-    type EventData = ApplicationEvent;
     type CreateEvent = UserCreationEvent;
     type UpdateEvent = UserUpdatedEvent;
     type DeleteEvent = UserDeletionEvent;
-    type EventStore = InMemoryEventStore<InMemoryEventBus<Self::EventData>>;
-    type StateStore = InMemoryStateStore<Self::State>;
-
-    fn get_event_store(&self) -> Self::EventStore {
-        self.event_store.clone()
-    }
+    type StateStore = InMemoryStateStore<User>;
 
     fn get_state_store(&self) -> Self::StateStore {
         self.state_store.clone()
     }
 
+    fn apply_create(
+        &self,
+        event: &Event<Self::CreateEvent>,
+    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
+        match event.data.as_ref().unwrap().clone() {
+            UserCreationEvent::UserCreated { name } => Ok(User {
+                id: event.stream_id,
+                name,
+                version: 0,
+            }),
+        }
+    }
+    fn apply_update(
+        &self,
+        mut state: Self::State,
+        event: &Event<Self::UpdateEvent>,
+    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
+        match event.data.as_ref().unwrap().clone() {
+            UserUpdatedEvent::UserNameUpdated { name } => {
+                state.name = name;
+                state.version += 1;
+                Ok(state)
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Aggregate<ApplicationEvent> for UserAggregate {
+    type CommandData = ApplicationCommand;
+    type CommandCredentials = ();
+    type CreateCommand = CreateUserCommand;
+    type UpdateCommand = UpdateUserNameCommand;
+    type DeleteCommand = DeleteUserCommand;
+
+    type EventStore = InMemoryEventStore<InMemoryEventBus<ApplicationEvent>>;
+
+    fn get_event_store(&self) -> Self::EventStore {
+        self.event_store.clone()
+    }
+
     async fn handle_create_command(
         &self,
         command: Command<Self::CreateCommand, Self::CommandCredentials>,
-    ) -> Result<
-        (Self::State, Vec<Event<Self::CreateEvent>>),
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<Vec<Event<ApplicationEvent>>, Box<dyn std::error::Error + Send + Sync>> {
         match command.data {
             CreateUserCommand::CreateUser { id, name } => {
-                let user = User {
-                    id,
-                    name,
-                    version: 0,
-                };
-                let event = UserCreationEvent::UserCreated {
-                    name: user.name.clone(),
-                }
-                .into_builder()
-                .stream_id(user.id)
-                .stream_version(user.version)
-                .build()?;
-                Ok((user, vec![event]))
+                let event = ApplicationEvent::UserCreated { name: name.clone() }
+                    .into_builder()
+                    .stream_id(id)
+                    .stream_version(0)
+                    .build()?;
+                Ok(vec![event])
             }
         }
     }
 
     async fn handle_update_command(
         &self,
-        mut state: Self::State,
+        state: &Self::State,
         command: Command<Self::UpdateCommand, Self::CommandCredentials>,
-    ) -> Result<
-        (Self::State, Vec<Event<Self::UpdateEvent>>),
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<Vec<Event<ApplicationEvent>>, Box<dyn std::error::Error + Send + Sync>> {
         match command.data {
-            UpdateUserNameCommand::UpdateUserName { id: _, name } => {
-                state.name = name;
-                state.version += 1;
-                let event = UserUpdatedEvent::UserNameUpdated {
-                    name: state.name.clone(),
-                }
-                .into_builder()
-                .stream_id(state.id)
-                .stream_version(state.version)
-                .build()?;
-                Ok((state, vec![event]))
+            UpdateUserNameCommand::UpdateUserName { id, name } => {
+                let event = ApplicationEvent::UserNameUpdated { name }
+                    .into_builder()
+                    .stream_id(id)
+                    .stream_version(state.version + 1)
+                    .build()?;
+                Ok(vec![event])
             }
         }
     }
 
     async fn handle_delete_command(
         &self,
-        state: Self::State,
+        state: &Self::State,
         _command: Command<Self::DeleteCommand, Self::CommandCredentials>,
-    ) -> Result<
-        (Option<Self::State>, Vec<Event<Self::DeleteEvent>>),
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        let event = UserDeletionEvent::UserDeleted
+    ) -> Result<Vec<Event<ApplicationEvent>>, Box<dyn std::error::Error + Send + Sync>> {
+        let event = ApplicationEvent::UserDeleted
             .into_builder()
             .stream_id(state.id)
             .stream_version(state.version + 1)
             .build()?;
-        Ok((None, vec![event]))
+        Ok(vec![event])
     }
 
     fn get_id_from_command(&self, command: &Self::CommandData) -> Uuid {
@@ -209,6 +218,15 @@ impl ProductProjection {
     }
 }
 
+impl ProjectionState for Product {
+    fn get_id(&self) -> Uuid {
+        self.id
+    }
+    fn get_version(&self) -> u64 {
+        self.version
+    }
+}
+
 impl Projection<ApplicationEvent> for ProductProjection {
     type State = Product;
     type StateStore = InMemoryStateStore<Self::State>;
@@ -216,7 +234,7 @@ impl Projection<ApplicationEvent> for ProductProjection {
     type UpdateEvent = ProductUpdateEvent;
     type DeleteEvent = EmptyEvent;
 
-    fn get_storage(&self) -> Self::StateStore {
+    fn get_state_store(&self) -> Self::StateStore {
         self.0.clone()
     }
 

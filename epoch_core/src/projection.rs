@@ -14,11 +14,21 @@ use uuid::Uuid;
 #[derive(Debug, Error)]
 pub enum HydrationError {
     /// The state of the projection was not found
-    #[error("State for ID {0} not found after rehydration")]
-    StateNotFound(Uuid),
+    #[error("State not built during rehydration")]
+    StateNotFound,
     /// Other errors
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// `ProjectionState` represents the current state of a projection.
+/// It encapsulates the current data derived from a sequence of events.
+pub trait ProjectionState {
+    /// Returns the unique identifier of the projection instance. This ID is used to retrieve and persist the projection's state and events.
+    fn get_id(&self) -> Uuid;
+    /// Returns the current version of the projection state. The version typically increments with each applied event and is used for
+    /// optimistic concurrency control to prevent conflicting updates.
+    fn get_version(&self) -> u64;
 }
 
 /// `Projection` is a trait that defines the interface for a read-model that can be built
@@ -32,7 +42,7 @@ where
     <Self::DeleteEvent as TryFrom<ED>>::Error: Send + Sync,
 {
     /// The type of the state that this `Projection` manages.
-    type State: Send + Sync + Clone;
+    type State: ProjectionState + Send + Sync + Clone;
     /// The type of `StateStorage` used by this `Projection`.
     type StateStore: StateStoreBackend<Self::State> + Send + Sync;
     /// The type of event that triggers a create operation on the state.
@@ -63,17 +73,14 @@ where
         Ok(None)
     }
     /// Returns the `StateStorage` implementation for this `Projection`.
-    fn get_storage(&self) -> Self::StateStore;
+    fn get_state_store(&self) -> Self::StateStore;
 
     /// Reconstructs the projection's state from an event stream.
-    async fn re_hydrate(
+    fn re_hydrate<'a>(
         &self,
-        id: Uuid,
-        event_stream: impl Iterator<Item = Event<ED>> + Send + Sync,
-    ) -> Result<Self::State, HydrationError> {
-        let state_storage = self.get_storage();
-        let mut state = state_storage.get_state(id).await?;
-
+        mut state: Option<Self::State>,
+        event_stream: impl Iterator<Item = &'a Event<ED>> + Send + Sync,
+    ) -> Result<Option<Self::State>, HydrationError> {
         for event in event_stream {
             if let Ok(create_event) = event.to_subset_event::<Self::CreateEvent>() {
                 state = Some(self.apply_create(&create_event)?);
@@ -86,7 +93,7 @@ where
             }
         }
 
-        state.ok_or_else(|| HydrationError::StateNotFound(id))
+        Ok(state)
     }
 
     /// Applies an event to the projection. This method dispatches the event to the appropriate
@@ -98,16 +105,16 @@ where
         let id = self.get_id_from_event(&event);
         if let Ok(create_event) = event.to_subset_event::<Self::CreateEvent>() {
             let state = self.apply_create(&create_event)?;
-            let mut storage = self.get_storage();
+            let mut storage = self.get_state_store();
             storage.persist_state(id, state).await?;
         } else if let Ok(update_event) = event.to_subset_event::<Self::UpdateEvent>() {
-            let mut storage = self.get_storage();
+            let mut storage = self.get_state_store();
             if let Some(state) = storage.get_state(id).await? {
                 let updated = self.apply_update(state, &update_event)?;
                 storage.persist_state(id, updated).await?;
             }
         } else if let Ok(delete_event) = event.to_subset_event::<Self::DeleteEvent>() {
-            let mut storage = self.get_storage();
+            let mut storage = self.get_state_store();
             if let Some(state) = storage.get_state(id).await? {
                 if let Some(deleted) = self.apply_delete(state, &delete_event)? {
                     storage.persist_state(id, deleted).await?;
