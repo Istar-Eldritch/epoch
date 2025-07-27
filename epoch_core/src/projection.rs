@@ -4,6 +4,7 @@
 use crate::{
     event::{Event, EventData},
     prelude::EventObserver,
+    state_store::StateStoreBackend,
 };
 use async_trait::async_trait;
 use thiserror::Error;
@@ -20,28 +21,6 @@ pub enum HydrationError {
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
-/// `StateStorage` is a trait that defines the interface for storing and retrieving
-/// the state of a `Projection`.
-#[async_trait]
-pub trait StateStorage<S> {
-    /// Retrieves the state for a given ID.
-    async fn get_state(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<S>, Box<dyn std::error::Error + Send + Sync>>;
-    /// Persists the state for a given ID.
-    async fn persist_state(
-        &mut self,
-        id: Uuid,
-        state: S,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    /// Deletes the state for a given ID.
-    async fn delete_state(
-        &mut self,
-        id: Uuid,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-}
-
 /// `Projection` is a trait that defines the interface for a read-model that can be built
 /// from a stream of events.
 #[async_trait]
@@ -55,7 +34,7 @@ where
     /// The type of the state that this `Projection` manages.
     type State: Send + Sync + Clone;
     /// The type of `StateStorage` used by this `Projection`.
-    type StateStorage: StateStorage<Self::State> + Send + Sync;
+    type StateStore: StateStoreBackend<Self::State> + Send + Sync;
     /// The type of event that triggers a create operation on the state.
     type CreateEvent: EventData + TryFrom<ED>;
     /// The type of event that triggers an update operation on the state.
@@ -84,7 +63,7 @@ where
         Ok(None)
     }
     /// Returns the `StateStorage` implementation for this `Projection`.
-    fn get_storage(&self) -> Self::StateStorage;
+    fn get_storage(&self) -> Self::StateStore;
 
     /// Reconstructs the projection's state from an event stream.
     async fn re_hydrate(

@@ -3,7 +3,7 @@ mod common;
 use async_trait::async_trait;
 use epoch_core::prelude::*;
 use epoch_derive::EventData;
-use epoch_mem::InMemoryStateStorage;
+use epoch_mem::InMemoryStateStore;
 use epoch_pg::event_bus::PgEventBus;
 use epoch_pg::event_store::PgEventStore;
 use sqlx::PgPool;
@@ -27,22 +27,22 @@ fn new_event(stream_id: Uuid, stream_version: u64, value: &str) -> Event<TestEve
         .unwrap()
 }
 
-struct TestProjection(InMemoryStateStorage<Vec<Event<TestEventData>>>);
+struct TestProjection(InMemoryStateStore<Vec<Event<TestEventData>>>);
 
 impl TestProjection {
     pub fn new() -> Self {
-        TestProjection(InMemoryStateStorage::new())
+        TestProjection(InMemoryStateStore::new())
     }
 }
 
 #[async_trait]
 impl Projection<TestEventData> for TestProjection {
     type State = Vec<Event<TestEventData>>;
-    type StateStorage = InMemoryStateStorage<Self::State>;
+    type StateStore = InMemoryStateStore<Self::State>;
     type CreateEvent = TestEventData;
     type UpdateEvent = TestEventData;
     type DeleteEvent = TestEventData;
-    fn get_storage(&self) -> Self::StateStorage {
+    fn get_storage(&self) -> Self::StateStore {
         self.0.clone()
     }
     fn apply_create(

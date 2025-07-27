@@ -52,14 +52,14 @@ impl AggregateState for User {
 }
 
 pub struct UserAggregate {
-    state_store: InMemoryStateStorage<User>,
+    state_store: InMemoryStateStore<User>,
     event_store: InMemoryEventStore<InMemoryEventBus<ApplicationEvent>>,
 }
 
 impl UserAggregate {
     pub fn new(
         event_store: InMemoryEventStore<InMemoryEventBus<ApplicationEvent>>,
-        state_store: InMemoryStateStorage<User>,
+        state_store: InMemoryStateStore<User>,
     ) -> Self {
         UserAggregate {
             state_store,
@@ -80,7 +80,7 @@ impl Aggregate for UserAggregate {
     type UpdateEvent = UserUpdatedEvent;
     type DeleteEvent = UserDeletionEvent;
     type EventStore = InMemoryEventStore<InMemoryEventBus<Self::EventData>>;
-    type StateStore = InMemoryStateStorage<Self::State>;
+    type StateStore = InMemoryStateStore<Self::State>;
 
     fn get_event_store(&self) -> Self::EventStore {
         self.event_store.clone()
@@ -209,22 +209,22 @@ pub enum ProductProjectionError {
 }
 
 #[derive(Debug)]
-struct ProductProjection(InMemoryStateStorage<Product>);
+struct ProductProjection(InMemoryStateStore<Product>);
 
 impl ProductProjection {
     pub fn new() -> Self {
-        ProductProjection(InMemoryStateStorage::new())
+        ProductProjection(InMemoryStateStore::new())
     }
 }
 
 impl Projection<ApplicationEvent> for ProductProjection {
     type State = Product;
-    type StateStorage = InMemoryStateStorage<Self::State>;
+    type StateStore = InMemoryStateStore<Self::State>;
     type CreateEvent = ProductCreationEvent;
     type UpdateEvent = ProductUpdateEvent;
     type DeleteEvent = EmptyEvent;
 
-    fn get_storage(&self) -> Self::StateStorage {
+    fn get_storage(&self) -> Self::StateStore {
         self.0.clone()
     }
 
@@ -269,7 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let event_store = InMemoryEventStore::new(bus);
 
-    let user_state = InMemoryStateStorage::new();
+    let user_state = InMemoryStateStore::new();
     let user_aggregate = UserAggregate::new(event_store.clone(), user_state.clone());
 
     let user_id = Uuid::new_v4();
