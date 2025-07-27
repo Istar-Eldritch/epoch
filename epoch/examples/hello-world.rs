@@ -71,7 +71,8 @@ impl UserAggregate {
 #[async_trait]
 impl Aggregate for UserAggregate {
     type State = User;
-    type Command = ApplicationCommand;
+    type CommandData = ApplicationCommand;
+    type CommandCredentials = ();
     type CreateCommand = CreateUserCommand;
     type UpdateCommand = UpdateUserNameCommand;
     type DeleteCommand = DeleteUserCommand;
@@ -92,12 +93,12 @@ impl Aggregate for UserAggregate {
 
     async fn handle_create_command(
         &self,
-        command: Self::CreateCommand,
+        command: Command<Self::CreateCommand, Self::CommandCredentials>,
     ) -> Result<
         (Self::State, Vec<Event<Self::CreateEvent>>),
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        match command {
+        match command.data {
             CreateUserCommand::CreateUser { id, name } => {
                 let user = User {
                     id,
@@ -119,12 +120,12 @@ impl Aggregate for UserAggregate {
     async fn handle_update_command(
         &self,
         mut state: Self::State,
-        command: Self::UpdateCommand,
+        command: Command<Self::UpdateCommand, Self::CommandCredentials>,
     ) -> Result<
         (Self::State, Vec<Event<Self::UpdateEvent>>),
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        match command {
+        match command.data {
             UpdateUserNameCommand::UpdateUserName { id: _, name } => {
                 state.name = name;
                 state.version += 1;
@@ -143,7 +144,7 @@ impl Aggregate for UserAggregate {
     async fn handle_delete_command(
         &self,
         state: Self::State,
-        _command: Self::DeleteCommand,
+        _command: Command<Self::DeleteCommand, Self::CommandCredentials>,
     ) -> Result<
         (Option<Self::State>, Vec<Event<Self::DeleteEvent>>),
         Box<dyn std::error::Error + Send + Sync>,
@@ -156,21 +157,12 @@ impl Aggregate for UserAggregate {
         Ok((None, vec![event]))
     }
 
-    fn get_id_from_command(&self, command: &Self::Command) -> Uuid {
+    fn get_id_from_command(&self, command: &Self::CommandData) -> Uuid {
         match command {
             ApplicationCommand::CreateUser { id, .. } => *id, // This should be handled in handle_create_command
             ApplicationCommand::UpdateUserName { id, .. } => *id,
             ApplicationCommand::DeleteUser { id } => *id,
             _ => panic!("Unexpected command type"),
-        }
-    }
-
-    fn get_expected_version_from_command(&self, command: &Self::Command) -> Option<u64> {
-        match command {
-            ApplicationCommand::CreateUser { .. } => None,
-            ApplicationCommand::UpdateUserName { .. } => None, // This example doesn't use expected version for updates
-            ApplicationCommand::DeleteUser { .. } => None, // This example doesn't use expected version for deletes
-            _ => None,
         }
     }
 }
@@ -285,15 +277,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let delete_user = ApplicationCommand::DeleteUser { id: user_id };
 
-    user_aggregate.handle_command(create_user).await?;
+    user_aggregate
+        .handle_command(Command::new(create_user, (), None))
+        .await?;
 
     println!("User in store: {:?}", user_state);
 
-    user_aggregate.handle_command(update_user_name).await?;
+    user_aggregate
+        .handle_command(Command::new(update_user_name, (), None))
+        .await?;
 
     println!("User in store: {:?}", user_state);
 
-    user_aggregate.handle_command(delete_user).await?;
+    user_aggregate
+        .handle_command(Command::new(delete_user, (), None))
+        .await?;
 
     println!("User in store after deletion: {:?}", user_state);
 
