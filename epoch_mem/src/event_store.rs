@@ -305,22 +305,22 @@ where
 
 /// Implementation of an InMemory State Storage
 #[derive(Clone, Debug)]
-pub struct InMemoryStateStorage<T>(std::sync::Arc<Mutex<HashMap<Uuid, T>>>)
+pub struct InMemoryStateStore<T>(std::sync::Arc<Mutex<HashMap<Uuid, T>>>)
 where
     T: Clone + std::fmt::Debug;
 
-impl<T> InMemoryStateStorage<T>
+impl<T> InMemoryStateStore<T>
 where
     T: Clone + std::fmt::Debug,
 {
-    /// Creates a new InMemoryStateStorage
+    /// Creates a new InMemoryStateStore
     pub fn new() -> Self {
-        InMemoryStateStorage(Arc::new(Mutex::new(HashMap::new())))
+        InMemoryStateStore(Arc::new(Mutex::new(HashMap::new())))
     }
 }
 
 #[async_trait]
-impl<T> StateStorage<T> for InMemoryStateStorage<T>
+impl<T> StateStoreBackend<T> for InMemoryStateStore<T>
 where
     T: Clone + Send + Sync + std::fmt::Debug,
 {
@@ -382,22 +382,22 @@ mod tests {
             .unwrap()
     }
 
-    struct TestProjection(InMemoryStateStorage<Vec<Event<MyEventData>>>);
+    struct TestProjection(InMemoryStateStore<Vec<Event<MyEventData>>>);
 
     impl TestProjection {
         pub fn new() -> Self {
-            TestProjection(InMemoryStateStorage::new())
+            TestProjection(InMemoryStateStore::new())
         }
     }
 
     #[async_trait]
     impl Projection<MyEventData> for TestProjection {
         type State = Vec<Event<MyEventData>>;
-        type StateStorage = InMemoryStateStorage<Self::State>;
+        type StateStore = InMemoryStateStore<Self::State>;
         type CreateEvent = MyEventData;
         type UpdateEvent = MyEventData;
         type DeleteEvent = MyEventData;
-        fn get_storage(&self) -> Self::StateStorage {
+        fn get_storage(&self) -> Self::StateStore {
             self.0.clone()
         }
         fn apply_create(

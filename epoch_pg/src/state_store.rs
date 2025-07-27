@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use epoch_core::prelude::StateStorage;
+use epoch_core::prelude::StateStoreBackend;
 use sqlx::postgres::PgArguments;
 use sqlx::query::Query;
 use sqlx::{FromRow, PgPool, postgres::PgRow};
@@ -7,13 +7,13 @@ use std::marker::PhantomData;
 use uuid::Uuid;
 
 /// State store implementation for postgres
-pub struct PgStateStorage<T> {
+pub struct PgStateStore<T> {
     _phantom: PhantomData<T>,
     pg: PgPool,
 }
 
-impl<T> PgStateStorage<T> {
-    /// Creates a new `PgStateStorage` instance.
+impl<T> PgStateStore<T> {
+    /// Creates a new `PgStateStore` instance.
     pub fn new(pool: PgPool) -> Self {
         Self {
             _phantom: PhantomData,
@@ -40,7 +40,7 @@ pub trait PgState: Send + Sync + for<'r> FromRow<'r, PgRow> + Unpin {
 }
 
 #[async_trait]
-impl<T> StateStorage<T> for PgStateStorage<T>
+impl<T> StateStoreBackend<T> for PgStateStore<T>
 where
     T: PgState,
 {

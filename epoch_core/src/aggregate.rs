@@ -2,7 +2,7 @@
 
 use crate::event::{Event, EventData};
 use crate::event_store::EventStoreBackend;
-use crate::prelude::StateStorage;
+use crate::prelude::StateStoreBackend;
 use async_trait::async_trait;
 use log::debug;
 use uuid::Uuid;
@@ -76,7 +76,7 @@ where
     /// The event store backend responsible for persisting and retrieving events for this aggregate.
     type EventStore: EventStoreBackend<EventType = Self::EventData> + Send + Sync + 'static;
     /// The state storage backend responsible for persisting and retrieving snapshots or the current state of the aggregate.
-    type StateStore: StateStorage<Self::State> + Send + Sync;
+    type StateStore: StateStoreBackend<Self::State> + Send + Sync;
     /// Returns an instance of the event store configured for this aggregate.
     fn get_event_store(&self) -> Self::EventStore;
     /// Returns an instance of the state store configured for this aggregate.

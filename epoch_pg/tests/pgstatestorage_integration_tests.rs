@@ -1,7 +1,7 @@
 mod common;
 
-use epoch_core::prelude::StateStorage;
-use epoch_pg::state_store::{PgState, PgStateStorage};
+use epoch_core::prelude::StateStoreBackend;
+use epoch_pg::state_store::{PgState, PgStateStore};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool, postgres::PgArguments, query::Query};
 use uuid::Uuid;
@@ -28,7 +28,7 @@ impl PgState for TestState {
     }
 }
 
-async fn setup() -> (PgPool, PgStateStorage<TestState>) {
+async fn setup() -> (PgPool, PgStateStore<TestState>) {
     let pool = common::get_pg_pool().await;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS test_states (id UUID PRIMARY KEY, value TEXT NOT NULL)",
@@ -36,7 +36,7 @@ async fn setup() -> (PgPool, PgStateStorage<TestState>) {
     .execute(&pool)
     .await
     .expect("Failed to create table");
-    let state_storage = PgStateStorage::new(pool.clone());
+    let state_storage = PgStateStore::new(pool.clone());
     (pool, state_storage)
 }
 
