@@ -1,3 +1,4 @@
+use epoch_core::event::EnumConversionError;
 use epoch_derive::subset_enum;
 
 #[derive(Debug, PartialEq)]

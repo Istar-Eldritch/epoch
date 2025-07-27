@@ -136,7 +136,7 @@ fn subset_enum_impl_internal(
             let original_enum_name_str = original_enum_name.to_string();
             let original_enum_variant_str = format!("{}::{}", original_enum_name_str, variant_name.to_string());
             let subset_enum_name_str = subset_enum_name.to_string();
-            let error = quote!(epoch_core::event::EnumConversionError::new(#original_enum_variant_str.to_string(), #subset_enum_name_str.to_string()));
+            let error = quote!(EnumConversionError::new(#original_enum_variant_str.to_string(), #subset_enum_name_str.to_string()));
 
             match fields {
                 syn::Fields::Unit => {
@@ -160,7 +160,7 @@ fn subset_enum_impl_internal(
 
     try_from_impls.extend(quote! {
         impl std::convert::TryFrom<#original_enum_name> for #subset_enum_name {
-            type Error = epoch_core::event::EnumConversionError;
+            type Error = EnumConversionError;
 
             fn try_from(value: #original_enum_name) -> Result<Self, Self::Error> {
                 match value {
@@ -238,7 +238,7 @@ mod tests {
             }
 
             impl std::convert::TryFrom<OriginalEnum> for MySubsetEnum {
-                type Error = epoch_core::event::EnumConversionError;
+                type Error = EnumConversionError;
 
                 fn try_from(value: OriginalEnum) -> Result<Self, Self::Error> {
                     match value {
@@ -285,14 +285,14 @@ mod tests {
             }
 
             impl std::convert::TryFrom<OriginalEnum> for MySubsetEnum {
-                type Error = epoch_core::event::EnumConversionError;
+                type Error = EnumConversionError;
 
                 fn try_from(value: OriginalEnum) -> Result<Self, Self::Error> {
                     match value {
                         OriginalEnum::VariantA => Ok(MySubsetEnum::VariantA),
-                        OriginalEnum::VariantB(..) => Err(epoch_core::event::EnumConversionError::new("OriginalEnum::VariantB".to_string(), "MySubsetEnum".to_string())),
+                        OriginalEnum::VariantB(..) => Err(EnumConversionError::new("OriginalEnum::VariantB".to_string(), "MySubsetEnum".to_string())),
                         OriginalEnum::VariantC { field } => Ok(MySubsetEnum::VariantC { field }),
-                        OriginalEnum::VariantD => Err(epoch_core::event::EnumConversionError::new("OriginalEnum::VariantD".to_string(), "MySubsetEnum".to_string())),
+                        OriginalEnum::VariantD => Err(EnumConversionError::new("OriginalEnum::VariantD".to_string(), "MySubsetEnum".to_string())),
                     }
                 }
             }
@@ -336,14 +336,14 @@ mod tests {
             }
 
             impl std::convert::TryFrom<OriginalEnum> for MySubsetEnum {
-                type Error = epoch_core::event::EnumConversionError;
+                type Error = EnumConversionError;
 
                 fn try_from(value: OriginalEnum) -> Result<Self, Self::Error> {
                     match value {
                         OriginalEnum::UnitVariant => Ok(MySubsetEnum::UnitVariant),
                         OriginalEnum::TupleVariant(__field0, __field1) => Ok(MySubsetEnum::TupleVariant(__field0, __field1)),
                         OriginalEnum::StructVariant { name, id } => Ok(MySubsetEnum::StructVariant { name, id }),
-                        OriginalEnum::AnotherUnit => Err(epoch_core::event::EnumConversionError::new("OriginalEnum::AnotherUnit".to_string(), "MySubsetEnum".to_string())),
+                        OriginalEnum::AnotherUnit => Err(EnumConversionError::new("OriginalEnum::AnotherUnit".to_string(), "MySubsetEnum".to_string())),
                     }
                 }
             }
@@ -387,7 +387,7 @@ mod tests {
             }
 
             impl std::convert::TryFrom<OriginalEnum> for MySubsetEnum {
-                type Error = epoch_core::event::EnumConversionError;
+                type Error = EnumConversionError;
 
                 fn try_from(value: OriginalEnum) -> Result<Self, Self::Error> {
                     match value {
@@ -432,7 +432,7 @@ mod tests {
             }
 
             impl std::convert::TryFrom<OriginalEnum> for MySubsetEnum {
-                type Error = epoch_core::event::EnumConversionError;
+                type Error = EnumConversionError;
 
                 fn try_from(value: OriginalEnum) -> Result<Self, Self::Error> {
                     match value {
