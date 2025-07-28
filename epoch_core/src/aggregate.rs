@@ -10,6 +10,8 @@ use uuid::Uuid;
 /// The command structure
 #[derive(Debug, Clone)]
 pub struct Command<D, C> {
+    /// The id of the root aggregate affected by this command
+    pub aggregate_id: Uuid,
     /// The data used by the command
     pub data: D,
     /// The credentials of the command
@@ -24,8 +26,14 @@ where
     C: std::fmt::Debug + Clone,
 {
     /// Create a new Command
-    pub fn new(data: D, credentials: Option<C>, aggregate_version: Option<u64>) -> Self {
+    pub fn new(
+        aggregate_id: Uuid,
+        data: D,
+        credentials: Option<C>,
+        aggregate_version: Option<u64>,
+    ) -> Self {
         Command {
+            aggregate_id,
             data,
             credentials,
             aggregate_version,
@@ -40,6 +48,7 @@ where
     {
         let data = CD::try_from(self.data.clone())?;
         Ok(Command {
+            aggregate_id: self.aggregate_id,
             data,
             credentials: self.credentials.clone(),
             aggregate_version: self.aggregate_version.clone(),
@@ -54,6 +63,7 @@ where
     {
         let data = self.data.clone().into();
         Command {
+            aggregate_id: self.aggregate_id,
             data,
             credentials: self.credentials.clone(),
             aggregate_version: self.aggregate_version.clone(),
@@ -227,7 +237,7 @@ where
                 std::any::type_name::<Self::UpdateCommand>()
             );
             let mut state_store = self.get_state_store();
-            let state_id = self.get_id_from_command(&command.data);
+            let state_id = self.get_id_from_command(&command);
             debug!(
                 "Retrieving state for update command. State ID: {:?}",
                 state_id
@@ -274,7 +284,7 @@ where
                 std::any::type_name::<Self::DeleteCommand>()
             );
             let mut state_store = self.get_state_store();
-            let state_id = self.get_id_from_command(&command.data);
+            let state_id = self.get_id_from_command(&command);
             debug!(
                 "Retrieving state for delete command. State ID: {:?}",
                 state_id
@@ -333,5 +343,10 @@ where
     ///
     /// # Arguments
     /// * `command` - A reference to the `Self::Command` from which to extract the ID.
-    fn get_id_from_command(&self, command: &Self::CommandData) -> Uuid;
+    fn get_id_from_command(
+        &self,
+        command: &Command<Self::CommandData, Self::CommandCredentials>,
+    ) -> Uuid {
+        command.aggregate_id
+    }
 }

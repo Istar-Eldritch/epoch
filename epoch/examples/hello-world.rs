@@ -25,9 +25,9 @@ pub enum ApplicationEvent {
 #[subset_enum(DeleteUserCommand, DeleteUser)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ApplicationCommand {
-    CreateUser { id: Uuid, name: String },
-    UpdateUserName { id: Uuid, name: String },
-    DeleteUser { id: Uuid },
+    CreateUser { name: String },
+    UpdateUserName { name: String },
+    DeleteUser,
     CreateProduct { name: String, price: f64 },
     UpdateProductName { id: Uuid, name: String },
     UpdateProductPrice { id: Uuid, price: f64 },
@@ -125,10 +125,10 @@ impl Aggregate<ApplicationEvent> for UserAggregate {
         command: Command<Self::CreateCommand, Self::CommandCredentials>,
     ) -> Result<Vec<Event<ApplicationEvent>>, Box<dyn std::error::Error + Send + Sync>> {
         match command.data {
-            CreateUserCommand::CreateUser { id, name } => {
+            CreateUserCommand::CreateUser { name } => {
                 let event = ApplicationEvent::UserCreated { name: name.clone() }
                     .into_builder()
-                    .stream_id(id)
+                    .stream_id(command.aggregate_id)
                     .stream_version(0)
                     .build()?;
                 Ok(vec![event])
@@ -142,10 +142,10 @@ impl Aggregate<ApplicationEvent> for UserAggregate {
         command: Command<Self::UpdateCommand, Self::CommandCredentials>,
     ) -> Result<Vec<Event<ApplicationEvent>>, Box<dyn std::error::Error + Send + Sync>> {
         match command.data {
-            UpdateUserNameCommand::UpdateUserName { id, name } => {
+            UpdateUserNameCommand::UpdateUserName { name } => {
                 let event = ApplicationEvent::UserNameUpdated { name }
                     .into_builder()
-                    .stream_id(id)
+                    .stream_id(command.aggregate_id)
                     .stream_version(state.version + 1)
                     .build()?;
                 Ok(vec![event])
@@ -164,15 +164,6 @@ impl Aggregate<ApplicationEvent> for UserAggregate {
             .stream_version(state.version + 1)
             .build()?;
         Ok(vec![event])
-    }
-
-    fn get_id_from_command(&self, command: &Self::CommandData) -> Uuid {
-        match command {
-            ApplicationCommand::CreateUser { id, .. } => *id, // This should be handled in handle_create_command
-            ApplicationCommand::UpdateUserName { id, .. } => *id,
-            ApplicationCommand::DeleteUser { id } => *id,
-            _ => panic!("Unexpected command type"),
-        }
     }
 }
 
@@ -284,31 +275,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let user_id = Uuid::new_v4();
     let create_user = ApplicationCommand::CreateUser {
-        id: user_id,
         name: "Debug Test".to_string(),
     };
 
     let update_user_name = ApplicationCommand::UpdateUserName {
-        id: user_id,
         name: "Debug Testo".to_string(),
     };
 
-    let delete_user = ApplicationCommand::DeleteUser { id: user_id };
+    let delete_user = ApplicationCommand::DeleteUser;
 
     user_aggregate
-        .handle_command(Command::new(create_user, None, None))
+        .handle_command(Command::new(user_id, create_user, None, None))
         .await?;
 
     println!("User in store: {:?}", user_state);
 
     user_aggregate
-        .handle_command(Command::new(update_user_name, None, None))
+        .handle_command(Command::new(user_id, update_user_name, None, None))
         .await?;
 
     println!("User in store: {:?}", user_state);
 
     user_aggregate
-        .handle_command(Command::new(delete_user, None, None))
+        .handle_command(Command::new(user_id, delete_user, None, None))
         .await?;
 
     println!("User in store after deletion: {:?}", user_state);
