@@ -215,10 +215,6 @@ where
             let events = self.handle_create_command(cmd).await?;
 
             let state = self.re_hydrate(None, events.iter())?;
-            for event in events.into_iter() {
-                debug!("Storing event: {:?}", std::any::type_name::<ED>());
-                self.get_event_store().store_event(event).await?;
-            }
 
             if let Some(state) = state {
                 debug!(
@@ -230,6 +226,10 @@ where
                     .await?;
             } else {
                 // TODO: Error when state was not aggregated from event
+            }
+            for event in events.into_iter() {
+                debug!("Storing event: {:?}", std::any::type_name::<ED>());
+                self.get_event_store().store_event(event).await?;
             }
         } else if let Ok(cmd) = command.to_subset_command() {
             debug!(
@@ -264,11 +264,6 @@ where
 
             let state = self.re_hydrate(Some(state), events.iter())?;
 
-            for event in events.into_iter() {
-                debug!("Storing event: {:?}", std::any::type_name::<ED>());
-                self.get_event_store().store_event(event).await?;
-            }
-
             if let Some(state) = state {
                 debug!(
                     "Persisting state for update command. State ID: {:?}",
@@ -277,6 +272,10 @@ where
                 state_store.persist_state(state.get_id(), state).await?;
             } else {
                 // TODO: Error when state is not present after aggregation
+            }
+            for event in events.into_iter() {
+                debug!("Storing event: {:?}", std::any::type_name::<ED>());
+                self.get_event_store().store_event(event).await?;
             }
         } else if let Ok(cmd) = command.to_subset_command() {
             debug!(
@@ -312,11 +311,6 @@ where
 
             let state = self.re_hydrate(Some(state), events.iter())?;
 
-            for event in events.into_iter() {
-                debug!("Storing event: {:?}", std::any::type_name::<ED>());
-                self.get_event_store().store_event(event).await?;
-            }
-
             if let Some(state) = state {
                 debug!(
                     "Persisting state for delete command. State ID: {:?}",
@@ -329,6 +323,10 @@ where
                     state_id
                 );
                 state_store.delete_state(state_id).await?;
+            }
+            for event in events.into_iter() {
+                debug!("Storing event: {:?}", std::any::type_name::<ED>());
+                self.get_event_store().store_event(event).await?;
             }
         }
         debug!("Command handling complete.");
