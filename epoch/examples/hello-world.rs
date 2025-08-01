@@ -45,7 +45,9 @@ impl ProjectionState for User {
     fn get_id(&self) -> Uuid {
         self.id
     }
+}
 
+impl AggregateState for User {
     fn get_version(&self) -> u64 {
         self.version
     }
@@ -212,9 +214,6 @@ impl ProductProjection {
 impl ProjectionState for Product {
     fn get_id(&self) -> Uuid {
         self.id
-    }
-    fn get_version(&self) -> u64 {
-        self.version
     }
 }
 

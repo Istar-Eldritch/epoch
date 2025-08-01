@@ -20,6 +20,14 @@ pub struct Command<D, C> {
     pub aggregate_version: Option<u64>,
 }
 
+/// `AggregateState` represents the current state of an aggregate.
+/// It encapsulates the current data derived from a sequence of events.
+pub trait AggregateState: ProjectionState {
+    /// Returns the current version of the projection state. The version typically increments with each applied event and is used for
+    /// optimistic concurrency control to prevent conflicting updates.
+    fn get_version(&self) -> u64;
+}
+
 impl<D, C> Command<D, C>
 where
     D: std::fmt::Debug + Clone,
@@ -98,6 +106,7 @@ pub enum HandleCommandError {
 pub trait Aggregate<ED>: Projection<ED>
 where
     ED: EventData + Send + Sync + 'static,
+    <Self as Projection<ED>>::State: AggregateState,
     Self::CommandData: Send + Sync,
     <Self::CreateCommand as TryFrom<Self::CommandData>>::Error: Send + Sync,
     <Self::UpdateCommand as TryFrom<Self::CommandData>>::Error: Send + Sync,

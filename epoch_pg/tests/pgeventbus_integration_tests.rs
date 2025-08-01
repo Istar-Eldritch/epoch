@@ -34,9 +34,6 @@ impl ProjectionState for TestState {
     fn get_id(&self) -> Uuid {
         Uuid::new_v4()
     }
-    fn get_version(&self) -> u64 {
-        0
-    }
 }
 
 struct TestProjection(InMemoryStateStore<TestState>);

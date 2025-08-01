@@ -26,9 +26,6 @@ pub enum HydrationError {
 pub trait ProjectionState {
     /// Returns the unique identifier of the projection instance. This ID is used to retrieve and persist the projection's state and events.
     fn get_id(&self) -> Uuid;
-    /// Returns the current version of the projection state. The version typically increments with each applied event and is used for
-    /// optimistic concurrency control to prevent conflicting updates.
-    fn get_version(&self) -> u64;
 }
 
 /// `Projection` is a trait that defines the interface for a read-model that can be built

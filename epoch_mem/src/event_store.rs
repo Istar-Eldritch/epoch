@@ -394,9 +394,6 @@ mod tests {
     struct TestState(Vec<Event<MyEventData>>);
 
     impl ProjectionState for TestState {
-        fn get_version(&self) -> u64 {
-            0
-        }
         fn get_id(&self) -> Uuid {
             Uuid::new_v4()
         }
