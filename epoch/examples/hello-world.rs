@@ -76,7 +76,7 @@ impl Projection<ApplicationEvent> for UserAggregate {
         self.state_store.clone()
     }
 
-    fn apply_event(
+    fn apply(
         &self,
         state: Option<Self::State>,
         event: &Event<Self::EventType>,
@@ -220,7 +220,7 @@ impl Projection<ApplicationEvent> for ProductProjection {
         self.0.clone()
     }
 
-    fn apply_event(
+    fn apply(
         &self,
         state: Option<Self::State>,
         event: &Event<Self::EventType>,

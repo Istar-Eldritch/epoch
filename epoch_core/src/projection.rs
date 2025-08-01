@@ -46,7 +46,7 @@ where
     /// Applies an event to the aggregate.
     /// If None is returned it will result in the state being deleted from storage.
     /// If `Some(state)` is returned, the state will be persisted instead of deleted.
-    fn apply_event(
+    fn apply(
         &self,
         _state: Option<Self::State>,
         _event: &Event<Self::EventType>,
@@ -63,7 +63,7 @@ where
     ) -> Result<Option<Self::State>, HydrationError> {
         for event in event_stream {
             if let Ok(event) = event.to_subset_event::<Self::EventType>() {
-                state = self.apply_event(state, &event)?;
+                state = self.apply(state, &event)?;
             }
         }
 
@@ -72,7 +72,7 @@ where
 
     /// Applies an event to the projection. This method dispatches the event to the appropriate
     /// `apply_create`, `apply_update`, or `apply_delete` method based on the event type.
-    async fn apply(
+    async fn apply_and_store(
         &self,
         event: Event<ED>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -80,7 +80,7 @@ where
         if let Ok(event) = event.to_subset_event::<Self::EventType>() {
             let mut storage = self.get_state_store();
             let state = storage.get_state(id).await?;
-            if let Some(new_state) = self.apply_event(state, &event)? {
+            if let Some(new_state) = self.apply(state, &event)? {
                 storage.persist_state(id, new_state).await?;
             } else {
                 storage.delete_state(id).await?;
@@ -104,7 +104,7 @@ where
         &self,
         event: Event<ED>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.apply(event).await?;
+        self.apply_and_store(event).await?;
         Ok(())
     }
 }

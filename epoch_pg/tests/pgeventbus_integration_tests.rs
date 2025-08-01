@@ -52,7 +52,7 @@ impl Projection<TestEventData> for TestProjection {
     fn get_state_store(&self) -> Self::StateStore {
         self.0.clone()
     }
-    fn apply_event(
+    fn apply(
         &self,
         state: Option<Self::State>,
         event: &Event<Self::EventType>,
