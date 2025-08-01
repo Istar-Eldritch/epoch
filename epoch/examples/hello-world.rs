@@ -65,10 +65,17 @@ impl UserAggregate {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum UserProjectionError {
+    #[error("No state present for id {0}")]
+    NoState(Uuid),
+}
+
 impl Projection<ApplicationEvent> for UserAggregate {
     type State = User;
     type EventType = UserEvent;
     type StateStore = InMemoryStateStore<User>;
+    type ProjectionError = UserProjectionError;
 
     fn get_state_store(&self) -> Self::StateStore {
         self.state_store.clone()
@@ -78,7 +85,7 @@ impl Projection<ApplicationEvent> for UserAggregate {
         &self,
         state: Option<Self::State>,
         event: &Event<Self::EventType>,
-    ) -> Result<Option<Self::State>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<Self::State>, UserProjectionError> {
         match event.data.as_ref().unwrap().clone() {
             UserEvent::UserNameUpdated { name } => {
                 if let Some(mut state) = state {
@@ -86,8 +93,7 @@ impl Projection<ApplicationEvent> for UserAggregate {
                     state.version += 1;
                     Ok(Some(state))
                 } else {
-                    // Would be an error
-                    Ok(None)
+                    Err(UserProjectionError::NoState(event.stream_id))
                 }
             }
             UserEvent::UserCreated { name } => Ok(Some(User {
@@ -100,11 +106,18 @@ impl Projection<ApplicationEvent> for UserAggregate {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum UserAggregateError {
+    #[error("Error building event")]
+    EventBuild(#[from] EventBuilderError),
+}
+
 #[async_trait]
 impl Aggregate<ApplicationEvent> for UserAggregate {
     type CommandData = ApplicationCommand;
     type CommandCredentials = ();
     type Command = UserCommand;
+    type AggregateError = UserAggregateError;
 
     type EventStore = InMemoryEventStore<InMemoryEventBus<ApplicationEvent>>;
 
@@ -116,7 +129,7 @@ impl Aggregate<ApplicationEvent> for UserAggregate {
         &self,
         state: &Option<Self::State>,
         command: Command<Self::Command, Self::CommandCredentials>,
-    ) -> Result<Vec<Event<ApplicationEvent>>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<Event<ApplicationEvent>>, Self::AggregateError> {
         match command.data {
             UserCommand::CreateUser { name } => {
                 let event = ApplicationEvent::UserCreated { name: name.clone() }
@@ -164,18 +177,6 @@ struct Product {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum UserProjectionError {
-    #[error("Ther user with id {0} already exists")]
-    UserAlreadyExists(Uuid),
-    #[error("Ther user with id {0} does not exists")]
-    UserDoesNotExist(Uuid),
-    #[error("Cant hydrate user with event {0}")]
-    UnexpectedEvent(String),
-    #[error("Unexpected error projecting user: {0}")]
-    Unexpected(#[from] Box<dyn std::error::Error + Send + Sync>),
-}
-
-#[derive(thiserror::Error, Debug)]
 pub enum ProductProjectionError {
     #[error("The product with id {0} already exists")]
     ProductAlreadyExists(Uuid),
@@ -206,6 +207,7 @@ impl Projection<ApplicationEvent> for ProductProjection {
     type State = Product;
     type StateStore = InMemoryStateStore<Self::State>;
     type EventType = ProductEvent;
+    type ProjectionError = ProductProjectionError;
 
     fn get_state_store(&self) -> Self::StateStore {
         self.0.clone()
@@ -215,7 +217,7 @@ impl Projection<ApplicationEvent> for ProductProjection {
         &self,
         state: Option<Self::State>,
         event: &Event<Self::EventType>,
-    ) -> Result<Option<Self::State>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<Self::State>, Self::ProjectionError> {
         match event.data.as_ref().unwrap().clone() {
             ProductEvent::ProductCreated { name, price } => Ok(Some(Product {
                 id: event.stream_id,
@@ -228,7 +230,7 @@ impl Projection<ApplicationEvent> for ProductProjection {
                     state.name = name;
                     Ok(Some(state))
                 } else {
-                    Ok(None)
+                    Err(ProductProjectionError::ProductDoesNotExist(event.stream_id))
                 }
             }
             ProductEvent::ProductPriceUpdated { price } => {
@@ -236,7 +238,7 @@ impl Projection<ApplicationEvent> for ProductProjection {
                     state.price = price;
                     Ok(Some(state))
                 } else {
-                    Ok(None)
+                    Err(ProductProjectionError::ProductDoesNotExist(event.stream_id))
                 }
             }
         }

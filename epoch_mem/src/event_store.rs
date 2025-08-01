@@ -319,31 +319,26 @@ where
     }
 }
 
+/// Error that may be raised by the InMemoryStateStore
+#[derive(Debug, thiserror::Error)]
+pub enum InMemoryStateStoreError {}
+
 #[async_trait]
 impl<T> StateStoreBackend<T> for InMemoryStateStore<T>
 where
     T: Clone + Send + Sync + std::fmt::Debug,
 {
-    async fn get_state(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<T>, Box<dyn std::error::Error + Send + Sync>> {
+    type Error = InMemoryStateStoreError;
+    async fn get_state(&self, id: Uuid) -> Result<Option<T>, Self::Error> {
         let data = self.0.lock().await;
         Ok(data.get(&id).map(|v| v.clone()))
     }
-    async fn persist_state(
-        &mut self,
-        id: Uuid,
-        state: T,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn persist_state(&mut self, id: Uuid, state: T) -> Result<(), Self::Error> {
         let mut data = self.0.lock().await;
         data.insert(id, state);
         Ok(())
     }
-    async fn delete_state(
-        &mut self,
-        id: Uuid,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_state(&mut self, id: Uuid) -> Result<(), Self::Error> {
         let mut data = self.0.lock().await;
         data.remove(&id);
         Ok(())
@@ -399,11 +394,15 @@ mod tests {
         }
     }
 
+    #[derive(Debug, thiserror::Error)]
+    pub enum TestProjectionError {}
+
     #[async_trait]
     impl Projection<MyEventData> for TestProjection {
         type State = TestState;
         type StateStore = InMemoryStateStore<Self::State>;
         type EventType = MyEventData;
+        type ProjectionError = TestProjectionError;
         fn get_state_store(&self) -> Self::StateStore {
             self.0.clone()
         }
@@ -411,7 +410,7 @@ mod tests {
             &self,
             state: Option<Self::State>,
             event: &Event<Self::EventType>,
-        ) -> Result<Option<Self::State>, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<Option<Self::State>, Self::ProjectionError> {
             if let Some(mut state) = state {
                 state.0.push(event.clone());
                 Ok(Some(state))

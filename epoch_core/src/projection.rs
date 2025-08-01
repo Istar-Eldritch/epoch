@@ -7,25 +7,25 @@ use crate::{
     state_store::StateStoreBackend,
 };
 use async_trait::async_trait;
-use thiserror::Error;
 use uuid::Uuid;
-
-/// Errors that may happen when re_hydrating a projection
-#[derive(Debug, Error)]
-pub enum HydrationError {
-    /// The state of the projection was not found
-    #[error("State not built during rehydration")]
-    StateNotFound,
-    /// Other errors
-    #[error(transparent)]
-    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
-}
 
 /// `ProjectionState` represents the current state of a projection.
 /// It encapsulates the current data derived from a sequence of events.
 pub trait ProjectionState {
     /// Returns the unique identifier of the projection instance. This ID is used to retrieve and persist the projection's state and events.
     fn get_id(&self) -> Uuid;
+}
+
+/// `ApplyAndStoreError` enumerates the possible errors that can occur during the application
+/// and storage of a projection's state.
+#[derive(Debug, thiserror::Error)]
+pub enum ApplyAndStoreError<E, S> {
+    /// Represents an error that occurred while applying an event to the projection.
+    #[error("Event application error: {0}")]
+    Event(E),
+    /// Represents an error that occurred while persisting the projection's state to storage.
+    #[error("Error persisting state: {0}")]
+    State(S),
 }
 
 /// `Projection` is a trait that defines the interface for a read-model that can be built
@@ -42,6 +42,8 @@ where
     type StateStore: StateStoreBackend<Self::State> + Send + Sync;
     /// The type of event used by this projection.
     type EventType: EventData + TryFrom<ED>;
+    /// The type of errors that may occur whey applying events
+    type ProjectionError: std::error::Error + Send + Sync + 'static;
 
     /// Applies an event to the aggregate.
     /// If None is returned it will result in the state being deleted from storage.
@@ -50,7 +52,7 @@ where
         &self,
         _state: Option<Self::State>,
         _event: &Event<Self::EventType>,
-    ) -> Result<Option<Self::State>, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<Option<Self::State>, Self::ProjectionError>;
 
     /// Returns the `StateStorage` implementation for this `Projection`.
     fn get_state_store(&self) -> Self::StateStore;
@@ -60,7 +62,7 @@ where
         &self,
         mut state: Option<Self::State>,
         event_stream: impl Iterator<Item = &'a Event<ED>> + Send + Sync,
-    ) -> Result<Option<Self::State>, HydrationError> {
+    ) -> Result<Option<Self::State>, Self::ProjectionError> {
         for event in event_stream {
             if let Ok(event) = event.to_subset_event::<Self::EventType>() {
                 state = self.apply(state, &event)?;
@@ -75,15 +77,33 @@ where
     async fn apply_and_store(
         &self,
         event: Event<ED>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        (),
+        ApplyAndStoreError<
+            Self::ProjectionError,
+            <Self::StateStore as StateStoreBackend<Self::State>>::Error,
+        >,
+    > {
         let id = self.get_id_from_event(&event);
         if let Ok(event) = event.to_subset_event::<Self::EventType>() {
             let mut storage = self.get_state_store();
-            let state = storage.get_state(id).await?;
-            if let Some(new_state) = self.apply(state, &event)? {
-                storage.persist_state(id, new_state).await?;
+            let state = storage
+                .get_state(id)
+                .await
+                .map_err(ApplyAndStoreError::State)?;
+            if let Some(new_state) = self
+                .apply(state, &event)
+                .map_err(ApplyAndStoreError::Event)?
+            {
+                storage
+                    .persist_state(id, new_state)
+                    .await
+                    .map_err(ApplyAndStoreError::State)?;
             } else {
-                storage.delete_state(id).await?;
+                storage
+                    .delete_state(id)
+                    .await
+                    .map_err(ApplyAndStoreError::State)?;
             }
         }
         Ok(())

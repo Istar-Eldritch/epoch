@@ -81,10 +81,7 @@ where
 
 /// Defines the errors that can happen when handling a command
 #[derive(Debug, thiserror::Error)]
-pub enum HandleCommandError {
-    /// The state was not found so the command cannot be applied
-    #[error("Could not find state for id {0}")]
-    StateNotFound(Uuid),
+pub enum HandleCommandError<C, H, S, E> {
     /// The version of the state is different than expected
     #[error("Expected to find state with version {expected} but found {found}")]
     VersionMismatch {
@@ -93,6 +90,18 @@ pub enum HandleCommandError {
         /// The actual version of the state
         found: u64,
     },
+    /// An error raised while handling the command
+    #[error("Error while handling command: {0}")]
+    Command(C),
+    /// An error raised by the state store
+    #[error("Error while hydrating events: {0}")]
+    Hydration(H),
+    /// An error raised by the state store
+    #[error("Error while storing state: {0}")]
+    State(S),
+    /// An error raised by the state store
+    #[error("Error while storing events: {0}")]
+    Event(E),
 }
 
 /// `Aggregate` is a central trait in `epoch_core` that defines the behavior of an aggregate in an event-sourced system.
@@ -120,6 +129,8 @@ where
     type Command: TryFrom<Self::CommandData> + Send;
     /// The event store backend responsible for persisting and retrieving events for this aggregate.
     type EventStore: EventStoreBackend<EventType = ED> + Send + Sync + 'static;
+    /// Error while handling commands
+    type AggregateError: std::error::Error + Send + Sync + 'static;
     /// Returns an instance of the event store configured for this aggregate.
     ///
     /// This method provides the concrete `EventStoreBackend` implementation that the aggregate
@@ -150,7 +161,7 @@ where
         &self,
         state: &Option<Self::State>,
         command: Command<Self::Command, Self::CommandCredentials>,
-    ) -> Result<Vec<Event<ED>>, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<Vec<Event<ED>>, Self::AggregateError>;
 
     /// Handles a generic command by retrieving the aggregate's state, applying the command,
     /// and persisting the resulting events and updated state.
@@ -170,7 +181,15 @@ where
     async fn handle(
         &self,
         command: Command<Self::CommandData, Self::CommandCredentials>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        (),
+        HandleCommandError<
+            Self::AggregateError,
+            Self::ProjectionError,
+            <Self::StateStore as StateStoreBackend<Self::State>>::Error,
+            <Self::EventStore as EventStoreBackend>::Error,
+        >,
+    > {
         if let Ok(cmd) = command.to_subset_command() {
             debug!(
                 "Handling command: {:?}",
@@ -179,7 +198,10 @@ where
             let mut state_store = self.get_state_store();
             let state_id = self.get_id_from_command(&command);
             debug!("Retrieving state for command. State ID: {:?}", state_id);
-            let state = state_store.get_state(state_id).await?;
+            let state = state_store
+                .get_state(state_id)
+                .await
+                .map_err(HandleCommandError::State)?;
 
             if let Some(expected_version) = command.aggregate_version {
                 if let Some(ref state) = state {
@@ -189,30 +211,44 @@ where
                             expected_version,
                             state.get_version()
                         );
-                        return Err(Box::new(HandleCommandError::VersionMismatch {
+                        return Err(HandleCommandError::VersionMismatch {
                             expected: expected_version,
                             found: state.get_version(),
-                        }));
+                        });
                     }
                 }
             }
 
-            let events = self.handle_command(&state, cmd).await?;
-            let state = self.re_hydrate(state, events.iter())?;
+            let events = self
+                .handle_command(&state, cmd)
+                .await
+                .map_err(|e| HandleCommandError::Command(e))?;
+            let state = self
+                .re_hydrate(state, events.iter())
+                .map_err(HandleCommandError::Hydration)?;
 
             if let Some(state) = state {
                 debug!(
                     "Persisting state for command. State ID: {:?}",
                     state.get_id()
                 );
-                state_store.persist_state(state.get_id(), state).await?;
+                state_store
+                    .persist_state(state.get_id(), state)
+                    .await
+                    .map_err(HandleCommandError::State)?;
             } else {
                 debug!("Deleting state for command. State ID: {:?}", state_id);
-                state_store.delete_state(state_id).await?;
+                state_store
+                    .delete_state(state_id)
+                    .await
+                    .map_err(HandleCommandError::State)?;
             }
             for event in events.into_iter() {
                 debug!("Storing event: {:?}", std::any::type_name::<ED>());
-                self.get_event_store().store_event(event).await?;
+                self.get_event_store()
+                    .store_event(event)
+                    .await
+                    .map_err(HandleCommandError::Event)?;
             }
         }
         debug!("Command handling complete.");

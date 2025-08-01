@@ -44,11 +44,15 @@ impl TestProjection {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum TestProjectionError {}
+
 #[async_trait]
 impl Projection<TestEventData> for TestProjection {
     type State = TestState;
     type StateStore = InMemoryStateStore<Self::State>;
     type EventType = TestEventData;
+    type ProjectionError = TestProjectionError;
     fn get_state_store(&self) -> Self::StateStore {
         self.0.clone()
     }
@@ -56,7 +60,7 @@ impl Projection<TestEventData> for TestProjection {
         &self,
         state: Option<Self::State>,
         event: &Event<Self::EventType>,
-    ) -> Result<Option<Self::State>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<Self::State>, Self::ProjectionError> {
         if let Some(mut state) = state {
             state.0.push(event.clone());
             Ok(Some(state))

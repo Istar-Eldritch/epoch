@@ -45,11 +45,9 @@ impl<T> StateStoreBackend<T> for PgStateStore<T>
 where
     T: PgState,
 {
+    type Error = sqlx::Error;
     /// Retrieves the state for a given ID.
-    async fn get_state(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<T>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_state(&self, id: Uuid) -> Result<Option<T>, Self::Error> {
         let mut conn = self.pg.acquire().await?;
         let query = format!(
             "SELECT * FROM {} WHERE {} = $1",
@@ -62,11 +60,7 @@ where
             .await?)
     }
     /// Persists the state for a given ID.
-    async fn persist_state(
-        &mut self,
-        _id: Uuid,
-        state: T,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn persist_state(&mut self, _id: Uuid, state: T) -> Result<(), Self::Error> {
         let mut conn = self.pg.acquire().await?;
         let query_str = T::upsert_query();
         let mut query_builder = sqlx::QueryBuilder::new(query_str);
@@ -78,10 +72,7 @@ where
         Ok(())
     }
     /// Deletes the state for a given ID.
-    async fn delete_state(
-        &mut self,
-        id: Uuid,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_state(&mut self, id: Uuid) -> Result<(), Self::Error> {
         let mut conn = self.pg.acquire().await?;
         let query = format!("DELETE FROM {} WHERE {} = $1", T::TABLE_NAME, T::ID_COLUMN);
         sqlx::query(&query).bind(id).execute(&mut *conn).await?;
