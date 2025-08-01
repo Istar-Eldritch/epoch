@@ -48,25 +48,21 @@ impl TestProjection {
 impl Projection<TestEventData> for TestProjection {
     type State = TestState;
     type StateStore = InMemoryStateStore<Self::State>;
-    type CreateEvent = TestEventData;
-    type UpdateEvent = TestEventData;
-    type DeleteEvent = TestEventData;
+    type EventType = TestEventData;
     fn get_state_store(&self) -> Self::StateStore {
         self.0.clone()
     }
-    fn apply_create(
+    fn apply_event(
         &self,
-        event: &Event<Self::CreateEvent>,
-    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(TestState(vec![event.clone()]))
-    }
-    fn apply_update(
-        &self,
-        mut state: Self::State,
-        event: &Event<Self::CreateEvent>,
-    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
-        state.0.push(event.clone());
-        Ok(state)
+        state: Option<Self::State>,
+        event: &Event<Self::EventType>,
+    ) -> Result<Option<Self::State>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(mut state) = state {
+            state.0.push(event.clone());
+            Ok(Some(state))
+        } else {
+            Ok(Some(TestState(vec![event.clone()])))
+        }
     }
 }
 

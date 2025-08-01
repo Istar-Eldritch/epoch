@@ -34,41 +34,24 @@ pub trait ProjectionState {
 pub trait Projection<ED>
 where
     ED: EventData + Send + Sync + 'static,
-    <Self::CreateEvent as TryFrom<ED>>::Error: Send + Sync,
-    <Self::UpdateEvent as TryFrom<ED>>::Error: Send + Sync,
-    <Self::DeleteEvent as TryFrom<ED>>::Error: Send + Sync,
+    <Self::EventType as TryFrom<ED>>::Error: Send + Sync,
 {
     /// The type of the state that this `Projection` manages.
     type State: ProjectionState + Send + Sync + Clone;
     /// The type of `StateStorage` used by this `Projection`.
     type StateStore: StateStoreBackend<Self::State> + Send + Sync;
-    /// The type of event that triggers a create operation on the state.
-    type CreateEvent: EventData + TryFrom<ED>;
-    /// The type of event that triggers an update operation on the state.
-    type UpdateEvent: EventData + TryFrom<ED>;
-    /// The type of event that triggers a delete operation on the state.
-    type DeleteEvent: EventData + TryFrom<ED>;
-    /// Applies a create event to produce a new state.
-    fn apply_create(
+    /// The type of event used by this projection.
+    type EventType: EventData + TryFrom<ED>;
+
+    /// Applies an event to the aggregate.
+    /// If None is returned it will result in the state being deleted from storage.
+    /// If `Some(state)` is returned, the state will be persisted instead of deleted.
+    fn apply_event(
         &self,
-        event: &Event<Self::CreateEvent>,
-    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>>;
-    /// Applies an update event to an existing state.
-    fn apply_update(
-        &self,
-        state: Self::State,
-        event: &Event<Self::UpdateEvent>,
-    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>>;
-    /// Applies a delete event to an existing state. By default, this method returns `None`,
-    /// which will result in the state being deleted from storage. If `Some(state)` is returned,
-    /// the state will be persisted instead of deleted.
-    fn apply_delete(
-        &self,
-        _state: Self::State,
-        _event: &Event<Self::DeleteEvent>,
-    ) -> Result<Option<Self::State>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(None)
-    }
+        _state: Option<Self::State>,
+        _event: &Event<Self::EventType>,
+    ) -> Result<Option<Self::State>, Box<dyn std::error::Error + Send + Sync>>;
+
     /// Returns the `StateStorage` implementation for this `Projection`.
     fn get_state_store(&self) -> Self::StateStore;
 
@@ -79,14 +62,8 @@ where
         event_stream: impl Iterator<Item = &'a Event<ED>> + Send + Sync,
     ) -> Result<Option<Self::State>, HydrationError> {
         for event in event_stream {
-            if let Ok(create_event) = event.to_subset_event::<Self::CreateEvent>() {
-                state = Some(self.apply_create(&create_event)?);
-            } else if let Some(ref current_state) = state {
-                if let Ok(update_event) = event.to_subset_event::<Self::UpdateEvent>() {
-                    state = Some(self.apply_update(current_state.clone(), &update_event)?);
-                } else if let Ok(delete_event) = event.to_subset_event::<Self::DeleteEvent>() {
-                    state = self.apply_delete(current_state.clone(), &delete_event)?;
-                }
+            if let Ok(event) = event.to_subset_event::<Self::EventType>() {
+                state = self.apply_event(state, &event)?;
             }
         }
 
@@ -100,24 +77,13 @@ where
         event: Event<ED>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let id = self.get_id_from_event(&event);
-        if let Ok(create_event) = event.to_subset_event::<Self::CreateEvent>() {
-            let state = self.apply_create(&create_event)?;
+        if let Ok(event) = event.to_subset_event::<Self::EventType>() {
             let mut storage = self.get_state_store();
-            storage.persist_state(id, state).await?;
-        } else if let Ok(update_event) = event.to_subset_event::<Self::UpdateEvent>() {
-            let mut storage = self.get_state_store();
-            if let Some(state) = storage.get_state(id).await? {
-                let updated = self.apply_update(state, &update_event)?;
-                storage.persist_state(id, updated).await?;
-            }
-        } else if let Ok(delete_event) = event.to_subset_event::<Self::DeleteEvent>() {
-            let mut storage = self.get_state_store();
-            if let Some(state) = storage.get_state(id).await? {
-                if let Some(deleted) = self.apply_delete(state, &delete_event)? {
-                    storage.persist_state(id, deleted).await?;
-                } else {
-                    storage.delete_state(id).await?;
-                }
+            let state = storage.get_state(id).await?;
+            if let Some(new_state) = self.apply_event(state, &event)? {
+                storage.persist_state(id, new_state).await?;
+            } else {
+                storage.delete_state(id).await?;
             }
         }
         Ok(())

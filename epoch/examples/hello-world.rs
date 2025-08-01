@@ -4,11 +4,8 @@ use epoch_mem::*;
 use serde::Deserialize;
 use uuid::Uuid;
 
-#[subset_enum(UserCreationEvent, UserCreated)]
-#[subset_enum(UserUpdatedEvent, UserNameUpdated)]
-#[subset_enum(UserDeletionEvent, UserDeleted)]
-#[subset_enum(ProductCreationEvent, ProductCreated)]
-#[subset_enum(ProductUpdateEvent, ProductNameUpdated, ProductPriceUpdated)]
+#[subset_enum(UserEvent, UserCreated, UserNameUpdated, UserDeleted)]
+#[subset_enum(ProductEvent, ProductCreated, ProductNameUpdated, ProductPriceUpdated)]
 #[subset_enum(EmptyEvent)]
 #[derive(Debug, Clone, serde::Serialize, EventData, Deserialize)]
 pub enum ApplicationEvent {
@@ -72,38 +69,35 @@ impl UserAggregate {
 
 impl Projection<ApplicationEvent> for UserAggregate {
     type State = User;
-    type CreateEvent = UserCreationEvent;
-    type UpdateEvent = UserUpdatedEvent;
-    type DeleteEvent = UserDeletionEvent;
+    type EventType = UserEvent;
     type StateStore = InMemoryStateStore<User>;
 
     fn get_state_store(&self) -> Self::StateStore {
         self.state_store.clone()
     }
 
-    fn apply_create(
+    fn apply_event(
         &self,
-        event: &Event<Self::CreateEvent>,
-    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
+        state: Option<Self::State>,
+        event: &Event<Self::EventType>,
+    ) -> Result<Option<Self::State>, Box<dyn std::error::Error + Send + Sync>> {
         match event.data.as_ref().unwrap().clone() {
-            UserCreationEvent::UserCreated { name } => Ok(User {
+            UserEvent::UserNameUpdated { name } => {
+                if let Some(mut state) = state {
+                    state.name = name;
+                    state.version += 1;
+                    Ok(Some(state))
+                } else {
+                    // Would be an error
+                    Ok(None)
+                }
+            }
+            UserEvent::UserCreated { name } => Ok(Some(User {
                 id: event.stream_id,
                 name,
                 version: 0,
-            }),
-        }
-    }
-    fn apply_update(
-        &self,
-        mut state: Self::State,
-        event: &Event<Self::UpdateEvent>,
-    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
-        match event.data.as_ref().unwrap().clone() {
-            UserUpdatedEvent::UserNameUpdated { name } => {
-                state.name = name;
-                state.version += 1;
-                Ok(state)
-            }
+            })),
+            UserEvent::UserDeleted => Ok(None),
         }
     }
 }
@@ -220,40 +214,39 @@ impl ProjectionState for Product {
 impl Projection<ApplicationEvent> for ProductProjection {
     type State = Product;
     type StateStore = InMemoryStateStore<Self::State>;
-    type CreateEvent = ProductCreationEvent;
-    type UpdateEvent = ProductUpdateEvent;
-    type DeleteEvent = EmptyEvent;
+    type EventType = ProductEvent;
 
     fn get_state_store(&self) -> Self::StateStore {
         self.0.clone()
     }
 
-    fn apply_create(
+    fn apply_event(
         &self,
-        event: &Event<Self::CreateEvent>,
-    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
+        state: Option<Self::State>,
+        event: &Event<Self::EventType>,
+    ) -> Result<Option<Self::State>, Box<dyn std::error::Error + Send + Sync>> {
         match event.data.as_ref().unwrap().clone() {
-            ProductCreationEvent::ProductCreated { name, price } => Ok(Product {
+            ProductEvent::ProductCreated { name, price } => Ok(Some(Product {
                 id: event.stream_id,
                 name,
                 price,
                 version: event.stream_version,
-            }),
-        }
-    }
-    fn apply_update(
-        &self,
-        mut state: Self::State,
-        event: &Event<Self::UpdateEvent>,
-    ) -> Result<Self::State, Box<dyn std::error::Error + Send + Sync>> {
-        match event.data.as_ref().unwrap().clone() {
-            ProductUpdateEvent::ProductNameUpdated { name } => {
-                state.name = name;
-                Ok(state)
+            })),
+            ProductEvent::ProductNameUpdated { name } => {
+                if let Some(mut state) = state {
+                    state.name = name;
+                    Ok(Some(state))
+                } else {
+                    Ok(None)
+                }
             }
-            ProductUpdateEvent::ProductPriceUpdated { price } => {
-                state.price = price;
-                Ok(state)
+            ProductEvent::ProductPriceUpdated { price } => {
+                if let Some(mut state) = state {
+                    state.price = price;
+                    Ok(Some(state))
+                } else {
+                    Ok(None)
+                }
             }
         }
     }
