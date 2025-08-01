@@ -108,229 +108,106 @@ where
     ED: EventData + Send + Sync + 'static,
     <Self as Projection<ED>>::State: AggregateState,
     Self::CommandData: Send + Sync,
-    <Self::CreateCommand as TryFrom<Self::CommandData>>::Error: Send + Sync,
-    <Self::UpdateCommand as TryFrom<Self::CommandData>>::Error: Send + Sync,
-    <Self::DeleteCommand as TryFrom<Self::CommandData>>::Error: Send + Sync,
+    <Self::Command as TryFrom<Self::CommandData>>::Error: Send + Sync,
 {
-    /// The overarching type of `Command` that this `Aggregate` can process.
+    /// The overarching type of `Command` data that this `Aggregate` can process.
     /// Commands are instructions to the aggregate to perform an action.
     type CommandData: Clone + std::fmt::Debug;
     /// The type of credentials used by the commands on this application.
     type CommandCredentials: Clone + std::fmt::Debug + Send;
     /// The specific command type used to create a new instance of the aggregate.
-    /// This type must be convertible from the general `Command` type.
-    type CreateCommand: TryFrom<Self::CommandData> + Send;
-    /// The specific command type used to update an existing instance of the aggregate.
-    /// This type must be convertible from the general `Command` type.
-    type UpdateCommand: TryFrom<Self::CommandData> + Send;
-    /// The specific command type used to delete an existing instance of the aggregate.
-    /// This type must be convertible from the general `Command` type.
-    type DeleteCommand: TryFrom<Self::CommandData> + Send;
+    /// This type must be convertible from the general `CommandData` type.
+    type Command: TryFrom<Self::CommandData> + Send;
     /// The event store backend responsible for persisting and retrieving events for this aggregate.
     type EventStore: EventStoreBackend<EventType = ED> + Send + Sync + 'static;
     /// Returns an instance of the event store configured for this aggregate.
+    ///
+    /// This method provides the concrete `EventStoreBackend` implementation that the aggregate
+    /// will use to store and retrieve events. It allows the aggregate to interact with the
+    /// underlying event persistence mechanism.
+    ///
+    /// # Returns
+    /// An instance of `Self::EventStore`, which is a type that implements `EventStoreBackend`.
     fn get_event_store(&self) -> Self::EventStore;
 
-    /// Handles a `CreateCommand` to create a new aggregate instance.
+    /// Handles a specific command, applying it to the current aggregate state and producing new events.
     ///
-    /// This method is responsible for validating the command, applying business logic,
-    /// and producing a new aggregate state along with a vector of events that represent
-    /// the changes made.
+    /// This method is responsible for the core business logic of the aggregate. It takes the current
+    /// state of the aggregate (if it exists) and a command, and based on these, it determines
+    /// which events should be generated. These events represent the changes that occurred due to
+    /// the command and will be persisted to the event store.
     ///
     /// # Arguments
-    /// * `command` - The `CreateCommand` to handle.
+    /// * `state` - An `Option` containing a reference to the current `AggregateState` of the aggregate.
+    ///             If `None`, it means the aggregate does not currently exist (e.g., for a creation command).
+    /// * `command` - The `Command` to be handled, containing the command-specific data and credentials.
     ///
     /// # Returns
-    /// A `Result` containing a tuple of the new `Self::State` and a `Vec<Event<Self::CreateEvent>>`
-    /// on success, or a boxed `std::error::Error` on failure.
-    async fn handle_create_command(
-        &self,
-        command: Command<Self::CreateCommand, Self::CommandCredentials>,
-    ) -> Result<Vec<Event<ED>>, Box<dyn std::error::Error + Send + Sync>>;
-
-    /// Handles an `UpdateCommand` to modify an existing aggregate instance.
-    ///
-    /// This method takes the current `state` of the aggregate, applies the `command`,
-    /// and generates a new state and a vector of events reflecting the updates.
-    ///
-    /// # Arguments
-    /// * `state` - The current `Self::State` of the aggregate.
-    /// * `command` - The `UpdateCommand` to handle.
-    ///
-    /// # Returns
-    /// A `Result` containing a tuple of the updated `Self::State` and a `Vec<Event<Self::UpdateEvent>>`
-    /// on success, or a boxed `std::error::Error` on failure.
-    async fn handle_update_command(
-        &self,
-        state: &Self::State,
-        command: Command<Self::UpdateCommand, Self::CommandCredentials>,
-    ) -> Result<Vec<Event<ED>>, Box<dyn std::error::Error + Send + Sync>>;
-
-    /// Handles a `DeleteCommand` to mark an aggregate for deletion or to remove it.
-    ///
-    /// This method processes the `DeleteCommand` against the current `state`,
-    /// and produces an optional new state (e.g., `None` if the aggregate is fully deleted,
-    /// or `Some(State)` if it's logically deleted/archived) and a vector of events.
-    ///
-    /// # Arguments
-    /// * `state` - The current `Self::State` of the aggregate.
-    /// * `command` - The `DeleteCommand` to handle.
-    ///
-    /// # Returns
-    /// A `Result` containing a tuple of an `Option<Self::State>` (indicating if a state remains)
-    /// and a `Vec<Event<Self::DeleteEvent>>` on success, or a boxed `std::error::Error` on failure.
-    async fn handle_delete_command(
-        &self,
-        state: &Self::State,
-        command: Command<Self::DeleteCommand, Self::CommandCredentials>,
-    ) -> Result<Vec<Event<ED>>, Box<dyn std::error::Error + Send + Sync>>;
-
-    /// The general command handler for the aggregate.
-    ///
-    /// This method acts as a dispatcher, attempting to convert the incoming `Command`
-    /// into a `CreateCommand`, `UpdateCommand`, or `DeleteCommand` and then delegating
-    /// to the appropriate specific handler (`handle_create_command`, `handle_update_command`,
-    /// or `handle_delete_command`).
-    ///
-    /// It also handles the persistence of generated events to the `EventStore` and
-    /// the updated aggregate state to the `StateStore`. It includes optimistic concurrency
-    /// control by checking the expected version for update and delete operations.
-    ///
-    /// # Arguments
-    /// * `command` - The `Self::Command` to handle.
-    ///
-    /// # Errors
-    /// Returns a `HandleCommandError::StateNotFound` if an update or delete command
-    /// is issued for a state that does not exist.
-    /// Returns a `HandleCommandError::VersionMismatch` if an update or delete command
-    /// specifies an `expected_version` that does not match the current state's version,
-    /// indicating a concurrency conflict.
-    /// Returns other errors from the underlying event store, state store, or specific
-    /// command handlers.
+    /// A `Result` indicating success or failure. On success, it returns a `Vec` of `Event<ED>`,
+    /// which are the events generated by the command. On failure, it returns a `Box<dyn std::error::Error + Send + Sync>`
+    /// representing the error that occurred during command handling.
     async fn handle_command(
+        &self,
+        state: &Option<Self::State>,
+        command: Command<Self::Command, Self::CommandCredentials>,
+    ) -> Result<Vec<Event<ED>>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Handles a generic command by retrieving the aggregate's state, applying the command,
+    /// and persisting the resulting events and updated state.
+    ///
+    /// This method orchestrates the command handling process, including state retrieval,
+    /// optimistic concurrency control (if `aggregate_version` is provided in the command),
+    /// event generation via `handle_command`, state re-hydration, and persistence of
+    /// the new state and events.
+    ///
+    /// # Arguments
+    /// * `command` - The `Command` to be handled, containing the command-specific data and credentials.
+    ///
+    /// # Returns
+    /// A `Result` indicating success or failure. On success, it returns `Ok(())`.
+    /// On failure, it returns a `Box<dyn std::error::Error + Send + Sync>` representing
+    /// the error that occurred during the handling process.
+    async fn handle(
         &self,
         command: Command<Self::CommandData, Self::CommandCredentials>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        debug!(
-            "Handling command: {:?}",
-            std::any::type_name::<Self::CommandData>()
-        );
         if let Ok(cmd) = command.to_subset_command() {
             debug!(
-                "Handling create command: {:?}",
-                std::any::type_name::<Self::CreateCommand>()
-            );
-
-            let events = self.handle_create_command(cmd).await?;
-
-            let state = self.re_hydrate(None, events.iter())?;
-
-            if let Some(state) = state {
-                debug!(
-                    "Persisting state for create command. State ID: {:?}",
-                    state.get_id()
-                );
-                self.get_state_store()
-                    .persist_state(state.get_id(), state)
-                    .await?;
-            } else {
-                // TODO: Error when state was not aggregated from event
-            }
-            for event in events.into_iter() {
-                debug!("Storing event: {:?}", std::any::type_name::<ED>());
-                self.get_event_store().store_event(event).await?;
-            }
-        } else if let Ok(cmd) = command.to_subset_command() {
-            debug!(
-                "Handling update command: {:?}",
-                std::any::type_name::<Self::UpdateCommand>()
+                "Handling command: {:?}",
+                std::any::type_name::<Self::Command>()
             );
             let mut state_store = self.get_state_store();
             let state_id = self.get_id_from_command(&command);
-            debug!(
-                "Retrieving state for update command. State ID: {:?}",
-                state_id
-            );
-            let state = state_store
-                .get_state(state_id)
-                .await?
-                .ok_or(HandleCommandError::StateNotFound(state_id))?;
+            debug!("Retrieving state for command. State ID: {:?}", state_id);
+            let state = state_store.get_state(state_id).await?;
 
             if let Some(expected_version) = command.aggregate_version {
-                if state.get_version() != expected_version {
-                    debug!(
-                        "Version mismatch for update command. Expected: {}, Found: {}",
-                        expected_version,
-                        state.get_version()
-                    );
-                    return Err(Box::new(HandleCommandError::VersionMismatch {
-                        expected: expected_version,
-                        found: state.get_version(),
-                    }));
+                if let Some(ref state) = state {
+                    if state.get_version() != expected_version {
+                        debug!(
+                            "Version mismatch for update command. Expected: {}, Found: {}",
+                            expected_version,
+                            state.get_version()
+                        );
+                        return Err(Box::new(HandleCommandError::VersionMismatch {
+                            expected: expected_version,
+                            found: state.get_version(),
+                        }));
+                    }
                 }
             }
-            let events = self.handle_update_command(&state, cmd).await?;
 
-            let state = self.re_hydrate(Some(state), events.iter())?;
+            let events = self.handle_command(&state, cmd).await?;
+            let state = self.re_hydrate(state, events.iter())?;
 
             if let Some(state) = state {
                 debug!(
-                    "Persisting state for update command. State ID: {:?}",
+                    "Persisting state for command. State ID: {:?}",
                     state.get_id()
                 );
                 state_store.persist_state(state.get_id(), state).await?;
             } else {
-                // TODO: Error when state is not present after aggregation
-            }
-            for event in events.into_iter() {
-                debug!("Storing event: {:?}", std::any::type_name::<ED>());
-                self.get_event_store().store_event(event).await?;
-            }
-        } else if let Ok(cmd) = command.to_subset_command() {
-            debug!(
-                "Handling delete command: {:?}",
-                std::any::type_name::<Self::DeleteCommand>()
-            );
-            let mut state_store = self.get_state_store();
-            let state_id = self.get_id_from_command(&command);
-            debug!(
-                "Retrieving state for delete command. State ID: {:?}",
-                state_id
-            );
-            let state = state_store
-                .get_state(state_id)
-                .await?
-                .ok_or(HandleCommandError::StateNotFound(state_id))?;
-
-            if let Some(expected_version) = command.aggregate_version {
-                if state.get_version() != expected_version {
-                    debug!(
-                        "Version mismatch for delete command. Expected: {}, Found: {}",
-                        expected_version,
-                        state.get_version()
-                    );
-                    return Err(Box::new(HandleCommandError::VersionMismatch {
-                        expected: expected_version,
-                        found: state.get_version(),
-                    }));
-                }
-            }
-
-            let events = self.handle_delete_command(&state, cmd).await?;
-
-            let state = self.re_hydrate(Some(state), events.iter())?;
-
-            if let Some(state) = state {
-                debug!(
-                    "Persisting state for delete command. State ID: {:?}",
-                    state.get_id()
-                );
-                state_store.persist_state(state.get_id(), state).await?;
-            } else {
-                debug!(
-                    "Deleting state for delete command. State ID: {:?}",
-                    state_id
-                );
+                debug!("Deleting state for command. State ID: {:?}", state_id);
                 state_store.delete_state(state_id).await?;
             }
             for event in events.into_iter() {
