@@ -84,8 +84,8 @@ where
             <Self::StateStore as StateStoreBackend<Self::State>>::Error,
         >,
     > {
-        let id = self.get_id_from_event(&event);
         if let Ok(event) = event.to_subset_event::<Self::EventType>() {
+            let id = self.get_id_from_event(&event);
             let mut storage = self.get_state_store();
             let state = storage
                 .get_state(id)
@@ -109,7 +109,7 @@ where
         Ok(())
     }
     /// Returns the ID of the stream from the given event.
-    fn get_id_from_event(&self, event: &Event<ED>) -> Uuid {
+    fn get_id_from_event(&self, event: &Event<Self::EventType>) -> Uuid {
         event.stream_id
     }
 }
