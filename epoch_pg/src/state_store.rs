@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use epoch_core::prelude::StateStoreBackend;
-use sqlx::postgres::PgArguments;
-use sqlx::query::Query;
+use sqlx::PgExecutor;
 use sqlx::{FromRow, PgPool, postgres::PgRow};
 use std::marker::PhantomData;
 use uuid::Uuid;
@@ -24,20 +23,22 @@ impl<T> PgStateStore<T> {
 }
 
 /// Trait definnig the required behavior of a PG state;
+#[async_trait]
 pub trait PgState: Send + Sync + for<'r> FromRow<'r, PgRow> + Unpin {
-    /// The table where this state will be persisted
-    const TABLE_NAME: &'static str;
-    /// The id of the column used to retrieve the state
-    const ID_COLUMN: &'static str;
+    /// Retrieve the entity from the storage using its id
+    async fn find_by_id<'a, T>(id: Uuid, executor: T) -> Result<Option<Self>, sqlx::Error>
+    where
+        T: PgExecutor<'a>;
 
-    /// Creates an upsert query for the state.
-    fn upsert_query() -> &'static str;
+    /// The upsert operation to save this entity in postgres
+    async fn upsert<'a, T>(id: Uuid, state: &'a Self, executor: T) -> Result<(), sqlx::Error>
+    where
+        T: PgExecutor<'a>;
 
-    /// Binds the state values to the query builder.
-    fn bind_upsert_values<'a>(
-        state: &'a Self,
-        query_builder: Query<'a, sqlx::Postgres, PgArguments>,
-    ) -> Query<'a, sqlx::Postgres, PgArguments>;
+    /// The upsert operation to save this entity in postgres
+    async fn delete<'a, T>(id: Uuid, executor: T) -> Result<(), sqlx::Error>
+    where
+        T: PgExecutor<'a>;
 }
 
 #[async_trait]
@@ -49,33 +50,18 @@ where
     /// Retrieves the state for a given ID.
     async fn get_state(&self, id: Uuid) -> Result<Option<T>, Self::Error> {
         let mut conn = self.pg.acquire().await?;
-        let query = format!(
-            "SELECT * FROM {} WHERE {} = $1",
-            T::TABLE_NAME,
-            T::ID_COLUMN
-        );
-        Ok(sqlx::query_as(&query)
-            .bind(id)
-            .fetch_optional(&mut *conn)
-            .await?)
+        Ok(T::find_by_id(id, &mut *conn).await?)
     }
     /// Persists the state for a given ID.
-    async fn persist_state(&mut self, _id: Uuid, state: T) -> Result<(), Self::Error> {
+    async fn persist_state(&mut self, id: Uuid, state: T) -> Result<(), Self::Error> {
         let mut conn = self.pg.acquire().await?;
-        let query_str = T::upsert_query();
-        let mut query_builder = sqlx::QueryBuilder::new(query_str);
-        let query = query_builder.build();
-        let query = T::bind_upsert_values(&state, query);
-
-        query.execute(&mut *conn).await?;
-
+        T::upsert(id, &state, &mut *conn).await?;
         Ok(())
     }
     /// Deletes the state for a given ID.
     async fn delete_state(&mut self, id: Uuid) -> Result<(), Self::Error> {
         let mut conn = self.pg.acquire().await?;
-        let query = format!("DELETE FROM {} WHERE {} = $1", T::TABLE_NAME, T::ID_COLUMN);
-        sqlx::query(&query).bind(id).execute(&mut *conn).await?;
+        T::delete(id, &mut *conn).await?;
         Ok(())
     }
 }

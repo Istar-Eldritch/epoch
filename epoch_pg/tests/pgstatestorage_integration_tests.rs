@@ -1,9 +1,10 @@
 mod common;
 
+use async_trait::async_trait;
 use epoch_core::prelude::StateStoreBackend;
 use epoch_pg::state_store::{PgState, PgStateStore};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool, postgres::PgArguments, query::Query};
+use sqlx::{FromRow, PgExecutor, PgPool};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, FromRow)]
@@ -12,19 +13,40 @@ struct TestState {
     value: String,
 }
 
+#[async_trait]
 impl PgState for TestState {
-    const TABLE_NAME: &'static str = "test_states";
-    const ID_COLUMN: &'static str = "id";
-
-    fn upsert_query() -> &'static str {
-        "INSERT INTO test_states (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = $2"
+    async fn find_by_id<'a, T>(id: Uuid, executor: T) -> Result<Option<Self>, sqlx::Error>
+    where
+        T: PgExecutor<'a>,
+    {
+        sqlx::query_as("select * from test_states where id = $1")
+            .bind(id)
+            .fetch_optional(executor)
+            .await
     }
 
-    fn bind_upsert_values<'a>(
-        state: &'a Self,
-        query: Query<'a, sqlx::Postgres, PgArguments>,
-    ) -> Query<'a, sqlx::Postgres, PgArguments> {
-        query.bind(state.id).bind(&state.value)
+    async fn upsert<'a, T>(id: Uuid, state: &'a Self, executor: T) -> Result<(), sqlx::Error>
+    where
+        T: PgExecutor<'a>,
+    {
+        sqlx::query(
+        "INSERT INTO test_states (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = $2"
+            )
+            .bind(id)
+            .bind(&state.value)
+            .execute(executor).await?;
+        Ok(())
+    }
+
+    async fn delete<'a, T>(id: Uuid, executor: T) -> Result<(), sqlx::Error>
+    where
+        T: PgExecutor<'a>,
+    {
+        sqlx::query("delete from test_states where id = $1")
+            .bind(id)
+            .execute(executor)
+            .await?;
+        Ok(())
     }
 }
 
