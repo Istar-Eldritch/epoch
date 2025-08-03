@@ -26,9 +26,9 @@ where
 {
     /// The type of the state of the saga. This acts as a state machine. It should be defined as an
     /// enum
-    type State: Into<u8> + From<u8> + Send + Sync + Default;
+    type State: Send + Sync + Default;
     /// The type of `StateStorage` used by this `Saga`.
-    type StateStore: StateStoreBackend<u8> + Send + Sync;
+    type StateStore: StateStoreBackend<Self::State> + Send + Sync;
     /// The type of errors that may occur when handling events in this `Saga`.
     type SagaError: std::error::Error + Send + Sync + 'static;
     /// The type of event used by this saga
@@ -55,7 +55,10 @@ where
         event: Event<ED>,
     ) -> Result<
         (),
-        HandleEventError<Self::SagaError, <Self::StateStore as StateStoreBackend<u8>>::Error>,
+        HandleEventError<
+            Self::SagaError,
+            <Self::StateStore as StateStoreBackend<Self::State>>::Error,
+        >,
     > {
         if let Ok(event) = event.to_subset_event::<Self::EventType>() {
             let id = self.get_id_from_event(&event);
@@ -64,7 +67,6 @@ where
                 .get_state(id)
                 .await
                 .map_err(HandleEventError::State)?
-                .map(|v| <Self::State as From<u8>>::from(v))
                 .unwrap_or_default();
 
             let state = self
@@ -74,7 +76,7 @@ where
 
             if let Some(state) = state {
                 storage
-                    .persist_state(id, state.into())
+                    .persist_state(id, state)
                     .await
                     .map_err(HandleEventError::State)?;
             } else {
