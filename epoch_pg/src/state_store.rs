@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use epoch_core::prelude::StateStoreBackend;
 use sqlx::PgExecutor;
-use sqlx::{FromRow, PgPool, postgres::PgRow};
+use sqlx::PgPool;
 use std::marker::PhantomData;
 use uuid::Uuid;
 
@@ -24,7 +24,7 @@ impl<T> PgStateStore<T> {
 
 /// Trait definnig the required behavior of a PG state;
 #[async_trait]
-pub trait PgState: Send + Sync + for<'r> FromRow<'r, PgRow> + Unpin {
+pub trait PgState: Send + Sync + Sized + Unpin {
     /// Retrieve the entity from the storage using its id
     async fn find_by_id<'a, T>(id: Uuid, executor: T) -> Result<Option<Self>, sqlx::Error>
     where
