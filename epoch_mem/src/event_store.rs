@@ -230,6 +230,7 @@ where
 {
     _phantom: PhantomData<D>,
     projections: Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>>,
+    tx: tokio::sync::mpsc::Sender<Event<D>>,
 }
 
 impl<D> InMemoryEventBus<D>
@@ -239,9 +240,29 @@ where
     /// Creates a new in-memory bus
     pub fn new() -> Self {
         log::debug!("Creating a new InMemoryEventBus");
+        let projections: Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>> =
+            Arc::new(Mutex::new(vec![]));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event<D>>(32);
+        let projections_recv = projections.clone();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                let projections = projections_recv.lock().await;
+                for projection in projections.iter() {
+                    let projection = projection.lock().await;
+                    projection
+                        .on_event(event.clone())
+                        .await
+                        .unwrap_or_else(|e| {
+                            log::error!("Error applying event: {:?}", e);
+                            //TODO: Retry mechanism and dead letter queue
+                        });
+                }
+            }
+        });
         Self {
             _phantom: PhantomData,
-            projections: Arc::new(Mutex::new(vec![])),
+            projections,
+            tx,
         }
     }
 }
@@ -257,13 +278,20 @@ where
 
 /// Errors for the InMemoryEventBus
 #[derive(Debug, thiserror::Error)]
-pub enum InMemoryEventBusError {}
+pub enum InMemoryEventBusError<D>
+where
+    D: EventData + std::fmt::Debug,
+{
+    /// The event could not be published
+    #[error("Error publishing event: {0}")]
+    PublishError(#[from] tokio::sync::mpsc::error::SendError<Event<D>>),
+}
 
 impl<D> EventBus for InMemoryEventBus<D>
 where
-    D: EventData + Send + Sync + 'static,
+    D: EventData + Send + Sync + std::fmt::Debug + 'static,
 {
-    type Error = InMemoryEventBusError;
+    type Error = InMemoryEventBusError<D>;
     type EventType = D;
     fn publish<'a>(
         &'a self,
@@ -271,17 +299,7 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
         Box::pin(async move {
             log::debug!("Publishing event with id: {}", event.id);
-            let projections = self.projections.lock().await;
-            for projection in projections.iter() {
-                let projection = projection.lock().await;
-                projection
-                    .on_event(event.clone())
-                    .await
-                    .unwrap_or_else(|e| {
-                        log::error!("Error applying event: {:?}", e);
-                        //TODO: Retry mechanism and dead letter queue
-                    });
-            }
+            self.tx.send(event).await?;
             Ok(())
         })
     }
@@ -347,6 +365,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use async_trait::async_trait;
     use epoch_core::event::EventData;
@@ -507,7 +527,7 @@ mod tests {
         let stream_id = Uuid::new_v4();
         let event = new_event(stream_id, 0, "test_publish");
         bus.publish(event.clone()).await.unwrap();
-
+        tokio::time::sleep(Duration::from_millis(30)).await;
         let events: TestState = storage.get_state(stream_id).await.unwrap().unwrap();
         assert_eq!(events.0.len(), 1);
         assert_eq!(events.0[0], event);
