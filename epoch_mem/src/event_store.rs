@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -238,11 +239,11 @@ where
     D: EventData + Send + Sync,
 {
     /// Creates a new in-memory bus
-    pub fn new() -> Self {
+    pub fn new(buf_size: usize) -> Self {
         log::debug!("Creating a new InMemoryEventBus");
         let projections: Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>> =
             Arc::new(Mutex::new(vec![]));
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event<D>>(32);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event<D>>(buf_size);
         let projections_recv = projections.clone();
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
@@ -285,6 +286,9 @@ where
     /// The event could not be published
     #[error("Error publishing event: {0}")]
     PublishError(#[from] tokio::sync::mpsc::error::SendError<Event<D>>),
+    /// The event could not be published
+    #[error("Timeout publishing event: {0}")]
+    PublishTimeoutError(#[from] tokio::sync::mpsc::error::SendTimeoutError<Event<D>>),
 }
 
 impl<D> EventBus for InMemoryEventBus<D>
@@ -299,7 +303,7 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
         Box::pin(async move {
             log::debug!("Publishing event with id: {}", event.id);
-            self.tx.send(event).await?;
+            self.tx.send_timeout(event, Duration::from_secs(1)).await?;
             Ok(())
         })
     }
@@ -442,7 +446,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_store_new() {
-        let bus = InMemoryEventBus::<MyEventData>::new();
+        let bus = InMemoryEventBus::<MyEventData>::new(16);
         let store = InMemoryEventStore::new(bus.clone());
         assert!(store.data.lock().await.events.is_empty());
         assert!(store.data.lock().await.stream_events.is_empty());
@@ -452,7 +456,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_store_store_event() {
-        let bus = InMemoryEventBus::<MyEventData>::new();
+        let bus = InMemoryEventBus::<MyEventData>::new(16);
         let store = InMemoryEventStore::new(bus);
         let stream_id = Uuid::new_v4();
 
@@ -470,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_store_store_event_version_mismatch() {
-        let bus = InMemoryEventBus::<MyEventData>::new();
+        let bus = InMemoryEventBus::<MyEventData>::new(16);
         let store = InMemoryEventStore::new(bus);
         let stream_id = Uuid::new_v4();
 
@@ -491,7 +495,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_store_read_events() {
-        let bus = InMemoryEventBus::<MyEventData>::new();
+        let bus = InMemoryEventBus::<MyEventData>::new(16);
         let store = InMemoryEventStore::new(bus);
         let stream_id = Uuid::new_v4();
 
@@ -513,13 +517,13 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_bus_new() {
-        let bus = InMemoryEventBus::<MyEventData>::new();
+        let bus = InMemoryEventBus::<MyEventData>::new(16);
         assert!(bus.projections.lock().await.is_empty());
     }
 
     #[tokio::test]
     async fn in_memory_event_bus_publish() {
-        let bus = InMemoryEventBus::<MyEventData>::new();
+        let bus = InMemoryEventBus::<MyEventData>::new(16);
         let projection = TestProjection::new();
         let storage = projection.get_state_store().clone();
         bus.subscribe(projection).await.unwrap();
@@ -535,7 +539,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_bus_subscribe() {
-        let bus = InMemoryEventBus::<MyEventData>::new();
+        let bus = InMemoryEventBus::<MyEventData>::new(16);
 
         let projection = TestProjection::new();
 
