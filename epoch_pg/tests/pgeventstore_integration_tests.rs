@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 
 async fn setup() -> (PgPool, PgEventStore<InMemoryEventBus<TestEventData>>) {
     let pool = common::get_pg_pool().await;
-    let event_bus = InMemoryEventBus::new(16);
+    let event_bus = InMemoryEventBus::new();
     let event_store = PgEventStore::new(pool.clone(), event_bus);
     event_store
         .initialize()

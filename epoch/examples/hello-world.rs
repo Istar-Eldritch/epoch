@@ -250,7 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let product_projection = ProductProjection::new();
     let _product_state = product_projection.0.clone();
 
-    let bus: InMemoryEventBus<ApplicationEvent> = InMemoryEventBus::new(16);
+    let bus: InMemoryEventBus<ApplicationEvent> = InMemoryEventBus::new();
     bus.subscribe(product_projection).await?;
 
     let event_store = InMemoryEventStore::new(bus);
