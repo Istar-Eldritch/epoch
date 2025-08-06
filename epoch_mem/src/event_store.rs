@@ -231,7 +231,7 @@ where
     D: EventData + Send + Sync + 'static,
 {
     _phantom: PhantomData<D>,
-    projections: Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>>,
+    projections: Arc<Mutex<Vec<Box<dyn EventObserver<D>>>>>,
     tx: tokio::sync::mpsc::Sender<Event<D>>,
 }
 
@@ -242,8 +242,7 @@ where
     /// Creates a new in-memory bus
     pub fn new(buf_size: usize) -> Self {
         log::debug!("Creating a new InMemoryEventBus");
-        let projections: Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>> =
-            Arc::new(Mutex::new(vec![]));
+        let projections: Arc<Mutex<Vec<Box<dyn EventObserver<D>>>>> = Arc::new(Mutex::new(vec![]));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event<D>>(buf_size);
         let projections_recv = projections.clone();
         tokio::spawn(async move {
@@ -251,7 +250,6 @@ where
                 let projections = projections_recv.lock().await;
                 for projection in projections.iter() {
                     log::debug!("Acquiring lock on projection: {:?}", projection);
-                    let projection = projection.lock().await;
                     projection
                         .on_event(event.clone())
                         .await
@@ -321,7 +319,7 @@ where
         let projectors = self.projections.clone();
         Box::pin(async move {
             let mut projectors = projectors.lock().await;
-            projectors.push(Arc::new(Mutex::new(projector)));
+            projectors.push(Box::new(projector));
             Ok(())
         })
     }
