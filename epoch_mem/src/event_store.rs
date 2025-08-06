@@ -4,8 +4,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use futures_core::Stream;
@@ -230,8 +229,7 @@ where
     D: EventData + Send + Sync + 'static,
 {
     _phantom: PhantomData<D>,
-    projections: Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>>,
-    tx: tokio::sync::mpsc::Sender<Event<D>>,
+    projections: Arc<RwLock<Vec<Box<dyn EventObserver<D>>>>>,
 }
 
 impl<D> InMemoryEventBus<D>
@@ -239,31 +237,13 @@ where
     D: EventData + Send + Sync,
 {
     /// Creates a new in-memory bus
-    pub fn new(buf_size: usize) -> Self {
+    pub fn new() -> Self {
         log::debug!("Creating a new InMemoryEventBus");
-        let projections: Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>> =
-            Arc::new(Mutex::new(vec![]));
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event<D>>(buf_size);
-        let projections_recv = projections.clone();
-        tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                let projections = projections_recv.lock().await;
-                for projection in projections.iter() {
-                    let projection = projection.lock().await;
-                    projection
-                        .on_event(event.clone())
-                        .await
-                        .unwrap_or_else(|e| {
-                            log::error!("Error applying event: {:?}", e);
-                            //TODO: Retry mechanism and dead letter queue
-                        });
-                }
-            }
-        });
+        let projections: Arc<RwLock<Vec<Box<dyn EventObserver<D>>>>> =
+            Arc::new(RwLock::new(vec![]));
         Self {
             _phantom: PhantomData,
             projections,
-            tx,
         }
     }
 }
@@ -303,7 +283,16 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
         Box::pin(async move {
             log::debug!("Publishing event with id: {}", event.id);
-            self.tx.send_timeout(event, Duration::from_secs(1)).await?;
+            let projections = self.projections.read().await;
+            for projection in projections.iter() {
+                projection
+                    .on_event(event.clone())
+                    .await
+                    .unwrap_or_else(|e| {
+                        log::error!("Error applying event: {:?}", e);
+                        //TODO: Retry mechanism and dead letter queue
+                    });
+            }
             Ok(())
         })
     }
@@ -318,8 +307,8 @@ where
         log::debug!("Subscribing projector to InMemoryEventBus");
         let projectors = self.projections.clone();
         Box::pin(async move {
-            let mut projectors = projectors.lock().await;
-            projectors.push(Arc::new(Mutex::new(projector)));
+            let mut projectors = projectors.write().await;
+            projectors.push(Box::new(projector));
             Ok(())
         })
     }
@@ -446,17 +435,17 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_store_new() {
-        let bus = InMemoryEventBus::<MyEventData>::new(16);
+        let bus = InMemoryEventBus::<MyEventData>::new();
         let store = InMemoryEventStore::new(bus.clone());
         assert!(store.data.lock().await.events.is_empty());
         assert!(store.data.lock().await.stream_events.is_empty());
         assert!(store.data.lock().await.stream_version.is_empty());
-        assert!(store.bus().projections.lock().await.is_empty());
+        assert!(store.bus().projections.read().await.is_empty());
     }
 
     #[tokio::test]
     async fn in_memory_event_store_store_event() {
-        let bus = InMemoryEventBus::<MyEventData>::new(16);
+        let bus = InMemoryEventBus::<MyEventData>::new();
         let store = InMemoryEventStore::new(bus);
         let stream_id = Uuid::new_v4();
 
@@ -474,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_store_store_event_version_mismatch() {
-        let bus = InMemoryEventBus::<MyEventData>::new(16);
+        let bus = InMemoryEventBus::<MyEventData>::new();
         let store = InMemoryEventStore::new(bus);
         let stream_id = Uuid::new_v4();
 
@@ -495,7 +484,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_store_read_events() {
-        let bus = InMemoryEventBus::<MyEventData>::new(16);
+        let bus = InMemoryEventBus::<MyEventData>::new();
         let store = InMemoryEventStore::new(bus);
         let stream_id = Uuid::new_v4();
 
@@ -517,13 +506,13 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_bus_new() {
-        let bus = InMemoryEventBus::<MyEventData>::new(16);
-        assert!(bus.projections.lock().await.is_empty());
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        assert!(bus.projections.read().await.is_empty());
     }
 
     #[tokio::test]
     async fn in_memory_event_bus_publish() {
-        let bus = InMemoryEventBus::<MyEventData>::new(16);
+        let bus = InMemoryEventBus::<MyEventData>::new();
         let projection = TestProjection::new();
         let storage = projection.get_state_store().clone();
         bus.subscribe(projection).await.unwrap();
@@ -539,13 +528,13 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_event_bus_subscribe() {
-        let bus = InMemoryEventBus::<MyEventData>::new(16);
+        let bus = InMemoryEventBus::<MyEventData>::new();
 
         let projection = TestProjection::new();
 
         bus.subscribe(projection).await.unwrap();
 
-        let projections = bus.projections.lock().await;
+        let projections = bus.projections.read().await;
         assert_eq!(projections.len(), 1);
     }
 }
