@@ -1,6 +1,8 @@
 //! This module defines traits for `Projection`
 //! A `Projection` is a read-model built from a stream of events.
 
+use std::fmt::Debug;
+
 use crate::{
     event::{Event, EventData},
     prelude::EventObserver,
@@ -117,8 +119,8 @@ where
 #[async_trait]
 impl<ED, T> EventObserver<ED> for T
 where
-    ED: EventData + Send + Sync + 'static,
-    T: Projection<ED> + Send + Sync,
+    ED: EventData + Send + Sync + Debug + 'static,
+    T: Projection<ED> + Send + Sync + Debug,
 {
     async fn on_event(
         &self,

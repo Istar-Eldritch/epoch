@@ -1,5 +1,7 @@
 //! Saga definition
 
+use std::fmt::Debug;
+
 use crate::event::{Event, EventData};
 use crate::prelude::{EventObserver, StateStoreBackend};
 use async_trait::async_trait;
@@ -21,8 +23,8 @@ pub enum HandleEventError<S, E> {
 #[async_trait]
 pub trait Saga<ED>: EventObserver<ED>
 where
-    ED: EventData + Send + Sync + 'static,
-    <Self::EventType as TryFrom<ED>>::Error: Send + Sync,
+    ED: EventData + Send + Sync + Debug + 'static,
+    <Self::EventType as TryFrom<ED>>::Error: Send + Sync + Debug,
 {
     /// The type of the state of the saga. This acts as a state machine. It should be defined as an
     /// enum

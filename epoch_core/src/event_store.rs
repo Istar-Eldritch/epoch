@@ -6,6 +6,7 @@
 use crate::event::{Event, EventData};
 use async_trait::async_trait;
 use futures_core::Stream;
+use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use uuid::Uuid;
@@ -40,7 +41,7 @@ pub trait EventStoreBackend: Send + Sync {
 /// A trait that defines the behavior of an event bus.
 pub trait EventBus {
     /// The type of event that can be published to this event bus.
-    type EventType: EventData + Send + Sync + 'static;
+    type EventType: EventData + Send + Sync + Debug + 'static;
     /// The errors when an event bus operation fails
     type Error: std::error::Error;
     /// Publishes events to the event bus.
@@ -55,14 +56,14 @@ pub trait EventBus {
         projector: T,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>>
     where
-        T: EventObserver<Self::EventType> + Send + Sync + 'static;
+        T: EventObserver<Self::EventType> + Debug + Send + Sync + 'static;
 }
 
 ///  Traits to defined observers to the event bus
 #[async_trait]
-pub trait EventObserver<ED>: Send + Sync
+pub trait EventObserver<ED>: Send + Sync + Debug
 where
-    ED: EventData + Send + Sync,
+    ED: EventData + Send + Sync + Debug,
 {
     /// Reacts to events published in an event bus
     async fn on_event(

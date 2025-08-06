@@ -8,6 +8,7 @@ use log::{error, info};
 use serde::de::DeserializeOwned;
 use sqlx::Error as SqlxError;
 use sqlx::postgres::{PgListener, PgPool};
+use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -37,7 +38,7 @@ where
 
 impl<D> PgEventBus<D>
 where
-    D: EventData + Send + Sync + DeserializeOwned + 'static,
+    D: EventData + Send + Sync + DeserializeOwned + Debug + 'static,
 {
     /// Creates a new `PgEventBus` instance.
     pub fn new(pool: PgPool, channel_name: impl Into<String>) -> Self {
@@ -236,7 +237,7 @@ where
 
 impl<D> EventBus for PgEventBus<D>
 where
-    D: EventData + Send + Sync + DeserializeOwned + 'static,
+    D: EventData + Send + Sync + DeserializeOwned + Debug + 'static,
 {
     type EventType = D;
     type Error = PgEventBusError;

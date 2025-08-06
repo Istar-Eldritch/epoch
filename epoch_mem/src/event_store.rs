@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -236,7 +237,7 @@ where
 
 impl<D> InMemoryEventBus<D>
 where
-    D: EventData + Send + Sync,
+    D: EventData + Send + Sync + Debug,
 {
     /// Creates a new in-memory bus
     pub fn new(buf_size: usize) -> Self {
@@ -249,6 +250,7 @@ where
             while let Some(event) = rx.recv().await {
                 let projections = projections_recv.lock().await;
                 for projection in projections.iter() {
+                    log::debug!("Acquiring lock on projection: {:?}", projection);
                     let projection = projection.lock().await;
                     projection
                         .on_event(event.clone())
@@ -401,6 +403,7 @@ mod tests {
             .unwrap()
     }
 
+    #[derive(Debug)]
     struct TestProjection(InMemoryStateStore<TestState>);
 
     impl TestProjection {

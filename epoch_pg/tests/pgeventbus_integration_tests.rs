@@ -36,6 +36,7 @@ impl ProjectionState for TestState {
     }
 }
 
+#[derive(Debug)]
 struct TestProjection(InMemoryStateStore<TestState>);
 
 impl TestProjection {
