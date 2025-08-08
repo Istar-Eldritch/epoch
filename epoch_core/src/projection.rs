@@ -1,12 +1,15 @@
 //! This module defines traits for `Projection`
 //! A `Projection` is a read-model built from a stream of events.
 
+use std::pin::Pin;
+
 use crate::{
     event::{Event, EventData},
-    prelude::EventObserver,
+    prelude::{EventObserver, EventStream},
     state_store::StateStoreBackend,
 };
 use async_trait::async_trait;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 /// `ProjectionState` represents the current state of a projection.
@@ -26,6 +29,20 @@ pub enum ApplyAndStoreError<E, S> {
     /// Represents an error that occurred while persisting the projection's state to storage.
     #[error("Error persisting state: {0}")]
     State(S),
+}
+
+/// The Errors that can arise during a rehydration
+#[derive(Debug, thiserror::Error)]
+pub enum ReHydrateError<E, S, ES> {
+    /// Event applicatione erors
+    #[error("Event application error: {0}")]
+    Application(E),
+    /// Event transformation errors
+    #[error("Error transforming event: {0}")]
+    Subset(S),
+    /// Event stream reading errors
+    #[error("Error reading from event stream: {0}")]
+    EventStream(ES),
 }
 
 /// `Projection` is a trait that defines the interface for a read-model that can be built
@@ -58,15 +75,26 @@ where
     fn get_state_store(&self) -> Self::StateStore;
 
     /// Reconstructs the projection's state from an event stream.
-    fn re_hydrate<'a>(
+    async fn re_hydrate<'a, E>(
         &self,
         mut state: Option<Self::State>,
-        event_stream: impl Iterator<Item = &'a Event<ED>> + Send + Sync,
-    ) -> Result<Option<Self::State>, Self::ProjectionError> {
-        for event in event_stream {
-            if let Ok(event) = event.to_subset_event::<Self::EventType>() {
-                state = self.apply(state, &event)?;
-            }
+        mut event_stream: Pin<Box<dyn EventStream<ED, E> + Send + 'a>>,
+    ) -> Result<
+        Option<Self::State>,
+        ReHydrateError<
+            <Self as Projection<ED>>::ProjectionError,
+            <<Self as Projection<ED>>::EventType as TryFrom<ED>>::Error,
+            E,
+        >,
+    > {
+        while let Some(event) = event_stream.next().await {
+            let event = event
+                .map_err(|e| ReHydrateError::EventStream(e))?
+                .to_subset_event()
+                .map_err(|e| ReHydrateError::Subset(e))?;
+            state = self
+                .apply(state, &event)
+                .map_err(|e| ReHydrateError::Application(e))?;
         }
 
         Ok(state)
@@ -95,11 +123,13 @@ where
                 .apply(state, &event)
                 .map_err(ApplyAndStoreError::Event)?
             {
+                log::debug!("Persisting state for projection: {:?}", id);
                 storage
                     .persist_state(id, new_state)
                     .await
                     .map_err(ApplyAndStoreError::State)?;
             } else {
+                log::debug!("Deleting state for projection: {:?}", id);
                 storage
                     .delete_state(id)
                     .await

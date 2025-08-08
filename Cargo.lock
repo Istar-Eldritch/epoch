@@ -392,11 +392,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "env_logger",
  "epoch_core",
  "epoch_derive",
  "epoch_mem",
  "epoch_pg",
  "futures-core",
+ "log",
  "serde",
  "thiserror 1.0.69",
  "tokio",

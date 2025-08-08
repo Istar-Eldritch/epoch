@@ -78,24 +78,20 @@ pub struct PgDBEvent {
 }
 
 /// A postgres based event stream.
-pub struct PgEventStream<'a, D>
+pub struct PgEventStream<'a, D, E>
 where
     D: EventData + Send + Sync + 'a,
+    E: std::error::Error + Send + Sync,
 {
-    inner: Pin<
-        Box<
-            dyn Stream<Item = Result<Event<D>, Box<dyn std::error::Error + Send + Sync>>>
-                + Send
-                + 'a,
-        >,
-    >,
+    inner: Pin<Box<dyn Stream<Item = Result<Event<D>, E>> + Send + 'a>>,
 }
 
-impl<'a, D> Stream for PgEventStream<'a, D>
+impl<'a, D, E> Stream for PgEventStream<'a, D, E>
 where
     D: EventData + Send + Sync + 'a,
+    E: std::error::Error + Send + Sync,
 {
-    type Item = Result<Event<D>, Box<dyn std::error::Error + Send + Sync>>;
+    type Item = Result<Event<D>, E>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -105,7 +101,12 @@ where
     }
 }
 
-impl<'a, D> EventStream<D> for PgEventStream<'a, D> where D: EventData + Send + Sync + 'a {}
+impl<'a, D, E> EventStream<D, E> for PgEventStream<'a, D, E>
+where
+    D: EventData + Send + Sync + 'a,
+    E: std::error::Error + Send + Sync,
+{
+}
 
 /// Errors returned by the PgEventStore
 #[derive(Debug, thiserror::Error)]
@@ -140,7 +141,17 @@ where
     async fn read_events(
         &self,
         stream_id: Uuid,
-    ) -> Result<Pin<Box<dyn EventStream<Self::EventType> + Send + 'life0>>, Self::Error> {
+    ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
+    {
+        self.read_events_since(stream_id, 0).await
+    }
+
+    async fn read_events_since(
+        &self,
+        stream_id: Uuid,
+        version: u64,
+    ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
+    {
         let stream = try_stream! {
             let mut inner_stream = sqlx::query_as::<_, PgDBEvent>(
                 r#"
@@ -155,11 +166,12 @@ where
                         purger_id,
                         purged_at
                     FROM events
-                    WHERE stream_id = $1
+                    WHERE stream_id = $1 AND stream_version >= $2
                     ORDER BY stream_version ASC
                     "#,
             )
             .bind(stream_id)
+            .bind(version as i64)
             .fetch(&self.postgres);
 
             while let Some(row) = inner_stream.next().await {
@@ -184,10 +196,7 @@ where
             }
         };
 
-        // let stream =
-        //     stream.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
-
-        let event_stream: Pin<Box<dyn EventStream<Self::EventType> + Send + 'life0>> =
+        let event_stream: Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>> =
             Box::pin(PgEventStream {
                 inner: Box::pin(stream),
             });

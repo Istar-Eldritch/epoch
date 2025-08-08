@@ -2,7 +2,9 @@
 
 use crate::event::{Event, EventData};
 use crate::event_store::EventStoreBackend;
-use crate::prelude::{Projection, ProjectionState, StateStoreBackend};
+use crate::prelude::{
+    Projection, ProjectionState, ReHydrateError, SliceEventStream, StateStoreBackend,
+};
 use async_trait::async_trait;
 use log::debug;
 use uuid::Uuid;
@@ -23,9 +25,12 @@ pub struct Command<D, C> {
 /// `AggregateState` represents the current state of an aggregate.
 /// It encapsulates the current data derived from a sequence of events.
 pub trait AggregateState: ProjectionState {
-    /// Returns the current version of the projection state. The version typically increments with each applied event and is used for
+    /// Returns the current version of the projection state. The version is incremented by the aggregate with each applied event and is used for
     /// optimistic concurrency control to prevent conflicting updates.
     fn get_version(&self) -> u64;
+    /// Sets the version of the projection state. The version is incremented by the aggregate with each applied event and is used for
+    /// optimistic concurrency control to prevent conflicting updates.
+    fn set_version(&mut self, version: u64);
 }
 
 impl<D, C> Command<D, C>
@@ -182,10 +187,14 @@ where
         &self,
         command: Command<Self::CommandData, Self::CommandCredentials>,
     ) -> Result<
-        (),
+        Option<<Self as Projection<ED>>::State>,
         HandleCommandError<
             Self::AggregateError,
-            Self::ProjectionError,
+            ReHydrateError<
+                <Self as Projection<ED>>::ProjectionError,
+                <<Self as Projection<ED>>::EventType as TryFrom<ED>>::Error,
+                <<Self as Aggregate<ED>>::EventStore as EventStoreBackend>::Error,
+            >,
             <Self::StateStore as StateStoreBackend<Self::State>>::Error,
             <Self::EventStore as EventStoreBackend>::Error,
         >,
@@ -203,29 +212,70 @@ where
                 .await
                 .map_err(HandleCommandError::State)?;
 
+            let state_version = state.as_ref().map(|s| s.get_version()).unwrap_or(0);
             if let Some(expected_version) = command.aggregate_version {
-                if let Some(ref state) = state {
-                    if state.get_version() != expected_version {
-                        debug!(
-                            "Version mismatch for update command. Expected: {}, Found: {}",
-                            expected_version,
-                            state.get_version()
-                        );
-                        return Err(HandleCommandError::VersionMismatch {
-                            expected: expected_version,
-                            found: state.get_version(),
-                        });
-                    }
+                debug!("Checking expected version");
+                if state_version != expected_version {
+                    debug!(
+                        "Version mismatch for update command. Expected: {}, Found: {}",
+                        expected_version, state_version
+                    );
+                    return Err(HandleCommandError::VersionMismatch {
+                        expected: expected_version,
+                        found: state_version,
+                    });
                 }
             }
 
-            let events = self
+            let mut new_state_version = state_version + 1;
+            if let Some(ref state) = state {
+                let event_store = self.get_event_store();
+                let stream = event_store
+                    .read_events_since(state_id, new_state_version)
+                    .await
+                    .map_err(HandleCommandError::Event)?;
+                self.re_hydrate::<<Self::EventStore as EventStoreBackend>::Error>(
+                    Some(state.clone()),
+                    stream,
+                )
+                .await
+                .map_err(|e| HandleCommandError::Hydration(e))?;
+            }
+
+            let events: Vec<Event<ED>> = self
                 .handle_command(&state, cmd)
                 .await
-                .map_err(|e| HandleCommandError::Command(e))?;
+                .map_err(|e| HandleCommandError::Command(e))?
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut e)| {
+                    e.stream_version = new_state_version + i as u64;
+                    new_state_version = e.stream_version;
+                    e
+                })
+                .collect();
+
+            let event_stream = Box::pin(SliceEventStream::from(events.as_slice()));
             let state = self
-                .re_hydrate(state, events.iter())
-                .map_err(HandleCommandError::Hydration)?;
+                .re_hydrate(state, event_stream)
+                .await
+                .map_err(HandleCommandError::Hydration)?
+                .map(|mut s| {
+                    s.set_version(new_state_version);
+                    s
+                });
+
+            for event in events.into_iter() {
+                debug!(
+                    "Storing event: {:?} - v{}",
+                    std::any::type_name::<ED>(),
+                    event.stream_version
+                );
+                self.get_event_store()
+                    .store_event(event)
+                    .await
+                    .map_err(HandleCommandError::Event)?;
+            }
 
             if let Some(state) = state {
                 debug!(
@@ -233,26 +283,22 @@ where
                     state.get_id()
                 );
                 state_store
-                    .persist_state(state.get_id(), state)
+                    .persist_state(state.get_id(), state.clone())
                     .await
                     .map_err(HandleCommandError::State)?;
+                Ok(Some(state))
             } else {
                 debug!("Deleting state for command. State ID: {:?}", state_id);
                 state_store
                     .delete_state(state_id)
                     .await
                     .map_err(HandleCommandError::State)?;
+                Ok(None)
             }
-            for event in events.into_iter() {
-                debug!("Storing event: {:?}", std::any::type_name::<ED>());
-                self.get_event_store()
-                    .store_event(event)
-                    .await
-                    .map_err(HandleCommandError::Event)?;
-            }
+        } else {
+            debug!("Command handling complete.");
+            Ok(None)
         }
-        debug!("Command handling complete.");
-        Ok(())
     }
 
     /// Extracts and returns the unique identifier (UUID) of the aggregate instance

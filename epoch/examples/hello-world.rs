@@ -46,6 +46,9 @@ impl AggregateState for User {
     fn get_version(&self) -> u64 {
         self.version
     }
+    fn set_version(&mut self, version: u64) {
+        self.version = version;
+    }
 }
 
 pub struct UserAggregate {
@@ -90,7 +93,6 @@ impl Projection<ApplicationEvent> for UserAggregate {
             UserEvent::UserNameUpdated { name } => {
                 if let Some(mut state) = state {
                     state.name = name;
-                    state.version += 1;
                     Ok(Some(state))
                 } else {
                     Err(UserProjectionError::NoState(event.stream_id))
@@ -135,16 +137,14 @@ impl Aggregate<ApplicationEvent> for UserAggregate {
                 let event = ApplicationEvent::UserCreated { name: name.clone() }
                     .into_builder()
                     .stream_id(command.aggregate_id)
-                    .stream_version(0)
                     .build()?;
                 Ok(vec![event])
             }
             UserCommand::UpdateUserName { name } => {
-                if let Some(state) = state {
+                if let Some(_state) = state {
                     let event = ApplicationEvent::UserNameUpdated { name }
                         .into_builder()
                         .stream_id(command.aggregate_id)
-                        .stream_version(state.version + 1)
                         .build()?;
                     Ok(vec![event])
                 } else {
@@ -156,7 +156,6 @@ impl Aggregate<ApplicationEvent> for UserAggregate {
                     let event = ApplicationEvent::UserDeleted
                         .into_builder()
                         .stream_id(state.id)
-                        .stream_version(state.version + 1)
                         .build()?;
                     Ok(vec![event])
                 } else {
@@ -249,6 +248,7 @@ impl Projection<ApplicationEvent> for ProductProjection {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let product_projection = ProductProjection::new();
     let _product_state = product_projection.0.clone();
+    env_logger::init();
 
     let bus: InMemoryEventBus<ApplicationEvent> = InMemoryEventBus::new();
     bus.subscribe(product_projection).await?;

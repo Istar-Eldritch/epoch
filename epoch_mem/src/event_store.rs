@@ -71,11 +71,27 @@ where
     async fn read_events(
         &self,
         stream_id: Uuid,
-    ) -> Result<Pin<Box<dyn EventStream<Self::EventType> + Send + 'life0>>, Self::Error> {
-        log::debug!("Reading events for stream_id: {}", stream_id);
+    ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
+    {
+        self.read_events_since(stream_id, 1).await
+    }
+
+    /// Fetches a stream from the storage backend.
+    async fn read_events_since(
+        &self,
+        stream_id: Uuid,
+        version: u64,
+    ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
+    {
+        log::debug!(
+            "Reading events for stream_id: {} since version: {}",
+            stream_id,
+            version
+        );
         let data = self.data.clone();
-        let stream: Pin<Box<dyn EventStream<Self::EventType> + Send>> =
-            Box::pin(InMemoryEventStoreStream::<B>::new(data, stream_id));
+        let stream: Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send>> = Box::pin(
+            InMemoryEventStoreStream::<B, Self::Error>::new(data, stream_id, version - 1),
+        );
         Ok(stream)
     }
 
@@ -85,8 +101,14 @@ where
         let mut data = data.lock().await;
         let stream_id = event.stream_id;
 
-        let version: u64 = *data.stream_version.get(&stream_id).unwrap_or(&0);
+        let version: u64 = *data.stream_version.get(&stream_id).unwrap_or(&1);
 
+        log::debug!(
+            "store_event: stream_id: {}, event.stream_version: {}, current_store_version: {}",
+            stream_id,
+            event.stream_version,
+            version
+        );
         if event.stream_version != version {
             log::debug!(
                 "Event version mismatch for stream_id: {}. Expected: {}, Got: {}",
@@ -128,41 +150,45 @@ where
 }
 
 /// An in-memory event store stream.
-pub struct InMemoryEventStoreStream<B>
+pub struct InMemoryEventStoreStream<B, E>
 where
     B: EventBus + Clone,
 {
     id: Uuid,
     data: Arc<Mutex<EventStoreData<B::EventType>>>,
     current_index: usize,
-    _phantom: PhantomData<B>,
+    _phantom: PhantomData<(B, E)>,
 }
 
-impl<B> InMemoryEventStoreStream<B>
+impl<B, E> InMemoryEventStoreStream<B, E>
 where
     B: EventBus + Clone,
+    E: std::error::Error + Send + Sync,
 {
-    fn new(data: Arc<Mutex<EventStoreData<B::EventType>>>, id: Uuid) -> Self {
+    fn new(data: Arc<Mutex<EventStoreData<B::EventType>>>, id: Uuid, start_version: u64) -> Self {
         Self {
             data,
             id,
-            current_index: 0,
+            current_index: start_version as usize,
             _phantom: PhantomData,
         }
     }
 }
 
-impl<B> EventStream<B::EventType> for InMemoryEventStoreStream<B> where
-    B: EventBus + Clone + Send + Sync
+impl<B, E> EventStream<B::EventType, E> for InMemoryEventStoreStream<B, E>
+where
+    B: EventBus + Clone + Send + Sync,
+    E: std::error::Error + Send + Sync,
 {
 }
 
-impl<B> Stream for InMemoryEventStoreStream<B>
+impl<B, E> Stream for InMemoryEventStoreStream<B, E>
 where
     B: EventBus + Clone + Send + Sync,
     B::EventType: Send + Sync,
+    E: std::error::Error + Send + Sync,
 {
-    type Item = Result<Event<B::EventType>, Box<dyn std::error::Error + Send + Sync>>;
+    type Item = Result<Event<B::EventType>, E>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // We need to use unsafe to get a mutable reference to the fields of the `!Unpin` struct.
@@ -186,9 +212,10 @@ where
         if let Some(event_ids) = data.stream_events.get(&this.id) {
             log::debug!(
                 "InMemoryEventStoreStream: poll_next - Found {} events for stream_id: {}",
-                event_ids.len(),
+                event_ids.len() - this.current_index,
                 this.id
             );
+
             while this.current_index < event_ids.len() {
                 let event_id = event_ids[this.current_index];
                 this.current_index += 1;
@@ -449,16 +476,16 @@ mod tests {
         let store = InMemoryEventStore::new(bus);
         let stream_id = Uuid::new_v4();
 
-        let event1 = new_event(stream_id, 0, "test1");
+        let event1 = new_event(stream_id, 1, "test1");
         store.store_event(event1.clone()).await.unwrap();
 
-        let event2 = new_event(stream_id, 1, "test2");
+        let event2 = new_event(stream_id, 2, "test2");
         store.store_event(event2.clone()).await.unwrap();
 
         let data = store.data.lock().await;
         assert_eq!(data.events.len(), 2);
         assert_eq!(data.stream_events.get(&stream_id).unwrap().len(), 2);
-        assert_eq!(*data.stream_version.get(&stream_id).unwrap(), 2);
+        assert_eq!(*data.stream_version.get(&stream_id).unwrap(), 3);
     }
 
     #[tokio::test]
@@ -467,16 +494,16 @@ mod tests {
         let store = InMemoryEventStore::new(bus);
         let stream_id = Uuid::new_v4();
 
-        let event1 = new_event(stream_id, 0, "test1");
+        let event1 = new_event(stream_id, 1, "test1");
         store.store_event(event1.clone()).await.unwrap();
 
-        let event_mismatch = new_event(stream_id, 0, "test_mismatch");
+        let event_mismatch = new_event(stream_id, 1, "test_mismatch");
         let result = store.store_event(event_mismatch).await;
         assert!(result.is_err());
         match result.unwrap_err() {
             InMemoryEventStoreBackendError::VersionMismatch(event_version, stream_version) => {
-                assert_eq!(event_version, 0);
-                assert_eq!(stream_version, 1);
+                assert_eq!(event_version, 1);
+                assert_eq!(stream_version, 2);
             }
             _ => panic!("Unexpected error type"),
         }
@@ -488,9 +515,9 @@ mod tests {
         let store = InMemoryEventStore::new(bus);
         let stream_id = Uuid::new_v4();
 
-        let event1 = new_event(stream_id, 0, "test1");
-        let event2 = new_event(stream_id, 1, "test2");
-        let event3 = new_event(stream_id, 2, "test3");
+        let event1 = new_event(stream_id, 1, "test1");
+        let event2 = new_event(stream_id, 2, "test2");
+        let event3 = new_event(stream_id, 3, "test3");
 
         store.store_event(event1.clone()).await.unwrap();
         store.store_event(event2.clone()).await.unwrap();
@@ -502,6 +529,34 @@ mod tests {
         assert_eq!(stream.next().await.unwrap().unwrap(), event2);
         assert_eq!(stream.next().await.unwrap().unwrap(), event3);
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_store_read_events_since() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let store = InMemoryEventStore::new(bus);
+        let stream_id = Uuid::new_v4();
+
+        let event1 = new_event(stream_id, 1, "test1");
+        let event2 = new_event(stream_id, 2, "test2");
+        let event3 = new_event(stream_id, 3, "test3");
+
+        store.store_event(event1.clone()).await.unwrap();
+        store.store_event(event2.clone()).await.unwrap();
+        store.store_event(event3.clone()).await.unwrap();
+
+        let mut stream = store.read_events_since(stream_id, 2).await.unwrap(); // Starts from index 1 (event2)
+
+        assert_eq!(stream.next().await.unwrap().unwrap(), event2);
+        assert_eq!(stream.next().await.unwrap().unwrap(), event3);
+        assert!(stream.next().await.is_none());
+
+        let mut stream_from_version_3 = store.read_events_since(stream_id, 3).await.unwrap(); // Starts from index 2 (event3)
+        assert_eq!(stream_from_version_3.next().await.unwrap().unwrap(), event3);
+        assert!(stream_from_version_3.next().await.is_none());
+
+        let mut stream_from_version_4 = store.read_events_since(stream_id, 4).await.unwrap(); // Starts from index 3 (non-existent)
+        assert!(stream_from_version_4.next().await.is_none());
     }
 
     #[tokio::test]
@@ -518,7 +573,7 @@ mod tests {
         bus.subscribe(projection).await.unwrap();
 
         let stream_id = Uuid::new_v4();
-        let event = new_event(stream_id, 0, "test_publish");
+        let event = new_event(stream_id, 1, "test_publish");
         bus.publish(event.clone()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
         let events: TestState = storage.get_state(stream_id).await.unwrap().unwrap();

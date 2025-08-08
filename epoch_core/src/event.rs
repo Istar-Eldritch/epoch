@@ -256,9 +256,7 @@ where
         Ok(Event {
             id: self.id.unwrap_or_else(|| Uuid::new_v4()),
             stream_id: self.stream_id.ok_or(EventBuilderError::StreamIdMissing)?,
-            stream_version: self
-                .stream_version
-                .ok_or(EventBuilderError::StreamVersionMissing)?,
+            stream_version: self.stream_version.unwrap_or(0),
             event_type: self.event_type.ok_or(EventBuilderError::EventTypeMissing)?,
             actor_id: self.actor_id,
             purger_id: self.purger_id,
