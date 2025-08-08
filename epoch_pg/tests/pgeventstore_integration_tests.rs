@@ -104,3 +104,68 @@ async fn test_read_events() {
 
     teardown(&pool).await;
 }
+
+#[tokio::test]
+async fn test_read_events_since() {
+    let (pool, event_store) = setup().await;
+
+    let stream_id = Uuid::new_v4();
+
+    let event1 = Event::<TestEventData>::builder()
+        .id(Uuid::new_v4())
+        .stream_id(stream_id)
+        .stream_version(1)
+        .event_type("TestEvent1".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "test1".to_string(),
+        }))
+        .build()
+        .unwrap();
+
+    let event2 = Event::<TestEventData>::builder()
+        .id(Uuid::new_v4())
+        .stream_id(stream_id)
+        .stream_version(2)
+        .event_type("TestEvent2".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "test2".to_string(),
+        }))
+        .build()
+        .unwrap();
+
+    let event3 = Event::<TestEventData>::builder()
+        .id(Uuid::new_v4())
+        .stream_id(stream_id)
+        .stream_version(3)
+        .event_type("TestEvent3".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "test3".to_string(),
+        }))
+        .build()
+        .unwrap();
+
+    event_store.store_event(event1.clone()).await.unwrap();
+    event_store.store_event(event2.clone()).await.unwrap();
+    event_store.store_event(event3.clone()).await.unwrap();
+
+    // Read events starting from version 2
+    let mut events = event_store.read_events_since(stream_id, 2).await.unwrap();
+
+    let read_event2 = events.next().await.unwrap().unwrap();
+    assert_eq!(read_event2.id, event2.id);
+    assert_eq!(read_event2.stream_id, event2.stream_id);
+    assert_eq!(read_event2.stream_version, event2.stream_version);
+    assert_eq!(read_event2.event_type, event2.event_type);
+    assert_eq!(read_event2.data, event2.data);
+
+    let read_event3 = events.next().await.unwrap().unwrap();
+    assert_eq!(read_event3.id, event3.id);
+    assert_eq!(read_event3.stream_id, event3.stream_id);
+    assert_eq!(read_event3.stream_version, event3.stream_version);
+    assert_eq!(read_event3.event_type, event3.event_type);
+    assert_eq!(read_event3.data, event3.data);
+
+    assert!(events.next().await.is_none());
+
+    teardown(&pool).await;
+}
