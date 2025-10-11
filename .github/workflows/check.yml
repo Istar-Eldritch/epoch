@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Start containers for epoch_pg
-        run: docker compose -f epoch_pg/docker-compose.yml up -d
+        run: docker compose -f epoch/epoch_pg/docker-compose.yml up -d
       - name: Wait for Postgres to be ready
         run: |
           for i in {1..10}; do
@@ -51,5 +51,5 @@ jobs:
       - name: Test epoch_pg
         run: cargo test --package epoch_pg -- --test-threads=1
       - name: Stop containers for epoch_pg
-        run: docker compose -f epoch_pg/docker-compose.yml down    
+        run: docker compose -f epoch/epoch_pg/docker-compose.yml down    
 
