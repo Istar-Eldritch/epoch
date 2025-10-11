@@ -13,6 +13,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
 
+type PgEventBusProjections<D> = Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D> + Send + Sync>>>>>;
+
 /// Errors that can occur when using `PgEventBus`.
 #[derive(Debug, thiserror::Error)]
 pub enum PgEventBusError {
@@ -32,7 +34,7 @@ where
 {
     pool: PgPool,
     channel_name: String,
-    projections: Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>>,
+    projections: PgEventBusProjections<D>,
 }
 
 impl<D> PgEventBus<D>
