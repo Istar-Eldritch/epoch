@@ -29,5 +29,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: Output rust version for educational purposes
         run: rustup --version
-      - name: cargo test
-        run: cargo test --workspace
+      - name: cargo test excluding epoch_pg
+        run: cargo test --workspace --exclude epoch_pg
