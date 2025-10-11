@@ -31,3 +31,25 @@ jobs:
         run: rustup --version
       - name: cargo test excluding epoch_pg
         run: cargo test --workspace --exclude epoch_pg
+  test_epoch_pg:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start containers for epoch_pg
+        run: docker compose -f epoch_pg/docker-compose.yml up -d
+      - name: Wait for Postgres to be ready
+        run: |
+          for i in {1..10}; do
+            if pg_isready -h localhost -p 5432; then
+              echo "Postgres is ready"
+              exit 0
+            fi
+            echo "Waiting for Postgres..."
+            sleep 3
+          done
+          echo "Postgres did not become ready in time"
+          exit 1
+      - name: Test epoch_pg
+        run: cargo test --package epoch_pg -- --test-threads=1
+      - name: Stop containers for epoch_pg
+        run: docker compose -f epoch_pg/docker-compose.yml down    
+
