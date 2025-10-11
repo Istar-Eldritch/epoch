@@ -179,7 +179,7 @@ where
 
                 let data: Option<B::EventType> = entry
                     .data
-                    .map(|d| serde_json::from_value(d))
+                    .map(serde_json::from_value)
                     .transpose()
                     .map_err(PgEventStoreError::DeserializeEventError::<B::Error>)?;
 
@@ -219,7 +219,7 @@ where
                 event
                     .data
                     .as_ref()
-                    .map(|d| serde_json::to_value(d))
+                    .map(serde_json::to_value)
                     .transpose()?,
             )
             .bind(event.created_at)
@@ -232,7 +232,7 @@ where
         self.bus
             .publish(event.clone())
             .await
-            .map_err(|e| PgEventStoreError::BUSPublishError(e))?;
+            .map_err(PgEventStoreError::BUSPublishError)?;
 
         Ok(())
     }

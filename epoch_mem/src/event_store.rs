@@ -52,7 +52,7 @@ impl<B: EventBus + Clone> InMemoryEventStore<B> {
 /// Errors returned by the InMemoryEventBus
 #[derive(Debug, thiserror::Error)]
 pub enum InMemoryEventStoreBackendError {
-    ///
+    /// Event version doesn't match stream version
     #[error("Event version ({0}) doesn't match stream version ({1})")]
     VersionMismatch(u64, u64),
     /// Error publishing event to bus
@@ -259,6 +259,15 @@ where
     projections: Arc<RwLock<Vec<Box<dyn EventObserver<D>>>>>,
 }
 
+impl<D> Default for InMemoryEventBus<D>
+where
+    D: EventData + Send + Sync,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<D> InMemoryEventBus<D>
 where
     D: EventData + Send + Sync,
@@ -347,6 +356,15 @@ pub struct InMemoryStateStore<T>(std::sync::Arc<Mutex<HashMap<Uuid, T>>>)
 where
     T: Clone + std::fmt::Debug;
 
+impl<T> Default for InMemoryStateStore<T>
+where
+    T: Clone + std::fmt::Debug,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> InMemoryStateStore<T>
 where
     T: Clone + std::fmt::Debug,
@@ -369,7 +387,7 @@ where
     type Error = InMemoryStateStoreError;
     async fn get_state(&self, id: Uuid) -> Result<Option<T>, Self::Error> {
         let data = self.0.lock().await;
-        Ok(data.get(&id).map(|v| v.clone()))
+        Ok(data.get(&id).cloned())
     }
     async fn persist_state(&mut self, id: Uuid, state: T) -> Result<(), Self::Error> {
         let mut data = self.0.lock().await;
