@@ -2,6 +2,7 @@ name: Check
 
 on:
   push:
+    # TODO: github-actions branch should be removed once we switch to main
     branches: [main, github-actions-ci]
   pull_request:
     branches: [main]
@@ -11,7 +12,6 @@ env:
 
 jobs:
   clippy:
-    if: false  # Temporarily disabled due to excessive warnings
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,15 +27,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Output rust version for educational purposes
-        run: rustup --version
-      - name: cargo test excluding epoch_pg
+      - name: Run 'cargo test' (excluding epoch_pg)
         run: cargo test --workspace --exclude epoch_pg
   test_epoch_pg:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Start containers for epoch_pg
+      - name: Start Postgres containers needed for epoch_pg
         run: docker compose -f epoch_pg/docker-compose.yml up -d
       - name: Wait for Postgres to be ready
         run: |
@@ -49,7 +47,7 @@ jobs:
           done
           echo "Postgres did not become ready in time"
           exit 1
-      - name: Test epoch_pg
+      - name: Run 'cargo test' only for epoch_pg
         run: cargo test --package epoch_pg -- --test-threads=1
       - name: Stop containers for epoch_pg
         run: docker compose -f epoch_pg/docker-compose.yml down    
