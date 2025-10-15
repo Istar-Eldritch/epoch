@@ -168,19 +168,10 @@ where
 impl<D> Default for EventBuilder<D>
 where
     D: EventData,
- {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<D> EventBuilder<D>
-where
-    D: EventData,
 {
     /// Creates a new `EventBuilder` instance with all fields set to `None`.
-    pub fn new() -> Self {
-        EventBuilder {
+    fn default() -> Self {
+        Self {
             id: None,
             stream_id: None,
             stream_version: None,
@@ -191,6 +182,16 @@ where
             created_at: None,
             purged_at: None,
         }
+    }
+}
+
+impl<D> EventBuilder<D>
+where
+    D: EventData,
+{
+    /// Creates a new `EventBuilder` instance with the default values.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Sets the ID for the event.
