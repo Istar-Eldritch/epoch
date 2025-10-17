@@ -1,12 +1,10 @@
-use proc_macro2;
 use quote::quote;
 use syn::{Data, DeriveInput};
 
-pub fn event_data_enum_impl(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    let item_tokens: proc_macro2::TokenStream = item.into();
-    let input = match syn::parse2::<DeriveInput>(item_tokens) {
+pub fn event_data_enum_impl(item: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    let input = match syn::parse2::<DeriveInput>(item) {
         Ok(tree) => tree,
-        Err(e) => return e.to_compile_error().into(),
+        Err(e) => return e.to_compile_error(),
     };
 
     let enum_name = &input.ident;
@@ -47,5 +45,49 @@ pub fn event_data_enum_impl(item: proc_macro::TokenStream) -> proc_macro::TokenS
         }
     };
 
-    expanded.into()
+    expanded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::quote;
+
+    fn test_event_data_enum(item: proc_macro2::TokenStream, expected: proc_macro2::TokenStream) {
+        let actual = event_data_enum_impl(item);
+        let actual_str = actual.to_string();
+        let expected_str = expected.to_string();
+
+        let actual_file = syn::parse_file(&actual_str).expect("Failed to parse actual tokens");
+        let expected_file =
+            syn::parse_file(&expected_str).expect("Failed to parse expected tokens");
+
+        assert_eq!(
+            prettyplease::unparse(&actual_file),
+            prettyplease::unparse(&expected_file)
+        );
+    }
+
+    #[test]
+    fn test_variants() {
+        let item = quote! {
+            enum OriginalEnum {
+                VariantA,
+                VariantB(i32),
+                VariantC { field: String },
+            }
+        };
+        let expected = quote! {
+            impl EventData for OriginalEnum {
+                fn event_type(&self) -> &'static str {
+                    match self {
+                        OriginalEnum::VariantA => "VariantA",
+                        OriginalEnum::VariantB(..) => "VariantB",
+                        OriginalEnum::VariantC{..} => "VariantC",
+                    }
+                }
+            }
+        };
+        test_event_data_enum(item, expected);
+    }
 }
