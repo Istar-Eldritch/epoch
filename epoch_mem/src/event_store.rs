@@ -14,7 +14,7 @@ use epoch_core::prelude::*;
 /// The in-memory data store.
 #[derive(Debug)]
 struct EventStoreData<D: EventData> {
-    events: HashMap<Uuid, Event<D>>,
+    events: HashMap<Uuid, Arc<Event<D>>>,
     stream_events: HashMap<Uuid, Vec<Uuid>>,
     stream_version: HashMap<Uuid, u64>,
 }
@@ -52,7 +52,7 @@ impl<B: EventBus + Clone> InMemoryEventStore<B> {
 /// Errors returned by the InMemoryEventBus
 #[derive(Debug, thiserror::Error)]
 pub enum InMemoryEventStoreBackendError {
-    ///
+    /// Event version doesn't match the stream version
     #[error("Event version ({0}) doesn't match stream version ({1})")]
     VersionMismatch(u64, u64),
     /// Error publishing event to bus
@@ -132,7 +132,9 @@ where
         data.stream_version.insert(stream_id, new_version);
 
         let event_id = event.id;
-        data.events.insert(event_id, event.clone());
+        // Wrap in Arc once for efficient sharing between storage and bus
+        let event = Arc::new(event);
+        data.events.insert(event_id, Arc::clone(&event));
         data.stream_events
             .entry(stream_id)
             .or_default()
@@ -142,7 +144,7 @@ where
             stream_id,
             event_id
         );
-        if bus.publish(event.clone()).await.is_err() {
+        if bus.publish(event).await.is_err() {
             return Err(InMemoryEventStoreBackendError::PublishEvent);
         }
         Ok(())
@@ -178,6 +180,7 @@ where
 impl<B, E> EventStream<B::EventType, E> for InMemoryEventStoreStream<B, E>
 where
     B: EventBus + Clone + Send + Sync,
+    B::EventType: Clone,
     E: std::error::Error + Send + Sync,
 {
 }
@@ -185,7 +188,7 @@ where
 impl<B, E> Stream for InMemoryEventStoreStream<B, E>
 where
     B: EventBus + Clone + Send + Sync,
-    B::EventType: Send + Sync,
+    B::EventType: Send + Sync + Clone,
     E: std::error::Error + Send + Sync,
 {
     type Item = Result<Event<B::EventType>, E>;
@@ -226,7 +229,9 @@ where
                         "InMemoryEventStoreStream: poll_next - Returning event_id: {}",
                         event_id
                     );
-                    return Poll::Ready(Some(Ok(event.clone())));
+                    // Dereference Arc and clone the inner Event for the stream
+                    // This is necessary because EventStream yields owned Event<D>, not Arc<Event<D>>
+                    return Poll::Ready(Some(Ok((**event).clone())));
                 }
             }
             log::debug!(
@@ -257,6 +262,15 @@ where
 {
     _phantom: PhantomData<D>,
     projections: Arc<RwLock<Vec<Box<dyn EventObserver<D>>>>>,
+}
+
+impl<D> Default for InMemoryEventBus<D>
+where
+    D: EventData + Send + Sync,
+{
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<D> InMemoryEventBus<D>
@@ -306,14 +320,14 @@ where
     type EventType = D;
     fn publish<'a>(
         &'a self,
-        event: Event<Self::EventType>,
+        event: Arc<Event<Self::EventType>>,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
         Box::pin(async move {
             log::debug!("Publishing event with id: {}", event.id);
             let projections = self.projections.read().await;
             for projection in projections.iter() {
                 projection
-                    .on_event(event.clone())
+                    .on_event(Arc::clone(&event))
                     .await
                     .unwrap_or_else(|e| {
                         log::error!("Error applying event: {:?}", e);
@@ -347,6 +361,15 @@ pub struct InMemoryStateStore<T>(std::sync::Arc<Mutex<HashMap<Uuid, T>>>)
 where
     T: Clone + std::fmt::Debug;
 
+impl<T> Default for InMemoryStateStore<T>
+where
+    T: Clone + std::fmt::Debug,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> InMemoryStateStore<T>
 where
     T: Clone + std::fmt::Debug,
@@ -369,7 +392,7 @@ where
     type Error = InMemoryStateStoreError;
     async fn get_state(&self, id: Uuid) -> Result<Option<T>, Self::Error> {
         let data = self.0.lock().await;
-        Ok(data.get(&id).map(|v| v.clone()))
+        Ok(data.get(&id).cloned())
     }
     async fn persist_state(&mut self, id: Uuid, state: T) -> Result<(), Self::Error> {
         let mut data = self.0.lock().await;
@@ -574,7 +597,7 @@ mod tests {
 
         let stream_id = Uuid::new_v4();
         let event = new_event(stream_id, 1, "test_publish");
-        bus.publish(event.clone()).await.unwrap();
+        bus.publish(Arc::new(event.clone())).await.unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
         let events: TestState = storage.get_state(stream_id).await.unwrap().unwrap();
         assert_eq!(events.0.len(), 1);

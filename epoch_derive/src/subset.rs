@@ -1,4 +1,3 @@
-use proc_macro2;
 use quote::quote;
 use syn::{Ident, ItemEnum, Token, punctuated::Punctuated};
 
@@ -111,7 +110,7 @@ fn subset_enum_impl_internal(
     let try_from_matches = original_variants.iter().map(|variant| {
         let variant_name = &variant.ident;
         let fields = &variant.fields;
-        if included_variants.is_empty() || included_variants.contains(&variant_name) {
+        if included_variants.is_empty() || included_variants.contains(variant_name) {
             match fields {
                 syn::Fields::Unit => {
                     quote! {
@@ -134,7 +133,7 @@ fn subset_enum_impl_internal(
             }
         } else {
             let original_enum_name_str = original_enum_name.to_string();
-            let original_enum_variant_str = format!("{}::{}", original_enum_name_str, variant_name.to_string());
+            let original_enum_variant_str = format!("{}::{}", original_enum_name_str, variant_name);
             let subset_enum_name_str = subset_enum_name.to_string();
             let error = quote!(EnumConversionError::new(#original_enum_variant_str.to_string(), #subset_enum_name_str.to_string()));
 

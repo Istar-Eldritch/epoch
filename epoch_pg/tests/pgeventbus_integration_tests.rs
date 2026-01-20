@@ -8,6 +8,7 @@ use epoch_pg::PgDBEvent;
 use epoch_pg::event_bus::PgEventBus;
 use epoch_pg::event_store::PgEventStore;
 use sqlx::PgPool;
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, EventData)]
@@ -164,7 +165,7 @@ async fn test_noop_publish() {
     let event = new_event(stream_id, 1, "test_value_noop");
 
     // Publish the event directly to the event bus (should be a no-op)
-    event_bus.publish(event.clone()).await.unwrap();
+    event_bus.publish(Arc::new(event.clone())).await.unwrap();
 
     // Give some time for the notification to be processed (even though it shouldn't happen)
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

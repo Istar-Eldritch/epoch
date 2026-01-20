@@ -1,4 +1,3 @@
-use proc_macro2;
 use quote::quote;
 use syn::{Data, DeriveInput};
 
