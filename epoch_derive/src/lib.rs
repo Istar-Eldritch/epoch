@@ -13,4 +13,3 @@ pub fn subset_enum(
 pub fn event_data(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     event_data::event_data_enum_impl(item)
 }
-

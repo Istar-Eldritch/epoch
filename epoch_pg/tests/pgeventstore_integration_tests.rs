@@ -6,6 +6,7 @@ use epoch_derive::EventData;
 use epoch_mem::InMemoryEventBus;
 use epoch_pg::event_store::PgEventStore;
 use serde::{Deserialize, Serialize};
+use serial_test::serial;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -35,6 +36,7 @@ async fn teardown(pool: &PgPool) {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_event() {
     let (pool, event_store) = setup().await;
 
@@ -70,6 +72,7 @@ async fn test_store_event() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_read_events() {
     let (pool, event_store) = setup().await;
 
@@ -122,6 +125,7 @@ async fn test_read_events() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_read_events_since() {
     let (pool, event_store) = setup().await;
 

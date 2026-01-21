@@ -33,6 +33,6 @@ derive = ["epoch_derive"]
 in-memory = ["epoch_mem"]
 postgres = ["epoch_pg"]
 
-[[examples]]
+[[example]]
 name = "hello-world"
 path = "examples/hello-world.rs"

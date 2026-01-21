@@ -2,6 +2,7 @@
 //! A `Projection` is a read-model built from a stream of events.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::{
     event::{Event, EventData},
@@ -102,9 +103,11 @@ where
 
     /// Applies an event to the projection. This method dispatches the event to the appropriate
     /// `apply_create`, `apply_update`, or `apply_delete` method based on the event type.
+    ///
+    /// Takes a reference to the event to avoid unnecessary cloning.
     async fn apply_and_store(
         &self,
-        event: Event<ED>,
+        event: &Event<ED>,
     ) -> Result<
         (),
         ApplyAndStoreError<
@@ -152,9 +155,9 @@ where
 {
     async fn on_event(
         &self,
-        event: Event<ED>,
+        event: Arc<Event<ED>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.apply_and_store(event).await?;
+        self.apply_and_store(&event).await?;
         Ok(())
     }
 }

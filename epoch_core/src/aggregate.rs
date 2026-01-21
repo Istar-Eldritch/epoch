@@ -64,7 +64,7 @@ where
             aggregate_id: self.aggregate_id,
             data,
             credentials: self.credentials.clone(),
-            aggregate_version: self.aggregate_version.clone(),
+            aggregate_version: self.aggregate_version,
         })
     }
 
@@ -79,7 +79,7 @@ where
             aggregate_id: self.aggregate_id,
             data,
             credentials: self.credentials.clone(),
-            aggregate_version: self.aggregate_version.clone(),
+            aggregate_version: self.aggregate_version,
         }
     }
 }
@@ -239,13 +239,13 @@ where
                     stream,
                 )
                 .await
-                .map_err(|e| HandleCommandError::Hydration(e))?;
+                .map_err(HandleCommandError::Hydration)?;
             }
 
             let events: Vec<Event<ED>> = self
                 .handle_command(&state, cmd)
                 .await
-                .map_err(|e| HandleCommandError::Command(e))?
+                .map_err(HandleCommandError::Command)?
                 .into_iter()
                 .enumerate()
                 .map(|(i, mut e)| {

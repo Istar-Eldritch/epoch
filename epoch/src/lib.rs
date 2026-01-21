@@ -2,24 +2,21 @@
 
 #![deny(missing_docs)]
 
-#[cfg(feature = "derive")]
 /// Proc-macros for the `epoch` crate.
+#[cfg(feature = "derive")]
 pub mod derive {
-    //! Contains proc-macros for the `epoch` crate.
     pub use epoch_derive::*;
 }
 
+/// In-memory event store implementation.
 #[cfg(feature = "in-memory")]
-/// Proc-macros for the `epoch` crate.
 pub mod mem_store {
-    //! Contains proc-macros for the `epoch` crate.
     pub use epoch_mem::*;
 }
 
+/// PostgreSQL event store implementation.
 #[cfg(feature = "postgres")]
-/// Proc-macros for the `epoch` crate.
 pub mod pg_store {
-    //! Contains proc-macros for the `epoch` crate.
     pub use epoch_pg::*;
 }
 
