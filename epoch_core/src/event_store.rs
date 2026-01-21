@@ -115,6 +115,14 @@ where
     }
 }
 
+// All fields (slice reference, usize, PhantomData) are Unpin, so SliceEventStream is Unpin.
+impl<'a, D, E> Unpin for SliceEventStream<'a, D, E>
+where
+    D: EventData + Send + Sync + 'a,
+    E: std::error::Error + Send + Sync,
+{
+}
+
 impl<'a, D, E> Stream for SliceEventStream<'a, D, E>
 where
     D: EventData + Send + Sync + 'a,
@@ -126,16 +134,14 @@ where
         mut self: Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        // SAFETY: `idx` is a `usize` and is therefore `Unpin`.
-        // Moving `SliceEventStream` would not invalidate the pointer to `idx`
-        // relative to the struct's memory layout.
-        // We are only projecting to a field that is itself `Unpin
-        if self.idx < self.inner.len() {
-            let res = Poll::Ready(Some(Ok(self.inner[self.idx].clone())));
-            unsafe { self.as_mut().get_unchecked_mut().idx += 1 };
-            return res;
+        let this = self.as_mut().get_mut();
+        if this.idx < this.inner.len() {
+            let event = this.inner[this.idx].clone();
+            this.idx += 1;
+            Poll::Ready(Some(Ok(event)))
+        } else {
+            Poll::Ready(None)
         }
-        Poll::Ready(None)
     }
 }
 

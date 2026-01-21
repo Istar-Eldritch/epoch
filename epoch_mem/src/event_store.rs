@@ -177,6 +177,9 @@ where
     }
 }
 
+// All fields (Uuid, Arc, usize, PhantomData) are Unpin, so InMemoryEventStoreStream is Unpin.
+impl<B, E> Unpin for InMemoryEventStoreStream<B, E> where B: EventBus + Clone {}
+
 impl<B, E> EventStream<B::EventType, E> for InMemoryEventStoreStream<B, E>
 where
     B: EventBus + Clone + Send + Sync,
@@ -193,10 +196,8 @@ where
 {
     type Item = Result<Event<B::EventType>, E>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // We need to use unsafe to get a mutable reference to the fields of the `!Unpin` struct.
-        // This is safe because we are not moving the `VirtualEventStoreStream` itself.
-        let this = unsafe { self.get_unchecked_mut() };
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
 
         let data = match this.data.try_lock() {
             Ok(guard) => {
