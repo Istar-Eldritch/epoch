@@ -7,6 +7,7 @@ use epoch_mem::InMemoryStateStore;
 use epoch_pg::PgDBEvent;
 use epoch_pg::event_bus::PgEventBus;
 use epoch_pg::event_store::PgEventStore;
+use serial_test::serial;
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -103,6 +104,7 @@ async fn teardown(pool: &PgPool) {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_initialize() {
     let (pool, _event_bus, _event_store) = setup().await;
     // If setup completes without panicking, initialization was successful
@@ -110,6 +112,7 @@ async fn test_initialize() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_subscribe_and_event_propagation() {
     let (pool, event_bus, event_store) = setup().await;
 
@@ -151,6 +154,7 @@ async fn test_subscribe_and_event_propagation() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_noop_publish() {
     let (pool, event_bus, _event_store) = setup().await;
 
@@ -186,6 +190,7 @@ async fn test_noop_publish() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_event_data_deserialization_failure() {
     let (pool, event_bus, _event_store) = setup().await;
 
@@ -284,6 +289,7 @@ async fn test_event_data_deserialization_failure() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_multiple_subscribers() {
     let (pool, event_bus, event_store) = setup().await;
 

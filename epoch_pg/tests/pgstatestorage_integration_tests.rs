@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use epoch_core::prelude::StateStoreBackend;
 use epoch_pg::state_store::{PgState, PgStateStore};
 use serde::{Deserialize, Serialize};
+use serial_test::serial;
 use sqlx::{FromRow, PgExecutor, PgPool};
 use uuid::Uuid;
 
@@ -70,6 +71,7 @@ async fn teardown(pool: &PgPool) {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_persist_and_get_state() {
     let (pool, mut state_storage) = setup().await;
 
@@ -91,6 +93,7 @@ async fn test_persist_and_get_state() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_update_state() {
     let (pool, mut state_storage) = setup().await;
 
@@ -120,6 +123,7 @@ async fn test_update_state() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_delete_state() {
     let (pool, mut state_storage) = setup().await;
 
@@ -143,6 +147,7 @@ async fn test_delete_state() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_get_non_existent_state() {
     let (pool, state_storage) = setup().await;
 

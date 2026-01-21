@@ -27,3 +27,4 @@ epoch_derive = { path = "../epoch_derive" }
 epoch_mem = { path = "../epoch_mem" }
 sqlx = { version = "0.8.6", features = ["postgres", "uuid", "derive", "chrono", "runtime-tokio"] }
 env_logger = "0.11.3"
+serial_test = "3"
