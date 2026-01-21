@@ -213,7 +213,12 @@ where
             )
             .bind(event.id)
             .bind(event.stream_id)
-            .bind(event.stream_version as i64)
+            .bind(TryInto::<i64>::try_into(event.stream_version).map_err(|e| {
+                PgEventStoreError::DBError(sqlx::error::Error::InvalidArgument(format!(
+                    "stream_version {} is too large to fit in i64: {}",
+                    event.stream_version, e
+                )))
+            })?)
             .bind(event.event_type.to_string())
             .bind(
                 event
