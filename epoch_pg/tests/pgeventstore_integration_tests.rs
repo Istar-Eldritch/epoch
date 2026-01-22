@@ -6,6 +6,7 @@ use epoch_derive::EventData;
 use epoch_mem::InMemoryEventBus;
 use epoch_pg::event_store::PgEventStore;
 use serde::{Deserialize, Serialize};
+use serial_test::serial;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -35,6 +36,7 @@ async fn teardown(pool: &PgPool) {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_event() {
     let (pool, event_store) = setup().await;
 
@@ -48,12 +50,29 @@ async fn test_store_event() {
         }))
         .build()
         .unwrap();
-
     event_store.store_event(event.clone()).await.unwrap();
+
+    let event_overflow = Event::<TestEventData>::builder()
+        .id(Uuid::new_v4())
+        .stream_id(Uuid::new_v4())
+        .stream_version(u64::MAX)
+        .event_type("TestEvent".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "test_overflow".to_string(),
+        }))
+        .build()
+        .unwrap();
+    assert!(matches!(
+        event_store.store_event(event_overflow.clone()).await,
+        Err(epoch_pg::event_store::PgEventStoreError::DBError(
+            sqlx::error::Error::InvalidArgument(_)
+        ))
+    ));
     teardown(&pool).await;
 }
 
 #[tokio::test]
+#[serial]
 async fn test_read_events() {
     let (pool, event_store) = setup().await;
 
@@ -106,6 +125,7 @@ async fn test_read_events() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_read_events_since() {
     let (pool, event_store) = setup().await;
 

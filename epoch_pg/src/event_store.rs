@@ -179,7 +179,7 @@ where
 
                 let data: Option<B::EventType> = entry
                     .data
-                    .map(|d| serde_json::from_value(d))
+                    .map(serde_json::from_value)
                     .transpose()
                     .map_err(PgEventStoreError::DeserializeEventError::<B::Error>)?;
 
@@ -213,13 +213,18 @@ where
             )
             .bind(event.id)
             .bind(event.stream_id)
-            .bind(event.stream_version as i64)
+            .bind(TryInto::<i64>::try_into(event.stream_version).map_err(|e| {
+                PgEventStoreError::DBError(sqlx::error::Error::InvalidArgument(format!(
+                    "stream_version {} is too large to fit in i64: {}",
+                    event.stream_version, e
+                )))
+            })?)
             .bind(event.event_type.to_string())
             .bind(
                 event
                     .data
                     .as_ref()
-                    .map(|d| serde_json::to_value(d))
+                    .map(serde_json::to_value)
                     .transpose()?,
             )
             .bind(event.created_at)
@@ -229,10 +234,11 @@ where
             .execute(&self.postgres)
             .await?;
 
+        // Wrap in Arc for efficient sharing - no clone needed
         self.bus
-            .publish(event.clone())
+            .publish(std::sync::Arc::new(event))
             .await
-            .map_err(|e| PgEventStoreError::BUSPublishError(e))?;
+            .map_err(PgEventStoreError::BUSPublishError)?;
 
         Ok(())
     }

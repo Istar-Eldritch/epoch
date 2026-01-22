@@ -7,7 +7,9 @@ use epoch_mem::InMemoryStateStore;
 use epoch_pg::PgDBEvent;
 use epoch_pg::event_bus::PgEventBus;
 use epoch_pg::event_store::PgEventStore;
+use serial_test::serial;
 use sqlx::PgPool;
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, EventData)]
@@ -102,6 +104,7 @@ async fn teardown(pool: &PgPool) {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_initialize() {
     let (pool, _event_bus, _event_store) = setup().await;
     // If setup completes without panicking, initialization was successful
@@ -109,6 +112,7 @@ async fn test_initialize() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_subscribe_and_event_propagation() {
     let (pool, event_bus, event_store) = setup().await;
 
@@ -150,6 +154,7 @@ async fn test_subscribe_and_event_propagation() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_noop_publish() {
     let (pool, event_bus, _event_store) = setup().await;
 
@@ -164,7 +169,7 @@ async fn test_noop_publish() {
     let event = new_event(stream_id, 1, "test_value_noop");
 
     // Publish the event directly to the event bus (should be a no-op)
-    event_bus.publish(event.clone()).await.unwrap();
+    event_bus.publish(Arc::new(event.clone())).await.unwrap();
 
     // Give some time for the notification to be processed (even though it shouldn't happen)
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -185,6 +190,7 @@ async fn test_noop_publish() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_event_data_deserialization_failure() {
     let (pool, event_bus, _event_store) = setup().await;
 
@@ -283,6 +289,7 @@ async fn test_event_data_deserialization_failure() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_multiple_subscribers() {
     let (pool, event_bus, event_store) = setup().await;
 

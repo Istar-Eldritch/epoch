@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use futures_core::Stream;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Poll;
 use uuid::Uuid;
 
@@ -51,9 +52,13 @@ pub trait EventBus {
     /// The errors when an event bus operation fails
     type Error: std::error::Error;
     /// Publishes events to the event bus.
+    ///
+    /// Events are wrapped in `Arc` to allow efficient sharing across multiple observers
+    /// without requiring deep clones. Each observer receives an `Arc::clone()` which is
+    /// an O(1) atomic increment operation.
     fn publish<'a>(
         &'a self,
-        event: Event<Self::EventType>,
+        event: Arc<Event<Self::EventType>>,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>;
 
     /// Allows to subscribe to events
@@ -65,16 +70,23 @@ pub trait EventBus {
         T: EventObserver<Self::EventType> + Send + Sync + 'static;
 }
 
-///  Traits to defined observers to the event bus
+/// Traits to define observers to the event bus.
+///
+/// Observers receive events wrapped in `Arc` for efficient sharing. Observers can:
+/// - Dereference for read-only access (zero cost)
+/// - Clone the `Arc` if they need to retain the event (cheap O(1) operation)
+/// - Pass `&*event` to functions expecting `&Event<ED>` (zero cost)
 #[async_trait]
 pub trait EventObserver<ED>: Send + Sync
 where
     ED: EventData + Send + Sync,
 {
-    /// Reacts to events published in an event bus
+    /// Reacts to events published in an event bus.
+    ///
+    /// The event is wrapped in `Arc` for efficient sharing across multiple observers.
     async fn on_event(
         &self,
-        event: Event<ED>,
+        event: Arc<Event<ED>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
@@ -103,6 +115,14 @@ where
     }
 }
 
+// All fields (slice reference, usize, PhantomData) are Unpin, so SliceEventStream is Unpin.
+impl<'a, D, E> Unpin for SliceEventStream<'a, D, E>
+where
+    D: EventData + Send + Sync + 'a,
+    E: std::error::Error + Send + Sync,
+{
+}
+
 impl<'a, D, E> Stream for SliceEventStream<'a, D, E>
 where
     D: EventData + Send + Sync + 'a,
@@ -114,16 +134,14 @@ where
         mut self: Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        // SAFETY: `idx` is a `usize` and is therefore `Unpin`.
-        // Moving `SliceEventStream` would not invalidate the pointer to `idx`
-        // relative to the struct's memory layout.
-        // We are only projecting to a field that is itself `Unpin
-        if self.idx < self.inner.len() {
-            let res = Poll::Ready(Some(Ok(self.inner[self.idx].clone())));
-            unsafe { self.as_mut().get_unchecked_mut().idx += 1 };
-            return res;
+        let this = self.as_mut().get_mut();
+        if this.idx < this.inner.len() {
+            let event = this.inner[this.idx].clone();
+            this.idx += 1;
+            Poll::Ready(Some(Ok(event)))
+        } else {
+            Poll::Ready(None)
         }
-        Poll::Ready(None)
     }
 }
 

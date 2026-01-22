@@ -165,6 +165,15 @@ where
     pub purged_at: Option<DateTime<Utc>>,
 }
 
+impl<D> Default for EventBuilder<D>
+where
+    D: EventData,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<D> EventBuilder<D>
 where
     D: EventData,
@@ -254,7 +263,7 @@ where
     /// Returns an error if `id`, `sequence_number`, `event_type`, or `created_at` are not set.
     pub fn build(self) -> Result<Event<D>, EventBuilderError> {
         Ok(Event {
-            id: self.id.unwrap_or_else(|| Uuid::new_v4()),
+            id: self.id.unwrap_or_else(Uuid::new_v4),
             stream_id: self.stream_id.ok_or(EventBuilderError::StreamIdMissing)?,
             stream_version: self.stream_version.unwrap_or(0),
             event_type: self.event_type.ok_or(EventBuilderError::EventTypeMissing)?,

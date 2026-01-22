@@ -13,6 +13,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
 
+use std::future::Future;
+
 /// Errors that can occur when using `PgEventBus`.
 #[derive(Debug, thiserror::Error)]
 pub enum PgEventBusError {
@@ -25,6 +27,10 @@ pub enum PgEventBusError {
 }
 
 /// PostgreSQL implementation of `EventBus`.
+/// Type alias for the projections collection to reduce type complexity.
+type Projections<D> = Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>>;
+
+/// PostgreSQL implementation of `EventBus`.
 #[derive(Clone)]
 pub struct PgEventBus<D>
 where
@@ -32,7 +38,7 @@ where
 {
     pool: PgPool,
     channel_name: String,
-    projections: Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>>,
+    projections: Projections<D>,
 }
 
 impl<D> PgEventBus<D>
@@ -198,11 +204,14 @@ where
                             data,
                         };
 
+                        // Wrap event in Arc once for efficient sharing across projections
+                        let event = Arc::new(event);
+
                         let mut projections_guard = projections.lock().await;
                         for projection in projections_guard.iter_mut() {
                             let projection_guard = projection.lock().await;
                             log::debug!("Applying event to projection: {:?}", event.id);
-                            match projection_guard.on_event(event.clone()).await {
+                            match projection_guard.on_event(Arc::clone(&event)).await {
                                 Ok(_) => {
                                     log::debug!(
                                         "Successfully applied event to projection: {:?}",
@@ -245,8 +254,8 @@ where
     /// bus will receive the notifications
     fn publish<'a>(
         &'a self,
-        _event: Event<Self::EventType>,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        _event: Arc<Event<Self::EventType>>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
         // This is a noop. Use the PgEventStore to add events to the event table.
         Box::pin(async { Ok(()) })
     }
