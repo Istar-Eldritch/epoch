@@ -227,20 +227,27 @@ where
                 }
             }
 
-            let mut new_state_version = state_version + 1;
-            if let Some(ref state) = state {
+            // Re-hydrate from event store to catch up with any events that occurred
+            // after the state was persisted. This ensures we have the latest state
+            // and correct version before handling the command.
+            let state = if let Some(state) = state {
                 let event_store = self.get_event_store();
                 let stream = event_store
-                    .read_events_since(state_id, new_state_version)
+                    .read_events_since(state_id, state_version + 1)
                     .await
                     .map_err(HandleCommandError::Event)?;
                 self.re_hydrate::<<Self::EventStore as EventStoreBackend>::Error>(
-                    Some(state.clone()),
+                    Some(state),
                     stream,
                 )
                 .await
-                .map_err(HandleCommandError::Hydration)?;
-            }
+                .map_err(HandleCommandError::Hydration)?
+            } else {
+                None
+            };
+
+            // Calculate the next version based on the re-hydrated state
+            let mut new_state_version = state.as_ref().map(|s| s.get_version()).unwrap_or(0) + 1;
 
             let events: Vec<Event<ED>> = self
                 .handle_command(&state, cmd)
