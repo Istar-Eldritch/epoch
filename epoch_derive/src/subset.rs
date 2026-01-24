@@ -107,6 +107,7 @@ fn subset_enum_impl_internal(
         }
     });
 
+    // TryFrom<OriginalEnum> for SubsetEnum (takes ownership)
     let try_from_matches = original_variants.iter().map(|variant| {
         let variant_name = &variant.ident;
         let fields = &variant.fields;
@@ -164,6 +165,79 @@ fn subset_enum_impl_internal(
             fn try_from(value: #original_enum_name) -> Result<Self, Self::Error> {
                 match value {
                     #(#try_from_matches)*
+                }
+            }
+        }
+    });
+
+    // TryFrom<&OriginalEnum> for SubsetEnum (borrows and clones only matched fields)
+    // Note: For Copy types (like i32, bool), `.clone()` is a no-op but still emitted.
+    // This is fine since Clone is already required by EventData.
+    let try_from_ref_matches = original_variants.iter().map(|variant| {
+        let variant_name = &variant.ident;
+        let fields = &variant.fields;
+        if included_variants.is_empty() || included_variants.contains(variant_name) {
+            match fields {
+                syn::Fields::Unit => {
+                    quote! {
+                        #original_enum_name::#variant_name => Ok(#subset_enum_name::#variant_name),
+                    }
+                }
+                syn::Fields::Unnamed(fields) => {
+                    let num_fields = fields.unnamed.len();
+                    let var_names: Vec<Ident> = (0..num_fields)
+                        .map(|i| Ident::new(&format!("__field{}", i), proc_macro2::Span::call_site()))
+                        .collect();
+                    let cloned_fields: Vec<_> = var_names.iter().map(|name| {
+                        quote! { #name.clone() }
+                    }).collect();
+                    quote! {
+                        #original_enum_name::#variant_name(#(#var_names),*) => Ok(#subset_enum_name::#variant_name(#(#cloned_fields),*)),
+                    }
+                }
+                syn::Fields::Named(fields) => {
+                    let field_names: Vec<_> = fields.named.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+                    let cloned_fields: Vec<_> = field_names.iter().map(|name| {
+                        quote! { #name: #name.clone() }
+                    }).collect();
+                    quote! {
+                        #original_enum_name::#variant_name { #(#field_names),* } => Ok(#subset_enum_name::#variant_name { #(#cloned_fields),* }),
+                    }
+                }
+            }
+        } else {
+            let original_enum_name_str = original_enum_name.to_string();
+            let original_enum_variant_str = format!("{}::{}", original_enum_name_str, variant_name);
+            let subset_enum_name_str = subset_enum_name.to_string();
+            let error = quote!(EnumConversionError::new(#original_enum_variant_str.to_string(), #subset_enum_name_str.to_string()));
+
+            match fields {
+                syn::Fields::Unit => {
+                    quote! {
+                        #original_enum_name::#variant_name => Err(#error),
+                    }
+                }
+                syn::Fields::Unnamed(_) => {
+                    quote! {
+                        #original_enum_name::#variant_name(..) => Err(#error),
+                    }
+                }
+                syn::Fields::Named(_) => {
+                    quote! {
+                        #original_enum_name::#variant_name { .. } => Err(#error),
+                    }
+                }
+            }
+        }
+    });
+
+    try_from_impls.extend(quote! {
+        impl std::convert::TryFrom<&#original_enum_name> for #subset_enum_name {
+            type Error = EnumConversionError;
+
+            fn try_from(value: &#original_enum_name) -> Result<Self, Self::Error> {
+                match value {
+                    #(#try_from_ref_matches)*
                 }
             }
         }
@@ -248,6 +322,18 @@ mod tests {
                 }
             }
 
+            impl std::convert::TryFrom<&OriginalEnum> for MySubsetEnum {
+                type Error = EnumConversionError;
+
+                fn try_from(value: &OriginalEnum) -> Result<Self, Self::Error> {
+                    match value {
+                        OriginalEnum::VariantA => Ok(MySubsetEnum::VariantA),
+                        OriginalEnum::VariantB(__field0) => Ok(MySubsetEnum::VariantB(__field0.clone())),
+                        OriginalEnum::VariantC { field } => Ok(MySubsetEnum::VariantC { field: field.clone() }),
+                    }
+                }
+            }
+
             enum OriginalEnum {
                 VariantA,
                 VariantB(i32),
@@ -291,6 +377,19 @@ mod tests {
                         OriginalEnum::VariantA => Ok(MySubsetEnum::VariantA),
                         OriginalEnum::VariantB(..) => Err(EnumConversionError::new("OriginalEnum::VariantB".to_string(), "MySubsetEnum".to_string())),
                         OriginalEnum::VariantC { field } => Ok(MySubsetEnum::VariantC { field }),
+                        OriginalEnum::VariantD => Err(EnumConversionError::new("OriginalEnum::VariantD".to_string(), "MySubsetEnum".to_string())),
+                    }
+                }
+            }
+
+            impl std::convert::TryFrom<&OriginalEnum> for MySubsetEnum {
+                type Error = EnumConversionError;
+
+                fn try_from(value: &OriginalEnum) -> Result<Self, Self::Error> {
+                    match value {
+                        OriginalEnum::VariantA => Ok(MySubsetEnum::VariantA),
+                        OriginalEnum::VariantB(..) => Err(EnumConversionError::new("OriginalEnum::VariantB".to_string(), "MySubsetEnum".to_string())),
+                        OriginalEnum::VariantC { field } => Ok(MySubsetEnum::VariantC { field: field.clone() }),
                         OriginalEnum::VariantD => Err(EnumConversionError::new("OriginalEnum::VariantD".to_string(), "MySubsetEnum".to_string())),
                     }
                 }
@@ -347,6 +446,19 @@ mod tests {
                 }
             }
 
+            impl std::convert::TryFrom<&OriginalEnum> for MySubsetEnum {
+                type Error = EnumConversionError;
+
+                fn try_from(value: &OriginalEnum) -> Result<Self, Self::Error> {
+                    match value {
+                        OriginalEnum::UnitVariant => Ok(MySubsetEnum::UnitVariant),
+                        OriginalEnum::TupleVariant(__field0, __field1) => Ok(MySubsetEnum::TupleVariant(__field0.clone(), __field1.clone())),
+                        OriginalEnum::StructVariant { name, id } => Ok(MySubsetEnum::StructVariant { name: name.clone(), id: id.clone() }),
+                        OriginalEnum::AnotherUnit => Err(EnumConversionError::new("OriginalEnum::AnotherUnit".to_string(), "MySubsetEnum".to_string())),
+                    }
+                }
+            }
+
             enum OriginalEnum {
                 UnitVariant,
                 TupleVariant(u32, bool),
@@ -396,6 +508,17 @@ mod tests {
                 }
             }
 
+            impl std::convert::TryFrom<&OriginalEnum> for MySubsetEnum {
+                type Error = EnumConversionError;
+
+                fn try_from(value: &OriginalEnum) -> Result<Self, Self::Error> {
+                    match value {
+                        OriginalEnum::VariantA => Ok(MySubsetEnum::VariantA),
+                        OriginalEnum::VariantB(__field0) => Ok(MySubsetEnum::VariantB(__field0.clone())),
+                    }
+                }
+            }
+
             #[derive(Debug, Clone)]
             #[allow(dead_code)]
             enum OriginalEnum {
@@ -437,6 +560,17 @@ mod tests {
                     match value {
                         OriginalEnum::VariantA => Ok(MySubsetEnum::VariantA),
                         OriginalEnum::VariantB(__field0) => Ok(MySubsetEnum::VariantB(__field0)),
+                    }
+                }
+            }
+
+            impl std::convert::TryFrom<&OriginalEnum> for MySubsetEnum {
+                type Error = EnumConversionError;
+
+                fn try_from(value: &OriginalEnum) -> Result<Self, Self::Error> {
+                    match value {
+                        OriginalEnum::VariantA => Ok(MySubsetEnum::VariantA),
+                        OriginalEnum::VariantB(__field0) => Ok(MySubsetEnum::VariantB(__field0.clone())),
                     }
                 }
             }

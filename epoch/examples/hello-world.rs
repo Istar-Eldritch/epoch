@@ -89,10 +89,10 @@ impl Projection<ApplicationEvent> for UserAggregate {
         state: Option<Self::State>,
         event: &Event<Self::EventType>,
     ) -> Result<Option<Self::State>, UserProjectionError> {
-        match event.data.as_ref().unwrap().clone() {
+        match event.data.as_ref().unwrap() {
             UserEvent::UserNameUpdated { name } => {
                 if let Some(mut state) = state {
-                    state.name = name;
+                    state.name = name.clone();
                     Ok(Some(state))
                 } else {
                     Err(UserProjectionError::NoState(event.stream_id))
@@ -100,7 +100,7 @@ impl Projection<ApplicationEvent> for UserAggregate {
             }
             UserEvent::UserCreated { name } => Ok(Some(User {
                 id: event.stream_id,
-                name,
+                name: name.clone(),
                 version: 0,
             })),
             UserEvent::UserDeleted => Ok(None),
@@ -217,16 +217,16 @@ impl Projection<ApplicationEvent> for ProductProjection {
         state: Option<Self::State>,
         event: &Event<Self::EventType>,
     ) -> Result<Option<Self::State>, Self::ProjectionError> {
-        match event.data.as_ref().unwrap().clone() {
+        match event.data.as_ref().unwrap() {
             ProductEvent::ProductCreated { name, price } => Ok(Some(Product {
                 id: event.stream_id,
-                name,
-                price,
+                name: name.clone(),
+                price: *price,
                 version: event.stream_version,
             })),
             ProductEvent::ProductNameUpdated { name } => {
                 if let Some(mut state) = state {
-                    state.name = name;
+                    state.name = name.clone();
                     Ok(Some(state))
                 } else {
                     Err(ProductProjectionError::ProductDoesNotExist(event.stream_id))
@@ -234,7 +234,7 @@ impl Projection<ApplicationEvent> for ProductProjection {
             }
             ProductEvent::ProductPriceUpdated { price } => {
                 if let Some(mut state) = state {
-                    state.price = price;
+                    state.price = *price;
                     Ok(Some(state))
                 } else {
                     Err(ProductProjectionError::ProductDoesNotExist(event.stream_id))
@@ -251,7 +251,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     env_logger::init();
 
     let bus: InMemoryEventBus<ApplicationEvent> = InMemoryEventBus::new();
-    bus.subscribe(product_projection).await?;
+    bus.subscribe(epoch::prelude::ProjectionHandler::new(product_projection))
+        .await?;
 
     let event_store = InMemoryEventStore::new(bus);
 

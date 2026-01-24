@@ -1,9 +1,18 @@
 # Specification: Reduce Event Cloning with Hybrid Arc/Reference Approach
 
 **Spec ID:** 0001  
-**Status:** Implemented  
+**Status:** Complete (All Phases)  
 **Created:** 2026-01-20  
-**Implemented:** 2026-01-20  
+**Last Updated:** 2026-01-24  
+
+## Implementation Status
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| Phase 1 | Arc wrapper for EventBus/EventObserver/Projection | ✅ Completed (2026-01-20) |
+| Phase 2 | Saga reference passing and SagaHandler wrapper | ✅ Completed (2026-01-24) |
+| Phase 3 | `to_subset_event` borrow-based conversion | ✅ Completed (2026-01-24) |
+| Phase 4 | `SliceEventStream` internal reference stream | ✅ Completed (2026-01-24) |
 
 ## 1. Problem Statement
 
@@ -13,10 +22,13 @@ Currently, events are cloned multiple times throughout the `epoch` codebase:
 2. **In `EventBus::publish`** → cloned for each projection/observer
 3. **In `EventObserver::on_event`** → takes ownership, forcing clones upstream
 4. **In `SliceEventStream`** → clones events from a borrowed slice
+5. **In `Saga::process_event`** → takes owned event, forcing clones upstream
+6. **In `Saga::handle_event`** → takes owned event, forcing clones in `process_event`
 
 This is inefficient, especially for:
 - Events with large payloads
 - Systems with many projections (each gets a clone)
+- Systems with multiple sagas (each must clone the event)
 - High-throughput scenarios
 
 ### Current Clone Points
@@ -28,6 +40,8 @@ This is inefficient, especially for:
 | `publish` loop | `epoch_mem/src/event_store.rs:316` | Each projection needs the event |
 | `store_event` | `epoch_mem/src/event_store.rs:135,145` | Storage and bus publish |
 | `SliceEventStream` | `epoch_core/src/event_store.rs:122` | Yielding owned events from slice |
+| `Saga::process_event` | `epoch_core/src/saga.rs:52` | Takes owned event |
+| `Saga::handle_event` | `epoch_core/src/saga.rs:42` | Takes owned event |
 
 ## 2. Proposed Solution: Hybrid Arc/Reference Approach
 
@@ -39,6 +53,8 @@ Use different ownership semantics based on the operation's nature:
 | `EventBus::publish` | `Arc<Event<T>>` | Distributes to many observers, shared ownership |
 | `EventObserver::on_event` | `Arc<Event<T>>` | Receives shared reference, can hold if needed |
 | `Projection::apply` | `&Event<T>` (unchanged) | Already uses reference, no change needed |
+| `Saga::process_event` | `&Event<T>` | Receives reference, no ownership needed |
+| `Saga::handle_event` | `&Event<T>` | Receives reference, no ownership needed |
 
 ### Why This Combination?
 
@@ -49,11 +65,21 @@ Use different ownership semantics based on the operation's nature:
 3. **`on_event` receives `Arc`**: Observers can:
    - Dereference for read-only access (zero cost)
    - Clone the `Arc` if they need to retain the event (cheap)
-   - Pass `&*event` to `Projection::apply` (zero cost)
+   - Pass `&*event` to `Projection::apply` or `Saga::process_event` (zero cost)
 
 4. **`apply` uses reference**: Already correct—projections only need to read events.
 
-## 3. Interface Changes
+5. **`process_event` and `handle_event` use references**: Sagas only need to read events to make decisions and dispatch commands. Ownership is unnecessary.
+
+---
+
+# PHASE 1: Arc Wrapper for EventBus/EventObserver/Projection
+
+**Status:** ✅ Completed (2026-01-20)
+
+---
+
+## 3. Interface Changes (Phase 1)
 
 ### 3.1 `epoch_core/src/event_store.rs`
 
@@ -379,7 +405,186 @@ The `SliceEventStream` is used internally in `Aggregate::handle` with a small, l
 
 **Recommendation:** Keep `SliceEventStream` as-is for now. Mark with a `// TODO` for future optimization if profiling shows it's a bottleneck.
 
-## 4. Files to Modify
+---
+
+# PHASE 2: Saga Reference Passing and Handler Wrappers
+
+**Status:** ✅ Completed (2026-01-24)
+
+---
+
+## 4. Problem Statement (Phase 2)
+
+Despite Phase 1 improvements, sagas still require unnecessary cloning:
+
+1. **No blanket `EventObserver` impl for `Saga`**: Unlike `Projection`, consumers must manually implement `EventObserver` for each saga, often inefficiently.
+
+2. **`Saga::process_event` takes owned event**: Forces upstream clones even when only a reference is needed.
+
+3. **`Saga::handle_event` takes owned event**: Forces `process_event` to pass ownership even though sagas only read events.
+
+### Current Saga Clone Flow
+
+```
+EventObserver::on_event(Arc<Event<ED>>)
+         │
+         ▼
+    (*event).clone()          ← CLONE: Manual impl clones Arc contents
+         │
+         ▼
+Saga::process_event(Event<ED>)
+         │
+         ▼
+    event.to_subset_event()   ← CLONE: Clones event data for conversion
+         │
+         ▼
+Saga::handle_event(Event<Self::EventType>)  ← Owns converted event
+```
+
+With 2 sagas, this means 2 full event clones per published event, plus 2 subset conversions.
+
+## 5. Interface Changes (Phase 2)
+
+### 5.1 `epoch_core/src/saga.rs`
+
+#### `Saga::handle_event` signature
+
+```rust
+// BEFORE
+async fn handle_event(
+    &self,
+    state: Self::State,
+    event: Event<Self::EventType>,
+) -> Result<Option<Self::State>, Self::SagaError>;
+
+// AFTER
+async fn handle_event(
+    &self,
+    state: Self::State,
+    event: &Event<Self::EventType>,  // Changed: reference instead of owned
+) -> Result<Option<Self::State>, Self::SagaError>;
+```
+
+#### `Saga::process_event` signature and implementation
+
+```rust
+// BEFORE
+async fn process_event(
+    &self,
+    event: Event<ED>,
+) -> Result<(), HandleEventError<...>> {
+    if let Ok(event) = event.to_subset_event::<Self::EventType>() {
+        // ...
+        let state = self.handle_event(state, event).await...;
+        // ...
+    }
+    Ok(())
+}
+
+// AFTER
+async fn process_event(
+    &self,
+    event: &Event<ED>,  // Changed: reference instead of owned
+) -> Result<(), HandleEventError<...>> {
+    if let Ok(event) = event.to_subset_event::<Self::EventType>() {
+        // ...
+        let state = self.handle_event(state, &event).await...;  // Pass reference
+        // ...
+    }
+    Ok(())
+}
+```
+
+#### Add `SagaHandler` wrapper type
+
+Since Rust doesn't allow multiple blanket implementations of the same trait, and
+`Projection` already had a blanket `EventObserver` impl, we use wrapper types for both.
+
+```rust
+use std::sync::Arc;
+
+/// Wrapper that provides EventObserver for Saga types
+pub struct SagaHandler<S>(pub S);
+
+impl<S> SagaHandler<S> {
+    pub fn new(saga: S) -> Self { Self(saga) }
+    pub fn inner(&self) -> &S { &self.0 }
+    pub fn into_inner(self) -> S { self.0 }
+}
+
+#[async_trait]
+impl<ED, S> EventObserver<ED> for SagaHandler<S>
+where
+    ED: EventData + Send + Sync + 'static,
+    S: Saga<ED> + Send + Sync,
+    <S::EventType as TryFrom<ED>>::Error: Send + Sync,
+{
+    async fn on_event(
+        &self,
+        event: Arc<Event<ED>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.0.process_event(&event).await?;  // Dereference Arc, pass reference
+        Ok(())
+    }
+}
+```
+
+### 5.2 `epoch_core/src/projection.rs`
+
+#### Replace blanket impl with `ProjectionHandler` wrapper
+
+For consistency with `SagaHandler`, the `Projection` blanket impl was also converted to a wrapper:
+
+```rust
+/// Wrapper that provides EventObserver for Projection types
+pub struct ProjectionHandler<P>(pub P);
+
+impl<P> ProjectionHandler<P> {
+    pub fn new(projection: P) -> Self { Self(projection) }
+    pub fn inner(&self) -> &P { &self.0 }
+    pub fn into_inner(self) -> P { self.0 }
+}
+
+#[async_trait]
+impl<ED, P> EventObserver<ED> for ProjectionHandler<P>
+where
+    ED: EventData + Send + Sync + 'static,
+    P: Projection<ED> + Send + Sync,
+    <P::EventType as TryFrom<ED>>::Error: Send + Sync,
+{
+    async fn on_event(
+        &self,
+        event: Arc<Event<ED>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.0.apply_and_store(&event).await?;
+        Ok(())
+    }
+}
+```
+
+### 5.3 Optimized Saga Event Flow (After Phase 2)
+
+```
+EventObserver::on_event(Arc<Event<ED>>)  ← Blanket impl
+         │
+         ▼
+    &*event                              ← DEREF: Zero-cost dereference
+         │
+         ▼
+Saga::process_event(&Event<ED>)
+         │
+         ▼
+    event.to_subset_event()              ← CLONE: Still clones for conversion
+         │                                  (acceptable, see Future Work)
+         ▼
+Saga::handle_event(&Event<Self::EventType>)  ← Borrows converted event
+```
+
+**Savings:** Eliminates 1 full event clone per saga. With 2 sagas, saves 2 clones per event.
+
+## 6. Files to Modify
+
+### Phase 1 (Completed)
 
 | File | Changes |
 |------|---------|
@@ -391,16 +596,32 @@ The `SliceEventStream` is used internally in `Aggregate::handle` with a small, l
 | `epoch_pg/tests/*.rs` | Update test code to match new signatures |
 | `epoch_mem/src/event_store.rs` (tests) | Update test code to match new signatures |
 
-## 5. Breaking Changes
+### Phase 2 (Completed)
+
+| File | Changes |
+|------|---------|
+| `epoch_core/src/saga.rs` | Change `handle_event` to `&Event`, change `process_event` to `&Event`, add `SagaHandler` wrapper with `EventObserver` impl |
+| `epoch_core/src/projection.rs` | Replace blanket `EventObserver` impl with `ProjectionHandler` wrapper |
+| `epoch_mem/src/event_store.rs` | Update tests to use `ProjectionHandler` |
+
+## 7. Breaking Changes
 
 This is a **breaking change** for downstream users who:
 
+### Phase 1
 1. Implement custom `EventBus` implementations
 2. Implement custom `EventObserver` implementations
 3. Call `EventBus::publish` directly
 4. Rely on `Event<D>` ownership in `on_event`
 
+### Phase 2
+5. Implement the `Saga` trait (must update `handle_event` signature)
+6. Implement custom `EventObserver` for sagas (remove manual impl, use blanket)
+7. Call `Saga::process_event` directly (must pass reference)
+
 ### Migration Guide
+
+#### Phase 1: Custom EventObserver
 
 ```rust
 // Before: Custom EventObserver
@@ -423,16 +644,82 @@ impl EventObserver<MyEvent> for MyObserver {
 }
 ```
 
-## 6. Testing Strategy
+#### Phase 2: Saga Implementation
+
+```rust
+// Before: Saga with manual EventObserver
+#[async_trait]
+impl Saga<ApplicationEvent> for MySaga {
+    // ...
+    async fn handle_event(
+        &self,
+        state: Self::State,
+        event: Event<Self::EventType>,
+    ) -> Result<Option<Self::State>, Self::SagaError> {
+        match event.data {
+            // ...
+        }
+    }
+}
+
+#[async_trait]
+impl EventObserver<ApplicationEvent> for MySaga {
+    async fn on_event(
+        &self,
+        event: Arc<Event<ApplicationEvent>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.process_event((*event).clone()).await?;  // Cloning here!
+        Ok(())
+    }
+}
+
+// Before: Subscribing
+event_bus.subscribe(my_saga).await?;
+
+// After: Saga with SagaHandler wrapper
+use epoch_core::saga::SagaHandler;
+
+#[async_trait]
+impl Saga<ApplicationEvent> for MySaga {
+    // ...
+    async fn handle_event(
+        &self,
+        state: Self::State,
+        event: &Event<Self::EventType>,  // Now takes reference
+    ) -> Result<Option<Self::State>, Self::SagaError> {
+        match &event.data {  // Borrow data
+            // ...
+        }
+    }
+}
+// No manual EventObserver impl needed - SagaHandler provides it!
+
+// After: Subscribing with wrapper
+event_bus.subscribe(SagaHandler::new(my_saga)).await?;
+```
+
+#### Phase 2: Projection Subscription
+
+```rust
+// Before: Direct subscription (blanket impl)
+event_bus.subscribe(my_projection).await?;
+
+// After: Wrap in ProjectionHandler
+use epoch_core::projection::ProjectionHandler;
+event_bus.subscribe(ProjectionHandler::new(my_projection)).await?;
+```
+
+## 8. Testing Strategy
 
 1. **Unit Tests:** All existing tests should pass after updating to new signatures
 2. **Integration Tests:** Verify events flow correctly through the system
+3. **Saga Tests:** Verify sagas receive and process events correctly with new signatures
 
-## 7. Dependencies
+## 9. Dependencies
 
 No new dependencies required. `std::sync::Arc` is in the standard library.
 
-## 8. Alternatives Considered
+## 10. Alternatives Considered
 
 ### A. Full Arc everywhere
 - Every interface uses `Arc<Event<T>>`
@@ -449,16 +736,308 @@ No new dependencies required. `std::sync::Arc` is in the standard library.
 ### D. Keep current design
 - Rejected: Inefficient for high-throughput systems with many projections
 
-## 9. Open Questions
+### E. Make `handle_event` take `Arc<Event>`
+- Rejected: Sagas don't need shared ownership, just read access
 
-1. Should `EventStream` also yield `Arc<Event<D>>`? This would affect `read_events` and `read_events_since`.
-   - **Recommendation:** Yes, for consistency and to avoid clones when replaying events.
+### F. Blanket `EventObserver` impl for `Saga`
+- Attempted but rejected due to Rust's orphan rules
+- Two blanket impls for `EventObserver` (one for `Projection`, one for `Saga`) conflict
+- The compiler can't prove that a type won't implement both traits
+- Solution: Use wrapper types (`ProjectionHandler`, `SagaHandler`) instead
 
-2. Should we provide a helper method `Event::into_arc(self) -> Arc<Event<D>>`?
-   - **Recommendation:** Not necessary, `Arc::new(event)` is clear enough.
+---
 
-## 10. Approval
+# PHASE 3: `to_subset_event` Borrow-Based Conversion
 
+**Status:** ✅ Completed (2026-01-24)
+
+---
+
+## 11. Problem Statement (Phase 3)
+
+Currently `to_subset_event()` clones event data via `TryFrom<D>`:
+
+```rust
+pub fn to_subset_event<ED>(&self) -> Result<Event<ED>, ED::Error>
+where
+    ED: EventData + TryFrom<D>,
+{
+    let data = self
+        .data
+        .as_ref()
+        .map(|d| ED::try_from(d.clone()))  // ← Clone here
+        .transpose()?;
+    // ...
+}
+```
+
+This clone happens in:
+- `Projection::re_hydrate` - for each event during projection rebuild
+- `Projection::apply_and_store` - for each event during live processing
+- `Saga::process_event` - for each event during saga processing
+
+**Impact:** Medium-High. This clone happens on every event processed by every projection and saga.
+
+## 12. Proposed Solution (Phase 3)
+
+### 12.1 Generate `TryFrom<&D>` in `subset_enum` derive macro
+
+The `#[subset_enum]` macro in `epoch_derive` currently generates:
+
+```rust
+impl TryFrom<SupersetEnum> for SubsetEnum {
+    type Error = ConversionError;
+    
+    fn try_from(value: SupersetEnum) -> Result<Self, Self::Error> {
+        match value {
+            SupersetEnum::VariantA { .. } => Ok(SubsetEnum::VariantA { .. }),
+            _ => Err(ConversionError::...),
+        }
+    }
+}
+```
+
+Add a parallel implementation for references:
+
+```rust
+impl TryFrom<&SupersetEnum> for SubsetEnum {
+    type Error = ConversionError;
+    
+    fn try_from(value: &SupersetEnum) -> Result<Self, Self::Error> {
+        match value {
+            SupersetEnum::VariantA { field1, field2, .. } => Ok(SubsetEnum::VariantA { 
+                field1: field1.clone(),  // Clone individual fields, not entire enum
+                field2: field2.clone(),
+            }),
+            _ => Err(ConversionError::...),
+        }
+    }
+}
+```
+
+### 12.2 Update `to_subset_event` to use reference conversion
+
+```rust
+// Before
+pub fn to_subset_event<ED>(&self) -> Result<Event<ED>, ED::Error>
+where
+    ED: EventData + TryFrom<D>,
+{
+    let data = self.data.as_ref().map(|d| ED::try_from(d.clone())).transpose()?;
+    // ...
+}
+
+// After
+pub fn to_subset_event<ED>(&self) -> Result<Event<ED>, ED::Error>
+where
+    ED: EventData + for<'a> TryFrom<&'a D>,  // Changed bound
+{
+    let data = self.data.as_ref().map(|d| ED::try_from(d)).transpose()?;  // No clone
+    // ...
+}
+```
+
+### 12.3 Benefits
+
+| Scenario | Before (clone entire enum) | After (clone matching fields) |
+|----------|---------------------------|------------------------------|
+| Event matches subset | Clone all variants' data | Clone only matched variant's fields |
+| Event doesn't match | Clone all, then discard | No clone, early return |
+| Large non-matching variants | Wasted clone | Zero cost |
+
+### 12.4 Implementation Notes
+
+**Approach Taken:** We updated the trait bounds and internal implementation to use reference-based conversion by default:
+
+1. Added `TryFrom<&D>` generation in the `subset_enum` macro alongside existing `TryFrom<D>`
+2. Added a new `to_subset_event_ref()` method that uses the reference-based conversion
+3. Changed `Projection::EventType` and `Saga::EventType` bounds to require `TryFrom<&ED, Error = EnumConversionError>`
+4. Updated internal `re_hydrate`, `apply_and_store`, and `process_event` to use `to_subset_event_ref()`
+
+### 12.5 Files Modified
+
+| File | Changes |
+|------|---------|
+| `epoch_derive/src/subset.rs` | Generate `TryFrom<&D>` impl alongside `TryFrom<D>` in `subset_enum` macro |
+| `epoch_core/src/event.rs` | Add `to_subset_event_ref()` method with reference-based conversion |
+| `epoch_core/src/projection.rs` | Change `EventType` bound to `TryFrom<&ED, Error = EnumConversionError>`, use `to_subset_event_ref()` internally |
+| `epoch_core/src/saga.rs` | Change `EventType` bound to `TryFrom<&ED, Error = EnumConversionError>`, use `to_subset_event_ref()` internally |
+| `epoch_core/src/aggregate.rs` | Update `ReHydrateError` type parameter to use `EnumConversionError` |
+
+### 12.6 Breaking Changes
+
+This is a **breaking change**:
+- `Projection::EventType` now requires `for<'a> TryFrom<&'a ED, Error = EnumConversionError>` instead of `TryFrom<ED>`
+- `Saga::EventType` now requires `for<'a> TryFrom<&'a ED, Error = EnumConversionError>` instead of `TryFrom<ED>`
+- For subset enums using `#[subset_enum]`, this is automatic
+- For identity conversions, users must add a manual `TryFrom<&Self>` impl
+
+---
+
+# PHASE 4: `SliceEventStream` Internal Reference Stream
+
+**Status:** ✅ Completed (2026-01-24)
+
+---
+
+## 13. Problem Statement (Phase 4)
+
+`SliceEventStream` clones events because `EventStream` trait yields owned `Event<D>`:
+
+```rust
+impl Stream for SliceEventStream<'a, D, E> {
+    type Item = Result<Event<D>, E>;  // Owned
+    
+    fn poll_next(...) {
+        let event = this.inner[this.idx].clone();  // Must clone
+        Poll::Ready(Some(Ok(event)))
+    }
+}
+```
+
+## 14. Analysis of Options (Phase 4)
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| A. Yield `&'a Event<D>` | Change trait to return references | Zero-cost | Lifetime contagion through entire API; `PgEventStream` can't return refs (deserializes on-the-fly); `InMemoryEventStoreStream` holds mutex lock |
+| B. Yield `Arc<Event<D>>` | Change trait to return Arc | Consistent with Phase 1 | `PgEventStream` gains Arc overhead; `SliceEventStream` needs Arc input or wraps on-the-fly |
+| C. Internal reference stream | Keep `EventStream` as-is; create separate internal type for `SliceEventStream` use case | Minimal API change; targeted fix | Adds complexity; two patterns for streaming |
+
+## 15. Proposed Solution (Phase 4)
+
+**Decision:** Option C (internal reference stream).
+
+Create a separate `RefEventStream` trait and `SliceRefEventStream` for internal use in `Aggregate::handle`:
+
+```rust
+/// Internal trait for reference-based event streaming (not public API)
+trait RefEventStream<'a, D, E>: Stream<Item = Result<&'a Event<D>, E>> + Send
+where
+    D: EventData + Send + Sync,
+{
+}
+
+/// Reference-based slice stream for aggregate re-hydration
+struct SliceRefEventStream<'a, D, E> {
+    inner: &'a [Event<D>],
+    idx: usize,
+    _marker: PhantomData<E>,
+}
+
+impl<'a, D, E> Stream for SliceRefEventStream<'a, D, E> {
+    type Item = Result<&'a Event<D>, E>;
+    
+    fn poll_next(...) {
+        if this.idx < this.inner.len() {
+            let event = &this.inner[this.idx];  // No clone!
+            this.idx += 1;
+            Poll::Ready(Some(Ok(event)))
+        } else {
+            Poll::Ready(None)
+        }
+    }
+}
+```
+
+Add a separate `re_hydrate_from_refs` method or make `re_hydrate` generic over stream item type.
+
+## 16. Implementation Notes (Phase 4)
+
+**Approach Taken:** Option C (internal reference stream) as proposed.
+
+### 16.1 New Types Added
+
+**`epoch_core/src/event_store.rs`:**
+
+```rust
+/// Trait for reference-based event streaming
+pub trait RefEventStream<'a, D, E>: Stream<Item = Result<&'a Event<D>, E>> + Send
+where
+    D: EventData + Send + Sync + 'a,
+{
+}
+
+/// Reference-based slice stream for aggregate re-hydration  
+pub struct SliceRefEventStream<'a, D, E> {
+    inner: &'a [Event<D>],
+    idx: usize,
+    _marker: PhantomData<E>,
+}
+```
+
+**`epoch_core/src/projection.rs`:**
+
+```rust
+/// Reconstructs the projection's state from a reference-based event stream.
+async fn re_hydrate_from_refs<'a, E>(
+    &self,
+    state: Option<Self::State>,
+    event_stream: Pin<Box<dyn RefEventStream<'a, ED, E> + Send + 'a>>,
+) -> Result<Option<Self::State>, ReHydrateError<...>>
+```
+
+### 16.2 Aggregate::handle Updated
+
+**`epoch_core/src/aggregate.rs`:**
+
+```rust
+// Before
+let event_stream = Box::pin(SliceEventStream::from(events.as_slice()));
+let state = self.re_hydrate(state, event_stream).await...;
+
+// After  
+let event_stream = Box::pin(SliceRefEventStream::from(events.as_slice()));
+let state = self.re_hydrate_from_refs(state, event_stream).await...;
+```
+
+### 16.3 Files Modified
+
+| File | Changes |
+|------|---------|
+| `epoch_core/src/event_store.rs` | Add `RefEventStream` trait and `SliceRefEventStream` struct |
+| `epoch_core/src/projection.rs` | Add `re_hydrate_from_refs()` method |
+| `epoch_core/src/aggregate.rs` | Update `handle()` to use `SliceRefEventStream` and `re_hydrate_from_refs()` |
+| `epoch_core/tests/slice_ref_event_stream_tests.rs` | New test file with 6 tests |
+
+### 16.4 Benefits
+
+- **Zero-copy iteration**: Events are borrowed from the slice, no cloning required
+- **Same semantics**: `re_hydrate_from_refs` produces identical results to `re_hydrate`
+- **Minimal API change**: Public `EventStream` trait unchanged, new types are additive
+- **Backwards compatible**: Existing code using `SliceEventStream` still works
+
+## 17. Open Questions
+
+1. ~~Should `EventStream` also yield `Arc<Event<D>>`?~~ → **Resolved:** No. Analysis showed that changing `EventStream` to yield `Arc<Event<D>>` would add overhead to `PgEventStream` (which deserializes fresh events) while only benefiting `InMemoryEventStoreStream` and `SliceEventStream`. The `EventBus::publish` path (Phase 1) benefits from `Arc` because events fan out to multiple observers. The `EventStream` path is typically single-consumer, so `Arc` overhead isn't justified.
+
+2. ~~Should we provide a helper method `Event::into_arc(self) -> Arc<Event<D>>`?~~ → **Resolved:** Not necessary, `Arc::new(event)` is clear enough.
+
+3. ~~Should `process_event` take `&Event<ED>` or `Arc<Event<ED>>`?~~ → **Resolved:** Take `&Event<ED>`. The blanket impl dereferences the `Arc`.
+
+4. ~~Should the `Saga` blanket impl be feature-gated?~~ → **Resolved:** Not applicable. We use wrapper types (`SagaHandler`, `ProjectionHandler`) instead of blanket impls to avoid trait coherence issues.
+
+5. ~~Should `SliceEventStream` be optimized to avoid cloning?~~ → **Resolved:** Deferred to Phase 4. The clone only occurs on the write path (1-3 events per command, freshly created). Option C (internal reference stream) will be implemented if profiling shows it's a bottleneck.
+
+6. ~~Should `TryFrom<&D>` be generated alongside or instead of `TryFrom<D>`?~~ → **Resolved:** Both are generated. The `#[subset_enum]` macro generates `TryFrom<D>` for backwards compatibility and `TryFrom<&D>` for efficient reference-based conversion.
+
+## 18. Approval
+
+### Phase 1
 - [x] Reviewed by project maintainer
 - [x] Implementation plan approved
 - [x] Implementation completed
+
+### Phase 2
+- [x] Reviewed by project maintainer
+- [x] Implementation plan approved
+- [x] Implementation completed
+
+### Phase 3
+- [x] Reviewed by project maintainer
+- [x] Implementation plan approved
+- [x] Implementation completed (2026-01-24)
+
+### Phase 4
+- [x] Reviewed by project maintainer
+- [x] Implementation plan approved
+- [x] Implementation completed (2026-01-24)

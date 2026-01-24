@@ -412,6 +412,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "epoch_derive",
  "epoch_mem",
  "futures-core",
  "log",

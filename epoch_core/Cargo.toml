@@ -21,5 +21,6 @@ uuid = { version = "1.17.0", features = ["serde", "v4"] }
 
 [dev-dependencies]
 epoch_mem = { path = "../epoch_mem" }
+epoch_derive = { path = "../epoch_derive" }
 
 

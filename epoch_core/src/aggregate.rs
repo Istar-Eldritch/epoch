@@ -1,9 +1,9 @@
 //! Aggregate definition
 
-use crate::event::{Event, EventData};
+use crate::event::{EnumConversionError, Event, EventData};
 use crate::event_store::EventStoreBackend;
 use crate::prelude::{
-    Projection, ProjectionState, ReHydrateError, SliceEventStream, StateStoreBackend,
+    Projection, ProjectionState, ReHydrateError, SliceRefEventStream, StateStoreBackend,
 };
 use async_trait::async_trait;
 use log::debug;
@@ -192,7 +192,7 @@ where
             Self::AggregateError,
             ReHydrateError<
                 <Self as Projection<ED>>::ProjectionError,
-                <<Self as Projection<ED>>::EventType as TryFrom<ED>>::Error,
+                EnumConversionError,
                 <<Self as Aggregate<ED>>::EventStore as EventStoreBackend>::Error,
             >,
             <Self::StateStore as StateStoreBackend<Self::State>>::Error,
@@ -262,9 +262,9 @@ where
                 })
                 .collect();
 
-            let event_stream = Box::pin(SliceEventStream::from(events.as_slice()));
+            let event_stream = Box::pin(SliceRefEventStream::from(events.as_slice()));
             let state = self
-                .re_hydrate(state, event_stream)
+                .re_hydrate_from_refs(state, event_stream)
                 .await
                 .map_err(HandleCommandError::Hydration)?
                 .map(|mut s| {

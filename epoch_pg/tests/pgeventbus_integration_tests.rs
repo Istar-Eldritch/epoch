@@ -17,6 +17,15 @@ enum TestEventData {
     TestEvent { value: String },
 }
 
+// Identity conversion for testing - clones the data
+impl TryFrom<&TestEventData> for TestEventData {
+    type Error = epoch_core::event::EnumConversionError;
+
+    fn try_from(value: &TestEventData) -> Result<Self, Self::Error> {
+        Ok(value.clone())
+    }
+}
+
 // Helper function to create a new event
 fn new_event(stream_id: Uuid, stream_version: u64, value: &str) -> Event<TestEventData> {
     Event::<TestEventData>::builder()
@@ -119,7 +128,7 @@ async fn test_subscribe_and_event_propagation() {
     let projection = TestProjection::new();
     let projection_events = projection.get_state_store().clone();
     event_bus
-        .subscribe(projection)
+        .subscribe(ProjectionHandler::new(projection))
         .await
         .expect("Failed to subscribe projection");
 
@@ -161,7 +170,7 @@ async fn test_noop_publish() {
     let projection = TestProjection::new();
     let projection_events = projection.get_state_store().clone();
     event_bus
-        .subscribe(projection)
+        .subscribe(ProjectionHandler::new(projection))
         .await
         .expect("Failed to subscribe projection");
 
@@ -197,7 +206,7 @@ async fn test_event_data_deserialization_failure() {
     let projection = TestProjection::new();
     let projection_events = projection.get_state_store().clone();
     event_bus
-        .subscribe(projection)
+        .subscribe(ProjectionHandler::new(projection))
         .await
         .expect("Failed to subscribe projection");
 
@@ -296,14 +305,14 @@ async fn test_multiple_subscribers() {
     let projection1 = TestProjection::new();
     let projection_events1 = projection1.get_state_store().clone();
     event_bus
-        .subscribe(projection1)
+        .subscribe(ProjectionHandler::new(projection1))
         .await
         .expect("Failed to subscribe projection 1");
 
     let projection2 = TestProjection::new();
     let projection_events2 = projection2.get_state_store().clone();
     event_bus
-        .subscribe(projection2)
+        .subscribe(ProjectionHandler::new(projection2))
         .await
         .expect("Failed to subscribe projection 2");
 

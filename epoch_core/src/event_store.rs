@@ -101,6 +101,42 @@ where
     _marker: std::marker::PhantomData<(&'a D, E)>,
 }
 
+/// A trait that defines the behavior of a reference-based event stream.
+///
+/// This is an internal optimization for scenarios where events are borrowed
+/// from a slice (e.g., in `Aggregate::handle` after generating events from a command).
+/// Unlike [`EventStream`], this yields references to events rather than owned events,
+/// avoiding unnecessary cloning.
+///
+/// This trait is not part of the public API and is used internally by the framework.
+pub trait RefEventStream<'a, D, E>: Stream<Item = Result<&'a Event<D>, E>> + Send
+where
+    D: EventData + Send + Sync + 'a,
+{
+}
+
+/// A reference-based event stream constructed from a slice.
+///
+/// This is an optimized version of [`SliceEventStream`] that yields references
+/// to events instead of cloning them. Used internally by [`Aggregate::handle`]
+/// to avoid cloning freshly created events during re-hydration.
+///
+/// # Performance
+///
+/// This eliminates the clone that occurs in [`SliceEventStream`], which is
+/// beneficial when events have large payloads. However, the lifetime of the
+/// yielded references is tied to the slice, so this can only be used when
+/// the slice outlives the stream consumption.
+pub struct SliceRefEventStream<'a, D, E>
+where
+    D: EventData + Send + Sync + 'a,
+    E: std::error::Error + Send + Sync,
+{
+    inner: &'a [Event<D>],
+    idx: usize,
+    _marker: std::marker::PhantomData<E>,
+}
+
 impl<'a, D, E> From<&'a [Event<D>]> for SliceEventStream<'a, D, E>
 where
     D: EventData + Send + Sync + 'a,
@@ -146,6 +182,57 @@ where
 }
 
 impl<'a, D, E> EventStream<D, E> for SliceEventStream<'a, D, E>
+where
+    D: EventData + Send + Sync + 'a,
+    E: std::error::Error + Send + Sync,
+{
+}
+
+impl<'a, D, E> From<&'a [Event<D>]> for SliceRefEventStream<'a, D, E>
+where
+    D: EventData + Send + Sync + 'a,
+    E: std::error::Error + Send + Sync,
+{
+    fn from(events: &'a [Event<D>]) -> Self {
+        Self {
+            inner: events,
+            idx: 0,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+// All fields (slice reference, usize, PhantomData) are Unpin, so SliceRefEventStream is Unpin.
+impl<'a, D, E> Unpin for SliceRefEventStream<'a, D, E>
+where
+    D: EventData + Send + Sync + 'a,
+    E: std::error::Error + Send + Sync,
+{
+}
+
+impl<'a, D, E> Stream for SliceRefEventStream<'a, D, E>
+where
+    D: EventData + Send + Sync + 'a,
+    E: std::error::Error + Send + Sync,
+{
+    type Item = Result<&'a Event<D>, E>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        if this.idx < this.inner.len() {
+            let event = &this.inner[this.idx];
+            this.idx += 1;
+            Poll::Ready(Some(Ok(event)))
+        } else {
+            Poll::Ready(None)
+        }
+    }
+}
+
+impl<'a, D, E> RefEventStream<'a, D, E> for SliceRefEventStream<'a, D, E>
 where
     D: EventData + Send + Sync + 'a,
     E: std::error::Error + Send + Sync,

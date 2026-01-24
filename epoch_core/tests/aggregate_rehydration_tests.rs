@@ -9,6 +9,7 @@
 //! - The state store hasn't been updated yet with the saga's changes
 
 use async_trait::async_trait;
+use epoch_core::event::EnumConversionError;
 use epoch_core::prelude::*;
 use epoch_mem::*;
 use uuid::Uuid;
@@ -26,6 +27,15 @@ impl EventData for CounterEvent {
             CounterEvent::Created => "CounterCreated",
             CounterEvent::Incremented => "CounterIncremented",
         }
+    }
+}
+
+// Identity conversion for testing - clones the data
+impl TryFrom<&CounterEvent> for CounterEvent {
+    type Error = EnumConversionError;
+
+    fn try_from(value: &CounterEvent) -> Result<Self, Self::Error> {
+        Ok(value.clone())
     }
 }
 

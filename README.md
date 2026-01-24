@@ -77,12 +77,48 @@ impl Projection<AppEvent> for UserListProjection {
         // Transform events into queryable state
     }
 }
+
+// Subscribe to the event bus using ProjectionHandler
+use epoch::ProjectionHandler;
+event_bus.subscribe(ProjectionHandler::new(user_list_projection)).await?;
+```
+
+### Sagas
+
+Sagas coordinate long-running business processes across multiple aggregates. They react to events and dispatch commands.
+
+```rust
+#[async_trait]
+impl Saga<AppEvent> for OrderFulfillmentSaga {
+    type State = OrderFulfillmentState;
+    type EventType = OrderEvent;
+    // ...
+
+    async fn handle_event(
+        &self,
+        state: Self::State,
+        event: &Event<Self::EventType>,  // Takes reference for efficiency
+    ) -> Result<Option<Self::State>, Self::SagaError> {
+        match &event.data {
+            OrderEvent::OrderPlaced { .. } => {
+                // Dispatch commands to other aggregates
+            }
+            // ...
+        }
+    }
+}
+
+// Subscribe to the event bus using SagaHandler
+use epoch::SagaHandler;
+event_bus.subscribe(SagaHandler::new(order_fulfillment_saga)).await?;
 ```
 
 ### Event Store & Event Bus
 
 - **`EventStoreBackend`** - Trait for persisting and reading events
-- **`EventBus`** - Trait for publishing events to subscribers (projections, sagas)
+- **`EventBus`** - Trait for publishing events to subscribers
+- **`ProjectionHandler`** - Wrapper to subscribe projections to the event bus
+- **`SagaHandler`** - Wrapper to subscribe sagas to the event bus
 
 ## Crate Structure
 

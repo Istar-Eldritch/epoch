@@ -417,6 +417,8 @@ mod tests {
     use tokio_stream::StreamExt;
     use uuid::Uuid;
 
+    use epoch_core::event::EnumConversionError;
+
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     struct MyEventData {
         value: String,
@@ -425,6 +427,15 @@ mod tests {
     impl EventData for MyEventData {
         fn event_type(&self) -> &'static str {
             "MyEvent"
+        }
+    }
+
+    // Identity conversion for testing - clones the data
+    impl TryFrom<&MyEventData> for MyEventData {
+        type Error = EnumConversionError;
+
+        fn try_from(value: &MyEventData) -> Result<Self, Self::Error> {
+            Ok(value.clone())
         }
     }
 
@@ -594,7 +605,9 @@ mod tests {
         let bus = InMemoryEventBus::<MyEventData>::new();
         let projection = TestProjection::new();
         let storage = projection.get_state_store().clone();
-        bus.subscribe(projection).await.unwrap();
+        bus.subscribe(ProjectionHandler::new(projection))
+            .await
+            .unwrap();
 
         let stream_id = Uuid::new_v4();
         let event = new_event(stream_id, 1, "test_publish");
@@ -611,7 +624,9 @@ mod tests {
 
         let projection = TestProjection::new();
 
-        bus.subscribe(projection).await.unwrap();
+        bus.subscribe(ProjectionHandler::new(projection))
+            .await
+            .unwrap();
 
         let projections = bus.projections.read().await;
         assert_eq!(projections.len(), 1);
