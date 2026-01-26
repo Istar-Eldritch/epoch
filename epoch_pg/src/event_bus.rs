@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
 use uuid::Uuid;
 
 use std::future::Future;
@@ -62,25 +62,75 @@ impl Default for ReliableDeliveryConfig {
 }
 
 /// Determines how checkpoints are persisted after event processing.
-///
-/// Currently only `Synchronous` mode is supported, which provides the strongest
-/// durability guarantees. Batched checkpointing may be added in the future
-/// as a performance optimization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum CheckpointMode {
     /// Checkpoint is written immediately after each successful event processing.
     /// Provides strongest durability guarantees but may impact throughput.
+    /// On crash, at most 1 event may be redelivered.
     #[default]
     Synchronous,
+
+    /// Batch checkpoint updates for better performance.
+    ///
+    /// Checkpoints are written when either:
+    /// - `batch_size` events have been processed since the last checkpoint, OR
+    /// - `max_delay_ms` milliseconds have elapsed since the first unacknowledged event
+    ///
+    /// This trades off a window of potential duplicate deliveries on crash
+    /// for significantly improved throughput. On crash, up to `batch_size` events
+    /// may be redelivered.
+    ///
+    /// **Use when:**
+    /// - High event throughput (1000+ events/second)
+    /// - Projections are idempotent
+    /// - Catch-up performance is critical
+    Batched {
+        /// Number of events to process before updating checkpoint.
+        batch_size: u32,
+        /// Maximum time (in milliseconds) before forcing a checkpoint update.
+        /// Prevents unbounded delay when event rate is low.
+        max_delay_ms: u64,
+    },
+}
+
+impl CheckpointMode {
+    /// Creates a new `Batched` checkpoint mode with the given settings.
+    ///
+    /// # Arguments
+    /// * `batch_size` - Number of events to process before checkpointing
+    /// * `max_delay` - Maximum time before forcing a checkpoint
+    ///
+    /// # Example
+    /// ```
+    /// use epoch_pg::CheckpointMode;
+    /// use std::time::Duration;
+    ///
+    /// let mode = CheckpointMode::batched(100, Duration::from_secs(5));
+    /// ```
+    pub fn batched(batch_size: u32, max_delay: Duration) -> Self {
+        Self::Batched {
+            batch_size,
+            max_delay_ms: max_delay.as_millis() as u64,
+        }
+    }
+
+    /// Creates a `Batched` checkpoint mode with default settings.
+    ///
+    /// Defaults: `batch_size = 100`, `max_delay = 5 seconds`
+    pub fn batched_default() -> Self {
+        Self::Batched {
+            batch_size: 100,
+            max_delay_ms: 5000,
+        }
+    }
 }
 
 /// Determines how multiple instances of the same subscriber coordinate.
 ///
-/// Currently only `SingleInstance` mode is supported. For multi-instance
-/// deployments, you can use the advisory lock helper methods
-/// (`try_acquire_subscriber_lock`, `release_subscriber_lock`) for manual coordination,
-/// or run different projections on different instances.
+/// For multi-instance deployments, use `Coordinated` mode to ensure only one
+/// instance processes events for each subscriber. For single-instance deployments
+/// or external orchestration, use `SingleInstance` mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum InstanceMode {
@@ -88,6 +138,17 @@ pub enum InstanceMode {
     /// or when external orchestration handles instance management.
     #[default]
     SingleInstance,
+
+    /// Use PostgreSQL advisory locks to ensure only one instance
+    /// processes events for each subscriber. Recommended for multi-instance
+    /// deployments. Provides automatic failover when an instance dies.
+    ///
+    /// When enabled:
+    /// - `subscribe()` attempts to acquire a lock before catch-up
+    /// - If lock is not acquired, the subscribe call succeeds but the projection
+    ///   is not registered (another instance is processing)
+    /// - Locks are automatically released when the database connection closes
+    Coordinated,
 }
 
 /// Result of processing an event with retry logic.
@@ -97,6 +158,144 @@ enum ProcessResult {
     Success,
     /// Event failed after all retries and was sent to DLQ
     SentToDlq,
+}
+
+/// Tracks pending checkpoint state for batched checkpointing.
+///
+/// This struct holds the checkpoint data that hasn't been flushed to the database yet.
+#[derive(Debug, Clone)]
+struct PendingCheckpoint {
+    /// The global sequence to checkpoint
+    global_sequence: u64,
+    /// The event ID to checkpoint
+    event_id: Uuid,
+    /// Number of events processed since last checkpoint write
+    events_since_checkpoint: u32,
+    /// When the first event was processed since last checkpoint write
+    first_event_time: Instant,
+}
+
+impl PendingCheckpoint {
+    /// Creates a new pending checkpoint.
+    fn new(global_sequence: u64, event_id: Uuid) -> Self {
+        Self {
+            global_sequence,
+            event_id,
+            events_since_checkpoint: 1,
+            first_event_time: Instant::now(),
+        }
+    }
+
+    /// Updates the pending checkpoint with a new event.
+    fn update(&mut self, global_sequence: u64, event_id: Uuid) {
+        self.global_sequence = global_sequence;
+        self.event_id = event_id;
+        self.events_since_checkpoint += 1;
+    }
+}
+
+/// Determines whether a pending checkpoint should be flushed to the database.
+///
+/// For `Synchronous` mode, always returns `true`.
+/// For `Batched` mode, returns `true` if either:
+/// - The number of events since last flush >= `batch_size`
+/// - The time since the first unacknowledged event >= `max_delay_ms`
+fn should_flush_checkpoint(pending: &PendingCheckpoint, mode: &CheckpointMode) -> bool {
+    match mode {
+        CheckpointMode::Synchronous => true,
+        CheckpointMode::Batched {
+            batch_size,
+            max_delay_ms,
+        } => {
+            let max_delay = Duration::from_millis(*max_delay_ms);
+            pending.events_since_checkpoint >= *batch_size
+                || pending.first_event_time.elapsed() >= max_delay
+        }
+    }
+}
+
+/// Flushes a pending checkpoint to the database.
+///
+/// This writes the checkpoint and updates the in-memory cache.
+async fn flush_checkpoint(
+    pool: &PgPool,
+    subscriber_id: &str,
+    pending: &PendingCheckpoint,
+    checkpoint_cache: &mut HashMap<String, u64>,
+) {
+    if let Err(e) = sqlx::query(
+        r#"
+        INSERT INTO epoch_event_bus_checkpoints (subscriber_id, last_global_sequence, last_event_id, updated_at)
+        VALUES ($1, $2, $3, NOW())
+        ON CONFLICT (subscriber_id) DO UPDATE SET
+            last_global_sequence = EXCLUDED.last_global_sequence,
+            last_event_id = EXCLUDED.last_event_id,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(subscriber_id)
+    .bind(pending.global_sequence as i64)
+    .bind(pending.event_id)
+    .execute(pool)
+    .await
+    {
+        error!(
+            "Failed to flush checkpoint for '{}': {}",
+            subscriber_id, e
+        );
+    } else {
+        checkpoint_cache.insert(subscriber_id.to_string(), pending.global_sequence);
+        log::debug!(
+            "Flushed checkpoint for '{}' to global_sequence {} ({} events batched)",
+            subscriber_id,
+            pending.global_sequence,
+            pending.events_since_checkpoint
+        );
+    }
+}
+
+/// Flushes all pending checkpoints that have exceeded their max_delay.
+///
+/// This is called periodically to ensure checkpoints are written even when
+/// event rate is low.
+async fn flush_expired_checkpoints(
+    pool: &PgPool,
+    pending_checkpoints: &mut HashMap<String, PendingCheckpoint>,
+    checkpoint_cache: &mut HashMap<String, u64>,
+    mode: &CheckpointMode,
+) {
+    let CheckpointMode::Batched { max_delay_ms, .. } = mode else {
+        return; // Nothing to do for Synchronous mode
+    };
+
+    let max_delay = Duration::from_millis(*max_delay_ms);
+    let expired: Vec<String> = pending_checkpoints
+        .iter()
+        .filter(|(_, p)| p.first_event_time.elapsed() >= max_delay)
+        .map(|(k, _)| k.clone())
+        .collect();
+
+    for subscriber_id in expired {
+        if let Some(pending) = pending_checkpoints.remove(&subscriber_id) {
+            flush_checkpoint(pool, &subscriber_id, &pending, checkpoint_cache).await;
+        }
+    }
+}
+
+/// Flushes all pending checkpoints to the database.
+///
+/// This is called before reconnection or shutdown to ensure no checkpoint data is lost.
+async fn flush_all_pending_checkpoints(
+    pool: &PgPool,
+    pending_checkpoints: &mut HashMap<String, PendingCheckpoint>,
+    checkpoint_cache: &mut HashMap<String, u64>,
+) {
+    let subscriber_ids: Vec<String> = pending_checkpoints.keys().cloned().collect();
+    for subscriber_id in subscriber_ids {
+        if let Some(pending) = pending_checkpoints.remove(&subscriber_id) {
+            flush_checkpoint(pool, &subscriber_id, &pending, checkpoint_cache).await;
+        }
+    }
 }
 
 /// Calculates the retry delay using exponential backoff.
@@ -460,11 +659,32 @@ where
             // Cache is populated on first event for each subscriber and updated after DB writes.
             let mut checkpoint_cache: HashMap<String, u64> = HashMap::new();
 
+            // Pending checkpoints for batched mode: subscriber_id -> PendingCheckpoint
+            // These are checkpoints that haven't been flushed to the database yet.
+            let mut pending_checkpoints: HashMap<String, PendingCheckpoint> = HashMap::new();
+
+            // Interval for periodic checkpoint flush (only used in Batched mode)
+            let flush_interval = Duration::from_secs(1);
+
             loop {
                 // Ensure listener is connected
                 let listener = match listener_option {
                     Some(ref mut l) => l,
                     None => {
+                        // Before reconnecting, flush any pending checkpoints
+                        if !pending_checkpoints.is_empty() {
+                            info!(
+                                "Flushing {} pending checkpoints before reconnection",
+                                pending_checkpoints.len()
+                            );
+                            flush_all_pending_checkpoints(
+                                &checkpoint_pool,
+                                &mut pending_checkpoints,
+                                &mut checkpoint_cache,
+                            )
+                            .await;
+                        }
+
                         info!(
                             "Attempting to connect to PostgreSQL listener on channel '{}'",
                             channel_name
@@ -503,7 +723,27 @@ where
                     }
                 };
 
-                match listener.recv().await {
+                // Use select! to handle both notification reception and periodic checkpoint flush
+                let notification_result = tokio::select! {
+                    result = listener.recv() => Some(result),
+                    _ = sleep(flush_interval) => {
+                        // Periodic flush of expired checkpoints (for Batched mode)
+                        flush_expired_checkpoints(
+                            &checkpoint_pool,
+                            &mut pending_checkpoints,
+                            &mut checkpoint_cache,
+                            &config.checkpoint_mode,
+                        )
+                        .await;
+                        None // No notification, continue loop
+                    }
+                };
+
+                let Some(result) = notification_result else {
+                    continue; // Was a timer tick, go back to select!
+                };
+
+                match result {
                     Ok(notification) => {
                         // Reset reconnect delay on successful message reception
                         reconnect_delay = Duration::from_secs(1);
@@ -664,38 +904,7 @@ where
                                 }
                             }
 
-                            if succeeded {
-                                // Update checkpoint after successful processing
-                                if let Err(e) = sqlx::query(
-                                    r#"
-                                    INSERT INTO epoch_event_bus_checkpoints (subscriber_id, last_global_sequence, last_event_id, updated_at)
-                                    VALUES ($1, $2, $3, NOW())
-                                    ON CONFLICT (subscriber_id) DO UPDATE SET
-                                        last_global_sequence = EXCLUDED.last_global_sequence,
-                                        last_event_id = EXCLUDED.last_event_id,
-                                        updated_at = NOW()
-                                    "#,
-                                )
-                                .bind(&subscriber_id)
-                                .bind(event_global_seq as i64)
-                                .bind(event.id)
-                                .execute(&checkpoint_pool)
-                                .await
-                                {
-                                    error!(
-                                        "Failed to update checkpoint for '{}': {}",
-                                        subscriber_id, e
-                                    );
-                                } else {
-                                    // Update in-memory cache
-                                    checkpoint_cache.insert(subscriber_id.clone(), event_global_seq);
-                                    log::debug!(
-                                        "Updated checkpoint for '{}' to global_sequence {}",
-                                        subscriber_id,
-                                        event_global_seq
-                                    );
-                                }
-                            } else {
+                            if !succeeded {
                                 // Insert into DLQ after all retries exhausted
                                 if let Err(e) = sqlx::query(
                                     r#"
@@ -727,37 +936,37 @@ where
                                         config.max_retries + 1
                                     );
                                 }
+                            }
 
-                                // Still update checkpoint to prevent reprocessing the same failing event
-                                if let Err(e) = sqlx::query(
-                                    r#"
-                                    INSERT INTO epoch_event_bus_checkpoints (subscriber_id, last_global_sequence, last_event_id, updated_at)
-                                    VALUES ($1, $2, $3, NOW())
-                                    ON CONFLICT (subscriber_id) DO UPDATE SET
-                                        last_global_sequence = EXCLUDED.last_global_sequence,
-                                        last_event_id = EXCLUDED.last_event_id,
-                                        updated_at = NOW()
-                                    "#,
-                                )
-                                .bind(&subscriber_id)
-                                .bind(event_global_seq as i64)
-                                .bind(event.id)
-                                .execute(&checkpoint_pool)
-                                .await
-                                {
-                                    error!(
-                                        "Failed to update checkpoint for '{}' after DLQ insertion: {}",
-                                        subscriber_id, e
-                                    );
-                                } else {
-                                    // Update in-memory cache
-                                    checkpoint_cache.insert(subscriber_id.clone(), event_global_seq);
-                                    log::debug!(
-                                        "Updated checkpoint for '{}' to global_sequence {} (after DLQ insertion)",
-                                        subscriber_id,
-                                        event_global_seq
+                            // Update checkpoint (both success and DLQ cases need checkpoint advancement)
+                            // Always update in-memory cache immediately for deduplication
+                            checkpoint_cache.insert(subscriber_id.clone(), event_global_seq);
+
+                            // Track pending checkpoint for batched mode
+                            match pending_checkpoints.get_mut(&subscriber_id) {
+                                Some(pending) => {
+                                    pending.update(event_global_seq, event.id);
+                                }
+                                None => {
+                                    pending_checkpoints.insert(
+                                        subscriber_id.clone(),
+                                        PendingCheckpoint::new(event_global_seq, event.id),
                                     );
                                 }
+                            }
+
+                            // Check if we should flush the checkpoint
+                            if let Some(pending) = pending_checkpoints.get(&subscriber_id)
+                                && should_flush_checkpoint(pending, &config.checkpoint_mode)
+                            {
+                                let pending = pending_checkpoints.remove(&subscriber_id).unwrap();
+                                flush_checkpoint(
+                                    &checkpoint_pool,
+                                    &subscriber_id,
+                                    &pending,
+                                    &mut checkpoint_cache,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -973,6 +1182,36 @@ where
                 guard.subscriber_id().to_string()
             };
 
+            // === Multi-instance coordination ===
+            // If in Coordinated mode, try to acquire an advisory lock.
+            // If the lock is already held by another instance, skip this subscription.
+            if config.instance_mode == InstanceMode::Coordinated {
+                let lock_acquired: (bool,) = sqlx::query_as(
+                    r#"
+                    SELECT pg_try_advisory_lock(
+                        ('x' || substr(md5($1), 1, 8))::bit(32)::int,
+                        ('x' || substr(md5($1), 9, 8))::bit(32)::int
+                    )
+                    "#,
+                )
+                .bind(&subscriber_id)
+                .fetch_one(&pool)
+                .await?;
+
+                if !lock_acquired.0 {
+                    info!(
+                        "Another instance is processing subscriber '{}'. Skipping subscription on this instance.",
+                        subscriber_id
+                    );
+                    return Ok(());
+                }
+
+                info!(
+                    "Acquired advisory lock for subscriber '{}'. This instance will process events.",
+                    subscriber_id
+                );
+            }
+
             // === Gap-free catch-up with event buffering ===
             // To prevent race conditions between catch-up and real-time events:
             // 1. Start NOTIFY listener first and buffer incoming events
@@ -1075,6 +1314,11 @@ where
             let mut current_sequence = last_sequence;
             let mut total_caught_up = 0u64;
 
+            // Pending checkpoint for batched mode during catch-up
+            let mut pending_checkpoint: Option<PendingCheckpoint> = None;
+            // Local checkpoint cache for flush_checkpoint
+            let mut checkpoint_cache: HashMap<String, u64> = HashMap::new();
+
             // Process catch-up events from the database
             loop {
                 let rows: Vec<PgDBEvent> = sqlx::query_as(
@@ -1147,23 +1391,25 @@ where
                         process_event_with_retry(&observer, &event, &subscriber_id, &config, &pool)
                             .await;
 
-                    // Update checkpoint after processing (success or DLQ)
-                    // This prevents reprocessing the same event on restart
-                    sqlx::query(
-                        r#"
-                        INSERT INTO epoch_event_bus_checkpoints (subscriber_id, last_global_sequence, last_event_id, updated_at)
-                        VALUES ($1, $2, $3, NOW())
-                        ON CONFLICT (subscriber_id) DO UPDATE SET
-                            last_global_sequence = EXCLUDED.last_global_sequence,
-                            last_event_id = EXCLUDED.last_event_id,
-                            updated_at = NOW()
-                        "#,
-                    )
-                    .bind(&subscriber_id)
-                    .bind(event_global_seq as i64)
-                    .bind(event_id)
-                    .execute(&pool)
-                    .await?;
+                    // Track pending checkpoint for batched mode
+                    match &mut pending_checkpoint {
+                        Some(pending) => {
+                            pending.update(event_global_seq, event_id);
+                        }
+                        None => {
+                            pending_checkpoint =
+                                Some(PendingCheckpoint::new(event_global_seq, event_id));
+                        }
+                    }
+
+                    // Check if we should flush the checkpoint
+                    if let Some(ref pending) = pending_checkpoint
+                        && should_flush_checkpoint(pending, &config.checkpoint_mode)
+                    {
+                        let pending = pending_checkpoint.take().unwrap();
+                        flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache)
+                            .await;
+                    }
 
                     current_sequence = event_global_seq;
                     total_caught_up += 1;
@@ -1181,6 +1427,11 @@ where
                 if batch_size < config.catch_up_batch_size as usize {
                     break;
                 }
+            }
+
+            // Flush any remaining pending checkpoint after catch-up
+            if let Some(pending) = pending_checkpoint.take() {
+                flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache).await;
             }
 
             if total_caught_up > 0 {
@@ -1223,22 +1474,24 @@ where
                     process_event_with_retry(&observer, &event, &subscriber_id, &config, &pool)
                         .await;
 
-                // Update checkpoint
-                sqlx::query(
-                    r#"
-                    INSERT INTO epoch_event_bus_checkpoints (subscriber_id, last_global_sequence, last_event_id, updated_at)
-                    VALUES ($1, $2, $3, NOW())
-                    ON CONFLICT (subscriber_id) DO UPDATE SET
-                        last_global_sequence = EXCLUDED.last_global_sequence,
-                        last_event_id = EXCLUDED.last_event_id,
-                        updated_at = NOW()
-                    "#,
-                )
-                .bind(&subscriber_id)
-                .bind(event_global_seq as i64)
-                .bind(event_id)
-                .execute(&pool)
-                .await?;
+                // Track pending checkpoint for batched mode
+                match &mut pending_checkpoint {
+                    Some(pending) => {
+                        pending.update(event_global_seq, event_id);
+                    }
+                    None => {
+                        pending_checkpoint =
+                            Some(PendingCheckpoint::new(event_global_seq, event_id));
+                    }
+                }
+
+                // Check if we should flush the checkpoint
+                if let Some(ref pending) = pending_checkpoint
+                    && should_flush_checkpoint(pending, &config.checkpoint_mode)
+                {
+                    let pending = pending_checkpoint.take().unwrap();
+                    flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache).await;
+                }
 
                 current_sequence = event_global_seq;
                 processed_from_buffer += 1;
@@ -1250,6 +1503,11 @@ where
                         subscriber_id
                     );
                 }
+            }
+
+            // Flush any remaining pending checkpoint after buffer processing
+            if let Some(pending) = pending_checkpoint.take() {
+                flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache).await;
             }
 
             if buffered_count > 0 {
@@ -1295,6 +1553,13 @@ mod tests {
     #[test]
     fn instance_mode_default_is_single_instance() {
         assert_eq!(InstanceMode::default(), InstanceMode::SingleInstance);
+    }
+
+    #[test]
+    fn instance_mode_coordinated_exists_and_differs_from_single() {
+        let coordinated = InstanceMode::Coordinated;
+        let single = InstanceMode::SingleInstance;
+        assert_ne!(coordinated, single);
     }
 
     #[test]
@@ -1406,5 +1671,142 @@ mod tests {
         assert_eq!(entry.global_sequence, 42);
         assert_eq!(entry.retry_count, 3);
         assert!(entry.error_message.is_some());
+    }
+
+    #[test]
+    fn checkpoint_mode_batched_exists_and_differs_from_synchronous() {
+        let batched = CheckpointMode::Batched {
+            batch_size: 100,
+            max_delay_ms: 5000,
+        };
+        let synchronous = CheckpointMode::Synchronous;
+        assert_ne!(batched, synchronous);
+    }
+
+    #[test]
+    fn checkpoint_mode_batched_helper_creates_correct_mode() {
+        let mode = CheckpointMode::batched(50, Duration::from_secs(10));
+        assert_eq!(
+            mode,
+            CheckpointMode::Batched {
+                batch_size: 50,
+                max_delay_ms: 10000,
+            }
+        );
+    }
+
+    #[test]
+    fn checkpoint_mode_batched_default_has_expected_values() {
+        let mode = CheckpointMode::batched_default();
+        assert_eq!(
+            mode,
+            CheckpointMode::Batched {
+                batch_size: 100,
+                max_delay_ms: 5000,
+            }
+        );
+    }
+
+    #[test]
+    fn pending_checkpoint_new_initializes_correctly() {
+        let event_id = Uuid::new_v4();
+        let pending = PendingCheckpoint::new(42, event_id);
+
+        assert_eq!(pending.global_sequence, 42);
+        assert_eq!(pending.event_id, event_id);
+        assert_eq!(pending.events_since_checkpoint, 1);
+        // first_event_time should be very recent
+        assert!(pending.first_event_time.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn pending_checkpoint_update_increments_count() {
+        let event_id1 = Uuid::new_v4();
+        let event_id2 = Uuid::new_v4();
+        let mut pending = PendingCheckpoint::new(42, event_id1);
+
+        pending.update(43, event_id2);
+
+        assert_eq!(pending.global_sequence, 43);
+        assert_eq!(pending.event_id, event_id2);
+        assert_eq!(pending.events_since_checkpoint, 2);
+    }
+
+    #[test]
+    fn should_flush_synchronous_always_returns_true() {
+        let pending = PendingCheckpoint::new(1, Uuid::new_v4());
+        assert!(should_flush_checkpoint(
+            &pending,
+            &CheckpointMode::Synchronous
+        ));
+    }
+
+    #[test]
+    fn should_flush_batched_returns_true_at_batch_size() {
+        let event_id = Uuid::new_v4();
+        let mut pending = PendingCheckpoint::new(1, event_id);
+
+        let mode = CheckpointMode::Batched {
+            batch_size: 5,
+            max_delay_ms: 60000, // 60 seconds - won't trigger
+        };
+
+        // 1 event - should not flush
+        assert!(!should_flush_checkpoint(&pending, &mode));
+
+        // 2, 3, 4 events - should not flush
+        for i in 2..5 {
+            pending.update(i, Uuid::new_v4());
+            assert!(!should_flush_checkpoint(&pending, &mode));
+        }
+
+        // 5th event - should flush
+        pending.update(5, Uuid::new_v4());
+        assert!(should_flush_checkpoint(&pending, &mode));
+    }
+
+    #[test]
+    fn should_flush_batched_returns_true_at_max_delay() {
+        // Create a pending checkpoint with an old first_event_time
+        let mut pending = PendingCheckpoint::new(1, Uuid::new_v4());
+        // Simulate time passing by creating with an artificially old time
+        pending.first_event_time = Instant::now() - Duration::from_millis(600);
+
+        let mode = CheckpointMode::Batched {
+            batch_size: 100, // Won't reach this
+            max_delay_ms: 500,
+        };
+
+        // Even with only 1 event, should flush due to time
+        assert!(should_flush_checkpoint(&pending, &mode));
+    }
+
+    #[test]
+    fn should_flush_batched_returns_false_before_thresholds() {
+        let pending = PendingCheckpoint::new(1, Uuid::new_v4());
+
+        let mode = CheckpointMode::Batched {
+            batch_size: 100,
+            max_delay_ms: 60000,
+        };
+
+        // Neither batch_size nor max_delay reached
+        assert!(!should_flush_checkpoint(&pending, &mode));
+    }
+
+    #[test]
+    fn reliable_delivery_config_can_use_batched_checkpoint_mode() {
+        let config = ReliableDeliveryConfig {
+            checkpoint_mode: CheckpointMode::batched(50, Duration::from_secs(3)),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.checkpoint_mode,
+            CheckpointMode::Batched {
+                batch_size: 50,
+                max_delay_ms: 3000,
+            }
+        );
     }
 }

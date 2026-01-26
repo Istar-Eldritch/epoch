@@ -7,15 +7,13 @@
 
 ## Implementation Notes
 
-The core reliability features have been implemented:
+All core reliability features have been implemented:
 - ✅ Checkpoint tracking and catch-up mechanism
 - ✅ Retry with exponential backoff and DLQ
 - ✅ Event buffering during catch-up to prevent race conditions
 - ✅ Global sequence number with NOT NULL constraint
-
-Deferred to future work:
-- Multi-instance coordination via advisory locks (helper methods provided, but not auto-integrated)
-- Batched checkpointing mode (synchronous mode only for now)  
+- ✅ Multi-instance coordination via advisory locks (`InstanceMode::Coordinated`)
+- ✅ Batched checkpointing mode (`CheckpointMode::Batched`)  
 
 ## 1. Problem Statement
 

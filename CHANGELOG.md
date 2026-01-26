@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `CheckpointMode::Batched` for high-throughput scenarios with configurable batch size and max delay
+- `CheckpointMode::batched()` and `CheckpointMode::batched_default()` helper constructors
+- `InstanceMode::Coordinated` for multi-instance coordination using PostgreSQL advisory locks
 - `ProjectionHandler<P>` wrapper type for subscribing projections to the event bus
 - `SagaHandler<S>` wrapper type for subscribing sagas to the event bus
 - `Event::to_subset_event_ref()` method for reference-based event conversion
@@ -45,8 +48,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `#[subset_enum]` macro generates `TryFrom<&D>` which only clones matched variant's fields instead of the entire enum
 - `Aggregate::handle` now uses `SliceRefEventStream` to avoid cloning events during internal re-hydration
 
-// REVIEW: Consider adding a note about the minimum supported Rust version (MSRV)
-// if the HRTB `for<'a> TryFrom<&'a D>` syntax requires a specific Rust version.
 ### Migration Guide
 
 #### Subscribing Projections

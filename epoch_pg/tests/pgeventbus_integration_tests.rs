@@ -1124,3 +1124,573 @@ async fn test_multiple_subscribers_have_independent_checkpoints() {
     assert_eq!(cp1, Some(1), "Subscriber 1 checkpoint should be 1");
     assert_eq!(cp2, Some(2), "Subscriber 2 checkpoint should be 2");
 }
+
+// ==================== InstanceMode::Coordinated Tests ====================
+
+#[tokio::test]
+#[serial]
+async fn test_coordinated_mode_acquires_lock_on_subscribe() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let pool = common::get_pg_pool().await;
+
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // Create event bus with coordinated mode
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        instance_mode: epoch_pg::event_bus::InstanceMode::Coordinated,
+        ..Default::default()
+    };
+    let channel_name = format!("test_coord_channel_{}", Uuid::new_v4().simple());
+    let event_bus: PgEventBus<TestEventData> =
+        epoch_pg::event_bus::PgEventBus::with_config(pool.clone(), channel_name, config);
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    // Subscribe a projection - should acquire lock
+    let projection = TestProjection::new();
+    let subscriber_id = Projection::subscriber_id(&projection).to_string();
+
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe projection");
+
+    // Verify lock was acquired by trying to acquire it from a completely separate connection
+    // Use a new pool with max_connections=1 to ensure we get a fresh connection
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/epoch_pg".to_string());
+    let check_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("Failed to create check pool");
+
+    let lock_result: (bool,) = sqlx::query_as(
+        r#"
+        SELECT pg_try_advisory_lock(
+            ('x' || substr(md5($1), 1, 8))::bit(32)::int,
+            ('x' || substr(md5($1), 9, 8))::bit(32)::int
+        )
+        "#,
+    )
+    .bind(&subscriber_id)
+    .fetch_one(&check_pool)
+    .await
+    .expect("Failed to check lock");
+
+    // If the lock is held by the event bus, our attempt to acquire should fail (return false)
+    assert!(
+        !lock_result.0,
+        "Lock should be held by the event bus after subscribe in coordinated mode (our attempt to acquire should fail)"
+    );
+
+    // Close the check pool
+    check_pool.close().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_coordinated_mode_skips_subscribe_if_lock_held() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let pool = common::get_pg_pool().await;
+
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // Use a fixed subscriber ID for this test
+    let subscriber_id = format!("projection:coord-test:{}", Uuid::new_v4());
+
+    // First, acquire the lock from a separate connection to simulate another instance
+    let mut lock_conn = pool.acquire().await.expect("Failed to acquire connection");
+    let acquired: (bool,) = sqlx::query_as(
+        r#"
+        SELECT pg_try_advisory_lock(
+            ('x' || substr(md5($1), 1, 8))::bit(32)::int,
+            ('x' || substr(md5($1), 9, 8))::bit(32)::int
+        )
+        "#,
+    )
+    .bind(&subscriber_id)
+    .fetch_one(&mut *lock_conn)
+    .await
+    .expect("Failed to acquire lock");
+
+    assert!(acquired.0, "Should acquire lock from separate connection");
+
+    // Create event bus with coordinated mode
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        instance_mode: epoch_pg::event_bus::InstanceMode::Coordinated,
+        ..Default::default()
+    };
+    let channel_name = format!("test_coord_skip_channel_{}", Uuid::new_v4().simple());
+    let event_bus: PgEventBus<TestEventData> =
+        epoch_pg::event_bus::PgEventBus::with_config(pool.clone(), channel_name, config);
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    // Store an event before subscribing
+    let stream_id = Uuid::new_v4();
+    let event = new_event(stream_id, 1, "test_event");
+    sqlx::query(
+        r#"
+        INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        "#,
+    )
+    .bind(event.id)
+    .bind(event.stream_id)
+    .bind(event.stream_version as i64)
+    .bind(&event.event_type)
+    .bind(serde_json::to_value(&event.data).unwrap())
+    .bind(event.created_at)
+    .execute(&pool)
+    .await
+    .expect("Failed to store event");
+
+    // Subscribe projection with the same subscriber_id - should skip because lock is held
+    let projection = TestProjection::with_subscriber_id(subscriber_id.clone());
+    let projection_events = projection.get_state_store().clone();
+
+    // Subscribe should succeed (not error), but projection should NOT be registered
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Subscribe should succeed even when lock is held");
+
+    // Give time for any potential processing
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // Verify projection did NOT receive any events (it was skipped)
+    let events_received = projection_events.get_state(stream_id).await.unwrap();
+    assert!(
+        events_received.is_none(),
+        "Projection should NOT have received events when lock was already held"
+    );
+
+    // Clean up - release the lock
+    let _: (bool,) = sqlx::query_as(
+        r#"
+        SELECT pg_advisory_unlock(
+            ('x' || substr(md5($1), 1, 8))::bit(32)::int,
+            ('x' || substr(md5($1), 9, 8))::bit(32)::int
+        )
+        "#,
+    )
+    .bind(&subscriber_id)
+    .fetch_one(&mut *lock_conn)
+    .await
+    .expect("Failed to release lock");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_coordinated_mode_allows_different_subscribers_on_same_instance() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let pool = common::get_pg_pool().await;
+
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // Create event bus with coordinated mode
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        instance_mode: epoch_pg::event_bus::InstanceMode::Coordinated,
+        ..Default::default()
+    };
+    let channel_name = format!("test_coord_multi_channel_{}", Uuid::new_v4().simple());
+    let event_bus: PgEventBus<TestEventData> =
+        epoch_pg::event_bus::PgEventBus::with_config(pool.clone(), channel_name, config);
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    // Subscribe two projections with different subscriber_ids
+    let projection1 = TestProjection::new(); // Has unique subscriber_id
+    let projection_events1 = projection1.get_state_store().clone();
+
+    let projection2 = TestProjection::new(); // Has different unique subscriber_id
+    let projection_events2 = projection2.get_state_store().clone();
+
+    event_bus
+        .subscribe(ProjectionHandler::new(projection1))
+        .await
+        .expect("Failed to subscribe projection 1");
+
+    event_bus
+        .subscribe(ProjectionHandler::new(projection2))
+        .await
+        .expect("Failed to subscribe projection 2");
+
+    // Store an event
+    let stream_id = Uuid::new_v4();
+    let event = new_event(stream_id, 1, "multi_subscriber_event");
+
+    // Give time for subscriptions to be ready
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    event_store
+        .store_event(event.clone())
+        .await
+        .expect("Failed to store event");
+
+    // Give time for processing
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // Both projections should receive the event
+    let events1 = projection_events1
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("Projection 1 should have received event");
+    let events2 = projection_events2
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("Projection 2 should have received event");
+
+    assert_eq!(events1.0.len(), 1, "Projection 1 should have 1 event");
+    assert_eq!(events2.0.len(), 1, "Projection 2 should have 1 event");
+}
+
+// ==================== CheckpointMode::Batched Tests ====================
+
+#[tokio::test]
+#[serial]
+async fn test_batched_checkpoint_flushes_at_batch_size() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let pool = common::get_pg_pool().await;
+
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // Configure batched mode with batch_size=5 and long max_delay (won't trigger)
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        checkpoint_mode: epoch_pg::event_bus::CheckpointMode::Batched {
+            batch_size: 5,
+            max_delay_ms: 60000, // 60 seconds - won't trigger
+        },
+        ..Default::default()
+    };
+
+    let channel_name = format!("test_batched_bs_{}", Uuid::new_v4().simple());
+    let event_bus =
+        epoch_pg::event_bus::PgEventBus::with_config(pool.clone(), channel_name, config);
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    // Subscribe a projection with known subscriber_id
+    let subscriber_id = format!("projection:batched_test:{}", Uuid::new_v4());
+    let projection = TestProjection::with_subscriber_id(subscriber_id.clone());
+
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+
+    // Give time for subscription setup
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let stream_id = Uuid::new_v4();
+
+    // Store 4 events - should NOT trigger checkpoint flush yet
+    for i in 1..=4 {
+        let event = new_event(stream_id, i, &format!("batched_event_{}", i));
+        event_store
+            .store_event(event)
+            .await
+            .expect("Failed to store event");
+    }
+
+    // Give time for events to be processed
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    // Check checkpoint - it might or might not be written yet (depends on timing)
+    // What we can verify is that after 5 events, it WILL be written
+
+    // Store the 5th event - should trigger checkpoint flush
+    let event = new_event(stream_id, 5, "batched_event_5");
+    event_store
+        .store_event(event)
+        .await
+        .expect("Failed to store event");
+
+    // Give time for the checkpoint to be flushed
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    // Now the checkpoint should definitely be written
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("Failed to get checkpoint");
+    assert!(
+        checkpoint.is_some(),
+        "Checkpoint should be written after 5 events in batched mode"
+    );
+    assert!(checkpoint.unwrap() >= 5, "Checkpoint should be at least 5");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_batched_checkpoint_flushes_at_max_delay() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let pool = common::get_pg_pool().await;
+
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // Configure batched mode with large batch_size (won't trigger) and short max_delay
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        checkpoint_mode: epoch_pg::event_bus::CheckpointMode::Batched {
+            batch_size: 1000,  // Won't reach this
+            max_delay_ms: 500, // 500ms - will trigger
+        },
+        ..Default::default()
+    };
+
+    let channel_name = format!("test_batched_delay_{}", Uuid::new_v4().simple());
+    let event_bus =
+        epoch_pg::event_bus::PgEventBus::with_config(pool.clone(), channel_name, config);
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    // Subscribe a projection with known subscriber_id
+    let subscriber_id = format!("projection:batched_delay_test:{}", Uuid::new_v4());
+    let projection = TestProjection::with_subscriber_id(subscriber_id.clone());
+
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+
+    // Give time for subscription setup
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let stream_id = Uuid::new_v4();
+
+    // Store 3 events - won't reach batch_size
+    for i in 1..=3 {
+        let event = new_event(stream_id, i, &format!("delay_event_{}", i));
+        event_store
+            .store_event(event)
+            .await
+            .expect("Failed to store event");
+    }
+
+    // Give time for events to be processed but not for max_delay to trigger
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // Now wait for the max_delay to trigger (flush_interval is 1s, max_delay is 500ms)
+    // The periodic flush should happen within ~1.5 seconds
+    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+
+    // Checkpoint should be written due to max_delay
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("Failed to get checkpoint");
+    assert!(
+        checkpoint.is_some(),
+        "Checkpoint should be written after max_delay in batched mode"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_batched_checkpoint_during_catchup() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let pool = common::get_pg_pool().await;
+
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // First, store some events before subscribing (these will be caught up)
+    let channel_name = format!("test_batched_catchup_{}", Uuid::new_v4().simple());
+
+    // Use a separate event bus just for storing events (with default config)
+    let store_bus = epoch_pg::event_bus::PgEventBus::new(pool.clone(), channel_name.clone());
+    let event_store = PgEventStore::new(pool.clone(), store_bus.clone());
+
+    let stream_id = Uuid::new_v4();
+
+    // Store 12 events before subscribing
+    for i in 1..=12 {
+        let event = new_event(stream_id, i, &format!("catchup_event_{}", i));
+        event_store
+            .store_event(event)
+            .await
+            .expect("Failed to store event");
+    }
+
+    // Give time for events to be committed
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Now create event bus with batched checkpointing (batch_size=5)
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        checkpoint_mode: epoch_pg::event_bus::CheckpointMode::Batched {
+            batch_size: 5,
+            max_delay_ms: 60000, // Won't trigger during catch-up
+        },
+        catch_up_batch_size: 100, // Large enough to get all events in one batch
+        ..Default::default()
+    };
+
+    let event_bus =
+        epoch_pg::event_bus::PgEventBus::with_config(pool.clone(), channel_name, config);
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    // Subscribe - will catch up on 12 events
+    let subscriber_id = format!("projection:batched_catchup:{}", Uuid::new_v4());
+    let projection = TestProjection::with_subscriber_id(subscriber_id.clone());
+    let projection_events = projection.get_state_store().clone();
+
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+
+    // Give time for catch-up to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Verify all events were received
+    let events = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("Should have received events");
+    assert_eq!(events.0.len(), 12, "All 12 events should be caught up");
+
+    // Checkpoint should be written (final flush after catch-up)
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("Failed to get checkpoint");
+    assert!(
+        checkpoint.is_some(),
+        "Checkpoint should be written after catch-up completes"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_synchronous_checkpoint_still_works() {
+    // Verify that synchronous mode (default) still works correctly
+    let _ = env_logger::builder().is_test(true).try_init();
+    let pool = common::get_pg_pool().await;
+
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // Explicitly use Synchronous mode
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        checkpoint_mode: epoch_pg::event_bus::CheckpointMode::Synchronous,
+        ..Default::default()
+    };
+
+    let channel_name = format!("test_sync_checkpoint_{}", Uuid::new_v4().simple());
+    let event_bus =
+        epoch_pg::event_bus::PgEventBus::with_config(pool.clone(), channel_name, config);
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    let subscriber_id = format!("projection:sync_test:{}", Uuid::new_v4());
+    let projection = TestProjection::with_subscriber_id(subscriber_id.clone());
+
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let stream_id = Uuid::new_v4();
+
+    // Store a single event
+    let event = new_event(stream_id, 1, "sync_event");
+    event_store
+        .store_event(event)
+        .await
+        .expect("Failed to store event");
+
+    // Give time for event to be processed
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    // In synchronous mode, checkpoint should be written immediately after each event
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("Failed to get checkpoint");
+    assert!(
+        checkpoint.is_some(),
+        "Checkpoint should be written immediately in synchronous mode"
+    );
+}
