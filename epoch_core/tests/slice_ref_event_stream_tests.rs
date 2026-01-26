@@ -51,7 +51,7 @@ struct TestState {
     update_count: u32,
 }
 
-impl EventApplicatorState for TestState {
+impl ProjectionState for TestState {
     fn get_id(&self) -> Uuid {
         self.id
     }
@@ -79,11 +79,15 @@ enum TestProjectionError {
     MissingState,
 }
 
-impl EventApplicator<TestEvent> for TestProjection {
+impl Projection<TestEvent> for TestProjection {
     type State = TestState;
     type StateStore = InMemoryStateStore<TestState>;
     type EventType = TestEvent;
-    type ApplyError = TestProjectionError;
+    type ProjectionError = TestProjectionError;
+
+    fn subscriber_id(&self) -> &str {
+        "projection:test-slice-ref"
+    }
 
     fn get_state_store(&self) -> Self::StateStore {
         self.state_store.clone()
@@ -93,7 +97,7 @@ impl EventApplicator<TestEvent> for TestProjection {
         &self,
         state: Option<Self::State>,
         event: &Event<Self::EventType>,
-    ) -> Result<Option<Self::State>, Self::ApplyError> {
+    ) -> Result<Option<Self::State>, Self::ProjectionError> {
         match event.data.as_ref().unwrap() {
             TestEvent::Created { name } => Ok(Some(TestState {
                 id: event.stream_id,
@@ -109,10 +113,6 @@ impl EventApplicator<TestEvent> for TestProjection {
         }
     }
 }
-
-// Note: This TestProjection only implements EventApplicator, not Projection,
-// because these tests only test the re_hydrate_from_refs functionality
-// which is part of EventApplicator.
 
 // ============================================================================
 // Tests for SliceRefEventStream

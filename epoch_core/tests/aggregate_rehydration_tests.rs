@@ -54,7 +54,7 @@ struct Counter {
     version: u64,
 }
 
-impl EventApplicatorState for Counter {
+impl ProjectionState for Counter {
     fn get_id(&self) -> Uuid {
         self.id
     }
@@ -76,16 +76,20 @@ struct CounterAggregate {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum CounterApplyError {
+enum CounterProjectionError {
     #[error("No state present for id {0}")]
     NoState(Uuid),
 }
 
-impl EventApplicator<CounterEvent> for CounterAggregate {
+impl Projection<CounterEvent> for CounterAggregate {
     type State = Counter;
     type EventType = CounterEvent;
     type StateStore = InMemoryStateStore<Counter>;
-    type ApplyError = CounterApplyError;
+    type ProjectionError = CounterProjectionError;
+
+    fn subscriber_id(&self) -> &str {
+        "projection:counter-aggregate"
+    }
 
     fn get_state_store(&self) -> Self::StateStore {
         self.state_store.clone()
@@ -95,7 +99,7 @@ impl EventApplicator<CounterEvent> for CounterAggregate {
         &self,
         state: Option<Self::State>,
         event: &Event<Self::EventType>,
-    ) -> Result<Option<Self::State>, CounterApplyError> {
+    ) -> Result<Option<Self::State>, CounterProjectionError> {
         match event.data.as_ref().unwrap() {
             CounterEvent::Created => Ok(Some(Counter {
                 id: event.stream_id,
@@ -103,7 +107,7 @@ impl EventApplicator<CounterEvent> for CounterAggregate {
                 version: event.stream_version,
             })),
             CounterEvent::Incremented => {
-                let mut state = state.ok_or(CounterApplyError::NoState(event.stream_id))?;
+                let mut state = state.ok_or(CounterProjectionError::NoState(event.stream_id))?;
                 state.value += 1;
                 state.version = event.stream_version;
                 Ok(Some(state))

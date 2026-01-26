@@ -144,9 +144,6 @@ where
             stream_id,
             event_id
         );
-        // Release the lock before publishing to avoid deadlock when projections
-        // need to read from the event store during apply_and_store
-        drop(data);
         if bus.publish(event).await.is_err() {
             return Err(InMemoryEventStoreBackendError::PublishEvent);
         }
@@ -415,6 +412,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use async_trait::async_trait;
     use epoch_core::event::EventData;
     use tokio_stream::StreamExt;
     use uuid::Uuid;
@@ -454,87 +452,51 @@ mod tests {
             .unwrap()
     }
 
-    struct TestProjection {
-        state_store: InMemoryStateStore<TestState>,
-        event_store: InMemoryEventStore<InMemoryEventBus<MyEventData>>,
-    }
+    struct TestProjection(InMemoryStateStore<TestState>);
 
     impl TestProjection {
-        pub fn new(event_store: InMemoryEventStore<InMemoryEventBus<MyEventData>>) -> Self {
-            TestProjection {
-                state_store: InMemoryStateStore::new(),
-                event_store,
-            }
+        pub fn new() -> Self {
+            TestProjection(InMemoryStateStore::new())
         }
     }
 
     #[derive(Debug, Clone)]
-    struct TestState {
-        id: Uuid,
-        events: Vec<Event<MyEventData>>,
-        version: u64,
-    }
-
-    impl TestState {
-        fn new(id: Uuid) -> Self {
-            Self {
-                id,
-                events: Vec::new(),
-                version: 0,
-            }
-        }
-    }
-
-    impl EventApplicatorState for TestState {
-        fn get_id(&self) -> Uuid {
-            self.id
-        }
-    }
+    struct TestState(Vec<Event<MyEventData>>);
 
     impl ProjectionState for TestState {
-        fn get_version(&self) -> u64 {
-            self.version
-        }
-
-        fn set_version(&mut self, version: u64) {
-            self.version = version;
+        fn get_id(&self) -> Uuid {
+            Uuid::new_v4()
         }
     }
 
     #[derive(Debug, thiserror::Error)]
     pub enum TestProjectionError {}
 
-    impl EventApplicator<MyEventData> for TestProjection {
+    #[async_trait]
+    impl Projection<MyEventData> for TestProjection {
         type State = TestState;
         type StateStore = InMemoryStateStore<Self::State>;
         type EventType = MyEventData;
-        type ApplyError = TestProjectionError;
+        type ProjectionError = TestProjectionError;
 
-        fn get_state_store(&self) -> Self::StateStore {
-            self.state_store.clone()
+        fn subscriber_id(&self) -> &str {
+            "projection:test"
         }
 
+        fn get_state_store(&self) -> Self::StateStore {
+            self.0.clone()
+        }
         fn apply(
             &self,
             state: Option<Self::State>,
             event: &Event<Self::EventType>,
-        ) -> Result<Option<Self::State>, Self::ApplyError> {
+        ) -> Result<Option<Self::State>, Self::ProjectionError> {
             if let Some(mut state) = state {
-                state.events.push(event.clone());
+                state.0.push(event.clone());
                 Ok(Some(state))
             } else {
-                let mut state = TestState::new(event.stream_id);
-                state.events.push(event.clone());
-                Ok(Some(state))
+                Ok(Some(TestState(vec![event.clone()])))
             }
-        }
-    }
-
-    impl Projection<MyEventData> for TestProjection {
-        type EventStore = InMemoryEventStore<InMemoryEventBus<MyEventData>>;
-
-        fn get_event_store(&self) -> Self::EventStore {
-            self.event_store.clone()
         }
     }
 
@@ -646,8 +608,7 @@ mod tests {
     #[tokio::test]
     async fn in_memory_event_bus_publish() {
         let bus = InMemoryEventBus::<MyEventData>::new();
-        let store = InMemoryEventStore::new(bus.clone());
-        let projection = TestProjection::new(store.clone());
+        let projection = TestProjection::new();
         let storage = projection.get_state_store().clone();
         bus.subscribe(ProjectionHandler::new(projection))
             .await
@@ -655,19 +616,18 @@ mod tests {
 
         let stream_id = Uuid::new_v4();
         let event = new_event(stream_id, 1, "test_publish");
-        store.store_event(event.clone()).await.unwrap();
+        bus.publish(Arc::new(event.clone())).await.unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
-        let state: TestState = storage.get_state(stream_id).await.unwrap().unwrap();
-        assert_eq!(state.events.len(), 1);
-        assert_eq!(state.events[0], event);
-        assert_eq!(state.version, 1);
+        let events: TestState = storage.get_state(stream_id).await.unwrap().unwrap();
+        assert_eq!(events.0.len(), 1);
+        assert_eq!(events.0[0], event);
     }
 
     #[tokio::test]
     async fn in_memory_event_bus_subscribe() {
         let bus = InMemoryEventBus::<MyEventData>::new();
-        let store = InMemoryEventStore::new(bus.clone());
-        let projection = TestProjection::new(store);
+
+        let projection = TestProjection::new();
 
         bus.subscribe(ProjectionHandler::new(projection))
             .await

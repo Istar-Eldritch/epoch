@@ -81,6 +81,21 @@ pub trait EventObserver<ED>: Send + Sync
 where
     ED: EventData + Send + Sync,
 {
+    /// Returns a unique identifier for this subscriber.
+    ///
+    /// This ID is used for:
+    /// - Checkpoint tracking: The event bus tracks the last processed event per subscriber
+    /// - Multi-instance coordination: Multiple instances with the same subscriber_id form a
+    ///   consumer pool where only one instance processes each event
+    /// - Dead letter queue: Failed events are associated with their subscriber_id
+    ///
+    /// # Naming Convention
+    ///
+    /// - Projections: `"projection:<name>"` (e.g., `"projection:user-profile"`)
+    /// - Sagas/Process Managers: `"saga:<name>"` (e.g., `"saga:order-fulfillment"`)
+    /// - Other observers: `"observer:<name>"` (e.g., `"observer:audit-logger"`)
+    fn subscriber_id(&self) -> &str;
+
     /// Reacts to events published in an event bus.
     ///
     /// The event is wrapped in `Arc` for efficient sharing across multiple observers.

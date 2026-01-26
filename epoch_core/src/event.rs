@@ -46,6 +46,13 @@ where
 
     /// The time at which this event was purged, if any
     pub purged_at: Option<DateTime<Utc>>,
+
+    /// Global sequence number assigned by the event store.
+    ///
+    /// This is a monotonically increasing sequence number across all events in the store,
+    /// used for reliable event delivery, checkpointing, and catch-up processing.
+    /// It is `None` until the event is persisted to the event store.
+    pub global_sequence: Option<u64>,
 }
 
 impl<D> Event<D>
@@ -100,6 +107,7 @@ where
             data,
             created_at: self.created_at,
             purged_at: self.purged_at,
+            global_sequence: self.global_sequence,
         })
     }
 
@@ -130,6 +138,7 @@ where
             id: self.id,
             stream_id: self.stream_id,
             stream_version: self.stream_version,
+            global_sequence: self.global_sequence,
             event_type: self.event_type.clone(),
             actor_id: self.actor_id,
             purger_id: self.purger_id,
@@ -156,6 +165,7 @@ where
             data,
             created_at: self.created_at,
             purged_at: self.purged_at,
+            global_sequence: self.global_sequence,
         }
     }
 }
@@ -175,6 +185,7 @@ where
             data: event.data,
             created_at: Some(event.created_at),
             purged_at: event.purged_at,
+            global_sequence: event.global_sequence,
         }
     }
 }
@@ -216,6 +227,8 @@ where
     pub created_at: Option<DateTime<Utc>>,
     /// The time at which this event was purged, if any.
     pub purged_at: Option<DateTime<Utc>>,
+    /// Global sequence number assigned by the event store.
+    pub global_sequence: Option<u64>,
 }
 
 impl<D> Default for EventBuilder<D>
@@ -243,6 +256,7 @@ where
             data: None,
             created_at: None,
             purged_at: None,
+            global_sequence: None,
         }
     }
 
@@ -294,6 +308,7 @@ where
             data,
             created_at: self.created_at,
             purged_at: self.purged_at,
+            global_sequence: self.global_sequence,
         }
     }
 
@@ -306,6 +321,15 @@ where
     /// Sets the purged timestamp for the event.
     pub fn purged_at(mut self, purged_at: DateTime<Utc>) -> Self {
         self.purged_at = Some(purged_at);
+        self
+    }
+
+    /// Sets the global sequence number for the event.
+    ///
+    /// This is typically set by the event store when persisting the event,
+    /// not by application code.
+    pub fn global_sequence(mut self, global_sequence: u64) -> Self {
+        self.global_sequence = Some(global_sequence);
         self
     }
 
@@ -325,6 +349,7 @@ where
             data: self.data,
             created_at: self.created_at.unwrap_or(Utc::now()),
             purged_at: self.purged_at,
+            global_sequence: self.global_sequence,
         })
     }
 }
@@ -372,4 +397,123 @@ pub enum EventBuilderError {
     /// The event type is missing.
     #[error("Event type is required")]
     EventTypeMissing,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum TestEventData {
+        TestEvent { value: String },
+    }
+
+    impl EventData for TestEventData {
+        fn event_type(&self) -> &'static str {
+            match self {
+                TestEventData::TestEvent { .. } => "TestEvent",
+            }
+        }
+    }
+
+    #[test]
+    fn event_builder_with_global_sequence() {
+        let event = Event::<TestEventData>::builder()
+            .stream_id(Uuid::new_v4())
+            .event_type("Test".to_string())
+            .global_sequence(42)
+            .build()
+            .unwrap();
+        assert_eq!(event.global_sequence, Some(42));
+    }
+
+    #[test]
+    fn event_builder_without_global_sequence_defaults_to_none() {
+        let event = Event::<TestEventData>::builder()
+            .stream_id(Uuid::new_v4())
+            .event_type("Test".to_string())
+            .build()
+            .unwrap();
+        assert_eq!(event.global_sequence, None);
+    }
+
+    #[test]
+    fn event_into_builder_preserves_global_sequence() {
+        let stream_id = Uuid::new_v4();
+        let original = Event {
+            id: Uuid::new_v4(),
+            stream_id,
+            stream_version: 1,
+            event_type: "Test".to_string(),
+            actor_id: None,
+            purger_id: None,
+            data: Some(TestEventData::TestEvent {
+                value: "test".to_string(),
+            }),
+            created_at: Utc::now(),
+            purged_at: None,
+            global_sequence: Some(100),
+        };
+        let rebuilt = original.into_builder().build().unwrap();
+        assert_eq!(rebuilt.global_sequence, Some(100));
+    }
+
+    #[test]
+    fn to_subset_event_preserves_global_sequence() {
+        let stream_id = Uuid::new_v4();
+        let original: Event<TestEventData> = Event {
+            id: Uuid::new_v4(),
+            stream_id,
+            stream_version: 1,
+            event_type: "Test".to_string(),
+            actor_id: None,
+            purger_id: None,
+            data: Some(TestEventData::TestEvent {
+                value: "test".to_string(),
+            }),
+            created_at: Utc::now(),
+            purged_at: None,
+            global_sequence: Some(50),
+        };
+        // TestEventData -> TestEventData conversion (identity)
+        let subset: Event<TestEventData> = original.to_subset_event().unwrap();
+        assert_eq!(subset.global_sequence, Some(50));
+    }
+
+    #[test]
+    fn to_superset_event_preserves_global_sequence() {
+        let stream_id = Uuid::new_v4();
+        let original: Event<TestEventData> = Event {
+            id: Uuid::new_v4(),
+            stream_id,
+            stream_version: 1,
+            event_type: "Test".to_string(),
+            actor_id: None,
+            purger_id: None,
+            data: Some(TestEventData::TestEvent {
+                value: "test".to_string(),
+            }),
+            created_at: Utc::now(),
+            purged_at: None,
+            global_sequence: Some(75),
+        };
+        // TestEventData -> TestEventData conversion (identity)
+        let superset: Event<TestEventData> = original.to_superset_event();
+        assert_eq!(superset.global_sequence, Some(75));
+    }
+
+    #[test]
+    fn data_builder_method_preserves_global_sequence() {
+        let builder = Event::<TestEventData>::builder()
+            .stream_id(Uuid::new_v4())
+            .event_type("Test".to_string())
+            .global_sequence(123);
+
+        let new_builder = builder.data(Some(TestEventData::TestEvent {
+            value: "test".to_string(),
+        }));
+
+        let event = new_builder.build().unwrap();
+        assert_eq!(event.global_sequence, Some(123));
+    }
 }

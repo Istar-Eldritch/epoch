@@ -29,28 +29,12 @@ impl<B: EventBus + Clone> PgEventStore<B> {
         &self.bus
     }
 
-    /// Initializes the event store, creating the events table if it does not exist.
-    pub async fn initialize(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS events (
-                id UUID PRIMARY KEY,
-                stream_id UUID NOT NULL,
-                stream_version BIGINT NOT NULL,
-                event_type VARCHAR(255) NOT NULL,
-                data JSONB,
-                created_at TIMESTAMPTZ NOT NULL,
-                actor_id UUID,
-                purger_id UUID,
-                purged_at TIMESTAMPTZ,
-                UNIQUE (stream_id, stream_version)
-            );
-            "#,
-        )
-        .execute(&self.postgres)
-        .await?;
-
-        Ok(())
+    /// Returns the PostgreSQL connection pool.
+    ///
+    /// This is useful for operations that need direct database access,
+    /// such as catch-up queries in the event bus.
+    pub fn pool(&self) -> &PgPool {
+        &self.postgres
     }
 }
 
@@ -75,6 +59,10 @@ pub struct PgDBEvent {
     pub purger_id: Option<Uuid>,
     /// If this event was purged, when it was purged
     pub purged_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Global sequence number for ordering across all streams.
+    /// Assigned by the database on insert using a sequence.
+    #[sqlx(default)]
+    pub global_sequence: Option<i64>,
 }
 
 /// A postgres based event stream.
@@ -164,8 +152,9 @@ where
                         created_at,
                         actor_id,
                         purger_id,
-                        purged_at
-                    FROM events
+                        purged_at,
+                        global_sequence
+                    FROM epoch_events
                     WHERE stream_id = $1 AND stream_version >= $2
                     ORDER BY stream_version ASC
                     "#,
@@ -183,13 +172,20 @@ where
                     .transpose()
                     .map_err(PgEventStoreError::DeserializeEventError::<B::Error>)?;
 
-                let event = Event::<B::EventType>::builder()
+                let mut builder = Event::<B::EventType>::builder()
                     .id(entry.id)
                     .stream_id(entry.stream_id)
                     .stream_version(entry.stream_version.try_into().unwrap())
                     .event_type(entry.event_type)
                     .created_at(entry.created_at)
-                    .data(data)
+                    .data(data);
+
+                // Add global_sequence if present
+                if let Some(gs) = entry.global_sequence {
+                    builder = builder.global_sequence(gs as u64);
+                }
+
+                let event = builder
                     .build()
                     .map_err(PgEventStoreError::BuildEventError::<B::Error>)?;
                 yield event;
@@ -205,10 +201,12 @@ where
     }
 
     async fn store_event(&self, event: Event<Self::EventType>) -> Result<(), Self::Error> {
-        sqlx::query(
+        // Insert the event and get back the assigned global_sequence
+        let row: (i64,) = sqlx::query_as(
                 r#"
-                INSERT INTO events (id, stream_id, stream_version, event_type, data, created_at, actor_id, purger_id, purged_at)
+                INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at, actor_id, purger_id, purged_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                RETURNING global_sequence
                 "#,
             )
             .bind(event.id)
@@ -231,15 +229,99 @@ where
             .bind(event.actor_id)
             .bind(event.purger_id)
             .bind(event.purged_at)
-            .execute(&self.postgres)
+            .fetch_one(&self.postgres)
             .await?;
+
+        // Create a new event with the assigned global_sequence
+        let event_with_sequence = Event {
+            id: event.id,
+            stream_id: event.stream_id,
+            stream_version: event.stream_version,
+            event_type: event.event_type,
+            actor_id: event.actor_id,
+            purger_id: event.purger_id,
+            data: event.data,
+            created_at: event.created_at,
+            purged_at: event.purged_at,
+            global_sequence: Some(row.0 as u64),
+        };
 
         // Wrap in Arc for efficient sharing - no clone needed
         self.bus
-            .publish(std::sync::Arc::new(event))
+            .publish(std::sync::Arc::new(event_with_sequence))
             .await
             .map_err(PgEventStoreError::BUSPublishError)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pg_db_event_serialization_with_global_sequence() {
+        let db_event = PgDBEvent {
+            id: Uuid::new_v4(),
+            stream_id: Uuid::new_v4(),
+            stream_version: 1,
+            actor_id: None,
+            event_type: "TestEvent".to_string(),
+            data: Some(serde_json::json!({"key": "value"})),
+            created_at: chrono::Utc::now(),
+            purger_id: None,
+            purged_at: None,
+            global_sequence: Some(123),
+        };
+
+        let json = serde_json::to_string(&db_event).unwrap();
+        let parsed: PgDBEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.global_sequence, Some(123));
+        assert_eq!(parsed.id, db_event.id);
+        assert_eq!(parsed.stream_id, db_event.stream_id);
+        assert_eq!(parsed.stream_version, db_event.stream_version);
+        assert_eq!(parsed.event_type, db_event.event_type);
+    }
+
+    #[test]
+    fn pg_db_event_serialization_without_global_sequence() {
+        let db_event = PgDBEvent {
+            id: Uuid::new_v4(),
+            stream_id: Uuid::new_v4(),
+            stream_version: 1,
+            actor_id: None,
+            event_type: "TestEvent".to_string(),
+            data: None,
+            created_at: chrono::Utc::now(),
+            purger_id: None,
+            purged_at: None,
+            global_sequence: None,
+        };
+
+        let json = serde_json::to_string(&db_event).unwrap();
+        let parsed: PgDBEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.global_sequence, None);
+    }
+
+    #[test]
+    fn pg_db_event_deserialization_missing_global_sequence_field() {
+        // Simulate a JSON payload from an older version without global_sequence
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "stream_id": "550e8400-e29b-41d4-a716-446655440001",
+            "stream_version": 1,
+            "actor_id": null,
+            "event_type": "TestEvent",
+            "data": null,
+            "created_at": "2026-01-21T00:00:00Z",
+            "purger_id": null,
+            "purged_at": null
+        }"#;
+
+        let parsed: PgDBEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.global_sequence, None);
     }
 }

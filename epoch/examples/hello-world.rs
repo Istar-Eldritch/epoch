@@ -36,7 +36,7 @@ pub struct User {
     version: u64,
 }
 
-impl EventApplicatorState for User {
+impl ProjectionState for User {
     fn get_id(&self) -> Uuid {
         self.id
     }
@@ -69,16 +69,20 @@ impl UserAggregate {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum UserApplyError {
+pub enum UserProjectionError {
     #[error("No state present for id {0}")]
     NoState(Uuid),
 }
 
-impl EventApplicator<ApplicationEvent> for UserAggregate {
+impl Projection<ApplicationEvent> for UserAggregate {
     type State = User;
     type EventType = UserEvent;
     type StateStore = InMemoryStateStore<User>;
-    type ApplyError = UserApplyError;
+    type ProjectionError = UserProjectionError;
+
+    fn subscriber_id(&self) -> &str {
+        "projection:user-aggregate"
+    }
 
     fn get_state_store(&self) -> Self::StateStore {
         self.state_store.clone()
@@ -88,14 +92,14 @@ impl EventApplicator<ApplicationEvent> for UserAggregate {
         &self,
         state: Option<Self::State>,
         event: &Event<Self::EventType>,
-    ) -> Result<Option<Self::State>, UserApplyError> {
+    ) -> Result<Option<Self::State>, UserProjectionError> {
         match event.data.as_ref().unwrap() {
             UserEvent::UserNameUpdated { name } => {
                 if let Some(mut state) = state {
                     state.name = name.clone();
                     Ok(Some(state))
                 } else {
-                    Err(UserApplyError::NoState(event.stream_id))
+                    Err(UserProjectionError::NoState(event.stream_id))
                 }
             }
             UserEvent::UserCreated { name } => Ok(Some(User {
@@ -175,22 +179,6 @@ struct Product {
     version: u64,
 }
 
-impl EventApplicatorState for Product {
-    fn get_id(&self) -> Uuid {
-        self.id
-    }
-}
-
-impl ProjectionState for Product {
-    fn get_version(&self) -> u64 {
-        self.version
-    }
-
-    fn set_version(&mut self, version: u64) {
-        self.version = version;
-    }
-}
-
 #[derive(thiserror::Error, Debug)]
 pub enum ProductProjectionError {
     #[error("The product with id {0} already exists")]
@@ -204,35 +192,39 @@ pub enum ProductProjectionError {
 }
 
 #[derive(Debug)]
-struct ProductProjection {
-    state_store: InMemoryStateStore<Product>,
-    event_store: InMemoryEventStore<InMemoryEventBus<ApplicationEvent>>,
-}
+struct ProductProjection(InMemoryStateStore<Product>);
 
 impl ProductProjection {
-    pub fn new(event_store: InMemoryEventStore<InMemoryEventBus<ApplicationEvent>>) -> Self {
-        ProductProjection {
-            state_store: InMemoryStateStore::new(),
-            event_store,
-        }
+    pub fn new() -> Self {
+        ProductProjection(InMemoryStateStore::new())
     }
 }
 
-impl EventApplicator<ApplicationEvent> for ProductProjection {
+impl ProjectionState for Product {
+    fn get_id(&self) -> Uuid {
+        self.id
+    }
+}
+
+impl Projection<ApplicationEvent> for ProductProjection {
     type State = Product;
     type StateStore = InMemoryStateStore<Self::State>;
     type EventType = ProductEvent;
-    type ApplyError = ProductProjectionError;
+    type ProjectionError = ProductProjectionError;
+
+    fn subscriber_id(&self) -> &str {
+        "projection:product"
+    }
 
     fn get_state_store(&self) -> Self::StateStore {
-        self.state_store.clone()
+        self.0.clone()
     }
 
     fn apply(
         &self,
         state: Option<Self::State>,
         event: &Event<Self::EventType>,
-    ) -> Result<Option<Self::State>, Self::ApplyError> {
+    ) -> Result<Option<Self::State>, Self::ProjectionError> {
         match event.data.as_ref().unwrap() {
             ProductEvent::ProductCreated { name, price } => Ok(Some(Product {
                 id: event.stream_id,
@@ -260,25 +252,17 @@ impl EventApplicator<ApplicationEvent> for ProductProjection {
     }
 }
 
-impl Projection<ApplicationEvent> for ProductProjection {
-    type EventStore = InMemoryEventStore<InMemoryEventBus<ApplicationEvent>>;
-
-    fn get_event_store(&self) -> Self::EventStore {
-        self.event_store.clone()
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let product_projection = ProductProjection::new();
+    let _product_state = product_projection.0.clone();
     env_logger::init();
 
     let bus: InMemoryEventBus<ApplicationEvent> = InMemoryEventBus::new();
-    let event_store = InMemoryEventStore::new(bus.clone());
-
-    let product_projection = ProductProjection::new(event_store.clone());
-    let _product_state = product_projection.state_store.clone();
     bus.subscribe(epoch::prelude::ProjectionHandler::new(product_projection))
         .await?;
+
+    let event_store = InMemoryEventStore::new(bus);
 
     let user_state = InMemoryStateStore::new();
     let user_aggregate = UserAggregate::new(event_store.clone(), user_state.clone());
