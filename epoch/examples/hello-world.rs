@@ -37,8 +37,8 @@ pub struct User {
 }
 
 impl ProjectionState for User {
-    fn get_id(&self) -> Uuid {
-        self.id
+    fn get_id(&self) -> &Uuid {
+        &self.id
     }
 }
 
@@ -74,15 +74,17 @@ pub enum UserProjectionError {
     NoState(Uuid),
 }
 
+impl epoch_core::SubscriberId for UserAggregate {
+    fn subscriber_id(&self) -> &str {
+        "projection:user-aggregate"
+    }
+}
+
 impl Projection<ApplicationEvent> for UserAggregate {
     type State = User;
     type EventType = UserEvent;
     type StateStore = InMemoryStateStore<User>;
     type ProjectionError = UserProjectionError;
-
-    fn subscriber_id(&self) -> &str {
-        "projection:user-aggregate"
-    }
 
     fn get_state_store(&self) -> Self::StateStore {
         self.state_store.clone()
@@ -200,9 +202,15 @@ impl ProductProjection {
     }
 }
 
+impl epoch_core::SubscriberId for ProductProjection {
+    fn subscriber_id(&self) -> &str {
+        "projection:product"
+    }
+}
+
 impl ProjectionState for Product {
-    fn get_id(&self) -> Uuid {
-        self.id
+    fn get_id(&self) -> &Uuid {
+        &self.id
     }
 }
 
@@ -211,10 +219,6 @@ impl Projection<ApplicationEvent> for ProductProjection {
     type StateStore = InMemoryStateStore<Self::State>;
     type EventType = ProductEvent;
     type ProjectionError = ProductProjectionError;
-
-    fn subscriber_id(&self) -> &str {
-        "projection:product"
-    }
 
     fn get_state_store(&self) -> Self::StateStore {
         self.0.clone()

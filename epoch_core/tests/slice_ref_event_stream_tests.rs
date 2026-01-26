@@ -52,8 +52,8 @@ struct TestState {
 }
 
 impl ProjectionState for TestState {
-    fn get_id(&self) -> Uuid {
-        self.id
+    fn get_id(&self) -> &Uuid {
+        &self.id
     }
 }
 
@@ -73,6 +73,12 @@ impl TestProjection {
     }
 }
 
+impl epoch_core::SubscriberId for TestProjection {
+    fn subscriber_id(&self) -> &str {
+        "projection:test-slice-ref"
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum TestProjectionError {
     #[error("Missing state")]
@@ -84,10 +90,6 @@ impl Projection<TestEvent> for TestProjection {
     type StateStore = InMemoryStateStore<TestState>;
     type EventType = TestEvent;
     type ProjectionError = TestProjectionError;
-
-    fn subscriber_id(&self) -> &str {
-        "projection:test-slice-ref"
-    }
 
     fn get_state_store(&self) -> Self::StateStore {
         self.state_store.clone()

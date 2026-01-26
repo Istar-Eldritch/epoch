@@ -57,6 +57,7 @@ impl Migration for CreateEventBusInfrastructure {
         .await?;
 
         // Create checkpoint table for tracking subscriber progress (legacy name)
+        // Note: Index on last_global_sequence is added in migration 005.
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS event_bus_checkpoints (
@@ -71,6 +72,15 @@ impl Migration for CreateEventBusInfrastructure {
         .await?;
 
         // Create dead letter queue for failed event processing (legacy name)
+        // Note: Resolution tracking columns (resolved_at, resolved_by, resolution_notes)
+        // are added in migration m006_add_dlq_resolution_columns.
+        //
+        // Design Decision: No foreign key to epoch_events(id) for event_id.
+        // While a FK would ensure referential integrity, we intentionally omit it:
+        // 1. Events should never be deleted in event-sourced systems
+        // 2. DLQ entries serve as audit records that should survive event compaction
+        // 3. FK constraints add overhead to DLQ inserts (which happen under failure conditions)
+        // 4. Allows DLQ to reference events in external stores (future extensibility)
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS event_bus_dlq (

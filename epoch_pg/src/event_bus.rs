@@ -46,6 +46,28 @@ pub struct ReliableDeliveryConfig {
 
     /// Number of events to process in each catch-up batch.
     pub catch_up_batch_size: u32,
+
+    /// Maximum number of events to buffer during catch-up.
+    ///
+    /// When a subscriber starts, it catches up from its checkpoint while also
+    /// buffering new real-time events. This setting limits the buffer size to
+    /// prevent memory exhaustion during extended catch-up periods with high
+    /// event rates.
+    ///
+    /// If the buffer fills up, the real-time listener will apply backpressure
+    /// (block) until catch-up drains some events from the buffer.
+    ///
+    /// Default: 10,000 events
+    ///
+    /// # Future Improvements
+    ///
+    /// Consider adding metrics/observability hooks for:
+    /// - Buffer utilization percentage during catch-up
+    /// - Catch-up duration and event count
+    /// - Backpressure events (when buffer fills)
+    ///
+    /// This would help operators tune these settings for their workloads.
+    pub catch_up_buffer_size: usize,
 }
 
 impl Default for ReliableDeliveryConfig {
@@ -57,6 +79,7 @@ impl Default for ReliableDeliveryConfig {
             checkpoint_mode: CheckpointMode::Synchronous,
             instance_mode: InstanceMode::SingleInstance,
             catch_up_batch_size: 100,
+            catch_up_buffer_size: 10_000,
         }
     }
 }
@@ -131,6 +154,14 @@ impl CheckpointMode {
 /// For multi-instance deployments, use `Coordinated` mode to ensure only one
 /// instance processes events for each subscriber. For single-instance deployments
 /// or external orchestration, use `SingleInstance` mode.
+///
+/// # Future Extensions
+///
+/// A potential third mode (`Partitioned`) could enable horizontal scaling where
+/// different instances process different streams (e.g., by `stream_id` hash).
+/// This would enable true horizontal scaling while maintaining per-stream
+/// ordering guarantees. The `#[non_exhaustive]` attribute allows adding this
+/// mode in a future release without breaking existing code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum InstanceMode {
@@ -217,13 +248,20 @@ fn should_flush_checkpoint(pending: &PendingCheckpoint, mode: &CheckpointMode) -
 /// Flushes a pending checkpoint to the database.
 ///
 /// This writes the checkpoint and updates the in-memory cache.
+///
+/// # Returns
+///
+/// Returns `Ok(())` if the checkpoint was successfully written, or an error if the
+/// database operation failed. Callers should handle errors appropriately based on
+/// the checkpoint mode - failures in `Synchronous` mode are more critical than in
+/// `Batched` mode.
 async fn flush_checkpoint(
     pool: &PgPool,
     subscriber_id: &str,
     pending: &PendingCheckpoint,
     checkpoint_cache: &mut HashMap<String, u64>,
-) {
-    if let Err(e) = sqlx::query(
+) -> Result<(), SqlxError> {
+    sqlx::query(
         r#"
         INSERT INTO epoch_event_bus_checkpoints (subscriber_id, last_global_sequence, last_event_id, updated_at)
         VALUES ($1, $2, $3, NOW())
@@ -237,27 +275,23 @@ async fn flush_checkpoint(
     .bind(pending.global_sequence as i64)
     .bind(pending.event_id)
     .execute(pool)
-    .await
-    {
-        error!(
-            "Failed to flush checkpoint for '{}': {}",
-            subscriber_id, e
-        );
-    } else {
-        checkpoint_cache.insert(subscriber_id.to_string(), pending.global_sequence);
-        log::debug!(
-            "Flushed checkpoint for '{}' to global_sequence {} ({} events batched)",
-            subscriber_id,
-            pending.global_sequence,
-            pending.events_since_checkpoint
-        );
-    }
+    .await?;
+
+    checkpoint_cache.insert(subscriber_id.to_string(), pending.global_sequence);
+    log::debug!(
+        "Flushed checkpoint for '{}' to global_sequence {} ({} events batched)",
+        subscriber_id,
+        pending.global_sequence,
+        pending.events_since_checkpoint
+    );
+    Ok(())
 }
 
 /// Flushes all pending checkpoints that have exceeded their max_delay.
 ///
 /// This is called periodically to ensure checkpoints are written even when
-/// event rate is low.
+/// event rate is low. Errors are logged but not propagated since this runs
+/// in a background loop and will be retried on the next interval.
 async fn flush_expired_checkpoints(
     pool: &PgPool,
     pending_checkpoints: &mut HashMap<String, PendingCheckpoint>,
@@ -276,8 +310,15 @@ async fn flush_expired_checkpoints(
         .collect();
 
     for subscriber_id in expired {
-        if let Some(pending) = pending_checkpoints.remove(&subscriber_id) {
-            flush_checkpoint(pool, &subscriber_id, &pending, checkpoint_cache).await;
+        if let Some(pending) = pending_checkpoints.remove(&subscriber_id)
+            && let Err(e) = flush_checkpoint(pool, &subscriber_id, &pending, checkpoint_cache).await
+        {
+            error!(
+                "Failed to flush expired checkpoint for '{}': {}",
+                subscriber_id, e
+            );
+            // Re-insert the pending checkpoint so it can be retried
+            pending_checkpoints.insert(subscriber_id, pending);
         }
     }
 }
@@ -285,6 +326,8 @@ async fn flush_expired_checkpoints(
 /// Flushes all pending checkpoints to the database.
 ///
 /// This is called before reconnection or shutdown to ensure no checkpoint data is lost.
+/// Errors are logged but not propagated since this is typically called during
+/// shutdown or reconnection scenarios where we want best-effort persistence.
 async fn flush_all_pending_checkpoints(
     pool: &PgPool,
     pending_checkpoints: &mut HashMap<String, PendingCheckpoint>,
@@ -292,16 +335,23 @@ async fn flush_all_pending_checkpoints(
 ) {
     let subscriber_ids: Vec<String> = pending_checkpoints.keys().cloned().collect();
     for subscriber_id in subscriber_ids {
-        if let Some(pending) = pending_checkpoints.remove(&subscriber_id) {
-            flush_checkpoint(pool, &subscriber_id, &pending, checkpoint_cache).await;
+        if let Some(pending) = pending_checkpoints.remove(&subscriber_id)
+            && let Err(e) = flush_checkpoint(pool, &subscriber_id, &pending, checkpoint_cache).await
+        {
+            error!(
+                "Failed to flush checkpoint for '{}' during shutdown/reconnect: {}",
+                subscriber_id, e
+            );
         }
     }
 }
 
-/// Calculates the retry delay using exponential backoff.
+/// Calculates the retry delay using exponential backoff with jitter.
 ///
 /// The delay doubles with each attempt, starting from `initial_retry_delay`,
-/// and is capped at `max_retry_delay`.
+/// and is capped at `max_retry_delay`. A ±10% random jitter is applied to
+/// prevent thundering herd problems when multiple subscribers fail on the
+/// same event.
 ///
 /// # Arguments
 ///
@@ -310,8 +360,21 @@ async fn flush_all_pending_checkpoints(
 ///
 /// # Returns
 ///
-/// The delay duration before the next retry attempt.
-pub fn calculate_retry_delay(config: &ReliableDeliveryConfig, attempt: u32) -> Duration {
+/// The delay duration before the next retry attempt, with jitter applied.
+pub(crate) fn calculate_retry_delay(config: &ReliableDeliveryConfig, attempt: u32) -> Duration {
+    calculate_retry_delay_with_jitter(config, attempt, true)
+}
+
+/// Internal function that calculates retry delay with optional jitter.
+///
+/// This is separated to allow deterministic testing without jitter.
+fn calculate_retry_delay_with_jitter(
+    config: &ReliableDeliveryConfig,
+    attempt: u32,
+    apply_jitter: bool,
+) -> Duration {
+    use rand::Rng;
+
     let initial_ms = config.initial_retry_delay.as_millis() as u64;
     let max_ms = config.max_retry_delay.as_millis() as u64;
 
@@ -319,9 +382,32 @@ pub fn calculate_retry_delay(config: &ReliableDeliveryConfig, attempt: u32) -> D
     // Cap attempt at 63 to prevent 2^attempt from overflowing u64
     let capped_attempt = attempt.min(63);
     let multiplier = 2u64.saturating_pow(capped_attempt);
-    let delay_ms = initial_ms.saturating_mul(multiplier);
+    let base_delay_ms = initial_ms.saturating_mul(multiplier).min(max_ms);
 
-    Duration::from_millis(delay_ms.min(max_ms))
+    if !apply_jitter || base_delay_ms == 0 {
+        return Duration::from_millis(base_delay_ms);
+    }
+
+    // Apply ±10% jitter to prevent thundering herd
+    let jitter_range = (base_delay_ms as f64 * 0.1) as u64;
+    if jitter_range == 0 {
+        return Duration::from_millis(base_delay_ms);
+    }
+
+    let mut rng = rand::thread_rng();
+    let jitter: i64 = rng.gen_range(-(jitter_range as i64)..=(jitter_range as i64));
+    let final_delay_ms = (base_delay_ms as i64 + jitter).max(1) as u64;
+
+    Duration::from_millis(final_delay_ms.min(max_ms))
+}
+
+/// Calculates the base retry delay without jitter (for testing).
+///
+/// This function is useful for deterministic testing where jitter would
+/// make assertions unreliable.
+#[cfg(test)]
+pub fn calculate_retry_delay_no_jitter(config: &ReliableDeliveryConfig, attempt: u32) -> Duration {
+    calculate_retry_delay_with_jitter(config, attempt, false)
 }
 
 /// Processes an event with retry logic and DLQ fallback.
@@ -331,6 +417,13 @@ pub fn calculate_retry_delay(config: &ReliableDeliveryConfig, attempt: u32) -> D
 /// and inserts into the DLQ if all retries are exhausted.
 ///
 /// Returns whether the event was processed successfully or sent to DLQ.
+///
+/// # Future Improvements
+///
+/// Consider making retry behavior configurable per-subscriber rather than globally.
+/// Some projections may want aggressive retries (critical data) while others prefer
+/// fast-fail. This could be achieved by adding an optional `RetryPolicy` to the
+/// `EventObserver` trait with a default implementation.
 async fn process_event_with_retry<ED>(
     observer: &Arc<Mutex<dyn EventObserver<ED>>>,
     event: &Arc<Event<ED>>,
@@ -426,6 +519,10 @@ where
 }
 
 /// Represents an entry in the dead letter queue.
+///
+/// DLQ entries are created when event processing fails after all retry attempts
+/// are exhausted. They can be queried for monitoring and manually resolved
+/// after investigation.
 #[derive(Debug, Clone)]
 pub struct DlqEntry {
     /// Unique identifier for the DLQ entry
@@ -444,6 +541,12 @@ pub struct DlqEntry {
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// When the last retry was attempted
     pub last_retry_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the entry was manually resolved (None if unresolved)
+    pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Identifier of the operator/system that resolved the entry
+    pub resolved_by: Option<String>,
+    /// Free-form notes about the resolution
+    pub resolution_notes: Option<String>,
 }
 
 /// Errors that can occur when using `PgEventBus`.
@@ -457,9 +560,40 @@ pub enum PgEventBusError {
     Json(#[from] serde_json::Error),
 }
 
-/// PostgreSQL implementation of `EventBus`.
 /// Type alias for the projections collection to reduce type complexity.
+///
+/// # Design Note
+///
+/// The nested `Arc<Mutex<Vec<Arc<Mutex<...>>>>>` structure is intentional:
+///
+/// - **Outer `Arc<Mutex<Vec<...>>>`**: Allows thread-safe access to the list of projections.
+///   We use `Mutex` instead of `RwLock` because:
+///   - Lock duration is very short (just to push/iterate)
+///   - `subscribe()` calls during startup are relatively common
+///   - `Mutex` has lower overhead than `RwLock` for short critical sections
+///   - We don't benefit from concurrent reads since iteration is fast
+///
+/// - **Inner `Arc<Mutex<dyn EventObserver<D>>>`**: Each projection needs thread-safe
+///   interior mutability for the retry loop, which must release the lock between
+///   retry attempts to avoid deadlocks.
+///
+/// # Performance Considerations
+///
+/// The outer `Mutex` is held while iterating through projections in the listener loop.
+/// For high-throughput scenarios with frequent `subscribe()` calls during runtime,
+/// consider using a `RwLock` or a lock-free concurrent data structure (like
+/// `crossbeam`'s `SkipMap`) to allow concurrent reads during event dispatch while
+/// writes (new subscriptions) wait. However, for most use cases where subscriptions
+/// happen at startup, the current design is sufficient.
 type Projections<D> = Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>>;
+
+/// Internal state for managing the listener lifecycle.
+struct ListenerState {
+    /// Handle to the spawned listener task.
+    handle: tokio::task::JoinHandle<()>,
+    /// Signal to trigger shutdown.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
 
 /// PostgreSQL implementation of `EventBus`.
 #[derive(Clone)]
@@ -471,6 +605,8 @@ where
     channel_name: String,
     projections: Projections<D>,
     config: ReliableDeliveryConfig,
+    /// Listener lifecycle state, set when `start_listener` is called.
+    listener_state: Arc<Mutex<Option<ListenerState>>>,
 }
 
 impl<D> PgEventBus<D>
@@ -493,6 +629,7 @@ where
             channel_name: channel_name.into(),
             projections: Arc::new(Mutex::new(vec![])),
             config,
+            listener_state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -641,7 +778,31 @@ where
     /// // Start the background listener
     /// event_bus.start_listener().await?;
     /// ```
+    ///
+    /// # Lifecycle Management
+    ///
+    /// This method spawns a background task that runs indefinitely. The task handles
+    /// reconnection automatically on connection failures.
+    ///
+    /// For graceful shutdown, use the [`shutdown`](Self::shutdown) method which will:
+    /// 1. Signal the listener to stop accepting new events
+    /// 2. Flush any pending checkpoints (important for `Batched` mode)
+    /// 3. Wait for the listener task to complete
+    ///
+    /// ```rust,ignore
+    /// // Graceful shutdown
+    /// event_bus.shutdown().await?;
+    /// ```
     pub async fn start_listener(&self) -> Result<(), SqlxError> {
+        // Check if already started
+        {
+            let state = self.listener_state.lock().await;
+            if state.is_some() {
+                warn!("Listener already started, ignoring duplicate start_listener call");
+                return Ok(());
+            }
+        }
+
         let listener_pool = self.pool.clone();
         let checkpoint_pool = self.pool.clone();
         let dlq_pool = self.pool.clone();
@@ -649,7 +810,10 @@ where
         let projections = self.projections.clone();
         let config = self.config.clone();
 
-        tokio::spawn(async move {
+        // Create shutdown signal channel
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(async move {
             let mut listener_option: Option<PgListener> = None;
             let mut reconnect_delay = Duration::from_secs(1);
             const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
@@ -723,7 +887,7 @@ where
                     }
                 };
 
-                // Use select! to handle both notification reception and periodic checkpoint flush
+                // Use select! to handle notification reception, periodic checkpoint flush, and shutdown
                 let notification_result = tokio::select! {
                     result = listener.recv() => Some(result),
                     _ = sleep(flush_interval) => {
@@ -737,10 +901,25 @@ where
                         .await;
                         None // No notification, continue loop
                     }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            info!("Shutdown signal received, flushing pending checkpoints...");
+                            // Flush all pending checkpoints before exiting
+                            flush_all_pending_checkpoints(
+                                &checkpoint_pool,
+                                &mut pending_checkpoints,
+                                &mut checkpoint_cache,
+                            )
+                            .await;
+                            info!("Listener shutdown complete");
+                            return; // Exit the task
+                        }
+                        None
+                    }
                 };
 
                 let Some(result) = notification_result else {
-                    continue; // Was a timer tick, go back to select!
+                    continue; // Was a timer tick or non-shutdown signal, go back to select!
                 };
 
                 match result {
@@ -790,6 +969,11 @@ where
                         let event = Arc::new(event);
                         let event_global_seq = event.global_sequence.unwrap_or(0);
 
+                        // NOTE: The projections lock is held while iterating and processing events.
+                        // This means new subscribers cannot be added during event processing.
+                        // This is intentional to ensure consistent event delivery order, but
+                        // long-running event handlers should be avoided as they will block
+                        // new subscriptions until processing completes.
                         let mut projections_guard = projections.lock().await;
                         for projection in projections_guard.iter_mut() {
                             let projection_guard = projection.lock().await;
@@ -852,94 +1036,27 @@ where
                                 event.id
                             );
 
-                            // Release the lock before retry loop to avoid holding it during retries
+                            // Release the lock before processing to avoid holding it during retries
                             drop(projection_guard);
 
-                            // Retry loop with exponential backoff
-                            let mut last_error: Option<String> = None;
-                            let mut succeeded = false;
-
-                            for attempt in 0..=config.max_retries {
-                                let projection_guard = projection.lock().await;
-                                match projection_guard.on_event(Arc::clone(&event)).await {
-                                    Ok(_) => {
-                                        log::debug!(
-                                            "Successfully applied event to projection '{}': {:?}{}",
-                                            subscriber_id,
-                                            event.id,
-                                            if attempt > 0 {
-                                                format!(" (after {} retries)", attempt)
-                                            } else {
-                                                String::new()
-                                            }
-                                        );
-                                        succeeded = true;
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        last_error = Some(format!("{:?}", e));
-                                        if attempt < config.max_retries {
-                                            let delay = calculate_retry_delay(&config, attempt);
-                                            warn!(
-                                                "Failed applying event {} to projection '{}' (attempt {}/{}): {:?}. Retrying in {:?}",
-                                                event.id,
-                                                subscriber_id,
-                                                attempt + 1,
-                                                config.max_retries + 1,
-                                                e,
-                                                delay
-                                            );
-                                            drop(projection_guard);
-                                            sleep(delay).await;
-                                        } else {
-                                            error!(
-                                                "Failed applying event {} to projection '{}' after {} attempts: {:?}. Sending to DLQ.",
-                                                event.id,
-                                                subscriber_id,
-                                                config.max_retries + 1,
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-
-                            if !succeeded {
-                                // Insert into DLQ after all retries exhausted
-                                if let Err(e) = sqlx::query(
-                                    r#"
-                                    INSERT INTO epoch_event_bus_dlq (subscriber_id, event_id, global_sequence, error_message, retry_count, last_retry_at)
-                                    VALUES ($1, $2, $3, $4, $5, NOW())
-                                    ON CONFLICT (subscriber_id, event_id) DO UPDATE SET
-                                        error_message = EXCLUDED.error_message,
-                                        retry_count = EXCLUDED.retry_count,
-                                        last_retry_at = NOW()
-                                    "#,
-                                )
-                                .bind(&subscriber_id)
-                                .bind(event.id)
-                                .bind(event_global_seq as i64)
-                                .bind(last_error.as_deref().unwrap_or("Unknown error"))
-                                .bind((config.max_retries + 1) as i32)
-                                .execute(&dlq_pool)
-                                .await
-                                {
-                                    error!(
-                                        "Failed to insert event {} into DLQ for '{}': {}",
-                                        event.id, subscriber_id, e
-                                    );
-                                } else {
-                                    info!(
-                                        "Event {} for '{}' inserted into DLQ after {} failed attempts",
-                                        event.id,
-                                        subscriber_id,
-                                        config.max_retries + 1
-                                    );
-                                }
-                            }
+                            // Process event with retry logic and DLQ fallback
+                            process_event_with_retry(
+                                projection,
+                                &event,
+                                &subscriber_id,
+                                &config,
+                                &dlq_pool,
+                            )
+                            .await;
 
                             // Update checkpoint (both success and DLQ cases need checkpoint advancement)
                             // Always update in-memory cache immediately for deduplication
+                            //
+                            // Note: Advancing checkpoint for DLQ'd events means they won't be
+                            // retried on restart. This is intentional (at-least-once with DLQ
+                            // fallback). The DLQ provides a clear audit trail and allows manual
+                            // intervention. A future "strict" mode could block checkpoint
+                            // advancement for DLQ'd events if needed.
                             checkpoint_cache.insert(subscriber_id.clone(), event_global_seq);
 
                             // Track pending checkpoint for batched mode
@@ -960,13 +1077,21 @@ where
                                 && should_flush_checkpoint(pending, &config.checkpoint_mode)
                             {
                                 let pending = pending_checkpoints.remove(&subscriber_id).unwrap();
-                                flush_checkpoint(
+                                if let Err(e) = flush_checkpoint(
                                     &checkpoint_pool,
                                     &subscriber_id,
                                     &pending,
                                     &mut checkpoint_cache,
                                 )
-                                .await;
+                                .await
+                                {
+                                    error!(
+                                        "Failed to flush checkpoint for '{}': {}",
+                                        subscriber_id, e
+                                    );
+                                    // Re-insert pending checkpoint for retry on next event
+                                    pending_checkpoints.insert(subscriber_id.clone(), pending);
+                                }
                             }
                         }
                     }
@@ -984,7 +1109,71 @@ where
             }
         });
 
+        // Store the handle and shutdown sender
+        {
+            let mut state = self.listener_state.lock().await;
+            *state = Some(ListenerState {
+                handle,
+                shutdown_tx,
+            });
+        }
+
         Ok(())
+    }
+
+    /// Gracefully shuts down the event bus listener.
+    ///
+    /// This method:
+    /// 1. Signals the listener to stop accepting new events
+    /// 2. Flushes any pending checkpoints (important for `Batched` mode)
+    /// 3. Waits for the listener task to complete
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if shutdown completed successfully
+    /// - `Err` if the listener was not started or if the task panicked
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Start the listener
+    /// event_bus.start_listener().await?;
+    ///
+    /// // ... process events ...
+    ///
+    /// // Graceful shutdown
+    /// event_bus.shutdown().await?;
+    /// ```
+    pub async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let state = {
+            let mut guard = self.listener_state.lock().await;
+            guard.take()
+        };
+
+        match state {
+            Some(ListenerState {
+                handle,
+                shutdown_tx,
+            }) => {
+                // Signal shutdown
+                let _ = shutdown_tx.send(true);
+
+                // Wait for the task to complete
+                handle
+                    .await
+                    .map_err(|e| format!("Listener task panicked: {}", e))?;
+
+                info!("Event bus listener shut down gracefully");
+                Ok(())
+            }
+            None => Err("Listener was not started".into()),
+        }
+    }
+
+    /// Returns whether the listener is currently running.
+    pub async fn is_running(&self) -> bool {
+        let state = self.listener_state.lock().await;
+        state.is_some()
     }
 
     /// Gets the last checkpoint for a subscriber.
@@ -1068,10 +1257,14 @@ where
     }
 
     /// Retrieves all DLQ entries for a specific subscriber.
+    ///
+    /// For production use cases with potentially large DLQs, consider using
+    /// [`get_dlq_entries_paginated`](Self::get_dlq_entries_paginated) instead.
     pub async fn get_dlq_entries(&self, subscriber_id: &str) -> Result<Vec<DlqEntry>, SqlxError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, subscriber_id, event_id, global_sequence, error_message, retry_count, created_at, last_retry_at
+            SELECT id, subscriber_id, event_id, global_sequence, error_message, retry_count,
+                   created_at, last_retry_at, resolved_at, resolved_by, resolution_notes
             FROM epoch_event_bus_dlq
             WHERE subscriber_id = $1
             ORDER BY created_at ASC
@@ -1093,8 +1286,139 @@ where
                 retry_count: row.get("retry_count"),
                 created_at: row.get("created_at"),
                 last_retry_at: row.get("last_retry_at"),
+                resolved_at: row.get("resolved_at"),
+                resolved_by: row.get("resolved_by"),
+                resolution_notes: row.get("resolution_notes"),
             })
             .collect())
+    }
+
+    /// Retrieves DLQ entries for a specific subscriber with pagination.
+    ///
+    /// This method is recommended for production use cases where the DLQ
+    /// could contain many entries.
+    ///
+    /// # Arguments
+    ///
+    /// * `subscriber_id` - The subscriber to retrieve entries for
+    /// * `offset` - Number of entries to skip (for pagination)
+    /// * `limit` - Maximum number of entries to return
+    ///
+    /// # Returns
+    ///
+    /// A vector of DLQ entries, ordered by creation time (oldest first).
+    pub async fn get_dlq_entries_paginated(
+        &self,
+        subscriber_id: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<DlqEntry>, SqlxError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, subscriber_id, event_id, global_sequence, error_message, retry_count,
+                   created_at, last_retry_at, resolved_at, resolved_by, resolution_notes
+            FROM epoch_event_bus_dlq
+            WHERE subscriber_id = $1
+            ORDER BY created_at ASC
+            OFFSET $2
+            LIMIT $3
+            "#,
+        )
+        .bind(subscriber_id)
+        .bind(offset as i64)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        use sqlx::Row;
+        Ok(rows
+            .into_iter()
+            .map(|row| DlqEntry {
+                id: row.get("id"),
+                subscriber_id: row.get("subscriber_id"),
+                event_id: row.get("event_id"),
+                global_sequence: row.get::<i64, _>("global_sequence") as u64,
+                error_message: row.get("error_message"),
+                retry_count: row.get("retry_count"),
+                created_at: row.get("created_at"),
+                last_retry_at: row.get("last_retry_at"),
+                resolved_at: row.get("resolved_at"),
+                resolved_by: row.get("resolved_by"),
+                resolution_notes: row.get("resolution_notes"),
+            })
+            .collect())
+    }
+
+    /// Counts the total number of DLQ entries for a specific subscriber.
+    ///
+    /// Useful for pagination when you need to know the total number of entries.
+    pub async fn count_dlq_entries(&self, subscriber_id: &str) -> Result<u64, SqlxError> {
+        let result: (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)
+            FROM epoch_event_bus_dlq
+            WHERE subscriber_id = $1
+            "#,
+        )
+        .bind(subscriber_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(result.0 as u64)
+    }
+
+    /// Removes a specific DLQ entry after successful manual reprocessing.
+    ///
+    /// Call this after you've successfully reprocessed a failed event to remove
+    /// it from the dead letter queue.
+    ///
+    /// # Arguments
+    ///
+    /// * `subscriber_id` - The subscriber the entry belongs to
+    /// * `event_id` - The event ID to remove
+    ///
+    /// # Returns
+    ///
+    /// `true` if an entry was removed, `false` if no matching entry was found.
+    pub async fn remove_dlq_entry(
+        &self,
+        subscriber_id: &str,
+        event_id: Uuid,
+    ) -> Result<bool, SqlxError> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM epoch_event_bus_dlq
+            WHERE subscriber_id = $1 AND event_id = $2
+            "#,
+        )
+        .bind(subscriber_id)
+        .bind(event_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Removes all DLQ entries for a specific subscriber.
+    ///
+    /// Use this to clear the DLQ for a subscriber after bulk reprocessing
+    /// or when you want to reset the error state.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries that were removed.
+    pub async fn remove_all_dlq_entries(&self, subscriber_id: &str) -> Result<u64, SqlxError> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM epoch_event_bus_dlq
+            WHERE subscriber_id = $1
+            "#,
+        )
+        .bind(subscriber_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
     }
 
     /// Attempts to acquire an advisory lock for a subscriber.
@@ -1220,22 +1544,37 @@ where
             // 4. Drain buffer with deduplication (skip if global_seq <= checkpoint)
             // 5. Add to live projections
 
-            // Create a buffer for events arriving during catch-up
-            let event_buffer: Arc<Mutex<Vec<Event<Self::EventType>>>> =
-                Arc::new(Mutex::new(Vec::new()));
+            // Create a bounded buffer for events arriving during catch-up.
+            // The buffer uses a bounded mpsc channel to apply backpressure when full,
+            // preventing memory exhaustion during extended catch-up periods.
+            let buffer_size = config.catch_up_buffer_size;
+            let (buffer_tx, mut buffer_rx) =
+                tokio::sync::mpsc::channel::<Event<Self::EventType>>(buffer_size);
 
             // Start a temporary listener to buffer events during catch-up
             let buffer_listener_pool = pool.clone();
             let buffer_channel = channel_name.clone();
-            let buffer_ref = event_buffer.clone();
 
+            // WARNING: If the buffer listener fails to connect, events arriving during catch-up
+            // may be missed. The catch-up process will still complete, but there's a window
+            // where new events could be lost. Monitor for these errors in production.
+            //
+            // Design Decision: We log errors rather than failing subscribe() because:
+            // 1. The catch-up will still process all historical events correctly
+            // 2. The main listener (started after catch-up) will handle new events
+            // 3. Only events arriving *during* catch-up in a narrow window could be missed
+            // 4. Failing subscribe() would prevent the projection from starting at all
+            //
+            // For stricter guarantees, callers can monitor logs for buffer listener errors
+            // and implement their own retry logic around subscribe().
+            //
             // Spawn a task to listen and buffer events
             let buffer_handle = tokio::spawn(async move {
                 let mut listener = match PgListener::connect_with(&buffer_listener_pool).await {
                     Ok(l) => l,
                     Err(e) => {
-                        warn!(
-                            "Failed to create buffer listener: {}. Proceeding without buffering.",
+                        error!(
+                            "Failed to create buffer listener: {}. Events during catch-up may be missed!",
                             e
                         );
                         return;
@@ -1243,8 +1582,8 @@ where
                 };
 
                 if let Err(e) = listener.listen(&buffer_channel).await {
-                    warn!(
-                        "Failed to listen for buffer: {}. Proceeding without buffering.",
+                    error!(
+                        "Failed to listen for buffer: {}. Events during catch-up may be missed!",
                         e
                     );
                     return;
@@ -1252,7 +1591,7 @@ where
 
                 log::debug!("Buffer listener started for catch-up");
 
-                // Listen until the channel is closed (when catch-up completes)
+                // Listen until the sender is dropped (when catch-up completes)
                 loop {
                     match tokio::time::timeout(Duration::from_millis(100), listener.recv()).await {
                         Ok(Ok(notification)) => {
@@ -1275,8 +1614,11 @@ where
                                     purged_at: db_event.purged_at,
                                     global_sequence: db_event.global_sequence.map(|gs| gs as u64),
                                 };
-                                let mut buffer = buffer_ref.lock().await;
-                                buffer.push(event);
+                                // Send to bounded channel - will apply backpressure if full
+                                if buffer_tx.send(event).await.is_err() {
+                                    // Receiver dropped, catch-up is complete
+                                    break;
+                                }
                                 log::debug!("Buffered event during catch-up: {:?}", db_event.id);
                             }
                         }
@@ -1285,9 +1627,8 @@ where
                             break;
                         }
                         Err(_) => {
-                            // Timeout - check if we should continue
-                            // The buffer_ref being dropped will signal completion
-                            if Arc::strong_count(&buffer_ref) <= 1 {
+                            // Timeout - check if sender is still connected
+                            if buffer_tx.is_closed() {
                                 break;
                             }
                         }
@@ -1407,8 +1748,17 @@ where
                         && should_flush_checkpoint(pending, &config.checkpoint_mode)
                     {
                         let pending = pending_checkpoint.take().unwrap();
-                        flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache)
-                            .await;
+                        if let Err(e) =
+                            flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache)
+                                .await
+                        {
+                            error!(
+                                "Catch-up: failed to flush checkpoint for '{}': {}",
+                                subscriber_id, e
+                            );
+                            // Re-insert pending checkpoint for retry
+                            pending_checkpoint = Some(pending);
+                        }
                     }
 
                     current_sequence = event_global_seq;
@@ -1430,8 +1780,14 @@ where
             }
 
             // Flush any remaining pending checkpoint after catch-up
-            if let Some(pending) = pending_checkpoint.take() {
-                flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache).await;
+            if let Some(pending) = pending_checkpoint.take()
+                && let Err(e) =
+                    flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache).await
+            {
+                error!(
+                    "Catch-up: failed to flush final checkpoint for '{}': {}",
+                    subscriber_id, e
+                );
             }
 
             if total_caught_up > 0 {
@@ -1444,11 +1800,13 @@ where
             // Stop the buffer listener
             buffer_handle.abort();
 
-            // Drain and process buffered events with deduplication
-            let buffered_events = {
-                let mut buffer = event_buffer.lock().await;
-                std::mem::take(&mut *buffer)
-            };
+            // Drain and process buffered events with deduplication.
+            // Close the receiver to signal the sender to stop.
+            buffer_rx.close();
+            let mut buffered_events = Vec::new();
+            while let Some(event) = buffer_rx.recv().await {
+                buffered_events.push(event);
+            }
 
             let buffered_count = buffered_events.len();
             let mut processed_from_buffer = 0u64;
@@ -1490,7 +1848,17 @@ where
                     && should_flush_checkpoint(pending, &config.checkpoint_mode)
                 {
                     let pending = pending_checkpoint.take().unwrap();
-                    flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache).await;
+                    if let Err(e) =
+                        flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache)
+                            .await
+                    {
+                        error!(
+                            "Buffer processing: failed to flush checkpoint for '{}': {}",
+                            subscriber_id, e
+                        );
+                        // Re-insert pending checkpoint for retry
+                        pending_checkpoint = Some(pending);
+                    }
                 }
 
                 current_sequence = event_global_seq;
@@ -1506,8 +1874,14 @@ where
             }
 
             // Flush any remaining pending checkpoint after buffer processing
-            if let Some(pending) = pending_checkpoint.take() {
-                flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache).await;
+            if let Some(pending) = pending_checkpoint.take()
+                && let Err(e) =
+                    flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache).await
+            {
+                error!(
+                    "Buffer processing: failed to flush final checkpoint for '{}': {}",
+                    subscriber_id, e
+                );
             }
 
             if buffered_count > 0 {
@@ -1520,7 +1894,17 @@ where
                 );
             }
 
-            // Now add to live projections for real-time events
+            // Add to live projections for real-time events.
+            //
+            // RACE CONDITION NOTE: Between stopping the buffer listener and adding to live
+            // projections, the main listener may receive events. This is safe because:
+            // 1. We flush the checkpoint before adding to live projections
+            // 2. The main listener checks checkpoints before processing each event
+            // 3. Events with sequence <= checkpoint are skipped as duplicates
+            //
+            // The only edge case is if checkpoint flush fails above - in that case,
+            // events may be reprocessed when the subscriber restarts, which is acceptable
+            // for at-least-once delivery semantics.
             let mut projections = projections.lock().await;
             projections.push(observer);
 
@@ -1571,6 +1955,7 @@ mod tests {
             checkpoint_mode: CheckpointMode::Synchronous,
             instance_mode: InstanceMode::SingleInstance,
             catch_up_batch_size: 500,
+            catch_up_buffer_size: 5_000,
         };
 
         assert_eq!(config.max_retries, 5);
@@ -1579,6 +1964,7 @@ mod tests {
         assert_eq!(config.checkpoint_mode, CheckpointMode::Synchronous);
         assert_eq!(config.instance_mode, InstanceMode::SingleInstance);
         assert_eq!(config.catch_up_batch_size, 500);
+        assert_eq!(config.catch_up_buffer_size, 5_000);
     }
 
     #[test]
@@ -1589,22 +1975,47 @@ mod tests {
             ..Default::default()
         };
 
+        // Use no-jitter version for deterministic testing
         // First attempt: 1 second
-        assert_eq!(calculate_retry_delay(&config, 0), Duration::from_secs(1));
+        assert_eq!(
+            calculate_retry_delay_no_jitter(&config, 0),
+            Duration::from_secs(1)
+        );
         // Second attempt: 2 seconds
-        assert_eq!(calculate_retry_delay(&config, 1), Duration::from_secs(2));
+        assert_eq!(
+            calculate_retry_delay_no_jitter(&config, 1),
+            Duration::from_secs(2)
+        );
         // Third attempt: 4 seconds
-        assert_eq!(calculate_retry_delay(&config, 2), Duration::from_secs(4));
+        assert_eq!(
+            calculate_retry_delay_no_jitter(&config, 2),
+            Duration::from_secs(4)
+        );
         // Fourth attempt: 8 seconds
-        assert_eq!(calculate_retry_delay(&config, 3), Duration::from_secs(8));
+        assert_eq!(
+            calculate_retry_delay_no_jitter(&config, 3),
+            Duration::from_secs(8)
+        );
         // Fifth attempt: 16 seconds
-        assert_eq!(calculate_retry_delay(&config, 4), Duration::from_secs(16));
+        assert_eq!(
+            calculate_retry_delay_no_jitter(&config, 4),
+            Duration::from_secs(16)
+        );
         // Sixth attempt: 32 seconds
-        assert_eq!(calculate_retry_delay(&config, 5), Duration::from_secs(32));
+        assert_eq!(
+            calculate_retry_delay_no_jitter(&config, 5),
+            Duration::from_secs(32)
+        );
         // Seventh attempt: would be 64, but capped at 60
-        assert_eq!(calculate_retry_delay(&config, 6), Duration::from_secs(60));
+        assert_eq!(
+            calculate_retry_delay_no_jitter(&config, 6),
+            Duration::from_secs(60)
+        );
         // Eighth attempt: still capped at 60
-        assert_eq!(calculate_retry_delay(&config, 7), Duration::from_secs(60));
+        assert_eq!(
+            calculate_retry_delay_no_jitter(&config, 7),
+            Duration::from_secs(60)
+        );
     }
 
     #[test]
@@ -1615,25 +2026,26 @@ mod tests {
             ..Default::default()
         };
 
+        // Use no-jitter version for deterministic testing
         assert_eq!(
-            calculate_retry_delay(&config, 0),
+            calculate_retry_delay_no_jitter(&config, 0),
             Duration::from_millis(100)
         );
         assert_eq!(
-            calculate_retry_delay(&config, 1),
+            calculate_retry_delay_no_jitter(&config, 1),
             Duration::from_millis(200)
         );
         assert_eq!(
-            calculate_retry_delay(&config, 2),
+            calculate_retry_delay_no_jitter(&config, 2),
             Duration::from_millis(400)
         );
         assert_eq!(
-            calculate_retry_delay(&config, 3),
+            calculate_retry_delay_no_jitter(&config, 3),
             Duration::from_millis(800)
         );
         // Capped at 1000ms
         assert_eq!(
-            calculate_retry_delay(&config, 4),
+            calculate_retry_delay_no_jitter(&config, 4),
             Duration::from_millis(1000)
         );
     }
@@ -1647,11 +2059,35 @@ mod tests {
         };
 
         // Very large attempt numbers should be capped and not overflow
-        assert_eq!(calculate_retry_delay(&config, 100), Duration::from_secs(60));
+        // Use no-jitter version for deterministic testing
         assert_eq!(
-            calculate_retry_delay(&config, 1000),
+            calculate_retry_delay_no_jitter(&config, 100),
             Duration::from_secs(60)
         );
+        assert_eq!(
+            calculate_retry_delay_no_jitter(&config, 1000),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn retry_delay_with_jitter_stays_within_bounds() {
+        let config = ReliableDeliveryConfig {
+            initial_retry_delay: Duration::from_secs(10),
+            max_retry_delay: Duration::from_secs(60),
+            ..Default::default()
+        };
+
+        // Run multiple times to test jitter variability
+        for _ in 0..100 {
+            let delay = calculate_retry_delay(&config, 0);
+            // Base delay is 10s, jitter is ±10% (±1s), so range is 9-11s
+            assert!(
+                delay >= Duration::from_secs(9) && delay <= Duration::from_secs(11),
+                "Delay {:?} outside expected range 9-11s",
+                delay
+            );
+        }
     }
 
     #[test]
@@ -1665,12 +2101,16 @@ mod tests {
             retry_count: 3,
             created_at: chrono::Utc::now(),
             last_retry_at: Some(chrono::Utc::now()),
+            resolved_at: None,
+            resolved_by: None,
+            resolution_notes: None,
         };
 
         assert_eq!(entry.subscriber_id, "projection:test");
         assert_eq!(entry.global_sequence, 42);
         assert_eq!(entry.retry_count, 3);
         assert!(entry.error_message.is_some());
+        assert!(entry.resolved_at.is_none());
     }
 
     #[test]

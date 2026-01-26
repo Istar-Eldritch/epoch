@@ -55,8 +55,8 @@ struct Counter {
 }
 
 impl ProjectionState for Counter {
-    fn get_id(&self) -> Uuid {
-        self.id
+    fn get_id(&self) -> &Uuid {
+        &self.id
     }
 }
 
@@ -75,6 +75,12 @@ struct CounterAggregate {
     event_store: InMemoryEventStore<InMemoryEventBus<CounterEvent>>,
 }
 
+impl epoch_core::SubscriberId for CounterAggregate {
+    fn subscriber_id(&self) -> &str {
+        "projection:counter-aggregate"
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum CounterProjectionError {
     #[error("No state present for id {0}")]
@@ -86,10 +92,6 @@ impl Projection<CounterEvent> for CounterAggregate {
     type EventType = CounterEvent;
     type StateStore = InMemoryStateStore<Counter>;
     type ProjectionError = CounterProjectionError;
-
-    fn subscriber_id(&self) -> &str {
-        "projection:counter-aggregate"
-    }
 
     fn get_state_store(&self) -> Self::StateStore {
         self.state_store.clone()

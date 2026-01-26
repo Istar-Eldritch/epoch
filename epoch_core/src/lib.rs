@@ -8,6 +8,9 @@ pub mod event_store;
 pub mod projection;
 pub mod saga;
 pub mod state_store;
+pub mod subscriber_id;
+
+pub use subscriber_id::SubscriberId;
 
 /// Re-exports the most commonly used traits and types for convenience.
 pub mod prelude {
@@ -17,4 +20,5 @@ pub mod prelude {
     pub use super::projection::*;
     pub use super::saga::*;
     pub use super::state_store::*;
+    pub use super::subscriber_id::*;
 }

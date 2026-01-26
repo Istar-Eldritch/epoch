@@ -25,10 +25,10 @@ pub struct Command<D, C> {
 /// `AggregateState` represents the current state of an aggregate.
 /// It encapsulates the current data derived from a sequence of events.
 pub trait AggregateState: ProjectionState {
-    /// Returns the current version of the projection state. The version is incremented by the aggregate with each applied event and is used for
+    /// Returns the current version of the aggregate state. The version is incremented by the aggregate with each applied event and is used for
     /// optimistic concurrency control to prevent conflicting updates.
     fn get_version(&self) -> u64;
-    /// Sets the version of the projection state. The version is incremented by the aggregate with each applied event and is used for
+    /// Sets the version of the aggregate state. The version is incremented by the aggregate with each applied event and is used for
     /// optimistic concurrency control to prevent conflicting updates.
     fn set_version(&mut self, version: u64);
 }
@@ -290,7 +290,7 @@ where
                     state.get_id()
                 );
                 state_store
-                    .persist_state(state.get_id(), state.clone())
+                    .persist_state(*state.get_id(), state.clone())
                     .await
                     .map_err(HandleCommandError::State)?;
                 Ok(Some(state))

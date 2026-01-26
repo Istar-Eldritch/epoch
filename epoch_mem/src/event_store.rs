@@ -460,12 +460,20 @@ mod tests {
         }
     }
 
+    impl epoch_core::SubscriberId for TestProjection {
+        fn subscriber_id(&self) -> &str {
+            "projection:test"
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct TestState(Vec<Event<MyEventData>>);
 
     impl ProjectionState for TestState {
-        fn get_id(&self) -> Uuid {
-            Uuid::new_v4()
+        fn get_id(&self) -> &Uuid {
+            // For testing purposes, return a static UUID reference
+            static TEST_UUID: std::sync::OnceLock<Uuid> = std::sync::OnceLock::new();
+            TEST_UUID.get_or_init(Uuid::new_v4)
         }
     }
 
@@ -478,10 +486,6 @@ mod tests {
         type StateStore = InMemoryStateStore<Self::State>;
         type EventType = MyEventData;
         type ProjectionError = TestProjectionError;
-
-        fn subscriber_id(&self) -> &str {
-            "projection:test"
-        }
 
         fn get_state_store(&self) -> Self::StateStore {
             self.0.clone()

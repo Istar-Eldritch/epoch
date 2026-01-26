@@ -52,6 +52,13 @@ where
     /// This is a monotonically increasing sequence number across all events in the store,
     /// used for reliable event delivery, checkpointing, and catch-up processing.
     /// It is `None` until the event is persisted to the event store.
+    ///
+    /// # Design Note
+    ///
+    /// A future improvement could introduce a `StoredEvent<D>` type that guarantees
+    /// `global_sequence` is always present for events read from the store. This would
+    /// eliminate the need for `.unwrap_or(0)` calls and make the type system enforce
+    /// the invariant that persisted events always have a sequence number.
     pub global_sequence: Option<u64>,
 }
 

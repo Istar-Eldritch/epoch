@@ -17,7 +17,7 @@ use uuid::Uuid;
 /// It encapsulates the current data derived from a sequence of events.
 pub trait ProjectionState {
     /// Returns the unique identifier of the projection instance. This ID is used to retrieve and persist the projection's state and events.
-    fn get_id(&self) -> Uuid;
+    fn get_id(&self) -> &Uuid;
 }
 
 /// `ApplyAndStoreError` enumerates the possible errors that can occur during the application
@@ -36,10 +36,10 @@ pub enum ApplyAndStoreError<E, S> {
     State(S),
 }
 
-/// The Errors that can arise during a rehydration
+/// The errors that can arise during a rehydration
 #[derive(Debug, thiserror::Error)]
 pub enum ReHydrateError<E, S, ES> {
-    /// Event applicatione erors
+    /// Event application errors
     #[error("Event application error: {0}")]
     Application(E),
     /// Event transformation errors
@@ -52,8 +52,23 @@ pub enum ReHydrateError<E, S, ES> {
 
 /// `Projection` is a trait that defines the interface for a read-model that can be built
 /// from a stream of events.
+///
+/// # Subscriber ID
+///
+/// Implementors must also implement [`SubscriberId`](crate::SubscriberId) to provide
+/// a unique identifier for checkpoint tracking, multi-instance coordination, and
+/// dead letter queue association. Use the `#[derive(SubscriberId)]` macro from
+/// `epoch_derive` for automatic implementation:
+///
+/// ```ignore
+/// use epoch_derive::SubscriberId;
+///
+/// #[derive(SubscriberId)]
+/// struct UserProfileProjection { /* ... */ }
+/// // Automatically implements SubscriberId with subscriber_id() -> "projection:user-profile"
+/// ```
 #[async_trait]
-pub trait Projection<ED>
+pub trait Projection<ED>: crate::SubscriberId
 where
     ED: EventData + Send + Sync + 'static,
 {
@@ -68,20 +83,6 @@ where
     type EventType: EventData + for<'a> TryFrom<&'a ED, Error = EnumConversionError>;
     /// The type of errors that may occur when applying events
     type ProjectionError: std::error::Error + Send + Sync + 'static;
-
-    /// Returns a unique identifier for this projection subscriber.
-    ///
-    /// This ID is used for checkpoint tracking, multi-instance coordination, and dead letter
-    /// queue association. Follow the naming convention: `"projection:<name>"`.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// fn subscriber_id(&self) -> &str {
-    ///     "projection:user-profile"
-    /// }
-    /// ```
-    fn subscriber_id(&self) -> &str;
 
     /// Applies an event to the aggregate.
     /// If None is returned it will result in the state being deleted from storage.
@@ -239,16 +240,21 @@ impl<P> ProjectionHandler<P> {
     }
 }
 
+impl<P> crate::SubscriberId for ProjectionHandler<P>
+where
+    P: crate::SubscriberId,
+{
+    fn subscriber_id(&self) -> &str {
+        self.0.subscriber_id()
+    }
+}
+
 #[async_trait]
 impl<ED, P> EventObserver<ED> for ProjectionHandler<P>
 where
     ED: EventData + Send + Sync + 'static,
     P: Projection<ED> + Send + Sync,
 {
-    fn subscriber_id(&self) -> &str {
-        Projection::subscriber_id(&self.0)
-    }
-
     async fn on_event(
         &self,
         event: Arc<Event<ED>>,
@@ -291,8 +297,8 @@ mod tests {
     }
 
     impl ProjectionState for TestState {
-        fn get_id(&self) -> Uuid {
-            self.id
+        fn get_id(&self) -> &Uuid {
+            &self.id
         }
     }
 
@@ -324,16 +330,18 @@ mod tests {
 
     struct TestProjection;
 
+    impl crate::SubscriberId for TestProjection {
+        fn subscriber_id(&self) -> &str {
+            "projection:test-projection"
+        }
+    }
+
     #[async_trait]
     impl Projection<TestEventData> for TestProjection {
         type State = TestState;
         type StateStore = TestStateStore;
         type EventType = TestEventData;
         type ProjectionError = TestProjectionError;
-
-        fn subscriber_id(&self) -> &str {
-            "projection:test-projection"
-        }
 
         fn get_state_store(&self) -> Self::StateStore {
             TestStateStore
@@ -354,15 +362,15 @@ mod tests {
     fn projection_subscriber_id_is_available_via_event_observer() {
         let projection = TestProjection;
 
+        // Access subscriber_id via SubscriberId trait
+        assert_eq!(
+            crate::SubscriberId::subscriber_id(&projection),
+            "projection:test-projection"
+        );
+
         // Access subscriber_id via EventObserver trait using ProjectionHandler
         let handler = ProjectionHandler::new(projection);
         let observer: &dyn EventObserver<TestEventData> = &handler;
         assert_eq!(observer.subscriber_id(), "projection:test-projection");
-
-        // Access subscriber_id via Projection trait directly
-        assert_eq!(
-            Projection::subscriber_id(handler.inner()),
-            "projection:test-projection"
-        );
     }
 }

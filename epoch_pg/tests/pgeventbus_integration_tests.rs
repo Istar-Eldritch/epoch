@@ -45,8 +45,10 @@ fn new_event(stream_id: Uuid, stream_version: u64, value: &str) -> Event<TestEve
 struct TestState(Vec<Event<TestEventData>>);
 
 impl ProjectionState for TestState {
-    fn get_id(&self) -> Uuid {
-        Uuid::new_v4()
+    fn get_id(&self) -> &Uuid {
+        // For testing purposes, return a static UUID reference
+        static TEST_UUID: std::sync::OnceLock<Uuid> = std::sync::OnceLock::new();
+        TEST_UUID.get_or_init(Uuid::new_v4)
     }
 }
 
@@ -68,6 +70,12 @@ impl TestProjection {
     }
 }
 
+impl epoch_core::SubscriberId for TestProjection {
+    fn subscriber_id(&self) -> &str {
+        &self.subscriber_id
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TestProjectionError {}
 
@@ -77,10 +85,6 @@ impl Projection<TestEventData> for TestProjection {
     type StateStore = InMemoryStateStore<Self::State>;
     type EventType = TestEventData;
     type ProjectionError = TestProjectionError;
-
-    fn subscriber_id(&self) -> &str {
-        &self.subscriber_id
-    }
 
     fn get_state_store(&self) -> Self::StateStore {
         self.state_store.clone()
@@ -145,14 +149,14 @@ async fn setup() -> (
 #[tokio::test]
 #[serial]
 async fn test_setup_with_migrations() {
-    let (pool, _event_bus, _event_store) = setup().await;
+    let (_pool, _event_bus, _event_store) = setup().await;
     // If setup completes without panicking, migrations and event bus setup was successful
 }
 
 #[tokio::test]
 #[serial]
 async fn test_subscribe_and_event_propagation() {
-    let (pool, event_bus, event_store) = setup().await;
+    let (_pool, event_bus, event_store) = setup().await;
 
     let projection = TestProjection::new();
     let projection_events = projection.get_state_store().clone();
@@ -330,7 +334,7 @@ async fn test_event_data_deserialization_failure() {
 #[tokio::test]
 #[serial]
 async fn test_multiple_subscribers() {
-    let (pool, event_bus, event_store) = setup().await;
+    let (_pool, event_bus, event_store) = setup().await;
 
     let projection1 = TestProjection::new();
     let projection_events1 = projection1.get_state_store().clone();
@@ -381,7 +385,7 @@ async fn test_multiple_subscribers() {
 #[tokio::test]
 #[serial]
 async fn test_event_bus_notification_includes_global_sequence() {
-    let (pool, event_bus, event_store) = setup().await;
+    let (_pool, event_bus, event_store) = setup().await;
 
     let projection = TestProjection::new();
     let projection_events = projection.get_state_store().clone();
@@ -468,7 +472,7 @@ async fn test_migrations_create_checkpoint_table() {
 #[tokio::test]
 #[serial]
 async fn test_checkpoint_read_returns_none_for_new_subscriber() {
-    let (pool, event_bus, _event_store) = setup().await;
+    let (_pool, event_bus, _event_store) = setup().await;
 
     let checkpoint = event_bus
         .get_checkpoint("projection:nonexistent")
@@ -486,7 +490,7 @@ async fn test_checkpoint_read_returns_none_for_new_subscriber() {
 #[tokio::test]
 #[serial]
 async fn test_checkpoint_write_and_read_roundtrip() {
-    let (pool, event_bus, _event_store) = setup().await;
+    let (_pool, event_bus, _event_store) = setup().await;
 
     let subscriber_id = "projection:test-roundtrip";
     let global_sequence = 42u64;
@@ -516,7 +520,7 @@ async fn test_checkpoint_write_and_read_roundtrip() {
 #[tokio::test]
 #[serial]
 async fn test_checkpoint_update_is_upsert() {
-    let (pool, event_bus, _event_store) = setup().await;
+    let (_pool, event_bus, _event_store) = setup().await;
 
     let subscriber_id = "projection:test-upsert";
     let event_id1 = Uuid::new_v4();
@@ -555,7 +559,7 @@ async fn test_checkpoint_updated_after_successful_event_processing() {
     let (_pool, event_bus, event_store) = setup().await;
 
     let projection = TestProjection::new();
-    let subscriber_id = Projection::subscriber_id(&projection).to_string();
+    let subscriber_id = projection.subscriber_id().to_string();
 
     // Verify no checkpoint exists before subscribing for this unique subscriber
     let initial_checkpoint = event_bus
@@ -730,7 +734,7 @@ async fn test_read_all_events_since_with_baseline_returns_new_events() {
 #[tokio::test]
 #[serial]
 async fn test_subscribe_catches_up_on_missed_events() {
-    let (pool, event_bus, event_store) = setup().await;
+    let (_pool, event_bus, event_store) = setup().await;
 
     // Store 3 events BEFORE subscribing
     let stream_id = Uuid::new_v4();
@@ -774,7 +778,7 @@ async fn test_subscribe_catches_up_on_missed_events() {
 #[tokio::test]
 #[serial]
 async fn test_subscribe_deduplicates_events_during_catchup() {
-    let (pool, event_bus, event_store) = setup().await;
+    let (_pool, event_bus, event_store) = setup().await;
 
     // Store event 1 before subscribing
     let stream_id = Uuid::new_v4();
@@ -1077,7 +1081,7 @@ async fn test_advisory_lock_can_be_acquired_by_different_subscribers() {
 #[tokio::test]
 #[serial]
 async fn test_multiple_subscribers_have_independent_checkpoints() {
-    let (pool, event_bus, event_store) = setup().await;
+    let (_pool, event_bus, event_store) = setup().await;
 
     // Create two different projections with different subscriber_ids
     // We'll simulate this by manually updating checkpoints
@@ -1158,7 +1162,7 @@ async fn test_coordinated_mode_acquires_lock_on_subscribe() {
 
     // Subscribe a projection - should acquire lock
     let projection = TestProjection::new();
-    let subscriber_id = Projection::subscriber_id(&projection).to_string();
+    let subscriber_id = projection.subscriber_id().to_string();
 
     event_bus
         .subscribe(ProjectionHandler::new(projection))
@@ -1692,5 +1696,232 @@ async fn test_synchronous_checkpoint_still_works() {
     assert!(
         checkpoint.is_some(),
         "Checkpoint should be written immediately in synchronous mode"
+    );
+}
+
+// ============================================================================
+// Lifecycle Tests
+// ============================================================================
+
+/// Helper to create an event bus without starting the listener
+async fn setup_without_listener() -> (PgPool, PgEventBus<TestEventData>) {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let pool = common::get_pg_pool().await;
+
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let channel_name = format!("test_channel_{}", Uuid::new_v4().simple());
+    let event_bus = PgEventBus::new(pool.clone(), channel_name);
+
+    (pool, event_bus)
+}
+
+#[tokio::test]
+#[serial]
+async fn test_is_running_returns_false_before_start() {
+    let (_pool, event_bus) = setup_without_listener().await;
+
+    assert!(
+        !event_bus.is_running().await,
+        "is_running should return false before start_listener is called"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_is_running_returns_true_after_start() {
+    let (_pool, event_bus) = setup_without_listener().await;
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    assert!(
+        event_bus.is_running().await,
+        "is_running should return true after start_listener is called"
+    );
+
+    // Cleanup
+    event_bus.shutdown().await.expect("Failed to shutdown");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_shutdown_stops_listener() {
+    let (_pool, event_bus) = setup_without_listener().await;
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    assert!(event_bus.is_running().await, "Listener should be running");
+
+    event_bus
+        .shutdown()
+        .await
+        .expect("Failed to shutdown listener");
+
+    assert!(
+        !event_bus.is_running().await,
+        "is_running should return false after shutdown"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_shutdown_without_start_returns_error() {
+    let (_pool, event_bus) = setup_without_listener().await;
+
+    let result = event_bus.shutdown().await;
+    assert!(
+        result.is_err(),
+        "shutdown should return error if listener was not started"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_start_listener_is_idempotent() {
+    let (_pool, event_bus) = setup_without_listener().await;
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+
+    // Start listener twice - second call should be a no-op
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener first time");
+
+    event_bus
+        .start_listener()
+        .await
+        .expect("Second start_listener should succeed (no-op)");
+
+    assert!(
+        event_bus.is_running().await,
+        "Listener should still be running"
+    );
+
+    // Cleanup
+    event_bus.shutdown().await.expect("Failed to shutdown");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_shutdown_flushes_batched_checkpoints() {
+    use epoch_pg::event_bus::{CheckpointMode, ReliableDeliveryConfig};
+    use std::time::Duration;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    let pool = common::get_pg_pool().await;
+
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // Create event bus with batched checkpointing (large batch size so it won't auto-flush)
+    let config = ReliableDeliveryConfig {
+        checkpoint_mode: CheckpointMode::Batched {
+            batch_size: 1000,
+            max_delay_ms: 60000, // 60 seconds - won't trigger during test
+        },
+        ..Default::default()
+    };
+
+    let channel_name = format!("test_shutdown_flush_{}", Uuid::new_v4().simple());
+    let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    // Subscribe a projection
+    let projection = TestProjection::new();
+    let subscriber_id = projection.subscriber_id().to_string();
+
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+
+    // Store an event
+    let stream_id = Uuid::new_v4();
+    let event = new_event(stream_id, 1, "batched_event");
+    event_store
+        .store_event(event)
+        .await
+        .expect("Failed to store event");
+
+    // Wait for event to be processed
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Before shutdown, checkpoint might not be flushed (batched mode)
+    // After shutdown, it should be flushed
+    event_bus
+        .shutdown()
+        .await
+        .expect("Failed to shutdown listener");
+
+    // Verify checkpoint was flushed during shutdown
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("Failed to get checkpoint");
+
+    assert!(
+        checkpoint.is_some(),
+        "Checkpoint should be flushed during graceful shutdown"
+    );
+}
+
+// ============================================================================
+// Configuration Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_catch_up_buffer_size_config() {
+    use epoch_pg::event_bus::ReliableDeliveryConfig;
+
+    // Verify default value
+    let default_config = ReliableDeliveryConfig::default();
+    assert_eq!(
+        default_config.catch_up_buffer_size, 10_000,
+        "Default catch_up_buffer_size should be 10,000"
+    );
+
+    // Verify custom value
+    let custom_config = ReliableDeliveryConfig {
+        catch_up_buffer_size: 500,
+        ..Default::default()
+    };
+    assert_eq!(
+        custom_config.catch_up_buffer_size, 500,
+        "Custom catch_up_buffer_size should be respected"
     );
 }

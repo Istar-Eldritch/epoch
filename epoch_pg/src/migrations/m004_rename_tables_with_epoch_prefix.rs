@@ -4,6 +4,16 @@
 //! to avoid conflicts with user tables. It handles both fresh installations
 //! (where tables already have the new names from IF NOT EXISTS) and
 //! existing production databases (where tables have legacy names).
+//!
+//! # Implementation Notes
+//!
+//! The migration uses existence checks before each rename operation to handle
+//! idempotency. This allows the migration to run safely whether:
+//! - Tables have legacy names (pre-migration) → renames are performed
+//! - Tables already have new names (fresh install or re-run) → renames are skipped
+//!
+//! For debugging migration state, query `information_schema.tables` to see
+//! which table names exist in the database.
 
 use async_trait::async_trait;
 use sqlx::{Postgres, Row, Transaction};
@@ -111,6 +121,28 @@ impl Migration for RenameTablesWithEpochPrefix {
             sqlx::query("ALTER TABLE event_bus_checkpoints RENAME TO epoch_event_bus_checkpoints")
                 .execute(&mut **tx)
                 .await?;
+        }
+
+        // === Rename checkpoints primary key constraint ===
+        // Check if old constraint exists (from legacy table name)
+        let checkpoints_pkey_exists: bool = sqlx::query(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM pg_constraint 
+                WHERE conname = 'event_bus_checkpoints_pkey'
+            )
+            "#,
+        )
+        .fetch_one(&mut **tx)
+        .await?
+        .get(0);
+
+        if checkpoints_pkey_exists {
+            sqlx::query(
+                "ALTER TABLE epoch_event_bus_checkpoints RENAME CONSTRAINT event_bus_checkpoints_pkey TO epoch_event_bus_checkpoints_pkey",
+            )
+            .execute(&mut **tx)
+            .await?;
         }
 
         // === Rename event_bus_dlq table ===
