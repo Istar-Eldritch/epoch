@@ -1,6 +1,5 @@
 mod common;
 
-use async_trait::async_trait;
 use epoch_core::prelude::*;
 use epoch_core::projection::ProjectionHandler;
 use epoch_derive::EventData;
@@ -44,7 +43,7 @@ fn new_event(stream_id: Uuid, stream_version: u64, value: &str) -> Event<TestEve
 #[derive(Debug, Clone)]
 struct TestState(Vec<Event<TestEventData>>);
 
-impl ProjectionState for TestState {
+impl EventApplicatorState for TestState {
     fn get_id(&self) -> &Uuid {
         // For testing purposes, return a static UUID reference
         static TEST_UUID: std::sync::OnceLock<Uuid> = std::sync::OnceLock::new();
@@ -79,12 +78,11 @@ impl epoch_core::SubscriberId for TestProjection {
 #[derive(Debug, thiserror::Error)]
 pub enum TestProjectionError {}
 
-#[async_trait]
-impl Projection<TestEventData> for TestProjection {
+impl EventApplicator<TestEventData> for TestProjection {
     type State = TestState;
     type StateStore = InMemoryStateStore<Self::State>;
     type EventType = TestEventData;
-    type ProjectionError = TestProjectionError;
+    type ApplyError = TestProjectionError;
 
     fn get_state_store(&self) -> Self::StateStore {
         self.state_store.clone()
@@ -93,7 +91,7 @@ impl Projection<TestEventData> for TestProjection {
         &self,
         state: Option<Self::State>,
         event: &Event<Self::EventType>,
-    ) -> Result<Option<Self::State>, Self::ProjectionError> {
+    ) -> Result<Option<Self::State>, Self::ApplyError> {
         if let Some(mut state) = state {
             state.0.push(event.clone());
             Ok(Some(state))
@@ -102,6 +100,8 @@ impl Projection<TestEventData> for TestProjection {
         }
     }
 }
+
+impl Projection<TestEventData> for TestProjection {}
 
 async fn setup() -> (
     PgPool,

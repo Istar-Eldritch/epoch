@@ -1,57 +1,69 @@
-//! This module defines traits for `Projection`
-//! A `Projection` is a read-model built from a stream of events.
+//! Projection trait for read models that subscribe to the event bus.
+//!
+//! A [`Projection`] is a read-model built from a stream of events. Unlike
+//! [`Aggregate`](crate::aggregate::Aggregate), a projection is designed to be
+//! subscribed to an event bus via [`ProjectionHandler`].
+//!
+//! # Important
+//!
+//! Do NOT implement `Projection` for types that also implement `Aggregate`.
+//! Aggregates manage their own state persistence in `handle()` and should never
+//! be subscribed to the event bus for their own events. This would cause
+//! duplicate writes and race conditions.
+//!
+//! The type system enforces this: `Aggregate` extends [`EventApplicator`](crate::event_applicator::EventApplicator),
+//! NOT `Projection`, so aggregates cannot be wrapped in `ProjectionHandler`.
 
-use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::{
-    event::{EnumConversionError, Event, EventData},
-    prelude::{EventObserver, EventStream, RefEventStream},
-    state_store::StateStoreBackend,
-};
+use crate::event::{Event, EventData};
+use crate::event_applicator::EventApplicator;
+use crate::state_store::StateStoreBackend;
 use async_trait::async_trait;
-use tokio_stream::StreamExt;
-use uuid::Uuid;
 
-/// `ProjectionState` represents the current state of a projection.
-/// It encapsulates the current data derived from a sequence of events.
-pub trait ProjectionState {
-    /// Returns the unique identifier of the projection instance. This ID is used to retrieve and persist the projection's state and events.
-    fn get_id(&self) -> &Uuid;
-}
+// Re-export for backward compatibility
+#[deprecated(
+    since = "0.2.0",
+    note = "Use EventApplicatorState from epoch_core::event_applicator instead"
+)]
+pub use crate::event_applicator::EventApplicatorState as ProjectionState;
 
-/// `ApplyAndStoreError` enumerates the possible errors that can occur during the application
-/// and storage of a projection's state.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use ReHydrateError from epoch_core::event_applicator instead"
+)]
+pub use crate::event_applicator::ReHydrateError;
+
+/// Errors that can occur during [`Projection::apply_and_store`].
 ///
 /// Note: Conversion failures (when converting from a superset event to the projection's
 /// subset event type) are intentionally ignored in `apply_and_store()`. This is expected
 /// behavior since projections only handle events from their subset.
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyAndStoreError<E, S> {
-    /// Represents an error that occurred while applying an event to the projection.
+    /// An error occurred while applying an event to the projection.
     #[error("Event application error: {0}")]
     Event(E),
-    /// Represents an error that occurred while persisting the projection's state to storage.
+
+    /// An error occurred while persisting the projection's state to storage.
     #[error("Error persisting state: {0}")]
     State(S),
 }
 
-/// The errors that can arise during a rehydration
-#[derive(Debug, thiserror::Error)]
-pub enum ReHydrateError<E, S, ES> {
-    /// Event application errors
-    #[error("Event application error: {0}")]
-    Application(E),
-    /// Event transformation errors
-    #[error("Error transforming event: {0}")]
-    Subset(S),
-    /// Event stream reading errors
-    #[error("Error reading from event stream: {0}")]
-    EventStream(ES),
-}
-
-/// `Projection` is a trait that defines the interface for a read-model that can be built
-/// from a stream of events.
+/// A read model that subscribes to the event bus to maintain derived state.
+///
+/// Unlike [`Aggregate`](crate::aggregate::Aggregate), a `Projection` is designed
+/// to be subscribed to an event bus via [`ProjectionHandler`]. It receives events
+/// asynchronously and updates its state.
+///
+/// # Type Safety
+///
+/// `Projection` extends [`EventApplicator`], adding the [`apply_and_store`](Projection::apply_and_store)
+/// method for event bus integration. `Aggregate` also extends `EventApplicator` but does NOT
+/// implement `Projection`. This means:
+///
+/// - ✅ `ProjectionHandler::new(my_projection)` - Works
+/// - ❌ `ProjectionHandler::new(my_aggregate)` - Compile error
 ///
 /// # Subscriber ID
 ///
@@ -67,112 +79,69 @@ pub enum ReHydrateError<E, S, ES> {
 /// struct UserProfileProjection { /* ... */ }
 /// // Automatically implements SubscriberId with subscriber_id() -> "projection:user-profile"
 /// ```
+///
+/// # Example
+///
+/// ```ignore
+/// use epoch_core::prelude::*;
+/// use epoch_derive::SubscriberId;
+///
+/// #[derive(SubscriberId)]
+/// struct ProductProjection {
+///     state_store: InMemoryStateStore<Product>,
+/// }
+///
+/// impl EventApplicator<ApplicationEvent> for ProductProjection {
+///     type State = Product;
+///     type StateStore = InMemoryStateStore<Product>;
+///     type EventType = ProductEvent;
+///     type ApplyError = ProductError;
+///
+///     fn apply(&self, state: Option<Self::State>, event: &Event<Self::EventType>)
+///         -> Result<Option<Self::State>, Self::ApplyError>
+///     {
+///         // Apply event to state...
+///     }
+///
+///     fn get_state_store(&self) -> Self::StateStore {
+///         self.state_store.clone()
+///     }
+/// }
+///
+/// // Enable subscription to event bus
+/// impl Projection<ApplicationEvent> for ProductProjection {}
+///
+/// // Usage:
+/// event_bus.subscribe(ProjectionHandler::new(product_projection)).await?;
+/// ```
 #[async_trait]
-pub trait Projection<ED>: crate::SubscriberId
+pub trait Projection<ED>: EventApplicator<ED> + crate::SubscriberId
 where
     ED: EventData + Send + Sync + 'static,
 {
-    /// The type of the state that this `Projection` manages.
-    type State: ProjectionState + Send + Sync + Clone;
-    /// The type of `StateStorage` used by this `Projection`.
-    type StateStore: StateStoreBackend<Self::State> + Send + Sync;
-    /// The type of event used by this projection.
+    /// Applies an event received from the event bus and persists the resulting state.
     ///
-    /// Must implement `TryFrom<&ED, Error = EnumConversionError>` for efficient
-    /// reference-based conversion. This is automatically generated by the `#[subset_enum]` macro.
-    type EventType: EventData + for<'a> TryFrom<&'a ED, Error = EnumConversionError>;
-    /// The type of errors that may occur when applying events
-    type ProjectionError: std::error::Error + Send + Sync + 'static;
-
-    /// Applies an event to the aggregate.
-    /// If None is returned it will result in the state being deleted from storage.
-    /// If `Some(state)` is returned, the state will be persisted instead of deleted.
-    fn apply(
-        &self,
-        _state: Option<Self::State>,
-        _event: &Event<Self::EventType>,
-    ) -> Result<Option<Self::State>, Self::ProjectionError>;
-
-    /// Returns the `StateStorage` implementation for this `Projection`.
-    fn get_state_store(&self) -> Self::StateStore;
-
-    /// Reconstructs the projection's state from an event stream.
-    async fn re_hydrate<'a, E>(
-        &self,
-        mut state: Option<Self::State>,
-        mut event_stream: Pin<Box<dyn EventStream<ED, E> + Send + 'a>>,
-    ) -> Result<
-        Option<Self::State>,
-        ReHydrateError<<Self as Projection<ED>>::ProjectionError, EnumConversionError, E>,
-    > {
-        while let Some(event) = event_stream.next().await {
-            let event = event.map_err(ReHydrateError::EventStream)?;
-            let event = event
-                .to_subset_event_ref()
-                .map_err(ReHydrateError::Subset)?;
-            state = self
-                .apply(state, &event)
-                .map_err(ReHydrateError::Application)?;
-        }
-
-        Ok(state)
-    }
-
-    /// Reconstructs the projection's state from a reference-based event stream.
+    /// This method is called by [`ProjectionHandler`] when events are received from
+    /// the event bus. It:
     ///
-    /// This is an optimized version of [`re_hydrate`](Self::re_hydrate) that accepts
-    /// a stream of event references rather than owned events. This avoids cloning
-    /// events when re-hydrating from a local slice (e.g., in [`Aggregate::handle`]).
+    /// 1. Attempts to convert the event to the projection's subset type
+    /// 2. If successful, retrieves the current state from the state store
+    /// 3. Applies the event to produce new state
+    /// 4. Persists (or deletes) the resulting state
     ///
-    /// # Type Parameters
+    /// Events that don't match the projection's subset type are silently ignored.
     ///
-    /// * `'a` - The lifetime of the event references in the stream
-    /// * `E` - The error type that can be returned by the stream
+    /// # Default Implementation
     ///
-    /// # Arguments
-    ///
-    /// * `state` - The initial state to start re-hydration from, or `None` for a fresh projection
-    /// * `event_stream` - A pinned reference-based event stream
-    ///
-    /// # Returns
-    ///
-    /// The re-hydrated state after applying all events from the stream, or an error if
-    /// event application or stream reading fails.
-    async fn re_hydrate_from_refs<'a, E>(
-        &self,
-        mut state: Option<Self::State>,
-        mut event_stream: Pin<Box<dyn RefEventStream<'a, ED, E> + Send + 'a>>,
-    ) -> Result<
-        Option<Self::State>,
-        ReHydrateError<<Self as Projection<ED>>::ProjectionError, EnumConversionError, E>,
-    >
-    where
-        E: 'a,
-    {
-        while let Some(event) = event_stream.next().await {
-            let event = event.map_err(ReHydrateError::EventStream)?;
-            let event = event
-                .to_subset_event_ref()
-                .map_err(ReHydrateError::Subset)?;
-            state = self
-                .apply(state, &event)
-                .map_err(ReHydrateError::Application)?;
-        }
-
-        Ok(state)
-    }
-
-    /// Applies an event to the projection. This method dispatches the event to the appropriate
-    /// `apply_create`, `apply_update`, or `apply_delete` method based on the event type.
-    ///
-    /// Takes a reference to the event to avoid unnecessary cloning.
+    /// The default implementation handles the full apply-and-store cycle. Override
+    /// only if you need custom behavior (e.g., batching, custom error handling).
     async fn apply_and_store(
         &self,
         event: &Event<ED>,
     ) -> Result<
         (),
         ApplyAndStoreError<
-            Self::ProjectionError,
+            Self::ApplyError,
             <Self::StateStore as StateStoreBackend<Self::State>>::Error,
         >,
     > {
@@ -202,15 +171,16 @@ where
         }
         Ok(())
     }
-    /// Returns the ID of the stream from the given event.
-    fn get_id_from_event(&self, event: &Event<Self::EventType>) -> Uuid {
-        event.stream_id
-    }
 }
 
-/// A wrapper type that provides an [`EventObserver`] implementation for [`Projection`] types.
+/// Wraps a [`Projection`] to implement [`EventObserver`](crate::event_store::EventObserver)
+/// for event bus subscription.
 ///
-/// This wrapper is used to subscribe projections to an event bus.
+/// # Type Safety
+///
+/// This handler only accepts types implementing `Projection`, NOT `Aggregate`.
+/// This prevents the anti-pattern of subscribing aggregates to their own events,
+/// which would cause duplicate writes and race conditions.
 ///
 /// # Example
 ///
@@ -221,10 +191,25 @@ where
 /// let handler = ProjectionHandler::new(projection);
 /// event_bus.subscribe(handler).await?;
 /// ```
+/// Wraps a [`Projection`] to implement [`EventObserver`](crate::event_store::EventObserver)
+/// for event bus subscription.
+///
+/// # Type Safety
+///
+/// While `ProjectionHandler::new()` accepts any type, the handler can only be
+/// subscribed to an event bus if the inner type implements `Projection<ED>`.
+/// This is enforced by the `EventObserver` implementation's trait bounds.
+///
+/// Attempting to subscribe a `ProjectionHandler<MyAggregate>` to an event bus
+/// will fail to compile because `Aggregate` extends `EventApplicator`, not `Projection`.
 pub struct ProjectionHandler<P>(pub P);
 
 impl<P> ProjectionHandler<P> {
-    /// Creates a new `ProjectionHandler` wrapping the given projection.
+    /// Creates a new `ProjectionHandler` wrapping the given type.
+    ///
+    /// Note: The handler can only be used with an event bus if `P` implements
+    /// `Projection<ED>`. Aggregates cannot be used because they don't implement
+    /// `Projection`.
     pub fn new(projection: P) -> Self {
         Self(projection)
     }
@@ -250,7 +235,7 @@ where
 }
 
 #[async_trait]
-impl<ED, P> EventObserver<ED> for ProjectionHandler<P>
+impl<ED, P> crate::event_store::EventObserver<ED> for ProjectionHandler<P>
 where
     ED: EventData + Send + Sync + 'static,
     P: Projection<ED> + Send + Sync,
@@ -268,7 +253,10 @@ where
 mod tests {
     use super::*;
     use crate::event::EnumConversionError;
+    use crate::event_applicator::EventApplicatorState;
+    use crate::event_store::EventObserver;
     use crate::state_store::StateStoreBackend;
+    use uuid::Uuid;
 
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     enum TestEventData {
@@ -296,7 +284,7 @@ mod tests {
         id: Uuid,
     }
 
-    impl ProjectionState for TestState {
+    impl EventApplicatorState for TestState {
         fn get_id(&self) -> &Uuid {
             &self.id
         }
@@ -336,12 +324,11 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl Projection<TestEventData> for TestProjection {
+    impl EventApplicator<TestEventData> for TestProjection {
         type State = TestState;
         type StateStore = TestStateStore;
         type EventType = TestEventData;
-        type ProjectionError = TestProjectionError;
+        type ApplyError = TestProjectionError;
 
         fn get_state_store(&self) -> Self::StateStore {
             TestStateStore
@@ -351,12 +338,14 @@ mod tests {
             &self,
             _state: Option<Self::State>,
             event: &Event<Self::EventType>,
-        ) -> Result<Option<Self::State>, Self::ProjectionError> {
+        ) -> Result<Option<Self::State>, Self::ApplyError> {
             Ok(Some(TestState {
                 id: event.stream_id,
             }))
         }
     }
+
+    impl Projection<TestEventData> for TestProjection {}
 
     #[test]
     fn projection_subscriber_id_is_available_via_event_observer() {

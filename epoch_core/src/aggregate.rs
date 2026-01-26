@@ -1,35 +1,60 @@
-//! Aggregate definition
+//! Aggregate trait for command handling and event sourcing.
+//!
+//! An [`Aggregate`] is a cluster of domain objects that can be treated as a single unit
+//! for data changes. It is the consistency boundary for commands and events in an
+//! event-sourced system.
+//!
+//! # Important
+//!
+//! Aggregates should NOT be subscribed to the event bus as projections.
+//! The `handle()` method already persists state before publishing events.
+//! Subscribing an aggregate to the bus causes duplicate writes and race conditions.
+//!
+//! Note: `Aggregate` extends [`EventApplicator`], NOT [`Projection`](crate::projection::Projection).
+//! This is intentional to prevent wrapping aggregates in [`ProjectionHandler`](crate::projection::ProjectionHandler).
 
 use crate::event::{EnumConversionError, Event, EventData};
+use crate::event_applicator::{EventApplicator, EventApplicatorState, ReHydrateError};
 use crate::event_store::EventStoreBackend;
-use crate::prelude::{
-    Projection, ProjectionState, ReHydrateError, SliceRefEventStream, StateStoreBackend,
-};
+use crate::prelude::{SliceRefEventStream, StateStoreBackend};
 use async_trait::async_trait;
 use log::debug;
 use uuid::Uuid;
 
-/// The command structure
+/// The command structure that wraps command data with metadata.
+///
+/// A command represents an intention to change state. It carries:
+/// - The target aggregate ID
+/// - The command-specific data
+/// - Optional credentials for authorization
+/// - Optional expected version for optimistic concurrency control
 #[derive(Debug, Clone)]
 pub struct Command<D, C> {
-    /// The id of the root aggregate affected by this command
+    /// The ID of the root aggregate affected by this command.
     pub aggregate_id: Uuid,
-    /// The data used by the command
+    /// The command-specific data.
     pub data: D,
-    /// The credentials of the command
+    /// Optional credentials for authorization.
     pub credentials: Option<C>,
-    /// The expected version of aggregate
+    /// Optional expected version of the aggregate for optimistic concurrency control.
     pub aggregate_version: Option<u64>,
 }
 
-/// `AggregateState` represents the current state of an aggregate.
-/// It encapsulates the current data derived from a sequence of events.
-pub trait AggregateState: ProjectionState {
-    /// Returns the current version of the aggregate state. The version is incremented by the aggregate with each applied event and is used for
+/// Aggregate state with version tracking for optimistic concurrency.
+///
+/// Extends [`EventApplicatorState`] with version tracking, which is used to:
+/// - Prevent conflicting concurrent modifications
+/// - Track how many events have been applied to this aggregate
+pub trait AggregateState: EventApplicatorState {
+    /// Returns the current version of the aggregate state.
+    ///
+    /// The version is incremented with each applied event and is used for
     /// optimistic concurrency control to prevent conflicting updates.
     fn get_version(&self) -> u64;
-    /// Sets the version of the aggregate state. The version is incremented by the aggregate with each applied event and is used for
-    /// optimistic concurrency control to prevent conflicting updates.
+
+    /// Sets the version of the aggregate state.
+    ///
+    /// Called by the aggregate after applying events to update the version.
     fn set_version(&mut self, version: u64);
 }
 
@@ -38,7 +63,7 @@ where
     D: std::fmt::Debug + Clone,
     C: std::fmt::Debug + Clone,
 {
-    /// Create a new Command
+    /// Creates a new command with the given parameters.
     pub fn new(
         aggregate_id: Uuid,
         data: D,
@@ -53,7 +78,9 @@ where
         }
     }
 
-    /// Transforms this command
+    /// Transforms this command's data to a subset type.
+    ///
+    /// Used to convert from a general command type to a specific aggregate's command type.
     pub fn to_subset_command<CD>(&self) -> Result<Command<CD, C>, CD::Error>
     where
         CD: TryFrom<D>,
@@ -68,7 +95,9 @@ where
         })
     }
 
-    /// Transforms this command
+    /// Transforms this command's data to a superset type.
+    ///
+    /// Used to convert from a specific aggregate's command type to a general command type.
     pub fn to_superset_command<CD>(&self) -> Command<CD, C>
     where
         CD: EventData,
@@ -84,114 +113,176 @@ where
     }
 }
 
-/// Defines the errors that can happen when handling a command
+/// Errors that can occur when handling a command.
 #[derive(Debug, thiserror::Error)]
 pub enum HandleCommandError<C, H, S, E> {
-    /// The version of the state is different than expected
+    /// The version of the state doesn't match the expected version.
+    ///
+    /// This indicates a concurrent modification - another process modified
+    /// the aggregate between when the command was created and when it was processed.
     #[error("Expected to find state with version {expected} but found {found}")]
     VersionMismatch {
-        /// The version expected by the command
+        /// The version expected by the command.
         expected: u64,
-        /// The actual version of the state
+        /// The actual version of the state.
         found: u64,
     },
-    /// An error raised while handling the command
+
+    /// An error raised while handling the command.
+    ///
+    /// This wraps business logic errors from the aggregate's `handle_command` method.
     #[error("Error while handling command: {0}")]
     Command(C),
-    /// An error raised by the state store
+
+    /// An error raised while re-hydrating state from the event store.
     #[error("Error while hydrating events: {0}")]
     Hydration(H),
-    /// An error raised by the state store
+
+    /// An error raised by the state store.
     #[error("Error while storing state: {0}")]
     State(S),
-    /// An error raised by the state store
+
+    /// An error raised while storing events.
     #[error("Error while storing events: {0}")]
     Event(E),
 }
 
-/// `Aggregate` is a central trait in `epoch_core` that defines the behavior of an aggregate in an event-sourced system.
-/// An aggregate is a cluster of domain objects that can be treated as a single unit for data changes.
-/// It is the consistency boundary for commands and events.
+/// An aggregate handles commands and produces events.
 ///
-/// This trait provides the necessary associated types for the aggregate's state, commands, events,
-/// and the stores used for persistence. It also defines the handlers for different types of commands
-/// (create, update, delete) and a general command handler.
+/// An `Aggregate` is the central concept in event sourcing. It:
+/// - Receives commands (intentions to change state)
+/// - Validates commands against current state
+/// - Produces events (facts about what happened)
+/// - Applies events to update its state
+///
+/// # Important
+///
+/// Aggregates should NOT be subscribed to the event bus as projections.
+/// The `handle()` method already persists state before publishing events.
+/// Subscribing an aggregate to the bus causes duplicate writes and race conditions.
+///
+/// Note: `Aggregate` extends [`EventApplicator`], NOT [`Projection`](crate::projection::Projection).
+/// This is intentional to prevent wrapping aggregates in [`ProjectionHandler`](crate::projection::ProjectionHandler).
+///
+/// # Type Parameters
+///
+/// * `ED` - The superset event data type (e.g., `ApplicationEvent`)
+///
+/// # Example
+///
+/// ```ignore
+/// use epoch_core::prelude::*;
+///
+/// struct UserAggregate {
+///     state_store: InMemoryStateStore<User>,
+///     event_store: InMemoryEventStore<InMemoryEventBus<ApplicationEvent>>,
+/// }
+///
+/// impl EventApplicator<ApplicationEvent> for UserAggregate {
+///     type State = User;
+///     type StateStore = InMemoryStateStore<User>;
+///     type EventType = UserEvent;
+///     type ApplyError = UserApplyError;
+///
+///     fn apply(&self, state: Option<Self::State>, event: &Event<Self::EventType>)
+///         -> Result<Option<Self::State>, Self::ApplyError> { /* ... */ }
+///
+///     fn get_state_store(&self) -> Self::StateStore { /* ... */ }
+/// }
+///
+/// #[async_trait]
+/// impl Aggregate<ApplicationEvent> for UserAggregate {
+///     type CommandData = ApplicationCommand;
+///     type CommandCredentials = ();
+///     type Command = UserCommand;
+///     type AggregateError = UserAggregateError;
+///     type EventStore = InMemoryEventStore<InMemoryEventBus<ApplicationEvent>>;
+///
+///     fn get_event_store(&self) -> Self::EventStore { /* ... */ }
+///
+///     async fn handle_command(&self, state: &Option<Self::State>, command: Command<Self::Command, Self::CommandCredentials>)
+///         -> Result<Vec<Event<ApplicationEvent>>, Self::AggregateError> { /* ... */ }
+/// }
+/// ```
 #[async_trait]
-pub trait Aggregate<ED>: Projection<ED>
+pub trait Aggregate<ED>: EventApplicator<ED>
 where
     ED: EventData + Send + Sync + 'static,
-    <Self as Projection<ED>>::State: AggregateState,
+    <Self as EventApplicator<ED>>::State: AggregateState,
     Self::CommandData: Send + Sync,
     <Self::Command as TryFrom<Self::CommandData>>::Error: Send + Sync,
 {
-    /// The overarching type of `Command` data that this `Aggregate` can process.
-    /// Commands are instructions to the aggregate to perform an action.
+    /// The overarching type of command data that this aggregate can process.
+    ///
+    /// This is typically a superset enum containing all commands for the application.
     type CommandData: Clone + std::fmt::Debug;
-    /// The type of credentials used by the commands on this application.
+
+    /// The type of credentials used for authorization.
     type CommandCredentials: Clone + std::fmt::Debug + Send;
-    /// The specific command type used to create a new instance of the aggregate.
-    /// This type must be convertible from the general `CommandData` type.
+
+    /// The specific command type used by this aggregate.
+    ///
+    /// Must be convertible from `CommandData` via `TryFrom`.
     type Command: TryFrom<Self::CommandData> + Send;
-    /// The event store backend responsible for persisting and retrieving events for this aggregate.
+
+    /// The event store backend for persisting events.
     type EventStore: EventStoreBackend<EventType = ED> + Send + Sync + 'static;
-    /// Error while handling commands
+
+    /// Error type for command handling.
     type AggregateError: std::error::Error + Send + Sync + 'static;
-    /// Returns an instance of the event store configured for this aggregate.
-    ///
-    /// This method provides the concrete `EventStoreBackend` implementation that the aggregate
-    /// will use to store and retrieve events. It allows the aggregate to interact with the
-    /// underlying event persistence mechanism.
-    ///
-    /// # Returns
-    /// An instance of `Self::EventStore`, which is a type that implements `EventStoreBackend`.
+
+    /// Returns the event store for this aggregate.
     fn get_event_store(&self) -> Self::EventStore;
 
-    /// Handles a specific command, applying it to the current aggregate state and producing new events.
+    /// Handles a specific command, producing events.
     ///
-    /// This method is responsible for the core business logic of the aggregate. It takes the current
-    /// state of the aggregate (if it exists) and a command, and based on these, it determines
-    /// which events should be generated. These events represent the changes that occurred due to
-    /// the command and will be persisted to the event store.
+    /// This method contains the core business logic of the aggregate. It:
+    /// - Validates the command against the current state
+    /// - Determines which events should be generated
+    /// - Returns the events (but does NOT persist them)
     ///
     /// # Arguments
-    /// * `state` - An `Option` containing a reference to the current `AggregateState` of the aggregate.
-    ///             If `None`, it means the aggregate does not currently exist (e.g., for a creation command).
-    /// * `command` - The `Command` to be handled, containing the command-specific data and credentials.
+    ///
+    /// * `state` - The current state, or `None` if the aggregate doesn't exist
+    /// * `command` - The command to handle
     ///
     /// # Returns
-    /// A `Result` indicating success or failure. On success, it returns a `Vec` of `Event<ED>`,
-    /// which are the events generated by the command. On failure, it returns a `Box<dyn std::error::Error + Send + Sync>`
-    /// representing the error that occurred during command handling.
+    ///
+    /// A vector of events to be persisted, or an error if the command is invalid.
     async fn handle_command(
         &self,
         state: &Option<Self::State>,
         command: Command<Self::Command, Self::CommandCredentials>,
     ) -> Result<Vec<Event<ED>>, Self::AggregateError>;
 
-    /// Handles a generic command by retrieving the aggregate's state, applying the command,
-    /// and persisting the resulting events and updated state.
+    /// Handles a command by retrieving state, validating, generating events, and persisting.
     ///
-    /// This method orchestrates the command handling process, including state retrieval,
-    /// optimistic concurrency control (if `aggregate_version` is provided in the command),
-    /// event generation via `handle_command`, state re-hydration, and persistence of
-    /// the new state and events.
+    /// This method orchestrates the full command handling process:
+    ///
+    /// 1. Retrieves current state from the state store
+    /// 2. Checks version for optimistic concurrency (if `aggregate_version` is provided)
+    /// 3. Re-hydrates from event store to catch up on any missed events
+    /// 4. Calls `handle_command` to generate events
+    /// 5. Applies events to update state
+    /// 6. Persists events to the event store
+    /// 7. Persists state to the state store
     ///
     /// # Arguments
-    /// * `command` - The `Command` to be handled, containing the command-specific data and credentials.
+    ///
+    /// * `command` - The command to handle
     ///
     /// # Returns
-    /// A `Result` indicating success or failure. On success, it returns `Ok(())`.
-    /// On failure, it returns a `Box<dyn std::error::Error + Send + Sync>` representing
-    /// the error that occurred during the handling process.
+    ///
+    /// The updated state after command handling, or an error.
     async fn handle(
         &self,
         command: Command<Self::CommandData, Self::CommandCredentials>,
     ) -> Result<
-        Option<<Self as Projection<ED>>::State>,
+        Option<<Self as EventApplicator<ED>>::State>,
         HandleCommandError<
             Self::AggregateError,
             ReHydrateError<
-                <Self as Projection<ED>>::ProjectionError,
+                <Self as EventApplicator<ED>>::ApplyError,
                 EnumConversionError,
                 <<Self as Aggregate<ED>>::EventStore as EventStoreBackend>::Error,
             >,
@@ -308,14 +399,10 @@ where
         }
     }
 
-    /// Extracts and returns the unique identifier (UUID) of the aggregate instance
-    /// from the given `command`.
+    /// Extracts the aggregate ID from a command.
     ///
-    /// This is necessary because the generic `Command` type needs a way to provide
-    /// the aggregate's ID for retrieval from the state store.
-    ///
-    /// # Arguments
-    /// * `command` - A reference to the `Self::Command` from which to extract the ID.
+    /// By default, returns the command's `aggregate_id`. Override this method if
+    /// your aggregate ID should be derived differently.
     fn get_id_from_command(
         &self,
         command: &Command<Self::CommandData, Self::CommandCredentials>,
