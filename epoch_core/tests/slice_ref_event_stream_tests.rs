@@ -51,7 +51,7 @@ struct TestState {
     update_count: u32,
 }
 
-impl ProjectionState for TestState {
+impl EventApplicatorState for TestState {
     fn get_id(&self) -> Uuid {
         self.id
     }
@@ -79,11 +79,11 @@ enum TestProjectionError {
     MissingState,
 }
 
-impl Projection<TestEvent> for TestProjection {
+impl EventApplicator<TestEvent> for TestProjection {
     type State = TestState;
     type StateStore = InMemoryStateStore<TestState>;
     type EventType = TestEvent;
-    type ProjectionError = TestProjectionError;
+    type ApplyError = TestProjectionError;
 
     fn get_state_store(&self) -> Self::StateStore {
         self.state_store.clone()
@@ -93,7 +93,7 @@ impl Projection<TestEvent> for TestProjection {
         &self,
         state: Option<Self::State>,
         event: &Event<Self::EventType>,
-    ) -> Result<Option<Self::State>, Self::ProjectionError> {
+    ) -> Result<Option<Self::State>, Self::ApplyError> {
         match event.data.as_ref().unwrap() {
             TestEvent::Created { name } => Ok(Some(TestState {
                 id: event.stream_id,
@@ -109,6 +109,8 @@ impl Projection<TestEvent> for TestProjection {
         }
     }
 }
+
+impl Projection<TestEvent> for TestProjection {}
 
 // ============================================================================
 // Tests for SliceRefEventStream

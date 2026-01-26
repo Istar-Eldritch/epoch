@@ -36,7 +36,7 @@ pub struct User {
     version: u64,
 }
 
-impl ProjectionState for User {
+impl EventApplicatorState for User {
     fn get_id(&self) -> Uuid {
         self.id
     }
@@ -69,16 +69,16 @@ impl UserAggregate {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum UserProjectionError {
+pub enum UserApplyError {
     #[error("No state present for id {0}")]
     NoState(Uuid),
 }
 
-impl Projection<ApplicationEvent> for UserAggregate {
+impl EventApplicator<ApplicationEvent> for UserAggregate {
     type State = User;
     type EventType = UserEvent;
     type StateStore = InMemoryStateStore<User>;
-    type ProjectionError = UserProjectionError;
+    type ApplyError = UserApplyError;
 
     fn get_state_store(&self) -> Self::StateStore {
         self.state_store.clone()
@@ -88,14 +88,14 @@ impl Projection<ApplicationEvent> for UserAggregate {
         &self,
         state: Option<Self::State>,
         event: &Event<Self::EventType>,
-    ) -> Result<Option<Self::State>, UserProjectionError> {
+    ) -> Result<Option<Self::State>, UserApplyError> {
         match event.data.as_ref().unwrap() {
             UserEvent::UserNameUpdated { name } => {
                 if let Some(mut state) = state {
                     state.name = name.clone();
                     Ok(Some(state))
                 } else {
-                    Err(UserProjectionError::NoState(event.stream_id))
+                    Err(UserApplyError::NoState(event.stream_id))
                 }
             }
             UserEvent::UserCreated { name } => Ok(Some(User {
@@ -196,17 +196,17 @@ impl ProductProjection {
     }
 }
 
-impl ProjectionState for Product {
+impl EventApplicatorState for Product {
     fn get_id(&self) -> Uuid {
         self.id
     }
 }
 
-impl Projection<ApplicationEvent> for ProductProjection {
+impl EventApplicator<ApplicationEvent> for ProductProjection {
     type State = Product;
     type StateStore = InMemoryStateStore<Self::State>;
     type EventType = ProductEvent;
-    type ProjectionError = ProductProjectionError;
+    type ApplyError = ProductProjectionError;
 
     fn get_state_store(&self) -> Self::StateStore {
         self.0.clone()
@@ -216,7 +216,7 @@ impl Projection<ApplicationEvent> for ProductProjection {
         &self,
         state: Option<Self::State>,
         event: &Event<Self::EventType>,
-    ) -> Result<Option<Self::State>, Self::ProjectionError> {
+    ) -> Result<Option<Self::State>, Self::ApplyError> {
         match event.data.as_ref().unwrap() {
             ProductEvent::ProductCreated { name, price } => Ok(Some(Product {
                 id: event.stream_id,
@@ -243,6 +243,8 @@ impl Projection<ApplicationEvent> for ProductProjection {
         }
     }
 }
+
+impl Projection<ApplicationEvent> for ProductProjection {}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

@@ -1,10 +1,22 @@
 //! Aggregate definition
+//!
+//! An [`Aggregate`] is a cluster of domain objects that can be treated as a single unit
+//! for data changes. It is the consistency boundary for commands and events in an
+//! event-sourced system.
+//!
+//! # Important
+//!
+//! Aggregates should NOT be subscribed to the event bus as projections.
+//! The `handle()` method already persists state before publishing events.
+//! Subscribing an aggregate to the bus causes duplicate writes and race conditions.
+//!
+//! Note: `Aggregate` extends [`EventApplicator`], NOT [`Projection`](crate::projection::Projection).
+//! This is intentional to prevent wrapping aggregates in [`ProjectionHandler`](crate::projection::ProjectionHandler).
 
 use crate::event::{EnumConversionError, Event, EventData};
+use crate::event_applicator::{EventApplicator, EventApplicatorState, ReHydrateError};
 use crate::event_store::EventStoreBackend;
-use crate::prelude::{
-    Projection, ProjectionState, ReHydrateError, SliceRefEventStream, StateStoreBackend,
-};
+use crate::prelude::{SliceRefEventStream, StateStoreBackend};
 use async_trait::async_trait;
 use log::debug;
 use uuid::Uuid;
@@ -24,12 +36,14 @@ pub struct Command<D, C> {
 
 /// `AggregateState` represents the current state of an aggregate.
 /// It encapsulates the current data derived from a sequence of events.
-pub trait AggregateState: ProjectionState {
-    /// Returns the current version of the projection state. The version is incremented by the aggregate with each applied event and is used for
-    /// optimistic concurrency control to prevent conflicting updates.
+pub trait AggregateState: EventApplicatorState {
+    /// Returns the current version of the aggregate state. The version is incremented
+    /// by the aggregate with each applied event and is used for optimistic concurrency
+    /// control to prevent conflicting updates.
     fn get_version(&self) -> u64;
-    /// Sets the version of the projection state. The version is incremented by the aggregate with each applied event and is used for
-    /// optimistic concurrency control to prevent conflicting updates.
+    /// Sets the version of the aggregate state. The version is incremented by the
+    /// aggregate with each applied event and is used for optimistic concurrency
+    /// control to prevent conflicting updates.
     fn set_version(&mut self, version: u64);
 }
 
@@ -116,11 +130,20 @@ pub enum HandleCommandError<C, H, S, E> {
 /// This trait provides the necessary associated types for the aggregate's state, commands, events,
 /// and the stores used for persistence. It also defines the handlers for different types of commands
 /// (create, update, delete) and a general command handler.
+///
+/// # Important
+///
+/// Aggregates should NOT be subscribed to the event bus as projections.
+/// The `handle()` method already persists state before publishing events.
+/// Subscribing an aggregate to the bus causes duplicate writes and race conditions.
+///
+/// Note: `Aggregate` extends [`EventApplicator`], NOT [`Projection`](crate::projection::Projection).
+/// This is intentional to prevent wrapping aggregates in [`ProjectionHandler`](crate::projection::ProjectionHandler).
 #[async_trait]
-pub trait Aggregate<ED>: Projection<ED>
+pub trait Aggregate<ED>: EventApplicator<ED>
 where
     ED: EventData + Send + Sync + 'static,
-    <Self as Projection<ED>>::State: AggregateState,
+    <Self as EventApplicator<ED>>::State: AggregateState,
     Self::CommandData: Send + Sync,
     <Self::Command as TryFrom<Self::CommandData>>::Error: Send + Sync,
 {
@@ -176,6 +199,9 @@ where
     /// event generation via `handle_command`, state re-hydration, and persistence of
     /// the new state and events.
     ///
+    /// The state is persisted BEFORE events are published to the bus. This guarantees that
+    /// when any subscriber receives an event, the aggregate's state is already up-to-date.
+    ///
     /// # Arguments
     /// * `command` - The `Command` to be handled, containing the command-specific data and credentials.
     ///
@@ -187,11 +213,11 @@ where
         &self,
         command: Command<Self::CommandData, Self::CommandCredentials>,
     ) -> Result<
-        Option<<Self as Projection<ED>>::State>,
+        Option<<Self as EventApplicator<ED>>::State>,
         HandleCommandError<
             Self::AggregateError,
             ReHydrateError<
-                <Self as Projection<ED>>::ProjectionError,
+                <Self as EventApplicator<ED>>::ApplyError,
                 EnumConversionError,
                 <<Self as Aggregate<ED>>::EventStore as EventStoreBackend>::Error,
             >,

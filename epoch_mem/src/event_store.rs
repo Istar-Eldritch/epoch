@@ -463,7 +463,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestState(Vec<Event<MyEventData>>);
 
-    impl ProjectionState for TestState {
+    impl EventApplicatorState for TestState {
         fn get_id(&self) -> Uuid {
             Uuid::new_v4()
         }
@@ -472,20 +472,21 @@ mod tests {
     #[derive(Debug, thiserror::Error)]
     pub enum TestProjectionError {}
 
-    #[async_trait]
-    impl Projection<MyEventData> for TestProjection {
+    impl EventApplicator<MyEventData> for TestProjection {
         type State = TestState;
         type StateStore = InMemoryStateStore<Self::State>;
         type EventType = MyEventData;
-        type ProjectionError = TestProjectionError;
+        type ApplyError = TestProjectionError;
+
         fn get_state_store(&self) -> Self::StateStore {
             self.0.clone()
         }
+
         fn apply(
             &self,
             state: Option<Self::State>,
             event: &Event<Self::EventType>,
-        ) -> Result<Option<Self::State>, Self::ProjectionError> {
+        ) -> Result<Option<Self::State>, Self::ApplyError> {
             if let Some(mut state) = state {
                 state.0.push(event.clone());
                 Ok(Some(state))
@@ -494,6 +495,9 @@ mod tests {
             }
         }
     }
+
+    #[async_trait]
+    impl Projection<MyEventData> for TestProjection {}
 
     #[tokio::test]
     async fn in_memory_event_store_new() {
