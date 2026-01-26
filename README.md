@@ -139,7 +139,10 @@ Add to your `Cargo.toml`:
 epoch = { version = "0.1", features = ["derive", "postgres"] }
 ```
 
-See [`epoch/examples/hello-world.rs`](epoch/examples/hello-world.rs) for a complete example.
+## Examples
+
+- [`epoch/examples/hello-world.rs`](epoch/examples/hello-world.rs) - Basic aggregate and projection usage
+- [`epoch/examples/saga-order-fulfillment.rs`](epoch/examples/saga-order-fulfillment.rs) - Saga pattern for coordinating multi-aggregate workflows
 
 ## Features
 

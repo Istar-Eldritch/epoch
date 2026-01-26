@@ -36,3 +36,7 @@ postgres = ["epoch_pg"]
 [[example]]
 name = "hello-world"
 path = "examples/hello-world.rs"
+
+[[example]]
+name = "saga-order-fulfillment"
+path = "examples/saga-order-fulfillment.rs"

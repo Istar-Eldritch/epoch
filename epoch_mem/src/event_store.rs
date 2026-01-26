@@ -327,6 +327,14 @@ where
 // pub struct InMemoryEventBusPublishError;
 //
 /// An implementation of an in-memory event bus
+///
+/// Uses a channel-based architecture similar to `PgEventBus`:
+/// - `publish()` sends events to a channel and returns immediately
+/// - A background task processes events and notifies observers
+/// - This matches production PostgreSQL NOTIFY/LISTEN behavior
+///
+/// This design prevents synchronous call chains that can cause
+/// race conditions in sagas and projections.
 #[derive(Clone)]
 pub struct InMemoryEventBus<D>
 where
@@ -334,6 +342,7 @@ where
 {
     _phantom: PhantomData<D>,
     projections: Arc<RwLock<Vec<Box<dyn EventObserver<D>>>>>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<Arc<Event<D>>>,
 }
 
 impl<D> Default for InMemoryEventBus<D>
@@ -354,9 +363,35 @@ where
         log::debug!("Creating a new InMemoryEventBus");
         let projections: Arc<RwLock<Vec<Box<dyn EventObserver<D>>>>> =
             Arc::new(RwLock::new(vec![]));
+
+        // Create channel for event notifications (like PostgreSQL NOTIFY)
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Event<D>>>();
+
+        // Spawn background task to process events (like PostgreSQL LISTEN)
+        let projections_clone = projections.clone();
+        tokio::spawn(async move {
+            log::debug!("InMemoryEventBus: Starting background event processor");
+
+            while let Some(event) = event_rx.recv().await {
+                log::debug!("InMemoryEventBus: Processing event {}", event.id);
+
+                // Process observers sequentially (maintaining order within this task)
+                let observers = projections_clone.read().await;
+                for observer in observers.iter() {
+                    if let Err(e) = observer.on_event(Arc::clone(&event)).await {
+                        log::error!("Error applying event {}: {:?}", event.id, e);
+                        //TODO: Retry mechanism and dead letter queue
+                    }
+                }
+            }
+
+            log::debug!("InMemoryEventBus: Background event processor stopped");
+        });
+
         Self {
             _phantom: PhantomData,
             projections,
+            event_tx,
         }
     }
 }
@@ -378,10 +413,7 @@ where
 {
     /// The event could not be published
     #[error("Error publishing event: {0}")]
-    PublishError(#[from] tokio::sync::mpsc::error::SendError<Event<D>>),
-    /// The event could not be published
-    #[error("Timeout publishing event: {0}")]
-    PublishTimeoutError(#[from] tokio::sync::mpsc::error::SendTimeoutError<Event<D>>),
+    PublishError(#[from] tokio::sync::mpsc::error::SendError<Arc<Event<D>>>),
 }
 
 impl<D> EventBus for InMemoryEventBus<D>
@@ -396,16 +428,12 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
         Box::pin(async move {
             log::debug!("Publishing event with id: {}", event.id);
-            let projections = self.projections.read().await;
-            for projection in projections.iter() {
-                projection
-                    .on_event(Arc::clone(&event))
-                    .await
-                    .unwrap_or_else(|e| {
-                        log::error!("Error applying event: {:?}", e);
-                        //TODO: Retry mechanism and dead letter queue
-                    });
-            }
+
+            // Send to channel and return immediately (like PgEventBus NO-OP + NOTIFY)
+            self.event_tx
+                .send(event)
+                .map_err(|e| InMemoryEventBusError::PublishError(e))?;
+
             Ok(())
         })
     }
