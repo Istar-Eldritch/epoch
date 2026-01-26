@@ -19,6 +19,8 @@ use crate::event_store::EventStoreBackend;
 use crate::prelude::{SliceRefEventStream, StateStoreBackend};
 use async_trait::async_trait;
 use log::debug;
+use std::collections::HashMap;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// The command structure that wraps command data with metadata.
@@ -145,6 +147,13 @@ pub enum HandleCommandError<C, H, S, E> {
     /// An error raised while storing events.
     #[error("Error while storing events: {0}")]
     Event(E),
+
+    /// The transaction has already been consumed (committed or rolled back).
+    ///
+    /// This error occurs when attempting to call `handle()` on a transaction
+    /// that has already been committed or rolled back.
+    #[error("Transaction already consumed (committed or rolled back)")]
+    TransactionConsumed,
 }
 
 /// An aggregate handles commands and produces events.
@@ -363,17 +372,15 @@ where
                     s
                 });
 
-            for event in events.into_iter() {
-                debug!(
-                    "Storing event: {:?} - v{}",
-                    std::any::type_name::<ED>(),
-                    event.stream_version
-                );
-                self.get_event_store()
-                    .store_event(event)
-                    .await
-                    .map_err(HandleCommandError::Event)?;
-            }
+            debug!(
+                "Storing {} events of type {:?}",
+                events.len(),
+                std::any::type_name::<ED>()
+            );
+            self.get_event_store()
+                .store_events(events)
+                .await
+                .map_err(HandleCommandError::Event)?;
 
             if let Some(state) = state {
                 debug!(
@@ -408,5 +415,518 @@ where
         command: &Command<Self::CommandData, Self::CommandCredentials>,
     ) -> Uuid {
         command.aggregate_id
+    }
+}
+
+// ============================================================================
+// Transaction Support
+// ============================================================================
+
+/// Errors that can occur when committing a transaction.
+#[derive(Debug, thiserror::Error)]
+pub enum CommitError<T, P>
+where
+    T: std::error::Error,
+    P: std::error::Error,
+{
+    /// The database transaction failed to commit.
+    #[error("Transaction commit failed: {0}")]
+    Transaction(T),
+
+    /// Event publishing failed after commit.
+    ///
+    /// Note: The transaction has already committed, so events are durable.
+    /// Projections can catch up by replaying from the event store.
+    #[error("Event publishing failed after commit: {0}")]
+    Publish(P),
+
+    /// The transaction has already been consumed (committed or rolled back).
+    #[error("Transaction already consumed (committed or rolled back)")]
+    TransactionConsumed,
+}
+
+/// Errors that can occur when rolling back a transaction.
+#[derive(Debug, thiserror::Error)]
+pub enum RollbackError<T>
+where
+    T: std::error::Error,
+{
+    /// The database transaction failed to rollback.
+    #[error("Transaction rollback failed: {0}")]
+    Transaction(T),
+
+    /// The transaction has already been consumed (committed or rolled back).
+    #[error("Transaction already consumed (committed or rolled back)")]
+    TransactionConsumed,
+}
+
+/// Operations that a transaction must support.
+///
+/// This trait abstracts over different transaction implementations
+/// (e.g., `sqlx::Transaction`, in-memory transactions).
+#[async_trait]
+pub trait TransactionOps: Send {
+    /// The error type for transaction operations.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Commits the transaction, making all changes durable.
+    async fn commit(self) -> Result<(), Self::Error>;
+
+    /// Rolls back the transaction, discarding all changes.
+    async fn rollback(self) -> Result<(), Self::Error>;
+}
+
+/// Error type alias for `AggregateTransaction::handle()`.
+///
+/// Simplifies the complex nested error type in method signatures.
+///
+/// # Why Different Error Types?
+///
+/// This alias uses the **event store's error type** for hydration errors rather than
+/// the transaction error type. This distinction exists because:
+///
+/// 1. **Re-hydration reads are outside the transaction**: When `handle()` needs to
+///    re-hydrate state from events, it calls `read_events_since` on the event store
+///    directly, not through the transaction. This is safe because the FOR UPDATE
+///    lock prevents concurrent writes.
+///
+/// 2. **Error type locality**: The event store error (e.g., `sqlx::Error`) is the
+///    natural error type for event stream operations. Converting to the transaction
+///    error type would lose information and add unnecessary coupling.
+///
+/// 3. **Clear error provenance**: Users can distinguish between errors from the
+///    event store (hydration) vs errors from the transaction (state persistence).
+///
+/// # Example Resolution
+///
+/// For a typical PostgreSQL aggregate with:
+/// - `AggregateError = MyBusinessError`
+/// - `ApplyError = MyApplyError`
+/// - `EventStore = PgEventStore<MyBus>` (where `EventStore::Error = sqlx::Error`)
+/// - `TransactionError = PgAggregateError<MyBusError>`
+///
+/// This type alias resolves to:
+/// ```ignore
+/// HandleCommandError<
+///     MyBusinessError,
+///     ReHydrateError<MyApplyError, EnumConversionError, sqlx::Error>,
+///     PgAggregateError<MyBusError>,
+///     PgAggregateError<MyBusError>,
+/// >
+/// ```
+pub type HandleInTxError<A> = HandleCommandError<
+    <A as Aggregate<<A as TransactionalAggregate>::SupersetEvent>>::AggregateError,
+    ReHydrateError<
+        <A as EventApplicator<<A as TransactionalAggregate>::SupersetEvent>>::ApplyError,
+        EnumConversionError,
+        <<A as Aggregate<<A as TransactionalAggregate>::SupersetEvent>>::EventStore as EventStoreBackend>::Error,
+    >,
+    <A as TransactionalAggregate>::TransactionError,
+    <A as TransactionalAggregate>::TransactionError,
+>;
+
+/// An aggregate that supports transactional command handling.
+///
+/// Extends [`Aggregate`] with the ability to begin a transaction that wraps
+/// multiple operations atomically. Events and state changes are committed
+/// together, and events are only published after the transaction commits.
+///
+/// # Usage
+///
+/// ```ignore
+/// // Single command with atomic events + state
+/// let aggregate = Arc::new(my_aggregate);
+/// let mut tx = aggregate.clone().begin().await?;
+/// let state = tx.handle(command).await?;
+/// tx.commit().await?;
+///
+/// // Batch multiple commands in one transaction (e.g., seeding)
+/// let mut tx = aggregate.clone().begin().await?;
+/// for command in commands {
+///     tx.handle(command).await?;
+/// }
+/// tx.commit().await?;  // Single fsync for all commands
+/// ```
+///
+/// # Why `Arc<Self>`?
+///
+/// The `begin()` method takes `self: Arc<Self>` rather than `&self` to allow
+/// the transaction to be moved across await points without lifetime issues.
+/// This is necessary because async code often needs owned values.
+#[async_trait]
+pub trait TransactionalAggregate: Aggregate<Self::SupersetEvent> + Sized + Send + Sync
+where
+    <Self as EventApplicator<Self::SupersetEvent>>::State: AggregateState,
+{
+    /// The superset event type.
+    ///
+    /// Must match the `ED` parameter from the `Aggregate<ED>` implementation.
+    /// This is the enum containing all event variants for the application.
+    type SupersetEvent: EventData + Send + Sync + 'static;
+
+    /// The transaction type (e.g., `sqlx::Transaction<'static, Postgres>`).
+    type Transaction: TransactionOps<Error = Self::TransactionError> + Send;
+
+    /// Error type for transaction operations.
+    type TransactionError: std::error::Error + Send + Sync + 'static;
+
+    /// Begins a new transaction.
+    ///
+    /// Returns a wrapper that provides the same `handle()` API but executes
+    /// all operations within a single database transaction.
+    ///
+    /// # Ownership
+    ///
+    /// Takes `Arc<Self>` to allow the transaction to be moved across await points
+    /// without lifetime issues.
+    async fn begin(
+        self: Arc<Self>,
+    ) -> Result<AggregateTransaction<Self, Self::Transaction>, Self::TransactionError>;
+
+    /// Stores events within a transaction.
+    ///
+    /// Events are inserted but not published. Returns events with database-assigned
+    /// fields populated (e.g., `global_sequence` for PostgreSQL).
+    async fn store_events_in_tx(
+        &self,
+        tx: &mut Self::Transaction,
+        events: Vec<Event<Self::SupersetEvent>>,
+    ) -> Result<Vec<Event<Self::SupersetEvent>>, Self::TransactionError>;
+
+    /// Retrieves state within a transaction.
+    ///
+    /// For PostgreSQL, this should use `SELECT ... FOR UPDATE` to acquire a row-level
+    /// lock, preventing concurrent modifications to the same aggregate.
+    async fn get_state_in_tx(
+        &self,
+        tx: &mut Self::Transaction,
+        id: Uuid,
+    ) -> Result<Option<<Self as EventApplicator<Self::SupersetEvent>>::State>, Self::TransactionError>;
+
+    /// Persists state within a transaction.
+    async fn persist_state_in_tx(
+        &self,
+        tx: &mut Self::Transaction,
+        id: Uuid,
+        state: <Self as EventApplicator<Self::SupersetEvent>>::State,
+    ) -> Result<(), Self::TransactionError>;
+
+    /// Deletes state within a transaction.
+    async fn delete_state_in_tx(
+        &self,
+        tx: &mut Self::Transaction,
+        id: Uuid,
+    ) -> Result<(), Self::TransactionError>;
+
+    /// Publishes an event to the event bus (called after commit).
+    async fn publish_event(
+        &self,
+        event: Event<Self::SupersetEvent>,
+    ) -> Result<(), Self::TransactionError>;
+}
+
+/// A transactional wrapper around an aggregate.
+///
+/// Created by calling [`begin()`](TransactionalAggregate::begin) on a transactional
+/// aggregate. Provides the same `handle()` method but executes all operations within
+/// a database transaction.
+///
+/// Events are buffered and only published after [`commit()`](Self::commit) succeeds.
+///
+/// # Ownership Model
+///
+/// Uses `Arc<A>` rather than `&'a A` to avoid lifetime complexity when the
+/// transaction needs to outlive the scope where it was created (e.g., across
+/// await points in async code).
+///
+/// # Example
+///
+/// ```ignore
+/// let aggregate = Arc::new(my_aggregate);
+/// let mut tx = aggregate.clone().begin().await?;
+///
+/// // Multiple handles in one transaction
+/// tx.handle(create_user_cmd).await?;
+/// tx.handle(update_user_cmd).await?;
+///
+/// // Commit makes everything durable and publishes events
+/// tx.commit().await?;
+/// ```
+pub struct AggregateTransaction<A, Tx>
+where
+    A: TransactionalAggregate,
+    <A as EventApplicator<A::SupersetEvent>>::State: AggregateState,
+{
+    aggregate: Arc<A>,
+    transaction: Option<Tx>,
+    pending_events: Vec<Event<A::SupersetEvent>>,
+    /// Cached state from previous `handle()` calls in this transaction.
+    ///
+    /// Ensures read-your-writes semantics for version tracking across multiple
+    /// commands on the same aggregate within a single transaction.
+    ///
+    /// **Note for batch operations**: This cache is unbounded. For transactions
+    /// spanning many distinct aggregates (e.g., thousands of creates), memory
+    /// usage scales with the number of unique aggregate IDs accessed. If this
+    /// becomes a concern, consider splitting large batches into multiple
+    /// transactions.
+    state_cache: HashMap<Uuid, Option<<A as EventApplicator<A::SupersetEvent>>::State>>,
+}
+
+impl<A, Tx> AggregateTransaction<A, Tx>
+where
+    A: TransactionalAggregate<Transaction = Tx>,
+    Tx: TransactionOps<Error = A::TransactionError> + Send,
+    <A as EventApplicator<A::SupersetEvent>>::State: AggregateState + Clone,
+    <A as Aggregate<A::SupersetEvent>>::CommandData: Send + Sync,
+    <<A as Aggregate<A::SupersetEvent>>::Command as TryFrom<
+        <A as Aggregate<A::SupersetEvent>>::CommandData,
+    >>::Error: Send + Sync,
+{
+    /// Creates a new `AggregateTransaction`.
+    ///
+    /// This is typically called by [`TransactionalAggregate::begin()`].
+    pub fn new(aggregate: Arc<A>, transaction: Tx) -> Self {
+        Self {
+            aggregate,
+            transaction: Some(transaction),
+            pending_events: Vec::new(),
+            state_cache: HashMap::new(),
+        }
+    }
+
+    /// Handles a command within this transaction.
+    ///
+    /// Events and state changes are written to the transaction but not yet committed.
+    /// Call [`commit()`](Self::commit) to persist all changes atomically.
+    ///
+    /// # Version Continuity
+    ///
+    /// When multiple `handle()` calls occur on the same aggregate within a transaction,
+    /// version numbers are tracked correctly via an internal state cache:
+    ///
+    /// ```ignore
+    /// tx.handle(create_cmd).await?;  // -> event v1, state.version = 1
+    /// tx.handle(update_cmd).await?;  // -> event v2, state.version = 2 (uses cached state)
+    /// tx.handle(update_cmd).await?;  // -> event v3, state.version = 3 (uses cached state)
+    /// ```
+    pub async fn handle(
+        &mut self,
+        command: Command<
+            <A as Aggregate<A::SupersetEvent>>::CommandData,
+            <A as Aggregate<A::SupersetEvent>>::CommandCredentials,
+        >,
+    ) -> Result<Option<<A as EventApplicator<A::SupersetEvent>>::State>, HandleInTxError<A>> {
+        let transaction = self
+            .transaction
+            .as_mut()
+            .ok_or(HandleCommandError::TransactionConsumed)?;
+
+        if let Ok(cmd) = command.to_subset_command() {
+            debug!(
+                "Handling command in transaction: {:?}",
+                std::any::type_name::<<A as Aggregate<A::SupersetEvent>>::Command>()
+            );
+
+            let state_id = self.aggregate.get_id_from_command(&command);
+
+            // First check our cache (for subsequent handles in same tx)
+            // Then fall back to reading from transaction
+            let state = if let Some(cached) = self.state_cache.get(&state_id) {
+                debug!("Using cached state for aggregate {}", state_id);
+                cached.clone()
+            } else {
+                debug!("Reading state from transaction for aggregate {}", state_id);
+                self.aggregate
+                    .get_state_in_tx(transaction, state_id)
+                    .await
+                    .map_err(HandleCommandError::State)?
+            };
+
+            // Version check against current state (cached or fresh)
+            let state_version = state.as_ref().map(|s| s.get_version()).unwrap_or(0);
+            if let Some(expected) = command.aggregate_version
+                && state_version != expected
+            {
+                debug!(
+                    "Version mismatch in transaction. Expected: {}, Found: {}",
+                    expected, state_version
+                );
+                return Err(HandleCommandError::VersionMismatch {
+                    expected,
+                    found: state_version,
+                });
+            }
+
+            // Re-hydrate if needed (only on first access, cache handles subsequent).
+            // For cached state, re-hydration already happened in previous handle().
+            //
+            // Safety: This read happens OUTSIDE the transaction, but it's safe because
+            // the FOR UPDATE lock on the state row prevents any concurrent transaction
+            // from writing new events for this aggregate until we release the lock
+            // (on commit/rollback). Thus, no new events can appear between get_state_in_tx
+            // and this read.
+            let state = if self.state_cache.contains_key(&state_id) {
+                state // Already up-to-date from previous handle()
+            } else if let Some(state) = state {
+                // First access: re-hydrate from event store
+                let event_store = self.aggregate.get_event_store();
+                let stream = event_store
+                    .read_events_since(state_id, state.get_version() + 1)
+                    .await
+                    .map_err(|e| HandleCommandError::Hydration(ReHydrateError::EventStream(e)))?;
+                self.aggregate
+                    .re_hydrate::<<<A as Aggregate<A::SupersetEvent>>::EventStore as EventStoreBackend>::Error>(Some(state), stream)
+                    .await
+                    .map_err(HandleCommandError::Hydration)?
+            } else {
+                None
+            };
+
+            // Calculate next version based on (possibly re-hydrated) state
+            let base_version = state.as_ref().map(|s| s.get_version()).unwrap_or(0);
+            let next_version = base_version + 1;
+
+            // Handle command to produce events
+            let events: Vec<Event<A::SupersetEvent>> = self
+                .aggregate
+                .handle_command(&state, cmd)
+                .await
+                .map_err(HandleCommandError::Command)?
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut e)| {
+                    e.stream_version = next_version + i as u64;
+                    e
+                })
+                .collect();
+
+            // Track the final version after all events
+            let final_version = events.last().map_or(base_version, |e| e.stream_version);
+
+            // Apply events to state
+            let event_stream = Box::pin(SliceRefEventStream::from(events.as_slice()));
+            let state = self
+                .aggregate
+                .re_hydrate_from_refs(state, event_stream)
+                .await
+                .map_err(HandleCommandError::Hydration)?
+                .map(|mut s| {
+                    s.set_version(final_version);
+                    s
+                });
+
+            // Store events in transaction (no publish yet)
+            let stored_events = self
+                .aggregate
+                .store_events_in_tx(transaction, events)
+                .await
+                .map_err(HandleCommandError::Event)?;
+
+            // Buffer events for publishing after commit
+            self.pending_events.extend(stored_events);
+
+            // Store state in transaction
+            if let Some(ref state) = state {
+                self.aggregate
+                    .persist_state_in_tx(transaction, state_id, state.clone())
+                    .await
+                    .map_err(HandleCommandError::State)?;
+            } else {
+                self.aggregate
+                    .delete_state_in_tx(transaction, state_id)
+                    .await
+                    .map_err(HandleCommandError::State)?;
+            }
+
+            // Cache state for subsequent handle() calls on same aggregate
+            self.state_cache.insert(state_id, state.clone());
+
+            Ok(state)
+        } else {
+            debug!("Command not handled by this aggregate (subset conversion failed)");
+            Ok(None)
+        }
+    }
+
+    /// Commits the transaction and publishes all buffered events.
+    ///
+    /// After this call, all events and state changes are durable.
+    /// Events are published to the event bus in order.
+    ///
+    /// # Errors
+    ///
+    /// - `CommitError::TransactionConsumed` - The transaction was already committed or rolled back
+    /// - `CommitError::Transaction` - The database transaction failed to commit
+    /// - `CommitError::Publish` - Event publishing failed (but transaction is committed)
+    pub async fn commit(
+        mut self,
+    ) -> Result<(), CommitError<A::TransactionError, A::TransactionError>> {
+        let transaction = self
+            .transaction
+            .take()
+            .ok_or(CommitError::TransactionConsumed)?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(CommitError::Transaction)?;
+
+        // Publish events after commit.
+        //
+        // Publish semantics:
+        // - Events are published sequentially in order
+        // - On first failure, remaining events are NOT published
+        // - The transaction is already committed at this point, so data is durable
+        // - Projections can catch up via replay from the event store
+        //
+        // We use fail-fast rather than continue-on-error because:
+        // 1. Event ordering must be preserved - skipping failed events breaks ordering
+        // 2. Partial publish is recoverable via replay, partial ordering is not
+        // 3. The error signals to the caller that manual intervention may be needed
+        let total_events = self.pending_events.len();
+        for (i, event) in self.pending_events.into_iter().enumerate() {
+            if let Err(e) = self.aggregate.publish_event(event).await {
+                log::error!(
+                    "Failed to publish event {}/{} after commit: {:?}",
+                    i + 1,
+                    total_events,
+                    e
+                );
+                return Err(CommitError::Publish(e));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Rolls back the transaction, discarding all changes.
+    ///
+    /// No events are published. State changes are discarded.
+    ///
+    /// # Errors
+    ///
+    /// - `RollbackError::TransactionConsumed` - The transaction was already committed or rolled back
+    /// - `RollbackError::Transaction` - The database rollback failed
+    pub async fn rollback(mut self) -> Result<(), RollbackError<A::TransactionError>> {
+        let transaction = self
+            .transaction
+            .take()
+            .ok_or(RollbackError::TransactionConsumed)?;
+
+        transaction
+            .rollback()
+            .await
+            .map_err(RollbackError::Transaction)
+    }
+
+    /// Returns a reference to the underlying aggregate.
+    pub fn aggregate(&self) -> &A {
+        &self.aggregate
+    }
+
+    /// Returns the number of pending events buffered for publishing.
+    pub fn pending_event_count(&self) -> usize {
+        self.pending_events.len()
     }
 }

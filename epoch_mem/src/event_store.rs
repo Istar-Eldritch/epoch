@@ -149,6 +149,77 @@ where
         }
         Ok(())
     }
+
+    async fn store_events(&self, events: Vec<Event<Self::EventType>>) -> Result<(), Self::Error> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let data = self.data.clone();
+        let bus = self.bus.clone();
+        let mut data = data.lock().await;
+
+        // Phase 1: Validate all versions first (atomic check)
+        // Group events by stream_id to validate versions correctly
+        let mut stream_versions: std::collections::HashMap<Uuid, u64> =
+            std::collections::HashMap::new();
+        for event in &events {
+            let expected_version = stream_versions
+                .get(&event.stream_id)
+                .copied()
+                .unwrap_or_else(|| *data.stream_version.get(&event.stream_id).unwrap_or(&1));
+
+            if event.stream_version != expected_version {
+                log::debug!(
+                    "Event version mismatch for stream_id: {}. Expected: {}, Got: {}",
+                    event.stream_id,
+                    expected_version,
+                    event.stream_version
+                );
+                return Err(InMemoryEventStoreBackendError::VersionMismatch(
+                    event.stream_version,
+                    expected_version,
+                ));
+            }
+
+            // Track what the next version should be for this stream
+            stream_versions.insert(event.stream_id, expected_version + 1);
+        }
+
+        // Phase 2: Store all events (all validations passed)
+        let mut stored_events = Vec::with_capacity(events.len());
+        for event in events {
+            let stream_id = event.stream_id;
+            let new_version = event.stream_version + 1;
+
+            data.stream_version.insert(stream_id, new_version);
+
+            let event_id = event.id;
+            let event = Arc::new(event);
+            data.events.insert(event_id, Arc::clone(&event));
+            data.stream_events
+                .entry(stream_id)
+                .or_default()
+                .push(event_id);
+
+            stored_events.push(event);
+        }
+
+        // Release lock before publishing
+        drop(data);
+
+        // Phase 3: Publish all events
+        // Note: If publishing fails partway through, events are stored but not all published.
+        // This is acceptable for event sourcing - events are durable and projections can
+        // catch up by replaying from the event store.
+        for event in stored_events {
+            if bus.publish(event).await.is_err() {
+                return Err(InMemoryEventStoreBackendError::PublishEvent);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// An in-memory event store stream.
@@ -412,7 +483,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use async_trait::async_trait;
     use epoch_core::event::EventData;
     use tokio_stream::StreamExt;
     use uuid::Uuid;
@@ -640,5 +710,87 @@ mod tests {
 
         let projections = bus.projections.read().await;
         assert_eq!(projections.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_store_store_events_batch() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let store = InMemoryEventStore::new(bus);
+        let stream_id = Uuid::new_v4();
+
+        let events: Vec<Event<MyEventData>> = (1..=5)
+            .map(|i| new_event(stream_id, i, &format!("test{}", i)))
+            .collect();
+
+        store.store_events(events).await.unwrap();
+
+        let data = store.data.lock().await;
+        assert_eq!(data.events.len(), 5);
+        assert_eq!(data.stream_events.get(&stream_id).unwrap().len(), 5);
+        assert_eq!(*data.stream_version.get(&stream_id).unwrap(), 6);
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_store_store_events_empty_batch() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let store = InMemoryEventStore::new(bus);
+
+        // Empty batch should succeed
+        store.store_events(Vec::new()).await.unwrap();
+
+        let data = store.data.lock().await;
+        assert!(data.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_store_store_events_version_mismatch_aborts_all() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let store = InMemoryEventStore::new(bus);
+        let stream_id = Uuid::new_v4();
+
+        // First, store one event normally
+        let event1 = new_event(stream_id, 1, "test1");
+        store.store_event(event1).await.unwrap();
+
+        // Try to store batch with version mismatch in the middle
+        let events = vec![
+            new_event(stream_id, 2, "test2"), // OK
+            new_event(stream_id, 3, "test3"), // OK
+            new_event(stream_id, 5, "test5"), // Version mismatch! (should be 4)
+        ];
+
+        let result = store.store_events(events).await;
+        assert!(result.is_err());
+
+        // Verify NO events from the batch were stored (atomic)
+        let data = store.data.lock().await;
+        assert_eq!(data.events.len(), 1); // Only the original event
+        assert_eq!(data.stream_events.get(&stream_id).unwrap().len(), 1);
+        assert_eq!(*data.stream_version.get(&stream_id).unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_store_store_events_multiple_streams() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let store = InMemoryEventStore::new(bus);
+        let stream_id_a = Uuid::new_v4();
+        let stream_id_b = Uuid::new_v4();
+
+        // Events for two different streams in the same batch
+        let events = vec![
+            new_event(stream_id_a, 1, "a1"),
+            new_event(stream_id_b, 1, "b1"),
+            new_event(stream_id_a, 2, "a2"),
+            new_event(stream_id_b, 2, "b2"),
+        ];
+
+        store.store_events(events).await.unwrap();
+
+        let data = store.data.lock().await;
+        assert_eq!(data.events.len(), 4);
+        assert_eq!(data.stream_events.get(&stream_id_a).unwrap().len(), 2);
+        assert_eq!(data.stream_events.get(&stream_id_b).unwrap().len(), 2);
+        assert_eq!(*data.stream_version.get(&stream_id_a).unwrap(), 3);
+        assert_eq!(*data.stream_version.get(&stream_id_b).unwrap(), 3);
     }
 }

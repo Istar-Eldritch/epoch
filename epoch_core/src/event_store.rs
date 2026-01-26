@@ -43,6 +43,31 @@ pub trait EventStoreBackend: Send + Sync {
 
     /// Appends events to a stream.
     async fn store_event(&self, event: Event<Self::EventType>) -> Result<(), Self::Error>;
+
+    /// Appends multiple events to a stream atomically.
+    ///
+    /// All events are persisted in a single transaction. For backends that support
+    /// transactions (e.g., PostgreSQL), this results in a single fsync operation
+    /// regardless of the number of events.
+    ///
+    /// Events are published to the event bus only after successful persistence.
+    ///
+    /// The default implementation falls back to individual `store_event` calls
+    /// for backward compatibility with custom implementations. Override this
+    /// method to provide true atomic batch writes.
+    ///
+    /// # Note
+    ///
+    /// The default implementation is **not atomic** - if a failure occurs partway
+    /// through, some events may have been persisted while others were not. Custom
+    /// implementations (e.g., `PgEventStore`) should override this to provide
+    /// transactional guarantees.
+    async fn store_events(&self, events: Vec<Event<Self::EventType>>) -> Result<(), Self::Error> {
+        for event in events {
+            self.store_event(event).await?;
+        }
+        Ok(())
+    }
 }
 
 /// A trait that defines the behavior of an event bus.

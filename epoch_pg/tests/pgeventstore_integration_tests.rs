@@ -35,7 +35,7 @@ async fn setup() -> (PgPool, PgEventStore<InMemoryEventBus<TestEventData>>) {
 #[tokio::test]
 #[serial]
 async fn test_store_event() {
-    let (pool, event_store) = setup().await;
+    let (_pool, event_store) = setup().await;
 
     let event = Event::<TestEventData>::builder()
         .id(Uuid::new_v4())
@@ -70,7 +70,7 @@ async fn test_store_event() {
 #[tokio::test]
 #[serial]
 async fn test_read_events() {
-    let (pool, event_store) = setup().await;
+    let (_pool, event_store) = setup().await;
 
     let stream_id = Uuid::new_v4();
 
@@ -121,7 +121,7 @@ async fn test_read_events() {
 #[tokio::test]
 #[serial]
 async fn test_read_events_since() {
-    let (pool, event_store) = setup().await;
+    let (_pool, event_store) = setup().await;
 
     let stream_id = Uuid::new_v4();
 
@@ -261,7 +261,7 @@ async fn test_migrator_is_idempotent() {
 #[tokio::test]
 #[serial]
 async fn test_store_event_assigns_global_sequence() {
-    let (pool, event_store) = setup().await;
+    let (_pool, event_store) = setup().await;
 
     let stream_id = Uuid::new_v4();
     let event = Event::<TestEventData>::builder()
@@ -293,7 +293,7 @@ async fn test_store_event_assigns_global_sequence() {
 #[tokio::test]
 #[serial]
 async fn test_global_sequence_is_monotonically_increasing() {
-    let (pool, event_store) = setup().await;
+    let (_pool, event_store) = setup().await;
 
     let stream_id1 = Uuid::new_v4();
     let stream_id2 = Uuid::new_v4();
@@ -359,7 +359,7 @@ async fn test_global_sequence_is_monotonically_increasing() {
 #[tokio::test]
 #[serial]
 async fn test_read_events_includes_global_sequence() {
-    let (pool, event_store) = setup().await;
+    let (_pool, event_store) = setup().await;
 
     let stream_id = Uuid::new_v4();
     let event = Event::<TestEventData>::builder()
@@ -382,4 +382,178 @@ async fn test_read_events_includes_global_sequence() {
         read_event.global_sequence.is_some(),
         "global_sequence should be populated when reading events"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_store_events_batch() {
+    let (_pool, event_store) = setup().await;
+
+    let stream_id = Uuid::new_v4();
+
+    let events: Vec<Event<TestEventData>> = (1..=5)
+        .map(|i| {
+            Event::<TestEventData>::builder()
+                .stream_id(stream_id)
+                .stream_version(i)
+                .event_type("TestEvent".to_string())
+                .data(Some(TestEventData::TestEvent {
+                    value: format!("test_{}", i),
+                }))
+                .build()
+                .unwrap()
+        })
+        .collect();
+
+    // Store all events in a single batch
+    event_store.store_events(events).await.unwrap();
+
+    // Read back and verify all events were stored
+    let mut read_events = event_store.read_events(stream_id).await.unwrap();
+    let mut count = 0;
+    while let Some(event) = read_events.next().await {
+        let event = event.unwrap();
+        count += 1;
+        assert!(event.global_sequence.is_some());
+    }
+    assert_eq!(count, 5);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_store_events_empty_batch() {
+    let (_pool, event_store) = setup().await;
+
+    // Empty batch should succeed without error
+    event_store.store_events(Vec::new()).await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_store_events_global_sequence_is_sequential() {
+    let (_pool, event_store) = setup().await;
+
+    let stream_id = Uuid::new_v4();
+
+    let events: Vec<Event<TestEventData>> = (1..=3)
+        .map(|i| {
+            Event::<TestEventData>::builder()
+                .stream_id(stream_id)
+                .stream_version(i)
+                .event_type("TestEvent".to_string())
+                .data(Some(TestEventData::TestEvent {
+                    value: format!("test_{}", i),
+                }))
+                .build()
+                .unwrap()
+        })
+        .collect();
+
+    event_store.store_events(events).await.unwrap();
+
+    // Read back and verify global_sequence values are sequential
+    let mut read_events = event_store.read_events(stream_id).await.unwrap();
+    let mut sequences = Vec::new();
+    while let Some(event) = read_events.next().await {
+        let event = event.unwrap();
+        sequences.push(event.global_sequence.unwrap());
+    }
+
+    assert_eq!(sequences.len(), 3);
+    // Verify sequences are strictly increasing
+    for i in 1..sequences.len() {
+        assert!(
+            sequences[i] > sequences[i - 1],
+            "Global sequences should be strictly increasing"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_store_events_in_tx_with_state() {
+    let (pool, event_store) = setup().await;
+
+    let stream_id = Uuid::new_v4();
+
+    let events: Vec<Event<TestEventData>> = (1..=3)
+        .map(|i| {
+            Event::<TestEventData>::builder()
+                .stream_id(stream_id)
+                .stream_version(i)
+                .event_type("TestEvent".to_string())
+                .data(Some(TestEventData::TestEvent {
+                    value: format!("test_{}", i),
+                }))
+                .build()
+                .unwrap()
+        })
+        .collect();
+
+    // Use a transaction to store events
+    let mut tx = pool.begin().await.unwrap();
+    let stored_events = event_store
+        .store_events_in_tx(&mut tx, events)
+        .await
+        .unwrap();
+
+    // Verify stored events have global_sequence
+    assert_eq!(stored_events.len(), 3);
+    for event in &stored_events {
+        assert!(event.global_sequence.is_some());
+    }
+
+    // Before commit, events should not be visible from another connection
+    let mut read_before_commit = event_store.read_events(stream_id).await.unwrap();
+    assert!(read_before_commit.next().await.is_none());
+
+    // Commit the transaction
+    tx.commit().await.unwrap();
+
+    // After commit, events should be visible
+    let mut read_after_commit = event_store.read_events(stream_id).await.unwrap();
+    let mut count = 0;
+    while (read_after_commit.next().await).is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 3);
+
+    // Now publish events (normally done after commit)
+    event_store.publish_events(stored_events).await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_store_events_in_tx_rollback() {
+    let (pool, event_store) = setup().await;
+
+    let stream_id = Uuid::new_v4();
+
+    let events: Vec<Event<TestEventData>> = (1..=3)
+        .map(|i| {
+            Event::<TestEventData>::builder()
+                .stream_id(stream_id)
+                .stream_version(i)
+                .event_type("TestEvent".to_string())
+                .data(Some(TestEventData::TestEvent {
+                    value: format!("test_{}", i),
+                }))
+                .build()
+                .unwrap()
+        })
+        .collect();
+
+    // Use a transaction to store events
+    let mut tx = pool.begin().await.unwrap();
+    let _stored_events = event_store
+        .store_events_in_tx(&mut tx, events)
+        .await
+        .unwrap();
+
+    // Rollback instead of commit
+    tx.rollback().await.unwrap();
+
+    // Events should not be visible
+    let mut read_events = event_store.read_events(stream_id).await.unwrap();
+    assert!(read_events.next().await.is_none());
 }

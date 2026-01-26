@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use epoch::prelude::*;
-use epoch_mem::*;
+use epoch_mem::{InMemoryEventBus, InMemoryEventStore, InMemoryStateStore};
 use serde::Deserialize;
 use uuid::Uuid;
 

@@ -26,6 +26,19 @@ impl PgState for TestState {
             .await
     }
 
+    async fn find_by_id_for_update<'a, T>(
+        id: Uuid,
+        executor: T,
+    ) -> Result<Option<Self>, sqlx::Error>
+    where
+        T: PgExecutor<'a>,
+    {
+        sqlx::query_as("select * from test_states where id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(executor)
+            .await
+    }
+
     async fn upsert<'a, T>(id: Uuid, state: &'a Self, executor: T) -> Result<(), sqlx::Error>
     where
         T: PgExecutor<'a>,

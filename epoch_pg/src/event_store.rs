@@ -6,6 +6,7 @@ use futures_util::{Stream, StreamExt};
 use serde::Serialize;
 use serde::{Deserialize, de::DeserializeOwned};
 use sqlx::{FromRow, PgPool};
+use std::sync::Arc;
 use std::{pin::Pin, task::Poll};
 use uuid::Uuid;
 
@@ -35,6 +36,105 @@ impl<B: EventBus + Clone> PgEventStore<B> {
     /// such as catch-up queries in the event bus.
     pub fn pool(&self) -> &PgPool {
         &self.postgres
+    }
+
+    /// Stores multiple events within a provided transaction.
+    ///
+    /// Does NOT publish to event bus - caller is responsible for publishing
+    /// after committing the transaction using [`publish_events`](Self::publish_events).
+    ///
+    /// Returns events with `global_sequence` populated.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut tx = event_store.pool().begin().await?;
+    ///
+    /// let stored_events = event_store.store_events_in_tx(&mut tx, events).await?;
+    /// MyState::upsert(id, &state, &mut *tx).await?;
+    ///
+    /// tx.commit().await?;
+    ///
+    /// event_store.publish_events(stored_events).await?;
+    /// ```
+    pub async fn store_events_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        events: Vec<Event<B::EventType>>,
+    ) -> Result<Vec<Event<B::EventType>>, PgEventStoreError<B::Error>>
+    where
+        B::EventType: Serialize,
+    {
+        let mut stored_events = Vec::with_capacity(events.len());
+
+        for event in events {
+            let row: (i64,) = sqlx::query_as(
+                r#"
+                INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at, actor_id, purger_id, purged_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                RETURNING global_sequence
+                "#,
+            )
+            .bind(event.id)
+            .bind(event.stream_id)
+            .bind(TryInto::<i64>::try_into(event.stream_version).map_err(|e| {
+                PgEventStoreError::DBError::<B::Error>(sqlx::error::Error::InvalidArgument(
+                    format!(
+                        "stream_version {} is too large to fit in i64: {}",
+                        event.stream_version, e
+                    ),
+                ))
+            })?)
+            .bind(event.event_type.to_string())
+            .bind(
+                event
+                    .data
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()?,
+            )
+            .bind(event.created_at)
+            .bind(event.actor_id)
+            .bind(event.purger_id)
+            .bind(event.purged_at)
+            .fetch_one(&mut **tx)
+            .await?;
+
+            stored_events.push(Event {
+                id: event.id,
+                stream_id: event.stream_id,
+                stream_version: event.stream_version,
+                event_type: event.event_type,
+                actor_id: event.actor_id,
+                purger_id: event.purger_id,
+                data: event.data,
+                created_at: event.created_at,
+                purged_at: event.purged_at,
+                global_sequence: Some(row.0 as u64),
+            });
+        }
+
+        Ok(stored_events)
+    }
+
+    /// Publishes events to the event bus.
+    ///
+    /// Call this after committing a transaction that used [`store_events_in_tx`](Self::store_events_in_tx).
+    pub async fn publish_events(
+        &self,
+        events: Vec<Event<B::EventType>>,
+    ) -> Result<(), PgEventStoreError<B::Error>>
+    where
+        B::EventType: Send + Sync,
+        B::Error: Send + Sync,
+    {
+        for event in events {
+            self.bus
+                .publish(Arc::new(event))
+                .await
+                .map_err(PgEventStoreError::BUSPublishError)?;
+        }
+        Ok(())
     }
 }
 
@@ -253,6 +353,28 @@ where
             .map_err(PgEventStoreError::BUSPublishError)?;
 
         Ok(())
+    }
+
+    /// Stores multiple events atomically in a single transaction.
+    ///
+    /// Events are persisted in a single database transaction, ensuring all-or-nothing
+    /// semantics. After the transaction commits, events are published to the event bus.
+    ///
+    /// # Note
+    ///
+    /// If event bus publishing fails partway through, the events remain committed to the
+    /// database. This is acceptable for event sourcing: events are durable and projections
+    /// can catch up by replaying from the event store.
+    async fn store_events(&self, events: Vec<Event<Self::EventType>>) -> Result<(), Self::Error> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.postgres.begin().await?;
+        let stored_events = self.store_events_in_tx(&mut tx, events).await?;
+        tx.commit().await?;
+
+        self.publish_events(stored_events).await
     }
 }
 

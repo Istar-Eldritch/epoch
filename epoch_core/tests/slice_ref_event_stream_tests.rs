@@ -301,8 +301,7 @@ async fn slice_ref_event_stream_implements_ref_event_stream_trait() {
         stream
             .next()
             .await
-            .map(|r| r.ok().map(|e| e.stream_version))
-            .flatten()
+            .and_then(|r| r.ok().map(|e| e.stream_version))
     }
 
     let stream: Pin<Box<dyn RefEventStream<'_, TestEvent, std::convert::Infallible> + Send>> =

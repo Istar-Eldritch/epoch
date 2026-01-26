@@ -22,20 +22,61 @@ impl<T> PgStateStore<T> {
     }
 }
 
-/// Trait definnig the required behavior of a PG state;
+/// Trait defining the required behavior of a PG state.
 #[async_trait]
 pub trait PgState: Send + Sync + Sized + Unpin {
-    /// Retrieve the entity from the storage using its id
+    /// Retrieve the entity from the storage using its id.
     async fn find_by_id<'a, T>(id: Uuid, executor: T) -> Result<Option<Self>, sqlx::Error>
     where
         T: PgExecutor<'a>;
 
-    /// The upsert operation to save this entity in postgres
+    /// Retrieve the entity with a row-level lock for update.
+    ///
+    /// Uses `SELECT ... FOR UPDATE` to prevent concurrent modifications within
+    /// the same transaction. This is used by [`TransactionalAggregate`](epoch_core::aggregate::TransactionalAggregate)
+    /// to ensure pessimistic locking during command handling.
+    ///
+    /// Returns `None` if the row doesn't exist (no lock acquired).
+    ///
+    /// # Lock Behavior
+    ///
+    /// - **Timeout:** By default, PostgreSQL waits indefinitely for the lock.
+    ///   Configure `lock_timeout` on the connection or transaction to set a limit:
+    ///   ```sql
+    ///   SET lock_timeout = '5s';
+    ///   ```
+    /// - **Deadlocks:** PostgreSQL automatically detects deadlocks and aborts one
+    ///   transaction with an error. To avoid deadlocks, always acquire locks on
+    ///   multiple aggregates in a consistent order (e.g., by aggregate ID).
+    ///
+    /// # Variants
+    ///
+    /// For non-blocking behavior, implement custom methods using:
+    /// - `FOR UPDATE NOWAIT` - Fails immediately if lock is unavailable
+    /// - `FOR UPDATE SKIP LOCKED` - Skips locked rows (useful for batch processing)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut tx = pool.begin().await?;
+    /// // This acquires a row-level lock until tx commits/rolls back
+    /// let state = MyState::find_by_id_for_update(id, &mut *tx).await?;
+    /// // ... modify state ...
+    /// tx.commit().await?;
+    /// ```
+    async fn find_by_id_for_update<'a, T>(
+        id: Uuid,
+        executor: T,
+    ) -> Result<Option<Self>, sqlx::Error>
+    where
+        T: PgExecutor<'a>;
+
+    /// The upsert operation to save this entity in postgres.
     async fn upsert<'a, T>(id: Uuid, state: &'a Self, executor: T) -> Result<(), sqlx::Error>
     where
         T: PgExecutor<'a>;
 
-    /// The upsert operation to save this entity in postgres
+    /// Delete the entity from postgres.
     async fn delete<'a, T>(id: Uuid, executor: T) -> Result<(), sqlx::Error>
     where
         T: PgExecutor<'a>;
