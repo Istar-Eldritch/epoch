@@ -131,6 +131,47 @@ where
         Ok(state)
     }
 
+    /// Reconstructs state from an event stream, stopping before a specified version.
+    ///
+    /// This is used by projections to re-hydrate state up to (but not including) the
+    /// event being processed, to avoid applying the same event twice.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `'a` - The lifetime of the event stream
+    /// * `E` - The error type that can be returned by the stream
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - The initial state to start from, or `None` for a fresh state
+    /// * `event_stream` - The stream of events to replay
+    /// * `stop_before_version` - Stop processing when reaching this version
+    ///
+    /// # Returns
+    ///
+    /// The final state after applying all events before the specified version.
+    async fn re_hydrate_until<'a, E>(
+        &self,
+        mut state: Option<Self::State>,
+        mut event_stream: Pin<Box<dyn EventStream<ED, E> + Send + 'a>>,
+        stop_before_version: u64,
+    ) -> Result<Option<Self::State>, ReHydrateError<Self::ApplyError, EnumConversionError, E>> {
+        while let Some(event) = event_stream.next().await {
+            let event = event.map_err(ReHydrateError::EventStream)?;
+            // Stop if we've reached the version we should stop before
+            if event.stream_version >= stop_before_version {
+                break;
+            }
+            let event = event
+                .to_subset_event_ref()
+                .map_err(ReHydrateError::Subset)?;
+            state = self
+                .apply(state, &event)
+                .map_err(ReHydrateError::Application)?;
+        }
+        Ok(state)
+    }
+
     /// Reconstructs state from a reference-based event stream.
     ///
     /// This is an optimized version of [`re_hydrate`](Self::re_hydrate) that accepts

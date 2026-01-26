@@ -1,6 +1,5 @@
 mod common;
 
-use async_trait::async_trait;
 use epoch_core::prelude::*;
 use epoch_derive::EventData;
 use epoch_mem::InMemoryStateStore;
@@ -40,19 +39,49 @@ fn new_event(stream_id: Uuid, stream_version: u64, value: &str) -> Event<TestEve
 }
 
 #[derive(Debug, Clone)]
-struct TestState(Vec<Event<TestEventData>>);
+struct TestState {
+    id: Uuid,
+    events: Vec<Event<TestEventData>>,
+    version: u64,
+}
 
-impl EventApplicatorState for TestState {
-    fn get_id(&self) -> Uuid {
-        Uuid::new_v4()
+impl TestState {
+    fn new(id: Uuid) -> Self {
+        Self {
+            id,
+            events: Vec::new(),
+            version: 0,
+        }
     }
 }
 
-struct TestProjection(InMemoryStateStore<TestState>);
+impl EventApplicatorState for TestState {
+    fn get_id(&self) -> Uuid {
+        self.id
+    }
+}
+
+impl ProjectionState for TestState {
+    fn get_version(&self) -> u64 {
+        self.version
+    }
+
+    fn set_version(&mut self, version: u64) {
+        self.version = version;
+    }
+}
+
+struct TestProjection {
+    state_store: InMemoryStateStore<TestState>,
+    event_store: PgEventStore<PgEventBus<TestEventData>>,
+}
 
 impl TestProjection {
-    pub fn new() -> Self {
-        TestProjection(InMemoryStateStore::new())
+    pub fn new(event_store: PgEventStore<PgEventBus<TestEventData>>) -> Self {
+        TestProjection {
+            state_store: InMemoryStateStore::new(),
+            event_store,
+        }
     }
 }
 
@@ -66,7 +95,7 @@ impl EventApplicator<TestEventData> for TestProjection {
     type ApplyError = TestProjectionError;
 
     fn get_state_store(&self) -> Self::StateStore {
-        self.0.clone()
+        self.state_store.clone()
     }
 
     fn apply(
@@ -75,16 +104,23 @@ impl EventApplicator<TestEventData> for TestProjection {
         event: &Event<Self::EventType>,
     ) -> Result<Option<Self::State>, Self::ApplyError> {
         if let Some(mut state) = state {
-            state.0.push(event.clone());
+            state.events.push(event.clone());
             Ok(Some(state))
         } else {
-            Ok(Some(TestState(vec![event.clone()])))
+            let mut state = TestState::new(event.stream_id);
+            state.events.push(event.clone());
+            Ok(Some(state))
         }
     }
 }
 
-#[async_trait]
-impl Projection<TestEventData> for TestProjection {}
+impl Projection<TestEventData> for TestProjection {
+    type EventStore = PgEventStore<PgEventBus<TestEventData>>;
+
+    fn get_event_store(&self) -> Self::EventStore {
+        self.event_store.clone()
+    }
+}
 
 async fn setup() -> (
     PgPool,
@@ -129,7 +165,7 @@ async fn test_initialize() {
 async fn test_subscribe_and_event_propagation() {
     let (pool, event_bus, event_store) = setup().await;
 
-    let projection = TestProjection::new();
+    let projection = TestProjection::new(event_store.clone());
     let projection_events = projection.get_state_store().clone();
     event_bus
         .subscribe(ProjectionHandler::new(projection))
@@ -156,12 +192,15 @@ async fn test_subscribe_and_event_propagation() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(events_received.0.len(), 1);
-    assert_eq!(events_received.0[0].id, event.id);
-    assert_eq!(events_received.0[0].stream_id, event.stream_id);
-    assert_eq!(events_received.0[0].stream_version, event.stream_version);
-    assert_eq!(events_received.0[0].event_type, event.event_type);
-    assert_eq!(events_received.0[0].data, event.data);
+    assert_eq!(events_received.events.len(), 1);
+    assert_eq!(events_received.events[0].id, event.id);
+    assert_eq!(events_received.events[0].stream_id, event.stream_id);
+    assert_eq!(
+        events_received.events[0].stream_version,
+        event.stream_version
+    );
+    assert_eq!(events_received.events[0].event_type, event.event_type);
+    assert_eq!(events_received.events[0].data, event.data);
 
     teardown(&pool).await;
 }
@@ -169,9 +208,9 @@ async fn test_subscribe_and_event_propagation() {
 #[tokio::test]
 #[serial]
 async fn test_noop_publish() {
-    let (pool, event_bus, _event_store) = setup().await;
+    let (pool, event_bus, event_store) = setup().await;
 
-    let projection = TestProjection::new();
+    let projection = TestProjection::new(event_store.clone());
     let projection_events = projection.get_state_store().clone();
     event_bus
         .subscribe(ProjectionHandler::new(projection))
@@ -202,12 +241,22 @@ async fn test_noop_publish() {
     teardown(&pool).await;
 }
 
+/// Tests that malformed events in the event store cause re-hydration to fail.
+///
+/// With the re-hydration approach to handle race conditions, projections read from
+/// the event store to catch up on any missed events. If there are malformed events
+/// in the store, re-hydration will fail for subsequent events on the same stream.
+///
+/// This test verifies that:
+/// 1. The first valid event is processed correctly
+/// 2. When a malformed event exists in the history, subsequent events on that stream
+///    fail to process (because re-hydration encounters the malformed event)
 #[tokio::test]
 #[serial]
 async fn test_event_data_deserialization_failure() {
-    let (pool, event_bus, _event_store) = setup().await;
+    let (pool, event_bus, event_store) = setup().await;
 
-    let projection = TestProjection::new();
+    let projection = TestProjection::new(event_store.clone());
     let projection_events = projection.get_state_store().clone();
     event_bus
         .subscribe(ProjectionHandler::new(projection))
@@ -239,6 +288,22 @@ async fn test_event_data_deserialization_failure() {
     .await
     .expect("Failed to insert valid event");
 
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // First event should be processed successfully
+    let events_received = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(events_received.events.len(), 1);
+    assert!(
+        events_received
+            .events
+            .iter()
+            .any(|e| e.id == valid_event.id)
+    );
+
     // Malformed event data (e.g., missing a required field, or wrong type)
     let malformed_event_id = Uuid::new_v4();
     let malformed_event_data = serde_json::json!({ "invalid_field": 123 }); // Malformed data
@@ -258,7 +323,19 @@ async fn test_event_data_deserialization_failure() {
     .await
     .expect("Failed to insert malformed event");
 
-    // Another valid event to ensure bus continues processing
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // The malformed event itself won't be applied (deserialization fails before apply)
+    // State should still have only 1 event
+    let events_received = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(events_received.events.len(), 1);
+
+    // Another valid event - this will fail during re-hydration because it needs
+    // to read through the malformed event to catch up
     let another_valid_event = new_event(stream_id, 3, "another_valid_data");
     sqlx::query(
         r#"
@@ -279,7 +356,7 @@ async fn test_event_data_deserialization_failure() {
     .await
     .expect("Failed to insert another valid event");
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await; // Give time for processing
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     let events_received = projection_events
         .get_state(stream_id)
@@ -287,16 +364,27 @@ async fn test_event_data_deserialization_failure() {
         .unwrap()
         .unwrap();
 
-    // Assert that only the valid events were processed
-    assert_eq!(events_received.0.len(), 2);
-    assert!(events_received.0.iter().any(|e| e.id == valid_event.id));
+    // Only the first valid event should be in state - the third event couldn't be processed
+    // because re-hydration failed when it encountered the malformed event at version 2
+    assert_eq!(events_received.events.len(), 1);
     assert!(
         events_received
-            .0
+            .events
+            .iter()
+            .any(|e| e.id == valid_event.id)
+    );
+    assert!(
+        !events_received
+            .events
+            .iter()
+            .any(|e| e.id == malformed_event_id)
+    );
+    assert!(
+        !events_received
+            .events
             .iter()
             .any(|e| e.id == another_valid_event.id)
     );
-    assert!(!events_received.0.iter().any(|e| e.id == malformed_event_id));
 
     teardown(&pool).await;
 }
@@ -306,14 +394,14 @@ async fn test_event_data_deserialization_failure() {
 async fn test_multiple_subscribers() {
     let (pool, event_bus, event_store) = setup().await;
 
-    let projection1 = TestProjection::new();
+    let projection1 = TestProjection::new(event_store.clone());
     let projection_events1 = projection1.get_state_store().clone();
     event_bus
         .subscribe(ProjectionHandler::new(projection1))
         .await
         .expect("Failed to subscribe projection 1");
 
-    let projection2 = TestProjection::new();
+    let projection2 = TestProjection::new(event_store.clone());
     let projection_events2 = projection2.get_state_store().clone();
     event_bus
         .subscribe(ProjectionHandler::new(projection2))
@@ -340,16 +428,16 @@ async fn test_multiple_subscribers() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(events_received1.0.len(), 1);
-    assert_eq!(events_received1.0[0].id, event.id);
+    assert_eq!(events_received1.events.len(), 1);
+    assert_eq!(events_received1.events[0].id, event.id);
 
     let events_received2 = projection_events2
         .get_state(stream_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(events_received2.0.len(), 1);
-    assert_eq!(events_received2.0[0].id, event.id);
+    assert_eq!(events_received2.events.len(), 1);
+    assert_eq!(events_received2.events[0].id, event.id);
 
     teardown(&pool).await;
 }

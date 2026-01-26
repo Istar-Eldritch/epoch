@@ -110,7 +110,9 @@ impl EventApplicator<TestEvent> for TestProjection {
     }
 }
 
-impl Projection<TestEvent> for TestProjection {}
+// Note: This TestProjection only implements EventApplicator, not Projection,
+// because these tests only test the re_hydrate_from_refs functionality
+// which is part of EventApplicator.
 
 // ============================================================================
 // Tests for SliceRefEventStream

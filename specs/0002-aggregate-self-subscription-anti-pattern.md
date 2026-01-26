@@ -1,3 +1,8 @@
+<!-- REVIEW: Excellent and thorough specification document. The problem analysis,
+     diagrams, and migration guide are very well done. Consider adding a "Known
+     Limitations" section noting that compile-time enforcement relies on users
+     not implementing both Projection and Aggregate for the same type. -->
+
 # Specification: Aggregate Self-Subscription Anti-Pattern
 
 **Spec ID:** 0002  

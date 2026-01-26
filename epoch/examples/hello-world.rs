@@ -175,6 +175,22 @@ struct Product {
     version: u64,
 }
 
+impl EventApplicatorState for Product {
+    fn get_id(&self) -> Uuid {
+        self.id
+    }
+}
+
+impl ProjectionState for Product {
+    fn get_version(&self) -> u64 {
+        self.version
+    }
+
+    fn set_version(&mut self, version: u64) {
+        self.version = version;
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum ProductProjectionError {
     #[error("The product with id {0} already exists")]
@@ -188,17 +204,17 @@ pub enum ProductProjectionError {
 }
 
 #[derive(Debug)]
-struct ProductProjection(InMemoryStateStore<Product>);
-
-impl ProductProjection {
-    pub fn new() -> Self {
-        ProductProjection(InMemoryStateStore::new())
-    }
+struct ProductProjection {
+    state_store: InMemoryStateStore<Product>,
+    event_store: InMemoryEventStore<InMemoryEventBus<ApplicationEvent>>,
 }
 
-impl EventApplicatorState for Product {
-    fn get_id(&self) -> Uuid {
-        self.id
+impl ProductProjection {
+    pub fn new(event_store: InMemoryEventStore<InMemoryEventBus<ApplicationEvent>>) -> Self {
+        ProductProjection {
+            state_store: InMemoryStateStore::new(),
+            event_store,
+        }
     }
 }
 
@@ -209,7 +225,7 @@ impl EventApplicator<ApplicationEvent> for ProductProjection {
     type ApplyError = ProductProjectionError;
 
     fn get_state_store(&self) -> Self::StateStore {
-        self.0.clone()
+        self.state_store.clone()
     }
 
     fn apply(
@@ -244,19 +260,25 @@ impl EventApplicator<ApplicationEvent> for ProductProjection {
     }
 }
 
-impl Projection<ApplicationEvent> for ProductProjection {}
+impl Projection<ApplicationEvent> for ProductProjection {
+    type EventStore = InMemoryEventStore<InMemoryEventBus<ApplicationEvent>>;
+
+    fn get_event_store(&self) -> Self::EventStore {
+        self.event_store.clone()
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let product_projection = ProductProjection::new();
-    let _product_state = product_projection.0.clone();
     env_logger::init();
 
     let bus: InMemoryEventBus<ApplicationEvent> = InMemoryEventBus::new();
+    let event_store = InMemoryEventStore::new(bus.clone());
+
+    let product_projection = ProductProjection::new(event_store.clone());
+    let _product_state = product_projection.state_store.clone();
     bus.subscribe(epoch::prelude::ProjectionHandler::new(product_projection))
         .await?;
-
-    let event_store = InMemoryEventStore::new(bus);
 
     let user_state = InMemoryStateStore::new();
     let user_aggregate = UserAggregate::new(event_store.clone(), user_state.clone());
