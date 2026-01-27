@@ -12,6 +12,7 @@
 //! use epoch_core::aggregate::TransactionalAggregate;
 //!
 //! // Assuming you have an aggregate that implements TransactionalAggregate
+//! // using the impl_pg_transactional_aggregate! macro
 //! let aggregate = Arc::new(my_pg_aggregate);
 //!
 //! // Begin a transaction (acquires database transaction)
@@ -35,8 +36,8 @@
 //! - **Ordered publishing**: Events published only after successful commit
 //! - **Deadlock detection**: PostgreSQL detects and reports deadlocks
 //!
-//! See [`PgTransaction`] for implementation details and
-//! [`PgAggregateError`] for error handling.
+//! See [`PgTransaction`], [`aggregate`] module, and
+//! [`PgAggregateError`] for implementation details.
 
 #![deny(missing_docs)]
 

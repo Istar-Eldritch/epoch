@@ -1,28 +1,75 @@
 //! PostgreSQL aggregate with transaction support.
 //!
-//! This module provides [`PgAggregate`], a PostgreSQL-backed aggregate that implements
-//! [`TransactionalAggregate`] for atomic command handling.
+//! This module provides [`PgTransaction`] and the [`impl_pg_transactional_aggregate!`]
+//! macro to implement [`epoch_core::aggregate::TransactionalAggregate`] for PostgreSQL-backed aggregates.
 //!
-//! # Example
+//! # Overview
+//!
+//! PostgreSQL aggregates use pessimistic locking (`SELECT ... FOR UPDATE`) to ensure
+//! consistency during concurrent operations. The transaction lifecycle is:
+//!
+//! 1. **Begin**: Acquire database transaction and lock aggregate state
+//! 2. **Handle**: Process commands and generate events
+//! 3. **Commit**: Atomically persist events and state, then publish to event bus
+//! 4. **Rollback**: Discard all changes (alternative to commit)
+//!
+//! # Example: Using the Macro
 //!
 //! ```ignore
-//! use epoch_pg::PgAggregate;
+//! use epoch_pg::{PgEventStore, PgStateStore, impl_pg_transactional_aggregate};
+//! use epoch_core::aggregate::TransactionalAggregate;
+//! use sqlx::PgPool;
 //! use std::sync::Arc;
 //!
-//! // Create aggregate with pool, event store, and state store
-//! let aggregate = Arc::new(PgAggregate::new(
-//!     pool.clone(),
-//!     event_store,
-//!     state_store,
-//!     |state, cmd| { /* handle_command logic */ },
-//!     |state, event| { /* apply logic */ },
-//! ));
+//! // Define your aggregate struct
+//! pub struct UserAggregate {
+//!     pool: PgPool,
+//!     event_store: PgEventStore<MyEventBus>,
+//!     // ... other fields
+//! }
 //!
-//! // Use transaction for atomic operations
-//! let mut tx = aggregate.clone().begin().await?;
-//! tx.handle(command).await?;
-//! tx.commit().await?;
+//! // Implement TransactionalAggregate using the macro
+//! impl_pg_transactional_aggregate! {
+//!     aggregate: UserAggregate,
+//!     event: MyAppEvent,
+//!     state: UserState,
+//!     bus: MyEventBus,
+//!     pool_field: pool,
+//!     event_store_field: event_store,
+//! }
+//!
+//! // Now use it with transactions
+//! async fn handle_user_command(
+//!     aggregate: Arc<UserAggregate>,
+//!     command: Command<UserCommand>,
+//! ) -> Result<(), Error> {
+//!     // Begin a transaction
+//!     let mut tx = aggregate.clone().begin().await?;
+//!     
+//!     // Handle one or more commands atomically
+//!     tx.handle(command).await?;
+//!     
+//!     // Commit persists state and publishes events
+//!     tx.commit().await?;
+//!     
+//!     Ok(())
+//! }
 //! ```
+//!
+//! # Lock Behavior
+//!
+//! When a transaction begins, it acquires a row-level lock using `SELECT ... FOR UPDATE`:
+//!
+//! - **Blocking**: By default, waits indefinitely for the lock
+//! - **Timeout**: Configure `lock_timeout` on the connection to set a maximum wait time
+//! - **Deadlock Detection**: PostgreSQL automatically detects and aborts deadlocks
+//!
+//! To avoid deadlocks when locking multiple aggregates, always acquire locks in a
+//! consistent order (e.g., sorted by aggregate ID).
+//!
+//! # Error Handling
+//!
+//! See [`PgAggregateError`] for possible error conditions during transaction operations.
 
 use crate::event_store::PgEventStoreError;
 use async_trait::async_trait;
@@ -145,7 +192,9 @@ macro_rules! impl_pg_transactional_aggregate {
         impl ::epoch_core::aggregate::TransactionalAggregate for $aggregate {
             type SupersetEvent = $event;
             type Transaction = $crate::aggregate::PgTransaction<
-                $crate::aggregate::PgAggregateError<<$bus as ::epoch_core::event_store::EventBus>::Error>,
+                $crate::aggregate::PgAggregateError<
+                    <$bus as ::epoch_core::event_store::EventBus>::Error,
+                >,
             >;
             type TransactionError = $crate::aggregate::PgAggregateError<
                 <$bus as ::epoch_core::event_store::EventBus>::Error,
@@ -207,9 +256,7 @@ macro_rules! impl_pg_transactional_aggregate {
                 id: ::uuid::Uuid,
             ) -> ::std::result::Result<(), Self::TransactionError> {
                 use $crate::state_store::PgState;
-                <$state>::delete(id, tx.as_mut())
-                    .await
-                    .map_err(Into::into)
+                <$state>::delete(id, tx.as_mut()).await.map_err(Into::into)
             }
 
             async fn publish_event(
