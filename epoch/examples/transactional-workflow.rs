@@ -28,8 +28,7 @@ use async_trait::async_trait;
 use epoch::prelude::*;
 use epoch_derive::subset_enum;
 use epoch_mem::{
-    impl_inmemory_transactional_aggregate, InMemoryEventBus, InMemoryEventStore,
-    InMemoryStateStore,
+    InMemoryEventBus, InMemoryEventStore, InMemoryStateStore, impl_inmemory_transactional_aggregate,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -250,10 +249,13 @@ impl Aggregate<ApplicationEvent> for AccountAggregate {
                 }
 
                 let new_balance = account.balance - amount;
-                let event = ApplicationEvent::AccountDebited { amount, new_balance }
-                    .into_builder()
-                    .stream_id(command.aggregate_id)
-                    .build()?;
+                let event = ApplicationEvent::AccountDebited {
+                    amount,
+                    new_balance,
+                }
+                .into_builder()
+                .stream_id(command.aggregate_id)
+                .build()?;
                 Ok(vec![event])
             }
 
@@ -267,10 +269,13 @@ impl Aggregate<ApplicationEvent> for AccountAggregate {
                 }
 
                 let new_balance = account.balance + amount;
-                let event = ApplicationEvent::AccountCredited { amount, new_balance }
-                    .into_builder()
-                    .stream_id(command.aggregate_id)
-                    .build()?;
+                let event = ApplicationEvent::AccountCredited {
+                    amount,
+                    new_balance,
+                }
+                .into_builder()
+                .stream_id(command.aggregate_id)
+                .build()?;
                 Ok(vec![event])
             }
         }
