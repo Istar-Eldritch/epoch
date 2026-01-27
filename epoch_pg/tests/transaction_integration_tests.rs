@@ -16,7 +16,7 @@ use epoch_core::prelude::{EventBus, EventStoreBackend, StateStoreBackend};
 use epoch_derive::EventData;
 use epoch_mem::InMemoryEventBus;
 use epoch_pg::Migrator;
-use epoch_pg::aggregate::{PgAggregateError, PgTransaction};
+use epoch_pg::impl_pg_transactional_aggregate;
 use epoch_pg::event_store::PgEventStore;
 use epoch_pg::state_store::{PgState, PgStateStore};
 use serde::{Deserialize, Serialize};
@@ -266,78 +266,20 @@ impl Aggregate<CounterEvent> for CounterAggregate {
 // since CounterCommand: Into<CounterCommand> (reflexive)
 
 // =============================================================================
-// TransactionalAggregate Implementation
+// TransactionalAggregate Implementation (via macro)
 // =============================================================================
 
-/// Type alias for the transaction error
-type CounterTransactionError =
-    PgAggregateError<<InMemoryEventBus<CounterEvent> as EventBus>::Error>;
-
-#[async_trait]
-impl TransactionalAggregate for CounterAggregate {
-    type SupersetEvent = CounterEvent;
-    type Transaction = PgTransaction<CounterTransactionError>;
-    type TransactionError = CounterTransactionError;
-
-    async fn begin(
-        self: Arc<Self>,
-    ) -> Result<AggregateTransaction<Self, Self::Transaction>, Self::TransactionError> {
-        let tx = self.pool.begin().await?;
-        Ok(AggregateTransaction::new(self, PgTransaction::new(tx)))
-    }
-
-    async fn store_events_in_tx(
-        &self,
-        tx: &mut Self::Transaction,
-        events: Vec<Event<Self::SupersetEvent>>,
-    ) -> Result<Vec<Event<Self::SupersetEvent>>, Self::TransactionError> {
-        self.event_store
-            .store_events_in_tx(&mut *tx, events)
-            .await
-            .map_err(PgAggregateError::EventStore)
-    }
-
-    async fn get_state_in_tx(
-        &self,
-        tx: &mut Self::Transaction,
-        id: Uuid,
-    ) -> Result<Option<Self::State>, Self::TransactionError> {
-        CounterState::find_by_id_for_update(id, tx.as_mut())
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn persist_state_in_tx(
-        &self,
-        tx: &mut Self::Transaction,
-        id: Uuid,
-        state: Self::State,
-    ) -> Result<(), Self::TransactionError> {
-        CounterState::upsert(id, &state, tx.as_mut())
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn delete_state_in_tx(
-        &self,
-        tx: &mut Self::Transaction,
-        id: Uuid,
-    ) -> Result<(), Self::TransactionError> {
-        CounterState::delete(id, tx.as_mut())
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn publish_event(
-        &self,
-        event: Event<Self::SupersetEvent>,
-    ) -> Result<(), Self::TransactionError> {
-        self.event_store
-            .publish_events(vec![event])
-            .await
-            .map_err(PgAggregateError::EventStore)
-    }
+impl_pg_transactional_aggregate! {
+    aggregate: CounterAggregate,
+    event: CounterEvent,
+    state: CounterState,
+    bus: InMemoryEventBus<CounterEvent>,
+    pool_field: pool,
+    event_store_field: event_store,
 }
+
+// The macro above generates the full TransactionalAggregate implementation!
+// No need to manually implement all ~60 lines of boilerplate.
 
 // =============================================================================
 // Test Setup

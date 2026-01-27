@@ -217,6 +217,138 @@ where
     }
 }
 
+// ============================================================================
+// Helper Macro for TransactionalAggregate Implementation
+// ============================================================================
+
+/// Implements `TransactionalAggregate` for an in-memory aggregate.
+///
+/// This macro reduces the boilerplate of implementing `TransactionalAggregate`
+/// for aggregates that use in-memory stores.
+///
+/// # Example
+///
+/// ```ignore
+/// use epoch_mem::impl_inmemory_transactional_aggregate;
+///
+/// pub struct MyAggregate {
+///     lock: Arc<Mutex<()>>,
+///     event_store: InMemoryEventStore<InMemoryEventBus<MyEvent>>,
+///     state_store: InMemoryStateStore<MyState>,
+/// }
+///
+/// impl_inmemory_transactional_aggregate! {
+///     aggregate: MyAggregate,
+///     event: MyEvent,
+///     bus: InMemoryEventBus<MyEvent>,
+///     lock_field: lock,
+///     event_store_field: event_store,
+///     state_store_field: state_store,
+/// }
+/// ```
+#[macro_export]
+macro_rules! impl_inmemory_transactional_aggregate {
+    (
+        aggregate: $aggregate:ty,
+        event: $event:ty,
+        bus: $bus:ty,
+        lock_field: $lock_field:ident,
+        event_store_field: $event_store_field:ident,
+        state_store_field: $state_store_field:ident$(,)?
+    ) => {
+        #[::async_trait::async_trait]
+        impl ::epoch_core::aggregate::TransactionalAggregate for $aggregate {
+            type SupersetEvent = $event;
+            type Transaction = $crate::InMemoryTransaction<
+                <Self as ::epoch_core::event_applicator::EventApplicator<$event>>::State,
+                $event,
+                $bus,
+            >;
+            type TransactionError = $crate::InMemoryTransactionError<
+                <$bus as ::epoch_core::event_store::EventBus>::Error,
+            >;
+
+            async fn begin(
+                self: ::std::sync::Arc<Self>,
+            ) -> ::std::result::Result<
+                ::epoch_core::aggregate::AggregateTransaction<Self, Self::Transaction>,
+                Self::TransactionError,
+            > {
+                let lock = self.$lock_field.clone().lock_owned().await;
+                let tx = $crate::InMemoryTransaction::new(
+                    self.$event_store_field.clone(),
+                    self.$state_store_field.clone(),
+                    lock,
+                );
+                Ok(::epoch_core::aggregate::AggregateTransaction::new(self, tx))
+            }
+
+            async fn store_events_in_tx(
+                &self,
+                tx: &mut Self::Transaction,
+                events: ::std::vec::Vec<::epoch_core::event::Event<Self::SupersetEvent>>,
+            ) -> ::std::result::Result<
+                ::std::vec::Vec<::epoch_core::event::Event<Self::SupersetEvent>>,
+                Self::TransactionError,
+            > {
+                tx.buffer_events(events.clone());
+                Ok(events)
+            }
+
+            async fn get_state_in_tx(
+                &self,
+                tx: &mut Self::Transaction,
+                id: ::uuid::Uuid,
+            ) -> ::std::result::Result<
+                ::std::option::Option<
+                    <Self as ::epoch_core::event_applicator::EventApplicator<$event>>::State,
+                >,
+                Self::TransactionError,
+            > {
+                // Check pending state first (read-your-writes)
+                if let ::std::option::Option::Some(pending) = tx.get_pending_state(&id) {
+                    return Ok(pending.clone());
+                }
+
+                // Fall back to state store
+                use ::epoch_core::state_store::StateStoreBackend;
+                tx.state_store().get_state(id).await.map_err(Into::into)
+            }
+
+            async fn persist_state_in_tx(
+                &self,
+                tx: &mut Self::Transaction,
+                id: ::uuid::Uuid,
+                state: <Self as ::epoch_core::event_applicator::EventApplicator<$event>>::State,
+            ) -> ::std::result::Result<(), Self::TransactionError> {
+                tx.buffer_state(id, ::std::option::Option::Some(state));
+                Ok(())
+            }
+
+            async fn delete_state_in_tx(
+                &self,
+                tx: &mut Self::Transaction,
+                id: ::uuid::Uuid,
+            ) -> ::std::result::Result<(), Self::TransactionError> {
+                tx.buffer_state(id, ::std::option::Option::None);
+                Ok(())
+            }
+
+            async fn publish_event(
+                &self,
+                event: ::epoch_core::event::Event<Self::SupersetEvent>,
+            ) -> ::std::result::Result<(), Self::TransactionError> {
+                use ::epoch_core::event_store::EventBus;
+                self.$event_store_field
+                    .bus()
+                    .publish(::std::sync::Arc::new(event))
+                    .await
+                    .map_err($crate::InMemoryTransactionError::Publish)
+            }
+        }
+    };
+}
+
 /// Unit tests for `InMemoryTransaction`.
 ///
 /// Note: These tests cover `InMemoryTransaction` in isolation. Full `TransactionalAggregate`
