@@ -2,10 +2,15 @@ error[E0277]: the trait bound `TestAggregate: Projection<TestEvent>` is not sati
    --> tests/compile_fail/aggregate_as_projection.rs:209:27
     |
 209 |     let _ = bus.subscribe(handler);
-    |                 --------- ^^^^^^^ the trait `Projection<TestEvent>` is not implemented for `TestAggregate`
+    |                 --------- ^^^^^^^ unsatisfied trait bound
     |                 |
     |                 required by a bound introduced by this call
     |
+help: the trait `Projection<TestEvent>` is not implemented for `TestAggregate`
+   --> tests/compile_fail/aggregate_as_projection.rs:111:1
+    |
+111 | struct TestAggregate {
+    | ^^^^^^^^^^^^^^^^^^^^
     = help: the trait `epoch_core::event_store::EventObserver<ED>` is implemented for `epoch_core::projection::ProjectionHandler<P>`
     = note: required for `epoch_core::projection::ProjectionHandler<TestAggregate>` to implement `epoch_core::event_store::EventObserver<TestEvent>`
 note: required by a bound in `subscribe`

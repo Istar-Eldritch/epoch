@@ -424,9 +424,9 @@ async fn handle_propagates_causation_id() {
     assert_eq!(event.causation_id, Some(triggering_event_id));
 }
 
-/// Test that multiple events in one command share the same auto-generated correlation_id
+/// Test that each command gets its own unique auto-generated correlation_id
 #[tokio::test]
-async fn handle_auto_generates_shared_correlation_for_multiple_events() {
+async fn handle_auto_generates_unique_correlation_for_each_command() {
     let state_store = InMemoryStateStore::<Counter>::default();
     let event_bus = InMemoryEventBus::<CounterEvent>::default();
     let event_store = InMemoryEventStore::new(event_bus.clone());
@@ -438,11 +438,11 @@ async fn handle_auto_generates_shared_correlation_for_multiple_events() {
 
     let counter_id = Uuid::new_v4();
 
-    // First create the counter
+    // First create the counter - this will get its own correlation_id
     let create_cmd = Command::new(counter_id, CounterCommand::Create, None, None);
     aggregate.handle(create_cmd).await.unwrap();
 
-    // Now increment - each command gets its own correlation_id
+    // Then increment - this is a separate command and will get its own correlation_id
     let increment_cmd = Command::new(counter_id, CounterCommand::Increment, None, None);
     aggregate.handle(increment_cmd).await.unwrap();
 
@@ -452,11 +452,12 @@ async fn handle_auto_generates_shared_correlation_for_multiple_events() {
 
     assert_eq!(events.len(), 2);
 
-    // Both events should have correlation_id (first one auto-generated, second inherited)
+    // Both events should have correlation_id, but they should be different
+    // since they came from different commands
     let event1 = events[0].as_ref().unwrap();
     let event2 = events[1].as_ref().unwrap();
 
     assert!(event1.correlation_id.is_some());
-    // Second event gets its own correlation since it's a separate command
     assert!(event2.correlation_id.is_some());
+    assert_ne!(event1.correlation_id, event2.correlation_id);
 }

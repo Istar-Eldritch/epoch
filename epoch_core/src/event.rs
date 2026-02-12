@@ -668,6 +668,62 @@ mod tests {
     }
 
     #[test]
+    fn to_subset_event_ref_preserves_causation() {
+        use crate::event::EnumConversionError;
+
+        // Create a simple subset relationship for testing
+        #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+        enum SubsetEventData {
+            TestEvent { value: String },
+        }
+
+        impl EventData for SubsetEventData {
+            fn event_type(&self) -> &'static str {
+                "TestEvent"
+            }
+        }
+
+        // Manual implementation of TryFrom<&TestEventData> for SubsetEventData
+        impl TryFrom<&TestEventData> for SubsetEventData {
+            type Error = EnumConversionError;
+
+            fn try_from(value: &TestEventData) -> Result<Self, Self::Error> {
+                match value {
+                    TestEventData::TestEvent { value } => Ok(SubsetEventData::TestEvent {
+                        value: value.clone(),
+                    }),
+                }
+            }
+        }
+
+        let correlation_id = Uuid::new_v4();
+        let causation_id = Uuid::new_v4();
+        let stream_id = Uuid::new_v4();
+
+        let original: Event<TestEventData> = Event {
+            id: Uuid::new_v4(),
+            stream_id,
+            stream_version: 1,
+            event_type: "Test".to_string(),
+            actor_id: None,
+            purger_id: None,
+            data: Some(TestEventData::TestEvent {
+                value: "test".to_string(),
+            }),
+            created_at: Utc::now(),
+            purged_at: None,
+            global_sequence: Some(75),
+            correlation_id: Some(correlation_id),
+            causation_id: Some(causation_id),
+        };
+
+        let subset: Event<SubsetEventData> = original.to_subset_event_ref().unwrap();
+
+        assert_eq!(subset.correlation_id, Some(correlation_id));
+        assert_eq!(subset.causation_id, Some(causation_id));
+    }
+
+    #[test]
     fn to_superset_event_preserves_causation() {
         let correlation_id = Uuid::new_v4();
         let causation_id = Uuid::new_v4();
