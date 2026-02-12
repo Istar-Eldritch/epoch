@@ -1193,7 +1193,9 @@ where
                         actor_id,
                         purger_id,
                         purged_at,
-                        global_sequence
+                        global_sequence,
+                        causation_id,
+                        correlation_id
                     FROM epoch_events
                     WHERE global_sequence > $1
                     ORDER BY global_sequence ASC

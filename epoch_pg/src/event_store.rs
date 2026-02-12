@@ -261,7 +261,9 @@ where
                         actor_id,
                         purger_id,
                         purged_at,
-                        global_sequence
+                        global_sequence,
+                        causation_id,
+                        correlation_id
                     FROM epoch_events
                     WHERE stream_id = $1 AND stream_version >= $2
                     ORDER BY stream_version ASC
@@ -291,6 +293,14 @@ where
                 // Add global_sequence if present
                 if let Some(gs) = entry.global_sequence {
                     builder = builder.global_sequence(gs as u64);
+                }
+
+                // Add causation/correlation if present
+                if let Some(cid) = entry.causation_id {
+                    builder = builder.causation_id(cid);
+                }
+                if let Some(cid) = entry.correlation_id {
+                    builder = builder.correlation_id(cid);
                 }
 
                 let event = builder
