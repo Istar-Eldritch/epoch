@@ -821,4 +821,35 @@ mod tests {
         assert_eq!(*data.stream_version.get(&stream_id_a).unwrap(), 3);
         assert_eq!(*data.stream_version.get(&stream_id_b).unwrap(), 3);
     }
+
+    #[tokio::test]
+    async fn store_and_read_event_with_causation() {
+        let bus = InMemoryEventBus::<MyEventData>::default();
+        let store = InMemoryEventStore::new(bus);
+
+        let correlation_id = Uuid::new_v4();
+        let causation_id = Uuid::new_v4();
+        let stream_id = Uuid::new_v4();
+
+        let event = Event::<MyEventData>::builder()
+            .stream_id(stream_id)
+            .stream_version(1)
+            .event_type("Created".to_string())
+            .data(Some(MyEventData {
+                value: "test".to_string(),
+            }))
+            .correlation_id(correlation_id)
+            .causation_id(causation_id)
+            .build()
+            .unwrap();
+
+        store.store_event(event.clone()).await.unwrap();
+
+        // Read back and verify causation fields preserved
+        let mut stream = store.read_events(stream_id).await.unwrap();
+        let retrieved = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(retrieved.correlation_id, Some(correlation_id));
+        assert_eq!(retrieved.causation_id, Some(causation_id));
+    }
 }

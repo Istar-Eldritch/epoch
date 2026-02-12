@@ -70,8 +70,8 @@ impl<B: EventBus + Clone> PgEventStore<B> {
         for event in events {
             let row: (i64,) = sqlx::query_as(
                 r#"
-                INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at, actor_id, purger_id, purged_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at, actor_id, purger_id, purged_at, causation_id, correlation_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING global_sequence
                 "#,
             )
@@ -97,6 +97,8 @@ impl<B: EventBus + Clone> PgEventStore<B> {
             .bind(event.actor_id)
             .bind(event.purger_id)
             .bind(event.purged_at)
+            .bind(event.causation_id)
+            .bind(event.correlation_id)
             .fetch_one(&mut **tx)
             .await?;
 
@@ -111,6 +113,8 @@ impl<B: EventBus + Clone> PgEventStore<B> {
                 created_at: event.created_at,
                 purged_at: event.purged_at,
                 global_sequence: Some(row.0 as u64),
+                causation_id: event.causation_id,
+                correlation_id: event.correlation_id,
             });
         }
 
@@ -163,6 +167,10 @@ pub struct PgDBEvent {
     /// Assigned by the database on insert using a sequence.
     #[sqlx(default)]
     pub global_sequence: Option<i64>,
+    /// The ID of the event that caused this event to be produced.
+    pub causation_id: Option<Uuid>,
+    /// A shared identifier tying together all events in a causal tree.
+    pub correlation_id: Option<Uuid>,
 }
 
 /// A postgres based event stream.
@@ -304,8 +312,8 @@ where
         // Insert the event and get back the assigned global_sequence
         let row: (i64,) = sqlx::query_as(
                 r#"
-                INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at, actor_id, purger_id, purged_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at, actor_id, purger_id, purged_at, causation_id, correlation_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING global_sequence
                 "#,
             )
@@ -329,6 +337,8 @@ where
             .bind(event.actor_id)
             .bind(event.purger_id)
             .bind(event.purged_at)
+            .bind(event.causation_id)
+            .bind(event.correlation_id)
             .fetch_one(&self.postgres)
             .await?;
 
@@ -344,6 +354,8 @@ where
             created_at: event.created_at,
             purged_at: event.purged_at,
             global_sequence: Some(row.0 as u64),
+            causation_id: event.causation_id,
+            correlation_id: event.correlation_id,
         };
 
         // Wrap in Arc for efficient sharing - no clone needed
@@ -395,6 +407,8 @@ mod tests {
             purger_id: None,
             purged_at: None,
             global_sequence: Some(123),
+            causation_id: None,
+            correlation_id: None,
         };
 
         let json = serde_json::to_string(&db_event).unwrap();
@@ -420,6 +434,8 @@ mod tests {
             purger_id: None,
             purged_at: None,
             global_sequence: None,
+            causation_id: None,
+            correlation_id: None,
         };
 
         let json = serde_json::to_string(&db_event).unwrap();
