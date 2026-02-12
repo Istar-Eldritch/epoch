@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use epoch_core::event::EnumConversionError;
 use epoch_core::prelude::*;
 use epoch_mem::*;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 /// Event data for aggregate tests
@@ -328,4 +329,135 @@ async fn aggregate_handles_multiple_stale_state_scenarios() {
     let final_state = state_store.get_state(counter_id).await.unwrap().unwrap();
     assert_eq!(final_state.value, 5);
     assert_eq!(final_state.version, 6);
+}
+
+/// Test that correlation_id is auto-generated when not provided on command
+#[tokio::test]
+async fn handle_auto_generates_correlation_id() {
+    let state_store = InMemoryStateStore::<Counter>::default();
+    let event_bus = InMemoryEventBus::<CounterEvent>::default();
+    let event_store = InMemoryEventStore::new(event_bus.clone());
+
+    let aggregate = CounterAggregate {
+        state_store: state_store.clone(),
+        event_store: event_store.clone(),
+    };
+
+    let counter_id = Uuid::new_v4();
+    let cmd = Command::new(counter_id, CounterCommand::Create, None, None);
+
+    let _state = aggregate.handle(cmd).await.unwrap();
+
+    // Read back the event and verify correlation_id was auto-generated
+    let stream = event_store.read_events(counter_id).await.unwrap();
+    let events: Vec<_> = stream.collect().await;
+
+    assert_eq!(events.len(), 1);
+    let event = events[0].as_ref().unwrap();
+
+    // Correlation should be set to the event's own ID
+    assert_eq!(event.correlation_id, Some(event.id));
+    assert_eq!(event.causation_id, None);
+}
+
+/// Test that explicit correlation_id on command is preserved
+#[tokio::test]
+async fn handle_preserves_explicit_correlation_id() {
+    let state_store = InMemoryStateStore::<Counter>::default();
+    let event_bus = InMemoryEventBus::<CounterEvent>::default();
+    let event_store = InMemoryEventStore::new(event_bus.clone());
+
+    let aggregate = CounterAggregate {
+        state_store: state_store.clone(),
+        event_store: event_store.clone(),
+    };
+
+    let counter_id = Uuid::new_v4();
+    let explicit_correlation = Uuid::new_v4();
+
+    let cmd = Command::new(counter_id, CounterCommand::Create, None, None)
+        .with_correlation_id(explicit_correlation);
+
+    let _state = aggregate.handle(cmd).await.unwrap();
+
+    // Read back the event and verify explicit correlation was preserved
+    let stream = event_store.read_events(counter_id).await.unwrap();
+    let events: Vec<_> = stream.collect().await;
+
+    assert_eq!(events.len(), 1);
+    let event = events[0].as_ref().unwrap();
+
+    assert_eq!(event.correlation_id, Some(explicit_correlation));
+    assert_eq!(event.causation_id, None);
+}
+
+/// Test that causation_id from command is propagated to events
+#[tokio::test]
+async fn handle_propagates_causation_id() {
+    let state_store = InMemoryStateStore::<Counter>::default();
+    let event_bus = InMemoryEventBus::<CounterEvent>::default();
+    let event_store = InMemoryEventStore::new(event_bus.clone());
+
+    let aggregate = CounterAggregate {
+        state_store: state_store.clone(),
+        event_store: event_store.clone(),
+    };
+
+    let counter_id = Uuid::new_v4();
+    let triggering_event_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
+
+    let mut cmd = Command::new(counter_id, CounterCommand::Create, None, None);
+    cmd.causation_id = Some(triggering_event_id);
+    cmd.correlation_id = Some(correlation_id);
+
+    let _state = aggregate.handle(cmd).await.unwrap();
+
+    // Read back the event and verify causation was propagated
+    let stream = event_store.read_events(counter_id).await.unwrap();
+    let events: Vec<_> = stream.collect().await;
+
+    assert_eq!(events.len(), 1);
+    let event = events[0].as_ref().unwrap();
+
+    assert_eq!(event.correlation_id, Some(correlation_id));
+    assert_eq!(event.causation_id, Some(triggering_event_id));
+}
+
+/// Test that each command gets its own unique auto-generated correlation_id
+#[tokio::test]
+async fn handle_auto_generates_unique_correlation_for_each_command() {
+    let state_store = InMemoryStateStore::<Counter>::default();
+    let event_bus = InMemoryEventBus::<CounterEvent>::default();
+    let event_store = InMemoryEventStore::new(event_bus.clone());
+
+    let aggregate = CounterAggregate {
+        state_store: state_store.clone(),
+        event_store: event_store.clone(),
+    };
+
+    let counter_id = Uuid::new_v4();
+
+    // First create the counter - this will get its own correlation_id
+    let create_cmd = Command::new(counter_id, CounterCommand::Create, None, None);
+    aggregate.handle(create_cmd).await.unwrap();
+
+    // Then increment - this is a separate command and will get its own correlation_id
+    let increment_cmd = Command::new(counter_id, CounterCommand::Increment, None, None);
+    aggregate.handle(increment_cmd).await.unwrap();
+
+    // Read back events
+    let stream = event_store.read_events(counter_id).await.unwrap();
+    let events: Vec<_> = stream.collect().await;
+
+    assert_eq!(events.len(), 2);
+
+    // Both events should have correlation_id, but they should be different
+    // since they came from different commands
+    let event1 = events[0].as_ref().unwrap();
+    let event2 = events[1].as_ref().unwrap();
+
+    assert!(event1.correlation_id.is_some());
+    assert!(event2.correlation_id.is_some());
+    assert_ne!(event1.correlation_id, event2.correlation_id);
 }

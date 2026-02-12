@@ -78,14 +78,14 @@ async fn test_migrator_runs_all_migrations() {
 
     // Run migrations
     let applied = migrator.run().await.expect("Should run migrations");
-    assert_eq!(applied, 6, "Should apply 6 migrations");
+    assert_eq!(applied, 7, "Should apply 7 migrations");
 
     // Verify current version
     let version = migrator
         .current_version()
         .await
         .expect("Should get version");
-    assert_eq!(version, 6, "Version should be 6 after all migrations");
+    assert_eq!(version, 7, "Version should be 7 after all migrations");
 
     // Verify epoch_events table exists
     let events_table: (i64,) = sqlx::query_as(
@@ -155,7 +155,7 @@ async fn test_migrator_is_idempotent() {
 
     // Run migrations first time
     let applied1 = migrator.run().await.expect("Should run migrations");
-    assert_eq!(applied1, 6, "Should apply 6 migrations first time");
+    assert_eq!(applied1, 7, "Should apply 7 migrations first time");
 
     // Run migrations second time
     let applied2 = migrator.run().await.expect("Should run migrations again");
@@ -168,12 +168,12 @@ async fn test_migrator_is_idempotent() {
         .expect("Should run migrations third time");
     assert_eq!(applied3, 0, "Should apply 0 migrations third time");
 
-    // Version should still be 6
+    // Version should still be 7
     let version = migrator
         .current_version()
         .await
         .expect("Should get version");
-    assert_eq!(version, 6, "Version should still be 6");
+    assert_eq!(version, 7, "Version should still be 7");
 
     teardown(&pool).await;
 }
@@ -188,7 +188,7 @@ async fn test_migrator_pending_returns_unapplied_migrations() {
 
     // Before running, all should be pending
     let pending = migrator.pending().await.expect("Should get pending");
-    assert_eq!(pending.len(), 6, "All 6 migrations should be pending");
+    assert_eq!(pending.len(), 7, "All 7 migrations should be pending");
 
     // Run migrations
     migrator.run().await.expect("Should run migrations");
@@ -221,7 +221,7 @@ async fn test_migrator_applied_returns_applied_migrations() {
 
     // After running, all should be applied
     let applied_after = migrator.applied().await.expect("Should get applied");
-    assert_eq!(applied_after.len(), 6, "All 6 migrations should be applied");
+    assert_eq!(applied_after.len(), 7, "All 7 migrations should be applied");
 
     // Verify the applied migrations have correct data
     assert_eq!(applied_after[0].version, 1);
@@ -242,6 +242,9 @@ async fn test_migrator_applied_returns_applied_migrations() {
 
     assert_eq!(applied_after[5].version, 6);
     assert_eq!(applied_after[5].name, "add_dlq_resolution_columns");
+
+    assert_eq!(applied_after[6].version, 7);
+    assert_eq!(applied_after[6].name, "add_causation_columns");
 
     teardown(&pool).await;
 }

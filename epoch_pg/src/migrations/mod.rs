@@ -33,6 +33,7 @@ mod m003_create_event_bus_infrastructure;
 mod m004_rename_tables_with_epoch_prefix;
 mod m005_add_checkpoint_sequence_index;
 mod m006_add_dlq_resolution_columns;
+mod m007_add_causation_columns;
 
 use m001_create_events_table::CreateEventsTable;
 use m002_add_global_sequence::AddGlobalSequence;
@@ -40,6 +41,7 @@ use m003_create_event_bus_infrastructure::CreateEventBusInfrastructure;
 use m004_rename_tables_with_epoch_prefix::RenameTablesWithEpochPrefix;
 use m005_add_checkpoint_sequence_index::AddCheckpointSequenceIndex;
 use m006_add_dlq_resolution_columns::AddDlqResolutionColumns;
+use m007_add_causation_columns::AddCausationColumns;
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -67,6 +69,7 @@ const MIGRATIONS: &[&dyn Migration] = &[
     &RenameTablesWithEpochPrefix,
     &AddCheckpointSequenceIndex,
     &AddDlqResolutionColumns,
+    &AddCausationColumns,
 ];
 
 /// Errors that can occur during migration operations.

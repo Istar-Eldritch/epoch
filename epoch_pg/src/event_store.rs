@@ -70,8 +70,8 @@ impl<B: EventBus + Clone> PgEventStore<B> {
         for event in events {
             let row: (i64,) = sqlx::query_as(
                 r#"
-                INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at, actor_id, purger_id, purged_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at, actor_id, purger_id, purged_at, causation_id, correlation_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING global_sequence
                 "#,
             )
@@ -97,6 +97,8 @@ impl<B: EventBus + Clone> PgEventStore<B> {
             .bind(event.actor_id)
             .bind(event.purger_id)
             .bind(event.purged_at)
+            .bind(event.causation_id)
+            .bind(event.correlation_id)
             .fetch_one(&mut **tx)
             .await?;
 
@@ -111,6 +113,8 @@ impl<B: EventBus + Clone> PgEventStore<B> {
                 created_at: event.created_at,
                 purged_at: event.purged_at,
                 global_sequence: Some(row.0 as u64),
+                causation_id: event.causation_id,
+                correlation_id: event.correlation_id,
             });
         }
 
@@ -163,6 +167,10 @@ pub struct PgDBEvent {
     /// Assigned by the database on insert using a sequence.
     #[sqlx(default)]
     pub global_sequence: Option<i64>,
+    /// The ID of the event that caused this event to be produced.
+    pub causation_id: Option<Uuid>,
+    /// A shared identifier tying together all events in a causal tree.
+    pub correlation_id: Option<Uuid>,
 }
 
 /// A postgres based event stream.
@@ -253,7 +261,9 @@ where
                         actor_id,
                         purger_id,
                         purged_at,
-                        global_sequence
+                        global_sequence,
+                        causation_id,
+                        correlation_id
                     FROM epoch_events
                     WHERE stream_id = $1 AND stream_version >= $2
                     ORDER BY stream_version ASC
@@ -285,6 +295,14 @@ where
                     builder = builder.global_sequence(gs as u64);
                 }
 
+                // Add causation/correlation if present
+                if let Some(cid) = entry.causation_id {
+                    builder = builder.causation_id(cid);
+                }
+                if let Some(cid) = entry.correlation_id {
+                    builder = builder.correlation_id(cid);
+                }
+
                 let event = builder
                     .build()
                     .map_err(PgEventStoreError::BuildEventError::<B::Error>)?;
@@ -304,8 +322,8 @@ where
         // Insert the event and get back the assigned global_sequence
         let row: (i64,) = sqlx::query_as(
                 r#"
-                INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at, actor_id, purger_id, purged_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at, actor_id, purger_id, purged_at, causation_id, correlation_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING global_sequence
                 "#,
             )
@@ -329,6 +347,8 @@ where
             .bind(event.actor_id)
             .bind(event.purger_id)
             .bind(event.purged_at)
+            .bind(event.causation_id)
+            .bind(event.correlation_id)
             .fetch_one(&self.postgres)
             .await?;
 
@@ -344,6 +364,8 @@ where
             created_at: event.created_at,
             purged_at: event.purged_at,
             global_sequence: Some(row.0 as u64),
+            causation_id: event.causation_id,
+            correlation_id: event.correlation_id,
         };
 
         // Wrap in Arc for efficient sharing - no clone needed
@@ -376,6 +398,124 @@ where
 
         self.publish_events(stored_events).await
     }
+
+    async fn read_events_by_correlation_id(
+        &self,
+        correlation_id: Uuid,
+    ) -> Result<Vec<Event<Self::EventType>>, Self::Error> {
+        let rows = sqlx::query_as::<_, PgDBEvent>(
+            r#"
+            SELECT
+                id, stream_id, stream_version, event_type, data, created_at,
+                actor_id, purger_id, purged_at, global_sequence,
+                causation_id, correlation_id
+            FROM epoch_events
+            WHERE correlation_id = $1
+            ORDER BY global_sequence ASC
+            "#,
+        )
+        .bind(correlation_id)
+        .fetch_all(&self.postgres)
+        .await?;
+
+        let mut events = Vec::with_capacity(rows.len());
+        for entry in rows {
+            let data: Option<B::EventType> = entry
+                .data
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(PgEventStoreError::DeserializeEventError::<B::Error>)?;
+
+            let mut builder = Event::<B::EventType>::builder()
+                .id(entry.id)
+                .stream_id(entry.stream_id)
+                .stream_version(entry.stream_version.try_into().unwrap())
+                .event_type(entry.event_type)
+                .created_at(entry.created_at)
+                .data(data);
+
+            if let Some(gs) = entry.global_sequence {
+                builder = builder.global_sequence(gs as u64);
+            }
+            if let Some(cid) = entry.causation_id {
+                builder = builder.causation_id(cid);
+            }
+            if let Some(cid) = entry.correlation_id {
+                builder = builder.correlation_id(cid);
+            }
+
+            let event = builder
+                .build()
+                .map_err(PgEventStoreError::BuildEventError::<B::Error>)?;
+            events.push(event);
+        }
+
+        Ok(events)
+    }
+
+    async fn trace_causation_chain(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Vec<Event<Self::EventType>>, Self::Error> {
+        // Fetch the starting event
+        let row = sqlx::query_as::<_, PgDBEvent>(
+            r#"
+            SELECT
+                id, stream_id, stream_version, event_type, data, created_at,
+                actor_id, purger_id, purged_at, global_sequence,
+                causation_id, correlation_id
+            FROM epoch_events
+            WHERE id = $1
+            "#,
+        )
+        .bind(event_id)
+        .fetch_optional(&self.postgres)
+        .await?;
+
+        let entry = match row {
+            Some(entry) => entry,
+            None => return Ok(vec![]),
+        };
+
+        // If no correlation_id, return just this event
+        let correlation_id = match entry.correlation_id {
+            Some(cid) => cid,
+            None => {
+                let data: Option<B::EventType> = entry
+                    .data
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(PgEventStoreError::DeserializeEventError::<B::Error>)?;
+
+                let mut builder = Event::<B::EventType>::builder()
+                    .id(entry.id)
+                    .stream_id(entry.stream_id)
+                    .stream_version(entry.stream_version.try_into().unwrap())
+                    .event_type(entry.event_type)
+                    .created_at(entry.created_at)
+                    .data(data);
+
+                if let Some(gs) = entry.global_sequence {
+                    builder = builder.global_sequence(gs as u64);
+                }
+                if let Some(cid) = entry.causation_id {
+                    builder = builder.causation_id(cid);
+                }
+
+                let event = builder
+                    .build()
+                    .map_err(PgEventStoreError::BuildEventError::<B::Error>)?;
+                return Ok(vec![event]);
+            }
+        };
+
+        // Get all correlated events and extract the subtree
+        let correlated_events = self.read_events_by_correlation_id(correlation_id).await?;
+        Ok(epoch_core::causation::extract_causation_subtree(
+            correlated_events,
+            event_id,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -395,6 +535,8 @@ mod tests {
             purger_id: None,
             purged_at: None,
             global_sequence: Some(123),
+            causation_id: None,
+            correlation_id: None,
         };
 
         let json = serde_json::to_string(&db_event).unwrap();
@@ -420,6 +562,8 @@ mod tests {
             purger_id: None,
             purged_at: None,
             global_sequence: None,
+            causation_id: None,
+            correlation_id: None,
         };
 
         let json = serde_json::to_string(&db_event).unwrap();

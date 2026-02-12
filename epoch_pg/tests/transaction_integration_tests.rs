@@ -7,12 +7,11 @@ mod common;
 
 use async_trait::async_trait;
 use epoch_core::aggregate::{
-    Aggregate, AggregateState, AggregateTransaction, Command, HandleCommandError,
-    TransactionalAggregate,
+    Aggregate, AggregateState, Command, HandleCommandError, TransactionalAggregate,
 };
 use epoch_core::event::{Event, EventData};
 use epoch_core::event_applicator::{EventApplicator, EventApplicatorState};
-use epoch_core::prelude::{EventBus, EventStoreBackend, StateStoreBackend};
+use epoch_core::prelude::{EventStoreBackend, StateStoreBackend};
 use epoch_derive::EventData;
 use epoch_mem::InMemoryEventBus;
 use epoch_pg::Migrator;

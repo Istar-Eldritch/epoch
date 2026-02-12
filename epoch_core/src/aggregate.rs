@@ -40,6 +40,16 @@ pub struct Command<D, C> {
     pub credentials: Option<C>,
     /// Optional expected version of the aggregate for optimistic concurrency control.
     pub aggregate_version: Option<u64>,
+    /// The ID of the event that caused this command to be dispatched.
+    ///
+    /// This is `None` for commands originating from external triggers (e.g., HTTP requests)
+    /// and `Some(event_id)` when the command is dispatched by a saga reacting to an event.
+    pub causation_id: Option<Uuid>,
+    /// The correlation ID to propagate to events produced by this command.
+    ///
+    /// All events in a causal tree share the same correlation ID. If not explicitly set,
+    /// the aggregate will auto-generate one from the first event's ID.
+    pub correlation_id: Option<Uuid>,
 }
 
 /// Aggregate state with version tracking for optimistic concurrency.
@@ -77,7 +87,55 @@ where
             data,
             credentials,
             aggregate_version,
+            causation_id: None,
+            correlation_id: None,
         }
+    }
+
+    /// Sets causation context from a triggering event.
+    ///
+    /// This is the primary way sagas thread causation context when dispatching commands.
+    /// Sets `causation_id = Some(event.id)` and inherits the event's `correlation_id`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// async fn handle_event(&self, state: Self::State, event: &Event<Self::EventType>)
+    ///     -> Result<Option<Self::State>, Self::SagaError>
+    /// {
+    ///     match &event.data {
+    ///         OrderEvent::OrderPlaced { order_id, .. } => {
+    ///             let cmd = Command::new(*order_id, ReserveItems { .. }, None, None)
+    ///                 .caused_by(event);
+    ///             self.command_dispatcher.dispatch(cmd).await?;
+    ///         }
+    ///     }
+    ///     Ok(Some(state))
+    /// }
+    /// ```
+    pub fn caused_by<ED: EventData>(mut self, event: &Event<ED>) -> Self {
+        self.causation_id = Some(event.id);
+        self.correlation_id = event.correlation_id;
+        self
+    }
+
+    /// Explicitly sets a correlation ID.
+    ///
+    /// Use this at system entry points (e.g., HTTP handlers) to inject an external
+    /// trace ID as the correlation ID for all downstream events.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // In an HTTP handler
+    /// let trace_id = extract_trace_id(request);
+    /// let cmd = Command::new(order_id, PlaceOrder { .. }, Some(user), None)
+    ///     .with_correlation_id(trace_id);
+    /// aggregate.handle(cmd).await?;
+    /// ```
+    pub fn with_correlation_id(mut self, correlation_id: Uuid) -> Self {
+        self.correlation_id = Some(correlation_id);
+        self
     }
 
     /// Transforms this command's data to a subset type.
@@ -94,6 +152,8 @@ where
             data,
             credentials: self.credentials.clone(),
             aggregate_version: self.aggregate_version,
+            causation_id: self.causation_id,
+            correlation_id: self.correlation_id,
         })
     }
 
@@ -111,6 +171,8 @@ where
             data,
             credentials: self.credentials.clone(),
             aggregate_version: self.aggregate_version,
+            causation_id: self.causation_id,
+            correlation_id: self.correlation_id,
         }
     }
 }
@@ -349,7 +411,12 @@ where
             // Calculate the next version based on the re-hydrated state
             let mut new_state_version = state.as_ref().map(|s| s.get_version()).unwrap_or(0) + 1;
 
-            let events: Vec<Event<ED>> = self
+            // Extract causation fields before consuming command in the iterator
+            let causation_id = command.causation_id;
+            let explicit_correlation = command.correlation_id;
+
+            // Generate events from command
+            let mut events: Vec<Event<ED>> = self
                 .handle_command(&state, cmd)
                 .await
                 .map_err(HandleCommandError::Command)?
@@ -361,6 +428,26 @@ where
                     e
                 })
                 .collect();
+
+            // Stamp causation fields on all events
+            if let Some(first_event) = events.first_mut() {
+                // Set causation_id if provided
+                first_event.causation_id = causation_id;
+
+                // Set correlation_id: use explicit or auto-generate from first event's id
+                first_event.correlation_id = Some(explicit_correlation.unwrap_or(first_event.id));
+            }
+
+            // Propagate correlation_id and causation_id to remaining events
+            if events.len() > 1 {
+                let correlation_id = events[0].correlation_id;
+                let causation_id = events[0].causation_id;
+
+                for event in events.iter_mut().skip(1) {
+                    event.correlation_id = correlation_id;
+                    event.causation_id = causation_id;
+                }
+            }
 
             let event_stream = Box::pin(SliceRefEventStream::from(events.as_slice()));
             let state = self
@@ -787,8 +874,12 @@ where
             let base_version = state.as_ref().map(|s| s.get_version()).unwrap_or(0);
             let next_version = base_version + 1;
 
+            // Extract causation fields before consuming command in the iterator
+            let causation_id = command.causation_id;
+            let explicit_correlation = command.correlation_id;
+
             // Handle command to produce events
-            let events: Vec<Event<A::SupersetEvent>> = self
+            let mut events: Vec<Event<A::SupersetEvent>> = self
                 .aggregate
                 .handle_command(&state, cmd)
                 .await
@@ -800,6 +891,22 @@ where
                     e
                 })
                 .collect();
+
+            // Stamp causation fields on all events
+            if let Some(first_event) = events.first_mut() {
+                first_event.causation_id = causation_id;
+                first_event.correlation_id = Some(explicit_correlation.unwrap_or(first_event.id));
+            }
+
+            if events.len() > 1 {
+                let correlation_id = events[0].correlation_id;
+                let causation_id = events[0].causation_id;
+
+                for event in events.iter_mut().skip(1) {
+                    event.correlation_id = correlation_id;
+                    event.causation_id = causation_id;
+                }
+            }
 
             // Track the final version after all events
             let final_version = events.last().map_or(base_version, |e| e.stream_version);

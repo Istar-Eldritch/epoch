@@ -40,3 +40,7 @@ path = "examples/hello-world.rs"
 [[example]]
 name = "saga-order-fulfillment"
 path = "examples/saga-order-fulfillment.rs"
+
+[[example]]
+name = "event-correlation-causation"
+path = "examples/event-correlation-causation.rs"

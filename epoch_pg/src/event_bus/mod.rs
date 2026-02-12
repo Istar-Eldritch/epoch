@@ -185,7 +185,9 @@ where
                 actor_id,
                 purger_id,
                 purged_at,
-                global_sequence
+                global_sequence,
+                causation_id,
+                correlation_id
             FROM epoch_events
             WHERE global_sequence > $1
             ORDER BY global_sequence ASC
@@ -219,6 +221,8 @@ where
                 created_at: row.created_at,
                 purged_at: row.purged_at,
                 global_sequence: row.global_sequence.map(|gs| gs as u64),
+                causation_id: row.causation_id,
+                correlation_id: row.correlation_id,
             });
         }
 
@@ -474,6 +478,8 @@ where
                             purged_at: db_event.purged_at,
                             data,
                             global_sequence: db_event.global_sequence.map(|gs| gs as u64),
+                            causation_id: db_event.causation_id,
+                            correlation_id: db_event.correlation_id,
                         };
 
                         // Wrap event in Arc once for efficient sharing across projections
@@ -1124,6 +1130,8 @@ where
                                     created_at: db_event.created_at,
                                     purged_at: db_event.purged_at,
                                     global_sequence: db_event.global_sequence.map(|gs| gs as u64),
+                                    causation_id: db_event.causation_id,
+                                    correlation_id: db_event.correlation_id,
                                 };
                                 // Send to bounded channel - will apply backpressure if full
                                 if buffer_tx.send(event).await.is_err() {
@@ -1185,7 +1193,9 @@ where
                         actor_id,
                         purger_id,
                         purged_at,
-                        global_sequence
+                        global_sequence,
+                        causation_id,
+                        correlation_id
                     FROM epoch_events
                     WHERE global_sequence > $1
                     ORDER BY global_sequence ASC
@@ -1236,6 +1246,8 @@ where
                         created_at: row.created_at,
                         purged_at: row.purged_at,
                         global_sequence: Some(event_global_seq),
+                        causation_id: row.causation_id,
+                        correlation_id: row.correlation_id,
                     });
 
                     // Use the same retry/DLQ logic as real-time processing

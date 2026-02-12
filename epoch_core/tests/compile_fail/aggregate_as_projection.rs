@@ -105,6 +105,20 @@ impl EventStoreBackend for TestEventStore {
     async fn store_event(&self, _event: Event<Self::EventType>) -> Result<(), Self::Error> {
         Ok(())
     }
+
+    async fn read_events_by_correlation_id(
+        &self,
+        _correlation_id: Uuid,
+    ) -> Result<Vec<Event<Self::EventType>>, Self::Error> {
+        unimplemented!()
+    }
+
+    async fn trace_causation_chain(
+        &self,
+        _event_id: Uuid,
+    ) -> Result<Vec<Event<Self::EventType>>, Self::Error> {
+        unimplemented!()
+    }
 }
 
 // Aggregate implementation (NOT a Projection)
