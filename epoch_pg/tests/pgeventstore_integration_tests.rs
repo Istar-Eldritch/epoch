@@ -557,3 +557,257 @@ async fn test_store_events_in_tx_rollback() {
     let mut read_events = event_store.read_events(stream_id).await.unwrap();
     assert!(read_events.next().await.is_none());
 }
+
+#[tokio::test]
+#[serial]
+async fn test_read_events_by_correlation_id() {
+    let (_pool, event_store) = setup().await;
+
+    let correlation_id = Uuid::new_v4();
+    let stream_a = Uuid::new_v4();
+    let stream_b = Uuid::new_v4();
+
+    let event1 = Event::<TestEventData>::builder()
+        .stream_id(stream_a)
+        .stream_version(1)
+        .event_type("TestEvent".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "a1".to_string(),
+        }))
+        .correlation_id(correlation_id)
+        .build()
+        .unwrap();
+
+    let event2 = Event::<TestEventData>::builder()
+        .stream_id(stream_b)
+        .stream_version(1)
+        .event_type("TestEvent".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "b1".to_string(),
+        }))
+        .correlation_id(correlation_id)
+        .causation_id(event1.id)
+        .build()
+        .unwrap();
+
+    event_store.store_event(event1.clone()).await.unwrap();
+    event_store.store_event(event2.clone()).await.unwrap();
+
+    let events = event_store
+        .read_events_by_correlation_id(correlation_id)
+        .await
+        .unwrap();
+
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].id, event1.id);
+    assert_eq!(events[1].id, event2.id);
+    assert_eq!(events[0].correlation_id, Some(correlation_id));
+    assert_eq!(events[1].causation_id, Some(event1.id));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_read_events_by_correlation_id_empty() {
+    let (_pool, event_store) = setup().await;
+
+    let events = event_store
+        .read_events_by_correlation_id(Uuid::new_v4())
+        .await
+        .unwrap();
+
+    assert!(events.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_read_events_by_correlation_id_ordered_by_global_sequence() {
+    let (_pool, event_store) = setup().await;
+
+    let correlation_id = Uuid::new_v4();
+    let stream_a = Uuid::new_v4();
+    let stream_b = Uuid::new_v4();
+    let stream_c = Uuid::new_v4();
+
+    // Store events across 3 streams with the same correlation
+    let event1 = Event::<TestEventData>::builder()
+        .stream_id(stream_a)
+        .stream_version(1)
+        .event_type("TestEvent".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "first".to_string(),
+        }))
+        .correlation_id(correlation_id)
+        .build()
+        .unwrap();
+
+    let event2 = Event::<TestEventData>::builder()
+        .stream_id(stream_b)
+        .stream_version(1)
+        .event_type("TestEvent".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "second".to_string(),
+        }))
+        .correlation_id(correlation_id)
+        .causation_id(event1.id)
+        .build()
+        .unwrap();
+
+    let event3 = Event::<TestEventData>::builder()
+        .stream_id(stream_c)
+        .stream_version(1)
+        .event_type("TestEvent".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "third".to_string(),
+        }))
+        .correlation_id(correlation_id)
+        .causation_id(event2.id)
+        .build()
+        .unwrap();
+
+    event_store.store_event(event1.clone()).await.unwrap();
+    event_store.store_event(event2.clone()).await.unwrap();
+    event_store.store_event(event3.clone()).await.unwrap();
+
+    let events = event_store
+        .read_events_by_correlation_id(correlation_id)
+        .await
+        .unwrap();
+
+    assert_eq!(events.len(), 3);
+    // Verify ordering by global_sequence
+    let gs1 = events[0].global_sequence.unwrap();
+    let gs2 = events[1].global_sequence.unwrap();
+    let gs3 = events[2].global_sequence.unwrap();
+    assert!(gs1 < gs2, "gs1 ({}) < gs2 ({})", gs1, gs2);
+    assert!(gs2 < gs3, "gs2 ({}) < gs3 ({})", gs2, gs3);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_trace_causation_chain() {
+    let (_pool, event_store) = setup().await;
+
+    let correlation_id = Uuid::new_v4();
+    let stream_a = Uuid::new_v4();
+    let stream_b = Uuid::new_v4();
+    let stream_c = Uuid::new_v4();
+
+    // A → B → C chain
+    let event_a = Event::<TestEventData>::builder()
+        .stream_id(stream_a)
+        .stream_version(1)
+        .event_type("TestEvent".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "root".to_string(),
+        }))
+        .correlation_id(correlation_id)
+        .build()
+        .unwrap();
+
+    let event_b = Event::<TestEventData>::builder()
+        .stream_id(stream_b)
+        .stream_version(1)
+        .event_type("TestEvent".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "middle".to_string(),
+        }))
+        .correlation_id(correlation_id)
+        .causation_id(event_a.id)
+        .build()
+        .unwrap();
+
+    let event_c = Event::<TestEventData>::builder()
+        .stream_id(stream_c)
+        .stream_version(1)
+        .event_type("TestEvent".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "leaf".to_string(),
+        }))
+        .correlation_id(correlation_id)
+        .causation_id(event_b.id)
+        .build()
+        .unwrap();
+
+    event_store.store_event(event_a.clone()).await.unwrap();
+    event_store.store_event(event_b.clone()).await.unwrap();
+    event_store.store_event(event_c.clone()).await.unwrap();
+
+    // Trace from middle → should include all 3
+    let chain = event_store.trace_causation_chain(event_b.id).await.unwrap();
+
+    assert_eq!(chain.len(), 3);
+    assert_eq!(chain[0].id, event_a.id);
+    assert_eq!(chain[1].id, event_b.id);
+    assert_eq!(chain[2].id, event_c.id);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_trace_causation_chain_not_found() {
+    let (_pool, event_store) = setup().await;
+
+    let chain = event_store
+        .trace_causation_chain(Uuid::new_v4())
+        .await
+        .unwrap();
+
+    assert!(chain.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_trace_causation_chain_excludes_sibling() {
+    let (_pool, event_store) = setup().await;
+
+    let correlation_id = Uuid::new_v4();
+    let stream_a = Uuid::new_v4();
+    let stream_b = Uuid::new_v4();
+    let stream_c = Uuid::new_v4();
+
+    // A → B, A → C (branching)
+    let event_a = Event::<TestEventData>::builder()
+        .stream_id(stream_a)
+        .stream_version(1)
+        .event_type("TestEvent".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "root".to_string(),
+        }))
+        .correlation_id(correlation_id)
+        .build()
+        .unwrap();
+
+    let event_b = Event::<TestEventData>::builder()
+        .stream_id(stream_b)
+        .stream_version(1)
+        .event_type("TestEvent".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "branch_b".to_string(),
+        }))
+        .correlation_id(correlation_id)
+        .causation_id(event_a.id)
+        .build()
+        .unwrap();
+
+    let event_c = Event::<TestEventData>::builder()
+        .stream_id(stream_c)
+        .stream_version(1)
+        .event_type("TestEvent".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "branch_c".to_string(),
+        }))
+        .correlation_id(correlation_id)
+        .causation_id(event_a.id)
+        .build()
+        .unwrap();
+
+    event_store.store_event(event_a.clone()).await.unwrap();
+    event_store.store_event(event_b.clone()).await.unwrap();
+    event_store.store_event(event_c.clone()).await.unwrap();
+
+    // Trace from B → should include A and B, but not C
+    let chain = event_store.trace_causation_chain(event_b.id).await.unwrap();
+
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[0].id, event_a.id);
+    assert_eq!(chain[1].id, event_b.id);
+}

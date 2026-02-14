@@ -68,6 +68,33 @@ pub trait EventStoreBackend: Send + Sync {
         }
         Ok(())
     }
+
+    /// Returns all events sharing the given correlation ID, ordered by global sequence.
+    ///
+    /// This is a cross-stream query — it searches across all event streams for events
+    /// tagged with the specified `correlation_id`. Use this to reconstruct the full
+    /// picture of everything that happened as a result of a single user action or
+    /// external trigger.
+    ///
+    /// Returns an empty `Vec` if no events match the given correlation ID.
+    async fn read_events_by_correlation_id(
+        &self,
+        correlation_id: Uuid,
+    ) -> Result<Vec<Event<Self::EventType>>, Self::Error>;
+
+    /// Returns the causal subtree for the given event.
+    ///
+    /// The subtree includes the event's ancestors (walking up via `causation_id`),
+    /// the event itself, and all descendants — excluding unrelated branches that
+    /// share the same correlation ID but are not in the direct causal path.
+    ///
+    /// Events are ordered by global sequence.
+    ///
+    /// Returns an empty `Vec` if the event is not found.
+    async fn trace_causation_chain(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Vec<Event<Self::EventType>>, Self::Error>;
 }
 
 /// A trait that defines the behavior of an event bus.

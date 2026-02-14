@@ -20,6 +20,7 @@
 #![deny(missing_docs)]
 
 pub mod aggregate;
+pub mod causation;
 pub mod event;
 pub mod event_applicator;
 pub mod event_store;
@@ -33,6 +34,7 @@ pub use subscriber_id::SubscriberId;
 /// Re-exports the most commonly used traits and types for convenience.
 pub mod prelude {
     pub use super::aggregate::*;
+    pub use super::causation::*;
     pub use super::event::*;
     pub use super::event_applicator::*;
     pub use super::event_store::*;
