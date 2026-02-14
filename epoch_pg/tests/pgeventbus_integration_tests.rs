@@ -1171,8 +1171,7 @@ async fn test_coordinated_mode_acquires_lock_on_subscribe() {
 
     // Verify lock was acquired by trying to acquire it from a completely separate connection
     // Use a new pool with max_connections=1 to ensure we get a fresh connection
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/epoch_pg".to_string());
+    let database_url = common::database_url();
     let check_pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(&database_url)
