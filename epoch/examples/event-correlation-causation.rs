@@ -66,7 +66,14 @@ pub enum AppCommand {
 #[subset_enum(OrderEvent, OrderPlaced, OrderConfirmed)]
 #[subset_enum(ShippingEvent, OrderShipped)]
 #[subset_enum(NotificationEvent, PlacementNotificationSent, ShipmentNotificationSent)]
-#[subset_enum(FulfillmentEvent, OrderPlaced, OrderShipped, OrderConfirmed, PlacementNotificationSent, ShipmentNotificationSent)]
+#[subset_enum(
+    FulfillmentEvent,
+    OrderPlaced,
+    OrderShipped,
+    OrderConfirmed,
+    PlacementNotificationSent,
+    ShipmentNotificationSent
+)]
 #[derive(Debug, Clone, Serialize, Deserialize, EventData)]
 pub enum AppEvent {
     OrderPlaced { items: Vec<String> },
@@ -328,18 +335,22 @@ impl EventApplicator<AppEvent> for NotificationAggregate {
         event: &Event<Self::EventType>,
     ) -> Result<Option<Self::State>, Self::ApplyError> {
         match event.data.as_ref().unwrap() {
-            NotificationEvent::PlacementNotificationSent { order_id } => Ok(Some(NotificationState {
-                id: event.stream_id,
-                order_id: *order_id,
-                notified: true,
-                version: 0,
-            })),
-            NotificationEvent::ShipmentNotificationSent { order_id } => Ok(Some(NotificationState {
-                id: event.stream_id,
-                order_id: *order_id,
-                notified: true,
-                version: 0,
-            })),
+            NotificationEvent::PlacementNotificationSent { order_id } => {
+                Ok(Some(NotificationState {
+                    id: event.stream_id,
+                    order_id: *order_id,
+                    notified: true,
+                    version: 0,
+                }))
+            }
+            NotificationEvent::ShipmentNotificationSent { order_id } => {
+                Ok(Some(NotificationState {
+                    id: event.stream_id,
+                    order_id: *order_id,
+                    notified: true,
+                    version: 0,
+                }))
+            }
         }
     }
 }
@@ -659,7 +670,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ========================================================================
     // Query: trace_causation_chain (from OrderShipped)
     // ========================================================================
-    let shipped_event = correlated_events.iter().find(|e| e.event_type == "OrderShipped");
+    let shipped_event = correlated_events
+        .iter()
+        .find(|e| e.event_type == "OrderShipped");
     if let Some(shipped_event) = shipped_event {
         println!();
         println!("═══════════════════════════════════════════════════════════════");
@@ -686,7 +699,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ========================================================================
     // Query: trace_causation_chain (from OrderConfirmed)
     // ========================================================================
-    let confirmed_event = correlated_events.iter().find(|e| e.event_type == "OrderConfirmed");
+    let confirmed_event = correlated_events
+        .iter()
+        .find(|e| e.event_type == "OrderConfirmed");
     if let Some(confirmed_event) = confirmed_event {
         println!();
         println!("═══════════════════════════════════════════════════════════════");
@@ -695,7 +710,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("═══════════════════════════════════════════════════════════════");
         println!();
 
-        let chain = event_store.trace_causation_chain(confirmed_event.id).await?;
+        let chain = event_store
+            .trace_causation_chain(confirmed_event.id)
+            .await?;
 
         println!("  Causal chain ({} events):", chain.len());
         println!();
