@@ -11,7 +11,14 @@ help: the trait `Projection<TestEvent>` is not implemented for `TestAggregate`
     |
 125 | struct TestAggregate {
     | ^^^^^^^^^^^^^^^^^^^^
-    = help: the trait `epoch_core::event_store::EventObserver<ED>` is implemented for `epoch_core::projection::ProjectionHandler<P>`
+help: the trait `epoch_core::event_store::EventObserver<ED>` is implemented for `epoch_core::projection::ProjectionHandler<P>`
+   --> src/projection.rs
+    |
+    | / impl<ED, P> crate::event_store::EventObserver<ED> for ProjectionHandler<P>
+    | | where
+    | |     ED: EventData + Send + Sync + 'static,
+    | |     P: Projection<ED> + Send + Sync,
+    | |____________________________________^
     = note: required for `epoch_core::projection::ProjectionHandler<TestAggregate>` to implement `epoch_core::event_store::EventObserver<TestEvent>`
 note: required by a bound in `subscribe`
    --> src/event_store.rs
