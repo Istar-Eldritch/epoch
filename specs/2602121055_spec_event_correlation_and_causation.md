@@ -1,40 +1,40 @@
 # Specification: Event Correlation and Causation Tracking
 
 **Document ID:** 2602121055  
-**Status:** Implemented  
+**Status:** ✅ Implemented  
 **Created:** 2026-02-12  
-**Updated:** 2026-02-14  
+**Completed:** 2026-02-14  
 **Author:** AI Agent  
 
 ---
 
-## 1. Problem Statement
+## Problem Statement
 
 When a user places an order and a saga coordinates inventory reservation, payment processing, and order confirmation across three aggregates, there is no way to query "show me everything that happened because of this order" or "what specifically caused this payment event." Events are isolated in their individual streams with no metadata linking them.
 
-Today, Epoch's `Event` struct has no concept of *why* an event was produced or *what other events* it's related to. The `Command` struct carries no context about what triggered it. The `EventStoreBackend` trait only supports querying by `stream_id` — there is no cross-stream query capability.
+Epoch's `Event` struct had no concept of *why* an event was produced or *what other events* it's related to. The `Command` struct carried no context about what triggered it. The `EventStoreBackend` trait only supported querying by `stream_id` — there was no cross-stream query capability.
 
-This makes debugging, auditing, and process tracing impossible at the framework level.
+This made debugging, auditing, and process tracing impossible at the framework level.
 
-## 2. Proposed Solution
+## Solution Overview
 
-Add `correlation_id` and `causation_id` metadata to both `Command` and `Event`, with automatic propagation through `Aggregate::handle()`, ergonomic helpers for sagas, and query APIs on `EventStoreBackend`.
+Added `correlation_id` and `causation_id` metadata to both `Command` and `Event`, with semi-automatic propagation through `Aggregate::handle()`, ergonomic helpers for sagas, and query APIs on `EventStoreBackend`.
 
-### 2.1 Causation Semantics
+### Causation Semantics
 
 - **`causation_id: Option<Uuid>`** — Points to the specific event that directly caused this event. For user-triggered commands, this is `None`. When a saga reacts to event A and dispatches a command that produces event B, then `B.causation_id = Some(A.id)`. Forms a parent→child chain.
 
 - **`correlation_id: Option<Uuid>`** — A shared group identifier tying together the entire causal tree rooted at the original user action. Auto-generated from the first event's `id` if not explicitly provided. All downstream events inherit the same `correlation_id`.
 
-### 2.2 Propagation Model — Semi-Automatic
+### Propagation Model
 
 - **Inside `Aggregate::handle()`**: Fully automatic. The framework stamps `correlation_id` and `causation_id` from the command onto all events produced by `handle_command()`. If no `correlation_id` is on the command, one is auto-generated from the first event's `id`.
 
-- **At the saga boundary**: Explicit via ergonomic helper. Sagas use `Command::new(...).caused_by(&event)` to thread causation context when dispatching commands. This keeps the `Saga::handle_event` signature unchanged and avoids hidden global state.
+- **At saga boundaries**: Explicit via `Command::new(...).caused_by(&event)` helper. This keeps the `Saga::handle_event` signature unchanged and avoids hidden global state.
 
-### 2.3 Query Model
+### Query Model
 
-Two new required methods on `EventStoreBackend`:
+Two new methods on `EventStoreBackend`:
 
 - **`read_events_by_correlation_id(correlation_id)`** — Returns all events sharing a correlation ID, ordered by `global_sequence`. Answers "show me everything that happened because of this user action."
 
@@ -42,15 +42,55 @@ Two new required methods on `EventStoreBackend`:
 
 Both return `Vec<Event<Self::EventType>>` (not streams), since correlation groups are bounded and small (typically 5-50 events).
 
-`trace_causation_chain` is implemented by fetching all events for the correlation group in a single query, then filtering the causal subtree in a shared Rust utility. This is faster than multiple sequential database round-trips for walking the tree.
+## Key Design Decisions
 
-## 3. Implementation
+### Semi-Automatic vs Fully Automatic Propagation
 
-### 3.1 `Event` Struct — `epoch_core/src/event.rs`
+**Decision:** Automatic inside aggregates, explicit at saga boundaries.
 
-**Status:** ✅ Implemented
+**Rationale:**
+- Aggregates produce events atomically — framework control is safe and ergonomic
+- Sagas dispatch commands asynchronously across boundaries — explicit threading prevents bugs and maintains clarity
+- The `.caused_by(&event)` helper is one line and makes causation visible in saga code
 
-Added two new fields:
+**Alternatives Considered:**
+- Thread-local storage to auto-propagate: Hidden magic, breaks with async executors
+- Change `Saga::handle_event` signature to include context: Breaking change for all sagas
+
+### Correlation ID Auto-Generation
+
+**Decision:** Auto-generate from the first event's ID if the command has none.
+
+**Rationale:**
+- Entry points may not know they should set a correlation ID
+- All events in a workflow should share one ID — using the first event's ID is deterministic and requires no coordination
+- Still allows explicit injection via `.with_correlation_id()` for distributed tracing integration
+
+### Query Implementation Strategy
+
+**Decision:** `trace_causation_chain` fetches the full correlation group once, then filters in Rust.
+
+**Rationale:**
+- Causation trees are small (5-50 events typically)
+- One SQL query + in-memory filtering is faster than multiple round-trips to walk the tree recursively
+- Easier to test and reason about than complex recursive CTEs
+
+**Alternatives Considered:**
+- PostgreSQL recursive CTE: More complex, harder to port to other backends
+- Multiple queries walking the tree: N+1 query problem
+
+### Causation Tree Utility
+
+**Decision:** Extracted `extract_causation_subtree()` as a pure function in `epoch_core/src/causation.rs`.
+
+**Rationale:**
+- Logic is identical across all backends (Pg, InMemory, future implementations)
+- Pure function is easier to unit test
+- Keeps backend implementations focused on data fetching
+
+## API Changes
+
+### Event Struct
 
 ```rust
 pub struct Event<D: EventData> {
@@ -72,100 +112,31 @@ pub struct Event<D: EventData> {
 }
 ```
 
-**`EventBuilder` updates:**
-- Added `correlation_id: Option<Uuid>` and `causation_id: Option<Uuid>` fields
-- Added `.correlation_id(id: Uuid)` and `.causation_id(id: Uuid)` builder methods
-- Updated `new()`, `build()`, `data()`, `Default`, and `From<Event<D>>`
-- Updated all subset/superset conversion methods to copy these fields
-
-### 3.2 `Command` Struct — `epoch_core/src/aggregate.rs`
-
-**Status:** ✅ Implemented
-
-Added two new fields and builder methods:
+### Command Struct
 
 ```rust
 pub struct Command<D, C> {
     // ... existing fields ...
 
-    /// The ID of the event that caused this command to be dispatched.
     pub causation_id: Option<Uuid>,
-
-    /// The correlation ID to propagate to events produced by this command.
     pub correlation_id: Option<Uuid>,
 }
-```
 
-**`Command::new()` unchanged** — new fields default to `None`.
+impl<D, C> Command<D, C> {
+    /// Sets causation context from a triggering event.
+    ///
+    /// Use this in saga `handle_event` implementations to thread causal context.
+    pub fn caused_by<ED: EventData>(self, event: &Event<ED>) -> Self;
 
-**New builder methods:**
-
-```rust
-/// Sets causation context from a triggering event.
-///
-/// Sets `causation_id = Some(event.id)` and inherits the event's `correlation_id`.
-/// Use this in saga `handle_event` implementations to thread causal context.
-pub fn caused_by<ED: EventData>(mut self, event: &Event<ED>) -> Self {
-    self.causation_id = Some(event.id);
-    self.correlation_id = event.correlation_id;
-    self
-}
-
-/// Explicitly sets a correlation ID.
-///
-/// Use this at entry points (e.g., HTTP handlers) to inject an external
-/// trace ID as the correlation ID for all downstream events.
-pub fn with_correlation_id(mut self, correlation_id: Uuid) -> Self {
-    self.correlation_id = Some(correlation_id);
-    self
+    /// Explicitly sets a correlation ID.
+    ///
+    /// Use this at entry points (e.g., HTTP handlers) to inject an external
+    /// trace ID as the correlation ID for all downstream events.
+    pub fn with_correlation_id(self, correlation_id: Uuid) -> Self;
 }
 ```
 
-**Updated conversion methods** to propagate both new fields.
-
-### 3.3 Automatic Propagation — `epoch_core/src/aggregate.rs`
-
-**Status:** ✅ Implemented
-
-Both `Aggregate::handle()` and `AggregateTransaction::handle()` now automatically:
-1. Stamp `causation_id` from the command onto all events
-2. Stamp `correlation_id` from the command if present
-3. Auto-generate `correlation_id` from the first event's `id` if the command has none
-4. Propagate the auto-generated `correlation_id` to all subsequent events in the batch
-
-### 3.4 PostgreSQL Persistence — `epoch_pg`
-
-**Status:** ✅ Implemented
-
-**Migration `m007_add_causation_columns.rs`:**
-- Added `correlation_id UUID` and `causation_id UUID` columns (nullable)
-- Created index `idx_epoch_events_correlation_id`
-- Updated NOTIFY trigger function to include new fields
-
-**`PgDBEvent` struct updates:**
-- Added `correlation_id` and `causation_id` fields with `#[sqlx(default)]`
-
-**Updated all SQL operations:**
-- INSERT statements include new columns
-- SELECT column lists include new columns
-- All Event construction sites populate new fields (6 locations across `event_store.rs` and `event_bus/mod.rs`)
-
-### 3.5 In-Memory Store Updates — `epoch_mem/src/event_store.rs`
-
-**Status:** ✅ Implemented
-
-**Added secondary index:**
-```rust
-correlation_events: HashMap<Uuid, Vec<Uuid>>
-```
-
-**Updated `store_event` and `store_events`** to maintain the correlation index.
-
-### 3.6 Query API — `epoch_core/src/event_store.rs`
-
-**Status:** ✅ Implemented
-
-Added to `EventStoreBackend` trait:
+### EventStoreBackend Trait
 
 ```rust
 /// Returns all events sharing the given correlation ID, ordered by global_sequence.
@@ -177,99 +148,44 @@ async fn read_events_by_correlation_id(
 /// Returns the causal subtree for the given event: its ancestors, the event
 /// itself, and all descendants — excluding unrelated branches that share
 /// the same correlation ID but are not in the direct causal path.
-///
-/// Events are ordered by global_sequence.
 async fn trace_causation_chain(
     &self,
     event_id: Uuid,
 ) -> Result<Vec<Event<Self::EventType>>, Self::Error>;
 ```
 
-### 3.7 Causation Tree Utility — `epoch_core/src/causation.rs`
-
-**Status:** ✅ Implemented
-
-New module with pure function:
+## Usage Example
 
 ```rust
-/// Extracts the causal subtree from a set of correlated events.
-///
-/// Given all events sharing a correlation ID and a target event ID, returns:
-/// - All ancestors (walking up via `causation_id`)
-/// - The target event itself
-/// - All descendants (events whose `causation_id` chains to the target)
-///
-/// Events are returned ordered by `global_sequence` (falling back to insertion order
-/// for events without a `global_sequence`).
-///
-/// Returns an empty `Vec` if `target_event_id` is not found among `events`.
-pub fn extract_causation_subtree<D: EventData>(
-    events: Vec<Event<D>>,
-    target_event_id: Uuid,
-) -> Vec<Event<D>>
+// Entry point: inject correlation ID for distributed tracing
+let trace_id = Uuid::new_v4();
+let cmd = Command::new(order_id, PlaceOrder { items }, None, None)
+    .with_correlation_id(trace_id);
+order_aggregate.handle(cmd).await?;
+
+// Saga: thread causation context explicitly
+async fn handle_event(&self, state: Self::State, event: &Event<Self::EventType>) 
+    -> Result<Option<Self::State>, Self::SagaError> 
+{
+    match event.data.as_ref().unwrap() {
+        OrderEvent::OrderPlaced { .. } => {
+            let cmd = Command::new(shipping_id, ShipOrder { order_id }, None, None)
+                .caused_by(event);  // ← Threads causation + correlation
+            
+            self.shipping_aggregate.handle(cmd).await?;
+            Ok(Some(SagaState::Shipped))
+        }
+    }
+}
+
+// Query all events in the workflow
+let all_events = event_store.read_events_by_correlation_id(trace_id).await?;
+
+// Query causal path through a specific event
+let causal_chain = event_store.trace_causation_chain(shipped_event_id).await?;
 ```
 
-**Algorithm:**
-1. Build `HashMap<Uuid, usize>` mapping event ID → index
-2. Build `HashMap<Uuid, Vec<usize>>` mapping causation_id → children indices
-3. Walk up from target via `causation_id` to collect ancestors
-4. Walk down from target via children map (BFS) to collect descendants
-5. Sort by `global_sequence` (or insertion order if not available)
-
-Exported in `epoch_core/src/lib.rs` prelude.
-
-### 3.8 Backend Implementations
-
-#### PostgreSQL (`epoch_pg/src/event_store.rs`)
-
-**Status:** ✅ Implemented
-
-**`read_events_by_correlation_id`:**
-```sql
-SELECT id, stream_id, stream_version, event_type, data, created_at,
-       actor_id, purger_id, purged_at, global_sequence,
-       correlation_id, causation_id
-FROM epoch_events
-WHERE correlation_id = $1
-ORDER BY global_sequence ASC
-```
-
-**`trace_causation_chain`:**
-1. SELECT event by ID to get starting event
-2. If not found or `correlation_id` is None, return just that event
-3. Call `read_events_by_correlation_id(correlation_id)`
-4. Apply `extract_causation_subtree(events, event_id)`
-
-#### In-Memory (`epoch_mem/src/event_store.rs`)
-
-**Status:** ✅ Implemented
-
-**`read_events_by_correlation_id`:**
-- Look up `correlation_events[correlation_id]` for event IDs
-- Collect events from `events` map
-- Sort by insertion order (in-memory store doesn't assign `global_sequence`)
-
-**`trace_causation_chain`:**
-- Look up event by ID from `events` map
-- If not found or `correlation_id` is None, return just that event
-- Call `read_events_by_correlation_id(correlation_id)`
-- Apply `extract_causation_subtree(events, event_id)`
-
-### 3.9 Example — `epoch/examples/event-correlation-causation.rs`
-
-**Status:** ✅ Implemented
-
-A complete demonstration of:
-
-1. **Explicit correlation ID injection** — `Command::with_correlation_id(trace_id)` at the entry point
-2. **Saga causation threading** — `Command::caused_by(&event)` in saga handlers
-3. **Event causation branching** — OrderPlaced triggers both PlacementNotificationSent and ShipOrder; OrderShipped triggers both OrderConfirmed and ShipmentNotificationSent
-4. **Query demonstration:**
-   - `read_events_by_correlation_id` showing all 5 correlated events
-   - `trace_causation_chain` from OrderShipped showing 4 events (including both branches)
-   - `trace_causation_chain` from OrderConfirmed showing 3 events (linear path, excluding sibling branch)
-
-**Scenario:**
+**Example scenario:**
 ```
 PlaceOrder command (correlation_id = trace_id)
   └─ OrderPlaced event
@@ -279,92 +195,28 @@ PlaceOrder command (correlation_id = trace_id)
             └─ NotifyShipment → ShipmentNotificationSent
 ```
 
-## 4. Backward Compatibility
+Full example: `epoch/examples/event-correlation-causation.rs`
 
-- **`Command::new()` signature unchanged** — 4 positional args, new fields default to `None`
-- **`Event` construction** — new fields are `Option<Uuid>` defaulting to `None`
-- **Existing PG databases** — nullable columns, no backfill. `NULL` means "predates tracking"
-- **`EventStoreBackend` trait** — gained two new required methods, but both implementations are in-tree
+## Database Schema
 
-## 5. Files Modified
+PostgreSQL migration `m007_add_causation_columns` added:
+- `correlation_id UUID` (nullable)
+- `causation_id UUID` (nullable)
+- Index on `correlation_id` for query performance
+- Updated NOTIFY trigger to include new fields
 
-| Crate | File | Status |
-|-------|------|--------|
-| `epoch_core` | `src/event.rs` | ✅ Implemented |
-| `epoch_core` | `src/aggregate.rs` | ✅ Implemented |
-| `epoch_core` | `src/event_store.rs` | ✅ Implemented |
-| `epoch_core` | `src/causation.rs` *(new)* | ✅ Implemented |
-| `epoch_core` | `src/lib.rs` | ✅ Implemented |
-| `epoch_pg` | `src/event_store.rs` | ✅ Implemented |
-| `epoch_pg` | `src/event_bus/mod.rs` | ✅ Implemented |
-| `epoch_pg` | `src/migrations/m007_add_causation_columns.rs` *(new)* | ✅ Implemented |
-| `epoch_pg` | `src/migrations/mod.rs` | ✅ Implemented |
-| `epoch_mem` | `src/event_store.rs` | ✅ Implemented |
-| `epoch` | `examples/event-correlation-causation.rs` *(new)* | ✅ Implemented |
-| `epoch` | `Cargo.toml` | ✅ Implemented |
+In-memory store maintains secondary index `HashMap<Uuid, Vec<Uuid>>` for correlation lookups.
 
-## 6. Testing Strategy
+## Backward Compatibility
 
-**Unit tests:**
-- ✅ `Event` field propagation through all conversion methods
-- ✅ `Command::caused_by()` and `.with_correlation_id()` behavior
-- ✅ `extract_causation_subtree` with various scenarios
-- ✅ Auto-generation of `correlation_id` when command has none
+- `Command::new()` signature unchanged — new fields default to `None`
+- `Event` fields are `Option<Uuid>`, no migration required
+- Existing events have `correlation_id = NULL`, meaning "predates tracking"
+- New trait methods are required but all implementations are in-tree
 
-**Integration tests:**
-- ✅ Full saga workflow with causation tracking
-- ✅ `read_events_by_correlation_id` returns complete correlated group
-- ✅ `trace_causation_chain` excludes unrelated branches
-- ✅ Events with `None` causation fields handled gracefully
+## Future Enhancements
 
-**Example/Demo:**
-- ✅ `event-correlation-causation.rs` demonstrates end-to-end workflow with query APIs
-
-## 7. Usage Examples
-
-### Entry Point (HTTP Handler)
-
-```rust
-let trace_id = Uuid::new_v4();
-let cmd = Command::new(order_id, PlaceOrder { items }, None, None)
-    .with_correlation_id(trace_id);
-order_aggregate.handle(cmd).await?;
-```
-
-### Saga Handler
-
-```rust
-async fn handle_event(&self, state: Self::State, event: &Event<Self::EventType>) 
-    -> Result<Option<Self::State>, Self::SagaError> 
-{
-    match event.data.as_ref().unwrap() {
-        OrderEvent::OrderPlaced { .. } => {
-            let cmd = Command::new(shipping_id, ShipOrder { order_id }, None, None)
-                .caused_by(event);  // ← Threads causation context
-            
-            self.shipping_aggregate.handle(cmd).await?;
-            Ok(Some(SagaState::Shipped))
-        }
-    }
-}
-```
-
-### Query Examples
-
-```rust
-// Get all events in the workflow
-let all_events = event_store
-    .read_events_by_correlation_id(trace_id)
-    .await?;
-
-// Get causal path through a specific event
-let causal_chain = event_store
-    .trace_causation_chain(shipped_event_id)
-    .await?;
-```
-
-## 8. References
-
-- Original query API spec: `specs/event-correlation-query-apis.md` (now merged into this document)
-- Example implementation: `epoch/examples/event-correlation-causation.rs`
-- Migration: `epoch_pg/src/migrations/m007_add_causation_columns.rs`
+- **Causation visualization tools** — Generate graphs from causation chains
+- **Correlation metadata** — Allow attaching key-value pairs to correlation IDs for tagging entire workflows
+- **Cross-system correlation** — Standardize on W3C Trace Context format for distributed tracing integration
+- **Performance monitoring** — Detect anomalously large correlation groups (potential infinite loops)
