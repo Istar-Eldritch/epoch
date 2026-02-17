@@ -201,14 +201,21 @@ where
 
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
-            let data: Option<D> = row
+            let data: Option<D> = match row
                 .data
                 .map(|d| serde_json::from_value(d))
                 .transpose()
-                .map_err(|e| {
-                    error!("Failed to deserialize event data: {}", e);
-                    SqlxError::Decode(Box::new(e))
-                })?;
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        "Skipping event {} (type: '{}', global_seq: {:?}): failed to deserialize: {}. \
+                         This is expected when event variants have been removed from the application enum.",
+                        row.id, row.event_type, row.global_sequence, e
+                    );
+                    continue;
+                }
+            };
 
             events.push(Event {
                 id: row.id,
@@ -459,10 +466,53 @@ where
                             match db_event.data.map(|d| serde_json::from_value(d)).transpose() {
                                 Ok(data) => data,
                                 Err(e) => {
-                                    error!(
-                                        "Failed to deserialize event data from payload '{}': {}",
-                                        payload, e
+                                    warn!(
+                                        "Skipping event {} (type: '{}'): failed to deserialize event data: {}. \
+                                         This is expected when event variants have been removed from the application enum. \
+                                         Advancing checkpoints past this event.",
+                                        db_event.id, db_event.event_type, e
                                     );
+                                    // Advance checkpoints for all projections so they don't get stuck
+                                    // on this undeserializable event after restart.
+                                    let event_global_seq = db_event.global_sequence.unwrap_or(0) as u64;
+                                    let mut projections_guard = projections.lock().await;
+                                    for projection in projections_guard.iter_mut() {
+                                        let projection_guard = projection.lock().await;
+                                        let subscriber_id = projection_guard.subscriber_id().to_string();
+                                        drop(projection_guard);
+
+                                        checkpoint_cache.insert(subscriber_id.clone(), event_global_seq);
+                                        match pending_checkpoints.get_mut(&subscriber_id) {
+                                            Some(pending) => {
+                                                pending.update(event_global_seq, db_event.id);
+                                            }
+                                            None => {
+                                                pending_checkpoints.insert(
+                                                    subscriber_id.clone(),
+                                                    PendingCheckpoint::new(event_global_seq, db_event.id),
+                                                );
+                                            }
+                                        }
+                                        if let Some(pending) = pending_checkpoints.get(&subscriber_id)
+                                            && should_flush_checkpoint(pending, &config.checkpoint_mode)
+                                        {
+                                            let pending = pending_checkpoints.remove(&subscriber_id).unwrap();
+                                            if let Err(e) = flush_checkpoint(
+                                                &checkpoint_pool,
+                                                &subscriber_id,
+                                                &pending,
+                                                &mut checkpoint_cache,
+                                            )
+                                            .await
+                                            {
+                                                error!(
+                                                    "Failed to flush checkpoint for '{}': {}",
+                                                    subscriber_id, e
+                                                );
+                                                pending_checkpoints.insert(subscriber_id.clone(), pending);
+                                            }
+                                        }
+                                    }
                                     continue; // Skip to next notification
                                 }
                             };
@@ -1220,20 +1270,50 @@ where
                 }
 
                 for row in rows {
+                    let event_global_seq = row.global_sequence.unwrap_or(0) as u64;
+                    let event_id = row.id;
+
                     let data: Option<Self::EventType> =
                         match row.data.map(|d| serde_json::from_value(d)).transpose() {
                             Ok(d) => d,
                             Err(e) => {
-                                error!(
-                                    "Catch-up: failed to deserialize event {} for '{}': {}",
-                                    row.id, subscriber_id, e
+                                warn!(
+                                    "Catch-up: skipping event {} (type: '{}', global_seq: {}) for '{}': \
+                                     failed to deserialize: {}. This is expected when event variants have \
+                                     been removed from the application enum. Advancing checkpoint past this event.",
+                                    event_id, row.event_type, event_global_seq, subscriber_id, e
                                 );
+                                // Advance current_sequence and checkpoint past the
+                                // undeserializable event to avoid an infinite retry loop.
+                                current_sequence = event_global_seq;
+                                total_caught_up += 1;
+                                match &mut pending_checkpoint {
+                                    Some(pending) => {
+                                        pending.update(event_global_seq, event_id);
+                                    }
+                                    None => {
+                                        pending_checkpoint =
+                                            Some(PendingCheckpoint::new(event_global_seq, event_id));
+                                    }
+                                }
+                                if let Some(ref pending) = pending_checkpoint
+                                    && should_flush_checkpoint(pending, &config.checkpoint_mode)
+                                {
+                                    let pending = pending_checkpoint.take().unwrap();
+                                    if let Err(flush_err) =
+                                        flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache)
+                                            .await
+                                    {
+                                        error!(
+                                            "Catch-up: failed to flush checkpoint for '{}': {}",
+                                            subscriber_id, flush_err
+                                        );
+                                        pending_checkpoint = Some(pending);
+                                    }
+                                }
                                 continue;
                             }
                         };
-
-                    let event_global_seq = row.global_sequence.unwrap_or(0) as u64;
-                    let event_id = row.id;
 
                     let event = Arc::new(Event {
                         id: row.id,
