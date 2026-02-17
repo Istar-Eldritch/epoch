@@ -12,7 +12,7 @@ pub fn subset_enum(
 
 #[proc_macro_derive(EventData)]
 pub fn event_data(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    event_data::event_data_enum_impl(item)
+    event_data::event_data_enum_impl(item.into()).into()
 }
 
 /// Derive macro for generating projection subscriber IDs.
