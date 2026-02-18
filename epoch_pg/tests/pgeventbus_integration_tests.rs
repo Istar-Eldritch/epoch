@@ -2084,3 +2084,144 @@ async fn test_out_of_order_notify_both_events_processed() {
         "Event B (higher sequence, early commit) must be processed"
     );
 }
+
+/// Test that a rolled-back transaction creating a permanent gap in global_sequence
+/// is resolved by the periodic timer after gap_timeout expires.
+///
+/// Scenario:
+///   1. Event at seq N commits normally
+///   2. A transaction obtains seq N+1 via nextval() but rolls back (permanent gap)
+///   3. Event at seq N+2 commits normally
+///   4. The periodic timer detects the gap has timed out and advances past it
+///   5. Both events N and N+2 are processed
+#[tokio::test]
+#[serial]
+async fn test_rolled_back_transaction_gap_resolved() {
+    let (pool, _event_bus, _event_store) = setup().await;
+
+    // Create event bus with short gap_timeout for testing
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: std::time::Duration::from_secs(1),
+        ..Default::default()
+    };
+    let channel_name = format!("test_gap_resolve_{}", Uuid::new_v4().simple());
+    let event_bus = epoch_pg::event_bus::PgEventBus::<TestEventData>::with_config(
+        pool.clone(),
+        channel_name,
+        config,
+    );
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup event bus trigger");
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    let projection = TestProjection::new();
+    let projection_events = projection.get_state_store().clone();
+
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe projection");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let stream_id = Uuid::new_v4();
+
+    // Event 1: normal commit (seq N)
+    let event1_id = Uuid::new_v4();
+    let event1_data = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: "event_1".to_string(),
+    }))
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at)
+           VALUES ($1, $2, 1, 'MyEvent', $3, NOW())"#,
+    )
+    .bind(event1_id)
+    .bind(stream_id)
+    .bind(&event1_data)
+    .execute(&pool)
+    .await
+    .expect("insert event 1");
+
+    // Small delay to let event 1 process
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Rolled-back transaction: obtains seq N+1 but never commits
+    {
+        let mut tx = pool.begin().await.expect("begin rollback tx");
+        sqlx::query(
+            r#"INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at)
+               VALUES ($1, $2, 2, 'MyEvent', $3, NOW())"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(stream_id)
+        .bind(&event1_data)
+        .execute(&mut *tx)
+        .await
+        .expect("insert rollback event");
+        tx.rollback().await.expect("rollback");
+    }
+
+    // Event 3: normal commit (seq N+2, with gap at N+1)
+    let event3_id = Uuid::new_v4();
+    let event3_data = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: "event_3".to_string(),
+    }))
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at)
+           VALUES ($1, $2, 3, 'MyEvent', $3, NOW())"#,
+    )
+    .bind(event3_id)
+    .bind(stream_id)
+    .bind(&event3_data)
+    .execute(&pool)
+    .await
+    .expect("insert event 3");
+
+    // Wait for gap_timeout (1s) + periodic tick (1s) + processing buffer
+    tokio::time::sleep(tokio::time::Duration::from_millis(3500)).await;
+
+    let events_received = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("Should have received events");
+
+    let received_ids: Vec<Uuid> = events_received.0.iter().map(|e| e.id).collect();
+
+    assert!(
+        received_ids.contains(&event1_id),
+        "Event 1 (before gap) must be processed"
+    );
+    assert!(
+        received_ids.contains(&event3_id),
+        "Event 3 (after gap) must be processed after gap timeout. Received: {:?}",
+        received_ids
+    );
+
+    // Verify checkpoint advanced past the gap
+    let checkpoint: Option<(i64,)> = sqlx::query_as(
+        "SELECT last_global_sequence FROM epoch_event_bus_checkpoints WHERE subscriber_id = $1",
+    )
+    .bind("TestProjection")
+    .fetch_optional(&pool)
+    .await
+    .expect("query checkpoint");
+
+    if let Some((seq,)) = checkpoint {
+        assert!(
+            seq as u64 >= 2,
+            "Checkpoint should have advanced past the gap, got: {}",
+            seq
+        );
+    }
+
+    event_bus.shutdown().await.expect("shutdown");
+}
