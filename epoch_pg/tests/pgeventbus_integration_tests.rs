@@ -2225,3 +2225,483 @@ async fn test_rolled_back_transaction_gap_resolved() {
 
     event_bus.shutdown().await.expect("shutdown");
 }
+
+#[tokio::test]
+#[serial]
+async fn test_burst_concurrent_events_all_processed() {
+    let (_pool, event_bus, event_store) = setup().await;
+
+    let projection = TestProjection::new();
+    let projection_events = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe projection");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let stream_id = Uuid::new_v4();
+    let event_store = Arc::new(event_store);
+    let mut handles = Vec::new();
+
+    for i in 1..=50u64 {
+        let es = event_store.clone();
+        let sid = stream_id;
+        handles.push(tokio::spawn(async move {
+            let event = new_event(sid, i, &format!("burst_event_{}", i));
+            es.store_event(event).await.expect("Failed to store event");
+        }));
+    }
+
+    for h in handles {
+        h.await.expect("task panicked");
+    }
+
+    // Allow time for all events to be processed (periodic tick + gap resolution)
+    tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
+
+    let events_received = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("Should have received events");
+
+    assert_eq!(
+        events_received.0.len(),
+        50,
+        "All 50 burst events must be processed. Got: {}",
+        events_received.0.len()
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_multiple_subscribers_out_of_order() {
+    let (pool, event_bus, _event_store) = setup().await;
+
+    let projection1 = TestProjection::new();
+    let projection_events1 = projection1.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection1))
+        .await
+        .expect("Failed to subscribe projection 1");
+
+    let projection2 = TestProjection::new();
+    let projection_events2 = projection2.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection2))
+        .await
+        .expect("Failed to subscribe projection 2");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let stream_id = Uuid::new_v4();
+    let event_a_id = Uuid::new_v4();
+    let event_b_id = Uuid::new_v4();
+
+    let event_data_a = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: "ooo_a".to_string(),
+    }))
+    .unwrap();
+    let event_data_b = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: "ooo_b".to_string(),
+    }))
+    .unwrap();
+
+    // Task A: lower seq, late commit
+    let pool_a = pool.clone();
+    let task_a = {
+        let data = event_data_a.clone();
+        tokio::spawn(async move {
+            let mut tx = pool_a.begin().await.expect("tx A begin");
+            sqlx::query(
+                r#"INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at)
+                 VALUES ($1, $2, $3, $4, $5, NOW())"#,
+            )
+            .bind(event_a_id)
+            .bind(stream_id)
+            .bind(1i64)
+            .bind("MyEvent")
+            .bind(data)
+            .execute(&mut *tx)
+            .await
+            .expect("tx A insert");
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            tx.commit().await.expect("tx A commit");
+        })
+    };
+
+    // Task B: higher seq, early commit
+    let pool_b = pool.clone();
+    let task_b = {
+        let data = event_data_b.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            let mut tx = pool_b.begin().await.expect("tx B begin");
+            sqlx::query(
+                r#"INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at)
+                 VALUES ($1, $2, $3, $4, $5, NOW())"#,
+            )
+            .bind(event_b_id)
+            .bind(stream_id)
+            .bind(2i64)
+            .bind("MyEvent")
+            .bind(data)
+            .execute(&mut *tx)
+            .await
+            .expect("tx B insert");
+            tx.commit().await.expect("tx B commit");
+        })
+    };
+
+    task_a.await.expect("task A panicked");
+    task_b.await.expect("task B panicked");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    for (label, store) in [
+        ("projection1", &projection_events1),
+        ("projection2", &projection_events2),
+    ] {
+        let events = store
+            .get_state(stream_id)
+            .await
+            .unwrap()
+            .expect(&format!("{} should have received events", label));
+        let ids: Vec<Uuid> = events.0.iter().map(|e| e.id).collect();
+        assert_eq!(
+            events.0.len(),
+            2,
+            "{} should have 2 events, got {:?}",
+            label,
+            ids
+        );
+        assert!(ids.contains(&event_a_id), "{} missing event A", label);
+        assert!(ids.contains(&event_b_id), "{} missing event B", label);
+    }
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_catchup_plus_realtime_handoff_no_loss() {
+    let (_pool, event_bus, event_store) = setup().await;
+
+    let stream_id = Uuid::new_v4();
+
+    // Store 10 events before subscribing (catch-up path)
+    for i in 1..=10 {
+        let event = new_event(stream_id, i, &format!("pre_event_{}", i));
+        event_store
+            .store_event(event)
+            .await
+            .expect("Failed to store event");
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let projection = TestProjection::new();
+    let projection_events = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+
+    // Wait for catch-up to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // Store 10 more events (real-time path)
+    for i in 11..=20 {
+        let event = new_event(stream_id, i, &format!("post_event_{}", i));
+        event_store
+            .store_event(event)
+            .await
+            .expect("Failed to store event");
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let events_received = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("Should have received events");
+
+    assert_eq!(
+        events_received.0.len(),
+        20,
+        "All 20 events (10 catch-up + 10 real-time) must be received. Got: {}",
+        events_received.0.len()
+    );
+
+    // Verify no duplicates
+    let ids: std::collections::HashSet<Uuid> = events_received.0.iter().map(|e| e.id).collect();
+    assert_eq!(ids.len(), 20, "No duplicate events should be present");
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_batched_checkpoint_with_gap_tracking() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let pool = common::get_pg_pool().await;
+
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        checkpoint_mode: epoch_pg::event_bus::CheckpointMode::Batched {
+            batch_size: 3,
+            max_delay_ms: 500,
+        },
+        gap_timeout: std::time::Duration::from_secs(1),
+        ..Default::default()
+    };
+
+    let channel_name = format!("test_batched_gap_{}", Uuid::new_v4().simple());
+    let event_bus = epoch_pg::event_bus::PgEventBus::<TestEventData>::with_config(
+        pool.clone(),
+        channel_name,
+        config,
+    );
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    let projection = TestProjection::new();
+    let subscriber_id = projection.subscriber_id().to_string();
+    let projection_events = projection.get_state_store().clone();
+
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let stream_id = Uuid::new_v4();
+
+    // Store 5 events normally
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+    for i in 1..=5 {
+        let event = new_event(stream_id, i, &format!("batched_gap_event_{}", i));
+        event_store
+            .store_event(event)
+            .await
+            .expect("Failed to store event");
+    }
+
+    // Wait for batched flush (batch_size=3 triggers at event 3, then max_delay at 500ms for rest)
+    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("Failed to get checkpoint");
+
+    assert!(
+        checkpoint.is_some(),
+        "Checkpoint should be written in batched mode with gap tracking"
+    );
+
+    let events_received = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("Should have received events");
+
+    assert_eq!(
+        events_received.0.len(),
+        5,
+        "All 5 events should be processed"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_undeserializable_event_advances_past() {
+    let (pool, event_bus, _event_store) = setup().await;
+
+    let projection = TestProjection::new();
+    let subscriber_id = projection.subscriber_id().to_string();
+    let projection_events = projection.get_state_store().clone();
+
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let stream_id = Uuid::new_v4();
+
+    // Valid event 1
+    let valid1_id = Uuid::new_v4();
+    let valid_data = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: "valid_1".to_string(),
+    }))
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at)
+         VALUES ($1, $2, 1, 'MyEvent', $3, NOW())",
+    )
+    .bind(valid1_id)
+    .bind(stream_id)
+    .bind(&valid_data)
+    .execute(&pool)
+    .await
+    .expect("insert valid 1");
+
+    // Malformed event
+    let malformed_id = Uuid::new_v4();
+    let malformed_data = serde_json::json!({"garbage": true});
+    sqlx::query(
+        "INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at)
+         VALUES ($1, $2, 2, 'MyEvent', $3, NOW())",
+    )
+    .bind(malformed_id)
+    .bind(stream_id)
+    .bind(&malformed_data)
+    .execute(&pool)
+    .await
+    .expect("insert malformed");
+
+    // Valid event 3
+    let valid3_id = Uuid::new_v4();
+    let valid3_data = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: "valid_3".to_string(),
+    }))
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at)
+         VALUES ($1, $2, 3, 'MyEvent', $3, NOW())",
+    )
+    .bind(valid3_id)
+    .bind(stream_id)
+    .bind(&valid3_data)
+    .execute(&pool)
+    .await
+    .expect("insert valid 3");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let events_received = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("Should have received events");
+
+    assert_eq!(
+        events_received.0.len(),
+        2,
+        "Only valid events should be received"
+    );
+    let ids: Vec<Uuid> = events_received.0.iter().map(|e| e.id).collect();
+    assert!(ids.contains(&valid1_id), "Valid event 1 should be received");
+    assert!(ids.contains(&valid3_id), "Valid event 3 should be received");
+    assert!(
+        !ids.contains(&malformed_id),
+        "Malformed event should NOT be received"
+    );
+
+    // Verify checkpoint advanced past the malformed event
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("Failed to get checkpoint");
+    assert!(
+        checkpoint.is_some(),
+        "Checkpoint should have advanced past malformed event"
+    );
+
+    // Clean up malformed event
+    sqlx::query("DELETE FROM epoch_events WHERE id = $1")
+        .bind(malformed_id)
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_graceful_shutdown_flushes_subscriber_states() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let pool = common::get_pg_pool().await;
+
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        checkpoint_mode: epoch_pg::event_bus::CheckpointMode::Batched {
+            batch_size: 1000,    // Won't auto-flush
+            max_delay_ms: 60000, // Won't trigger
+        },
+        ..Default::default()
+    };
+
+    let channel_name = format!("test_shutdown_states_{}", Uuid::new_v4().simple());
+    let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    let projection = TestProjection::new();
+    let subscriber_id = projection.subscriber_id().to_string();
+
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Store 3 events
+    let stream_id = Uuid::new_v4();
+    for i in 1..=3 {
+        let event = new_event(stream_id, i, &format!("shutdown_event_{}", i));
+        event_store
+            .store_event(event)
+            .await
+            .expect("Failed to store event");
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // Shutdown should flush
+    event_bus.shutdown().await.expect("Failed to shutdown");
+
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("Failed to get checkpoint");
+
+    assert!(
+        checkpoint.is_some(),
+        "Checkpoint should be flushed on graceful shutdown with subscriber states"
+    );
+}
