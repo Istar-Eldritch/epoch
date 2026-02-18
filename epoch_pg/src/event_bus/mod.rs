@@ -572,6 +572,12 @@ where
                                     .filter_map(|r| r.global_sequence.map(|gs| (gs as u64, r.id)))
                                     .collect();
 
+                                // Track whether any new events were processed in this
+                                // iteration. If all events were already in processed_ahead
+                                // (e.g., a gap is blocking checkpoint advancement but the
+                                // batch is full), we break to avoid an infinite hot loop
+                                // hammering the DB while waiting for gap_timeout to expire.
+                                let mut processed_any = false;
                                 for row in rows {
                                     let event_seq = row.global_sequence.unwrap_or(0) as u64;
                                     let event_id = row.id;
@@ -612,6 +618,20 @@ where
                                                 subscriber_states.get_mut(&subscriber_id).unwrap();
                                             state.processed_ahead.insert(event_seq);
                                             last_event_ids.insert(subscriber_id.clone(), event_id);
+                                            // Count skipped event toward batched checkpoint
+                                            // threshold so batch_size triggers correctly.
+                                            match pending_checkpoints.get_mut(&subscriber_id) {
+                                                Some(pending) => {
+                                                    pending.update(event_seq, event_id);
+                                                }
+                                                None => {
+                                                    pending_checkpoints.insert(
+                                                        subscriber_id.clone(),
+                                                        PendingCheckpoint::new(event_seq, event_id),
+                                                    );
+                                                }
+                                            }
+                                            processed_any = true;
                                             continue;
                                         }
                                     };
@@ -656,6 +676,22 @@ where
                                         state.processed_ahead.insert(event_seq);
                                     }
                                     last_event_ids.insert(subscriber_id.clone(), event_id);
+                                    // Count each newly-processed event toward the batched
+                                    // checkpoint threshold so batch_size triggers correctly.
+                                    // global_sequence is set to a safe contiguous position
+                                    // below after advance_contiguous_checkpoint runs.
+                                    match pending_checkpoints.get_mut(&subscriber_id) {
+                                        Some(pending) => {
+                                            pending.update(event_seq, event_id);
+                                        }
+                                        None => {
+                                            pending_checkpoints.insert(
+                                                subscriber_id.clone(),
+                                                PendingCheckpoint::new(event_seq, event_id),
+                                            );
+                                        }
+                                    }
+                                    processed_any = true;
                                 }
 
                                 // Advance the contiguous checkpoint as far as possible.
@@ -675,9 +711,11 @@ where
                                     .unwrap()
                                     .contiguous_checkpoint;
 
-                                // Only update the pending checkpoint when it actually advanced.
-                                // If there's a gap and the checkpoint hasn't moved, we must not
-                                // persist a checkpoint that would skip unprocessed events.
+                                // Only flush the pending checkpoint when it actually advanced to
+                                // a contiguous position. If there's a gap blocking advancement,
+                                // we must not persist a checkpoint that would skip unprocessed
+                                // events. Note: events_since_checkpoint is tracked per-event
+                                // in the for loop above for accurate batch_size triggering.
                                 if new_contiguous > contiguous_before {
                                     // Associate the event_id at the new checkpoint position.
                                     // Falls back to the last known event_id when the checkpoint
@@ -691,19 +729,32 @@ where
                                     last_event_ids
                                         .insert(subscriber_id.clone(), checkpoint_event_id);
 
-                                    match pending_checkpoints.get_mut(&subscriber_id) {
-                                        Some(pending) => {
-                                            pending.update(new_contiguous, checkpoint_event_id);
-                                        }
-                                        None => {
-                                            pending_checkpoints.insert(
-                                                subscriber_id.clone(),
-                                                PendingCheckpoint::new(
-                                                    new_contiguous,
-                                                    checkpoint_event_id,
-                                                ),
-                                            );
-                                        }
+                                    // Keep checkpoint_cache in sync with contiguous_checkpoint.
+                                    // This mirrors the authoritative subscriber_states value so
+                                    // future reads of checkpoint_cache are never stale.
+                                    checkpoint_cache.insert(subscriber_id.clone(), new_contiguous);
+
+                                    // Override global_sequence and event_id to the safe
+                                    // contiguous position. events_since_checkpoint was already
+                                    // incremented per-event in the for loop, so we must NOT
+                                    // call update() here (that would double-count).
+                                    if let Some(pending) =
+                                        pending_checkpoints.get_mut(&subscriber_id)
+                                    {
+                                        pending.global_sequence = new_contiguous;
+                                        pending.event_id = checkpoint_event_id;
+                                    } else {
+                                        // No events were processed in this iteration (all
+                                        // already in processed_ahead, e.g., gap timed out and
+                                        // checkpoint advanced through them). Create an entry so
+                                        // the flush check below can run.
+                                        pending_checkpoints.insert(
+                                            subscriber_id.clone(),
+                                            PendingCheckpoint::new(
+                                                new_contiguous,
+                                                checkpoint_event_id,
+                                            ),
+                                        );
                                     }
 
                                     if let Some(pending) = pending_checkpoints.get(&subscriber_id)
@@ -729,7 +780,13 @@ where
                                     }
                                 }
 
-                                if !batch_was_full {
+                                // Break if the batch wasn't full (caught up to the DB) OR if
+                                // no new events were processed this iteration. The latter
+                                // guards against an infinite hot loop: when a gap blocks
+                                // checkpoint advancement but the batch was full (events above
+                                // the gap already in processed_ahead), looping would just
+                                // re-query the same rows and skip them all again.
+                                if !batch_was_full || !processed_any {
                                     break;
                                 }
                             }
