@@ -23,7 +23,6 @@ use tokio::time::Instant;
 /// - `gap_first_seen`: Same size as the number of active gaps. Entries are removed when gaps
 ///   fill or time out.
 #[derive(Debug)]
-#[allow(dead_code)] // Used in a future phase when wired into the listener loop
 pub(crate) struct SubscriberState {
     /// The highest contiguous global_sequence that has been processed.
     /// All events with sequence <= this value have been processed or confirmed missing.
@@ -47,7 +46,6 @@ impl SubscriberState {
     ///
     /// * `checkpoint` - The last persisted contiguous global_sequence for this subscriber.
     ///   Pass `0` if no checkpoint exists yet.
-    #[allow(dead_code)] // Used in a future phase when wired into the listener loop
     pub fn new(checkpoint: u64) -> Self {
         Self {
             contiguous_checkpoint: checkpoint,
@@ -75,7 +73,6 @@ impl SubscriberState {
 /// * `visible_seqs` - The set of global_sequence numbers returned by the DB query.
 ///   These are committed, visible events ordered by sequence.
 /// * `gap_timeout` - How long to wait before assuming a gap is from a rolled-back transaction.
-#[allow(dead_code)] // Used in a future phase when wired into the listener loop
 pub(crate) fn advance_contiguous_checkpoint(
     state: &mut SubscriberState,
     visible_seqs: &BTreeSet<u64>,

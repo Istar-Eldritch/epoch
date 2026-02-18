@@ -1924,3 +1924,163 @@ async fn test_catch_up_buffer_size_config() {
         "Custom catch_up_buffer_size should be respected"
     );
 }
+
+// ============================================================================
+// Phase 3: Out-of-Order NOTIFY Regression Test
+// ============================================================================
+
+/// Reproduces the out-of-order NOTIFY delivery bug described in spec 0012.
+///
+/// PostgreSQL's `nextval()` is non-transactional: two concurrent transactions
+/// can obtain adjacent sequence numbers but commit in reverse order. This causes
+/// NOTIFY messages to arrive out-of-order relative to `global_sequence`.
+///
+/// The old payload-based listener would process event N+1 first and set the
+/// checkpoint to N+1, then skip event N when its NOTIFY arrived (N ≤ checkpoint).
+///
+/// The new DB-query-driven listener fetches committed events in sequence order
+/// on each NOTIFY, uses gap tracking to wait for N to become visible, and
+/// processes both events correctly.
+#[tokio::test]
+#[serial]
+async fn test_out_of_order_notify_both_events_processed() {
+    let (pool, event_bus, _event_store) = setup().await;
+
+    let projection = TestProjection::new();
+    let projection_events = projection.get_state_store().clone();
+
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe projection");
+
+    // Give the subscription time to become active (catch-up and buffer setup)
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let stream_id = Uuid::new_v4();
+    let event_a_id = Uuid::new_v4();
+    let event_b_id = Uuid::new_v4();
+
+    // Prepare serialized event data in the format the event bus expects.
+    let event_a_data = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: "event_a".to_string(),
+    }))
+    .unwrap();
+    let event_b_data = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: "event_b".to_string(),
+    }))
+    .unwrap();
+
+    // Task A: insert event A (obtains a lower global_sequence via nextval()),
+    // then deliberately delays its COMMIT so that event B commits first.
+    //
+    // Timeline:
+    //   t=0ms   : Task A begins tx, executes INSERT (nextval → seq N)
+    //   t=50ms  : Task B begins tx, executes INSERT (nextval → seq N+1), COMMITs
+    //             → NOTIFY for seq N+1 fires; event N not yet committed
+    //   t=200ms : Task A COMMITs
+    //             → NOTIFY for seq N fires; both N and N+1 now visible in DB
+    //
+    // Old behaviour (bug): listener receives NOTIFY N+1, processes from payload,
+    //   sets checkpoint=N+1. On NOTIFY N, sees N ≤ checkpoint → skips event N.
+    //
+    // New behaviour (fix): listener receives NOTIFY N+1, queries DB (only N+1
+    //   visible), processes N+1, detects gap at N. On NOTIFY N, queries DB
+    //   (both visible), processes N, advances checkpoint past both.
+    let pool_a = pool.clone();
+    let task_a = {
+        let event_a_id = event_a_id;
+        let stream_id = stream_id;
+        let event_a_data = event_a_data.clone();
+        tokio::spawn(async move {
+            let mut tx = pool_a.begin().await.expect("tx A: begin");
+            sqlx::query(
+                r#"
+                INSERT INTO epoch_events
+                    (id, stream_id, stream_version, event_type, data, created_at)
+                VALUES ($1, $2, $3, $4, $5, NOW())
+                "#,
+            )
+            .bind(event_a_id)
+            .bind(stream_id)
+            .bind(1i64)
+            .bind("MyEvent")
+            .bind(event_a_data)
+            .execute(&mut *tx)
+            .await
+            .expect("tx A: insert");
+
+            // Hold the transaction open so event B commits first, producing a
+            // NOTIFY for N+1 before the NOTIFY for N.
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+            tx.commit().await.expect("tx A: commit");
+        })
+    };
+
+    // Task B: insert event B (obtains a higher global_sequence) and commit
+    // immediately, so its NOTIFY fires before Task A's NOTIFY.
+    let pool_b = pool.clone();
+    let task_b = {
+        let event_b_id = event_b_id;
+        let stream_id = stream_id;
+        let event_b_data = event_b_data.clone();
+        tokio::spawn(async move {
+            // Small delay ensures Task A's INSERT has already executed (and
+            // consumed a lower sequence number) before Task B inserts.
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            let mut tx = pool_b.begin().await.expect("tx B: begin");
+            sqlx::query(
+                r#"
+                INSERT INTO epoch_events
+                    (id, stream_id, stream_version, event_type, data, created_at)
+                VALUES ($1, $2, $3, $4, $5, NOW())
+                "#,
+            )
+            .bind(event_b_id)
+            .bind(stream_id)
+            .bind(2i64)
+            .bind("MyEvent")
+            .bind(event_b_data)
+            .execute(&mut *tx)
+            .await
+            .expect("tx B: insert");
+
+            // Commit immediately → NOTIFY for seq N+1 fires before Task A commits
+            tx.commit().await.expect("tx B: commit");
+        })
+    };
+
+    // Wait for both transactions to complete (Task A finishes last at ~200ms)
+    task_a.await.expect("Task A panicked");
+    task_b.await.expect("Task B panicked");
+
+    // Allow enough time for the listener to receive both NOTIFYs and process them.
+    // Task A commits at ~200ms, so we need well beyond that.
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let events_received = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("Should have received at least one event");
+
+    let received_ids: Vec<Uuid> = events_received.0.iter().map(|e| e.id).collect();
+
+    assert_eq!(
+        events_received.0.len(),
+        2,
+        "Both events must be processed despite out-of-order NOTIFY delivery. \
+         Received event IDs: {:?}",
+        received_ids
+    );
+    assert!(
+        received_ids.contains(&event_a_id),
+        "Event A (lower sequence, late commit) must be processed"
+    );
+    assert!(
+        received_ids.contains(&event_b_id),
+        "Event B (higher sequence, early commit) must be processed"
+    );
+}
