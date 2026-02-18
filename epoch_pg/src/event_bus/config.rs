@@ -53,6 +53,20 @@ pub struct ReliableDeliveryConfig {
     ///
     /// This would help operators tune these settings for their workloads.
     pub catch_up_buffer_size: usize,
+
+    /// Maximum time to wait for a sequence gap to fill before assuming the
+    /// transaction was rolled back.
+    ///
+    /// When a gap in `global_sequence` numbers is detected (e.g., event N+1
+    /// exists but N doesn't), the system waits up to this duration for event N
+    /// to appear. After the timeout, the gap is assumed to be from a rolled-back
+    /// transaction and the checkpoint advances past it.
+    ///
+    /// Default: 5 seconds
+    ///
+    /// Increase this value if your system has long-running transactions that
+    /// write events. Decrease for faster recovery from rolled-back transactions.
+    pub gap_timeout: Duration,
 }
 
 impl Default for ReliableDeliveryConfig {
@@ -65,6 +79,7 @@ impl Default for ReliableDeliveryConfig {
             instance_mode: InstanceMode::SingleInstance,
             catch_up_batch_size: 100,
             catch_up_buffer_size: 10_000,
+            gap_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -181,6 +196,7 @@ mod tests {
         assert_eq!(config.instance_mode, InstanceMode::SingleInstance);
         assert_eq!(config.catch_up_batch_size, 100);
         assert_eq!(config.catch_up_buffer_size, 10_000);
+        assert_eq!(config.gap_timeout, Duration::from_secs(5));
     }
 
     #[test]
@@ -193,6 +209,7 @@ mod tests {
             instance_mode: InstanceMode::Coordinated,
             catch_up_batch_size: 200,
             catch_up_buffer_size: 20_000,
+            gap_timeout: Duration::from_secs(10),
         };
 
         assert_eq!(config.max_retries, 5);
@@ -200,6 +217,7 @@ mod tests {
         assert_eq!(config.max_retry_delay, Duration::from_secs(120));
         assert_eq!(config.catch_up_batch_size, 200);
         assert_eq!(config.catch_up_buffer_size, 20_000);
+        assert_eq!(config.gap_timeout, Duration::from_secs(10));
     }
 
     #[test]
@@ -275,5 +293,27 @@ mod tests {
         let single = InstanceMode::SingleInstance;
         let coordinated = InstanceMode::Coordinated;
         assert_ne!(single, coordinated);
+    }
+
+    #[test]
+    fn gap_timeout_can_be_customized() {
+        let config = ReliableDeliveryConfig {
+            gap_timeout: Duration::from_secs(10),
+            ..Default::default()
+        };
+
+        assert_eq!(config.gap_timeout, Duration::from_secs(10));
+        // Other defaults unchanged
+        assert_eq!(config.max_retries, 3);
+    }
+
+    #[test]
+    fn gap_timeout_supports_sub_second_precision() {
+        let config = ReliableDeliveryConfig {
+            gap_timeout: Duration::from_millis(500),
+            ..Default::default()
+        };
+
+        assert_eq!(config.gap_timeout, Duration::from_millis(500));
     }
 }
