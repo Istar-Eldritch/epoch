@@ -4,10 +4,13 @@
 mod checkpoint;
 mod config;
 mod retry;
+mod subscriber_state;
 
 pub(crate) use checkpoint::*;
 pub use config::{CheckpointMode, InstanceMode, ReliableDeliveryConfig};
 pub(crate) use retry::{ProcessResult, process_event_with_retry};
+#[allow(unused_imports)] // Used in a future phase when wired into the listener loop
+pub(crate) use subscriber_state::{SubscriberState, advance_contiguous_checkpoint};
 
 #[cfg(test)]
 pub use retry::calculate_retry_delay_no_jitter;
