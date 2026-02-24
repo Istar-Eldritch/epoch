@@ -7,7 +7,7 @@ mod retry;
 mod subscriber_state;
 
 pub(crate) use checkpoint::*;
-pub use config::{CheckpointMode, InstanceMode, ReliableDeliveryConfig};
+pub use config::{CheckpointMode, DlqCallback, DlqInsertionInfo, InstanceMode, ReliableDeliveryConfig};
 pub(crate) use retry::{ProcessResult, process_event_with_retry};
 pub(crate) use subscriber_state::{SubscriberState, advance_contiguous_checkpoint};
 

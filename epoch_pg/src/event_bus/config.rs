@@ -1,11 +1,60 @@
 //! Configuration types for reliable event delivery.
 
+use async_trait::async_trait;
+use std::sync::Arc;
 use std::time::Duration;
+use uuid::Uuid;
+
+/// Information about a DLQ insertion, passed to the [`DlqCallback`].
+///
+/// Contains all context available at the point of DLQ insertion, allowing
+/// the callback to create alerts, increment metrics, or trigger recovery actions.
+#[derive(Debug, Clone)]
+pub struct DlqInsertionInfo {
+    /// The subscriber that failed to process the event.
+    pub subscriber_id: String,
+    /// The event ID that failed processing.
+    pub event_id: Uuid,
+    /// The global sequence of the failed event.
+    pub global_sequence: u64,
+    /// The error message from the final failed attempt.
+    pub error_message: String,
+    /// Total number of attempts made (including the initial attempt and all retries).
+    pub retry_count: u32,
+}
+
+/// Callback invoked when an event is sent to the Dead Letter Queue.
+///
+/// Implementations should be lightweight and avoid blocking for extended periods.
+/// Errors from the callback are logged but do **not** affect DLQ insertion — the
+/// event is always persisted to the DLQ table regardless of callback outcome.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use epoch_pg::{DlqCallback, DlqInsertionInfo};
+/// use async_trait::async_trait;
+///
+/// struct MetricsCallback;
+///
+/// #[async_trait]
+/// impl DlqCallback for MetricsCallback {
+///     async fn on_dlq_insertion(&self, info: DlqInsertionInfo) {
+///         metrics::counter!("dlq_insertions", 1,
+///             "subscriber" => info.subscriber_id.clone());
+///     }
+/// }
+/// ```
+#[async_trait]
+pub trait DlqCallback: Send + Sync {
+    /// Called after an event has been successfully inserted into the DLQ.
+    async fn on_dlq_insertion(&self, info: DlqInsertionInfo);
+}
 
 /// Configuration for reliable event delivery.
 ///
 /// This struct controls retry behavior, checkpointing strategy, and multi-instance coordination.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ReliableDeliveryConfig {
     /// Maximum number of retry attempts for failed event processing.
     /// After this many failures, the event is sent to the dead letter queue.
@@ -67,6 +116,18 @@ pub struct ReliableDeliveryConfig {
     /// Increase this value if your system has long-running transactions that
     /// write events. Decrease for faster recovery from rolled-back transactions.
     pub gap_timeout: Duration,
+
+    /// Optional callback invoked when an event is sent to the Dead Letter Queue.
+    ///
+    /// Use this to trigger alerts (e.g., Telegram, PagerDuty), increment metrics
+    /// counters, or dispatch commands to application-level aggregates.
+    ///
+    /// The callback is invoked **after** the DLQ row has been persisted to the
+    /// database. Errors from the callback are logged but do not affect DLQ
+    /// insertion or checkpoint advancement.
+    ///
+    /// Default: `None` (no callback)
+    pub on_dlq_insertion: Option<Arc<dyn DlqCallback>>,
 }
 
 impl Default for ReliableDeliveryConfig {
@@ -80,7 +141,24 @@ impl Default for ReliableDeliveryConfig {
             catch_up_batch_size: 100,
             catch_up_buffer_size: 10_000,
             gap_timeout: Duration::from_secs(5),
+            on_dlq_insertion: None,
         }
+    }
+}
+
+impl std::fmt::Debug for ReliableDeliveryConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReliableDeliveryConfig")
+            .field("max_retries", &self.max_retries)
+            .field("initial_retry_delay", &self.initial_retry_delay)
+            .field("max_retry_delay", &self.max_retry_delay)
+            .field("checkpoint_mode", &self.checkpoint_mode)
+            .field("instance_mode", &self.instance_mode)
+            .field("catch_up_batch_size", &self.catch_up_batch_size)
+            .field("catch_up_buffer_size", &self.catch_up_buffer_size)
+            .field("gap_timeout", &self.gap_timeout)
+            .field("on_dlq_insertion", &self.on_dlq_insertion.as_ref().map(|_| "Some(<callback>)"))
+            .finish()
     }
 }
 
@@ -210,6 +288,7 @@ mod tests {
             catch_up_batch_size: 200,
             catch_up_buffer_size: 20_000,
             gap_timeout: Duration::from_secs(10),
+            on_dlq_insertion: None,
         };
 
         assert_eq!(config.max_retries, 5);
@@ -218,6 +297,7 @@ mod tests {
         assert_eq!(config.catch_up_batch_size, 200);
         assert_eq!(config.catch_up_buffer_size, 20_000);
         assert_eq!(config.gap_timeout, Duration::from_secs(10));
+        assert!(config.on_dlq_insertion.is_none());
     }
 
     #[test]
@@ -315,5 +395,124 @@ mod tests {
         };
 
         assert_eq!(config.gap_timeout, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn on_dlq_insertion_defaults_to_none() {
+        let config = ReliableDeliveryConfig::default();
+        assert!(config.on_dlq_insertion.is_none());
+    }
+
+    #[test]
+    fn on_dlq_insertion_can_be_set() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct CountingCallback {
+            count: AtomicU32,
+        }
+
+        #[async_trait]
+        impl DlqCallback for CountingCallback {
+            async fn on_dlq_insertion(&self, _info: DlqInsertionInfo) {
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let callback = Arc::new(CountingCallback {
+            count: AtomicU32::new(0),
+        });
+
+        let config = ReliableDeliveryConfig {
+            on_dlq_insertion: Some(callback.clone()),
+            ..Default::default()
+        };
+
+        assert!(config.on_dlq_insertion.is_some());
+    }
+
+    #[test]
+    fn dlq_insertion_info_fields() {
+        let event_id = Uuid::new_v4();
+        let info = DlqInsertionInfo {
+            subscriber_id: "saga:test".to_string(),
+            event_id,
+            global_sequence: 42,
+            error_message: "something failed".to_string(),
+            retry_count: 4,
+        };
+
+        assert_eq!(info.subscriber_id, "saga:test");
+        assert_eq!(info.event_id, event_id);
+        assert_eq!(info.global_sequence, 42);
+        assert_eq!(info.error_message, "something failed");
+        assert_eq!(info.retry_count, 4);
+    }
+
+    #[test]
+    fn dlq_insertion_info_is_clone() {
+        let info = DlqInsertionInfo {
+            subscriber_id: "test".to_string(),
+            event_id: Uuid::new_v4(),
+            global_sequence: 1,
+            error_message: "err".to_string(),
+            retry_count: 3,
+        };
+        let cloned = info.clone();
+        assert_eq!(info.subscriber_id, cloned.subscriber_id);
+        assert_eq!(info.event_id, cloned.event_id);
+    }
+
+    #[test]
+    fn config_debug_output_shows_callback_presence() {
+        let config_without = ReliableDeliveryConfig::default();
+        let debug_str = format!("{:?}", config_without);
+        assert!(debug_str.contains("None"));
+
+        struct NoopCallback;
+        #[async_trait]
+        impl DlqCallback for NoopCallback {
+            async fn on_dlq_insertion(&self, _info: DlqInsertionInfo) {}
+        }
+
+        let config_with = ReliableDeliveryConfig {
+            on_dlq_insertion: Some(Arc::new(NoopCallback)),
+            ..Default::default()
+        };
+        let debug_str = format!("{:?}", config_with);
+        assert!(debug_str.contains("<callback>"));
+    }
+
+    #[tokio::test]
+    async fn dlq_callback_can_be_invoked() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct CountingCallback {
+            count: AtomicU32,
+        }
+
+        #[async_trait]
+        impl DlqCallback for CountingCallback {
+            async fn on_dlq_insertion(&self, info: DlqInsertionInfo) {
+                assert_eq!(info.subscriber_id, "saga:test");
+                assert_eq!(info.retry_count, 4);
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let callback = Arc::new(CountingCallback {
+            count: AtomicU32::new(0),
+        });
+
+        callback
+            .on_dlq_insertion(DlqInsertionInfo {
+                subscriber_id: "saga:test".to_string(),
+                event_id: Uuid::new_v4(),
+                global_sequence: 10,
+                error_message: "test error".to_string(),
+                retry_count: 4,
+            })
+            .await;
+
+        assert_eq!(callback.count.load(Ordering::Relaxed), 1);
     }
 }

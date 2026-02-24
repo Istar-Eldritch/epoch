@@ -156,6 +156,7 @@ where
 
     // All retries exhausted - insert into DLQ
     let error_message = last_error.unwrap_or_else(|| "Unknown error".to_string());
+    let retry_count = config.max_retries + 1;
     if let Err(e) = sqlx::query(
         r#"
         INSERT INTO epoch_event_bus_dlq (subscriber_id, event_id, global_sequence, error_message, retry_count, last_retry_at)
@@ -170,7 +171,7 @@ where
     .bind(event_id)
     .bind(event_global_seq as i64)
     .bind(&error_message)
-    .bind((config.max_retries + 1) as i32)
+    .bind(retry_count as i32)
     .execute(dlq_pool)
     .await
     {
@@ -181,10 +182,20 @@ where
     } else {
         info!(
             "Event {} for '{}' inserted into DLQ after {} failed attempts",
-            event_id,
-            subscriber_id,
-            config.max_retries + 1
+            event_id, subscriber_id, retry_count
         );
+
+        // Invoke the optional DLQ callback after successful persistence
+        if let Some(callback) = &config.on_dlq_insertion {
+            let info = super::config::DlqInsertionInfo {
+                subscriber_id: subscriber_id.to_string(),
+                event_id,
+                global_sequence: event_global_seq,
+                error_message: error_message.clone(),
+                retry_count,
+            };
+            callback.on_dlq_insertion(info).await;
+        }
     }
 
     ProcessResult::SentToDlq
