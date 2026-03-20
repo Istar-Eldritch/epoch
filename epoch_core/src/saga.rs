@@ -221,4 +221,10 @@ where
         self.0.process_event(&event).await?;
         Ok(())
     }
+
+    /// Sagas are processed after projections (priority 0) to ensure read
+    /// models are up-to-date when sagas query them.
+    fn priority(&self) -> u8 {
+        100
+    }
 }

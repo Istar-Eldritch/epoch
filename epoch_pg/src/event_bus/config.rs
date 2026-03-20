@@ -157,7 +157,10 @@ impl std::fmt::Debug for ReliableDeliveryConfig {
             .field("catch_up_batch_size", &self.catch_up_batch_size)
             .field("catch_up_buffer_size", &self.catch_up_buffer_size)
             .field("gap_timeout", &self.gap_timeout)
-            .field("on_dlq_insertion", &self.on_dlq_insertion.as_ref().map(|_| "Some(<callback>)"))
+            .field(
+                "on_dlq_insertion",
+                &self.on_dlq_insertion.as_ref().map(|_| "Some(<callback>)"),
+            )
             .finish()
     }
 }

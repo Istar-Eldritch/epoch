@@ -7,7 +7,9 @@ mod retry;
 mod subscriber_state;
 
 pub(crate) use checkpoint::*;
-pub use config::{CheckpointMode, DlqCallback, DlqInsertionInfo, InstanceMode, ReliableDeliveryConfig};
+pub use config::{
+    CheckpointMode, DlqCallback, DlqInsertionInfo, InstanceMode, ReliableDeliveryConfig,
+};
 pub(crate) use retry::{ProcessResult, process_event_with_retry};
 pub(crate) use subscriber_state::{SubscriberState, advance_contiguous_checkpoint};
 
@@ -334,6 +336,23 @@ where
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
         let handle = tokio::spawn(async move {
+            // Sort subscribers by priority so projections (priority 0) are
+            // processed before sagas (priority 100). This ensures read models
+            // are up-to-date when sagas query them. Stable sort preserves
+            // registration order within the same priority level.
+            {
+                let mut guard = projections.lock().await;
+                let mut priorities: Vec<u8> = Vec::with_capacity(guard.len());
+                for p in guard.iter() {
+                    let obs = p.lock().await;
+                    priorities.push(obs.priority());
+                }
+                let mut indices: Vec<usize> = (0..guard.len()).collect();
+                indices.sort_by_key(|&i| priorities[i]);
+                let sorted: Vec<_> = indices.iter().map(|&i| guard[i].clone()).collect();
+                *guard = sorted;
+            }
+
             let mut listener_option: Option<PgListener> = None;
             let mut reconnect_delay = Duration::from_secs(1);
             const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);

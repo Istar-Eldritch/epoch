@@ -147,6 +147,15 @@ where
         &self,
         event: Arc<Event<ED>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Processing priority for event bus ordering.
+    ///
+    /// Lower values are processed first. Projections default to `0` and sagas
+    /// (via [`SagaHandler`](crate::saga::SagaHandler)) default to `100`, ensuring
+    /// read models are up-to-date before sagas query them.
+    fn priority(&self) -> u8 {
+        0
+    }
 }
 
 /// Used to construct an event stream from a slice.
