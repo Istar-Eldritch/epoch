@@ -116,6 +116,16 @@ where
         event.stream_id
     }
 
+    /// Processing priority for event bus ordering.
+    ///
+    /// Lower values are processed first. Convention:
+    /// - `0`: Projections (via `ProjectionHandler`)
+    /// - `50`: Complex projections using the `Saga` trait
+    /// - `100`: Sagas (default)
+    fn priority(&self) -> u8 {
+        100
+    }
+
     /// Processes an incoming event, applies it to the saga, and persists the resulting state.
     ///
     /// This method is called by the blanket [`EventObserver`] implementation. It handles:
@@ -222,9 +232,8 @@ where
         Ok(())
     }
 
-    /// Sagas are processed after projections (priority 0) to ensure read
-    /// models are up-to-date when sagas query them.
+    /// Delegates to the inner saga's [`Saga::priority`] method.
     fn priority(&self) -> u8 {
-        100
+        self.0.priority()
     }
 }

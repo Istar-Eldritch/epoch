@@ -347,10 +347,27 @@ where
                     let obs = p.lock().await;
                     priorities.push(obs.priority());
                 }
+                log::debug!(
+                    "Event bus: sorting {} subscribers. Priorities before sort: {:?}",
+                    guard.len(),
+                    priorities
+                );
                 let mut indices: Vec<usize> = (0..guard.len()).collect();
                 indices.sort_by_key(|&i| priorities[i]);
                 let sorted: Vec<_> = indices.iter().map(|&i| guard[i].clone()).collect();
                 *guard = sorted;
+
+                // Log the sorted order
+                let mut sorted_info = Vec::new();
+                for p in guard.iter() {
+                    let obs = p.lock().await;
+                    sorted_info.push(format!(
+                        "{}(p={})",
+                        obs.subscriber_id(),
+                        obs.priority()
+                    ));
+                }
+                log::debug!("Event bus: processing order after sort: {:?}", sorted_info);
             }
 
             let mut listener_option: Option<PgListener> = None;
