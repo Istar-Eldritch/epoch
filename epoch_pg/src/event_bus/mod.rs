@@ -521,25 +521,30 @@ where
                 // For NOTIFY: processes newly committed events.
                 // For TimerTick: fills gaps from delayed commits, advances past
                 //   timed-out gaps (rolled-back transactions), catches missed NOTIFYs.
+                //
+                // SHARED FETCH: Events are fetched ONCE per batch from the minimum
+                // checkpoint across all subscribers. Each subscriber then processes
+                // only events above its own checkpoint. This ensures all subscribers
+                // see the same snapshot of events, preventing race conditions where
+                // a projection misses events that a later saga sees.
 
                 // NOTE: The projections lock is held while iterating and processing events.
                 // This means new subscribers cannot be added during event processing.
                 let mut projections_guard = projections.lock().await;
-                for projection in projections_guard.iter_mut() {
+
+                // Initialize per-subscriber state for any new subscribers.
+                for projection in projections_guard.iter() {
                     let subscriber_id = {
                         let guard = projection.lock().await;
                         guard.subscriber_id().to_string()
                     };
-
-                    // Initialize per-subscriber state on first encounter.
-                    // Load the persisted checkpoint from the DB as the starting point.
                     if !subscriber_states.contains_key(&subscriber_id) {
                         let checkpoint = match sqlx::query_as::<_, (i64,)>(
                             r#"
-                                    SELECT last_global_sequence
-                                    FROM epoch_event_bus_checkpoints
-                                    WHERE subscriber_id = $1
-                                    "#,
+                            SELECT last_global_sequence
+                            FROM epoch_event_bus_checkpoints
+                            WHERE subscriber_id = $1
+                            "#,
                         )
                         .bind(&subscriber_id)
                         .fetch_optional(&checkpoint_pool)
@@ -558,85 +563,85 @@ where
                         subscriber_states
                             .insert(subscriber_id.clone(), SubscriberState::new(checkpoint));
                     }
+                }
 
-                    // Process all pending events in batches until caught up.
-                    // Each NOTIFY may represent multiple committed events if they arrived
-                    // in rapid succession, so we loop until the DB returns fewer rows
-                    // than the batch size.
-                    loop {
+                // Shared batch loop: fetch events once from the minimum checkpoint,
+                // then fan out to all subscribers in priority order.
+                loop {
+                    // Find the minimum contiguous checkpoint across all subscribers.
+                    let min_checkpoint = subscriber_states
+                        .values()
+                        .map(|s| s.contiguous_checkpoint)
+                        .min()
+                        .unwrap_or(0);
+
+                    let rows: Vec<PgDBEvent> = match sqlx::query_as(
+                        r#"
+                        SELECT
+                            id, stream_id, stream_version, event_type, data,
+                            created_at, actor_id, purger_id, purged_at,
+                            global_sequence, causation_id, correlation_id
+                        FROM epoch_events
+                        WHERE global_sequence > $1
+                        ORDER BY global_sequence ASC
+                        LIMIT $2
+                        "#,
+                    )
+                    .bind(min_checkpoint as i64)
+                    .bind(config.catch_up_batch_size as i64)
+                    .fetch_all(&checkpoint_pool)
+                    .await
+                    {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            error!("Failed to query events: {}", e);
+                            break;
+                        }
+                    };
+
+                    if rows.is_empty() {
+                        break;
+                    }
+
+                    let batch_was_full = rows.len() == config.catch_up_batch_size as usize;
+
+                    // Pre-compute shared indexes from the batch.
+                    let visible_seqs: BTreeSet<u64> = rows
+                        .iter()
+                        .filter_map(|r| r.global_sequence.map(|gs| gs as u64))
+                        .collect();
+
+                    let seq_to_id: HashMap<u64, Uuid> = rows
+                        .iter()
+                        .filter_map(|r| r.global_sequence.map(|gs| (gs as u64, r.id)))
+                        .collect();
+
+                    let mut any_subscriber_processed = false;
+
+                    // Process the shared batch for each subscriber in priority order.
+                    for projection in projections_guard.iter_mut() {
+                        let subscriber_id = {
+                            let guard = projection.lock().await;
+                            guard.subscriber_id().to_string()
+                        };
+
                         let contiguous_before = subscriber_states
                             .get(&subscriber_id)
                             .unwrap()
                             .contiguous_checkpoint;
 
-                        let rows: Vec<PgDBEvent> = match sqlx::query_as(
-                            r#"
-                                    SELECT
-                                        id,
-                                        stream_id,
-                                        stream_version,
-                                        event_type,
-                                        data,
-                                        created_at,
-                                        actor_id,
-                                        purger_id,
-                                        purged_at,
-                                        global_sequence,
-                                        causation_id,
-                                        correlation_id
-                                    FROM epoch_events
-                                    WHERE global_sequence > $1
-                                    ORDER BY global_sequence ASC
-                                    LIMIT $2
-                                    "#,
-                        )
-                        .bind(contiguous_before as i64)
-                        .bind(config.catch_up_batch_size as i64)
-                        .fetch_all(&checkpoint_pool)
-                        .await
-                        {
-                            Ok(rows) => rows,
-                            Err(e) => {
-                                error!(
-                                    "Failed to query events for subscriber '{}': {}",
-                                    subscriber_id, e
-                                );
-                                break;
-                            }
-                        };
-
-                        if rows.is_empty() {
-                            break;
-                        }
-
-                        let batch_was_full = rows.len() == config.catch_up_batch_size as usize;
-
-                        // Collect visible sequence numbers for gap detection in
-                        // advance_contiguous_checkpoint.
-                        let visible_seqs: BTreeSet<u64> = rows
-                            .iter()
-                            .filter_map(|r| r.global_sequence.map(|gs| gs as u64))
-                            .collect();
-
-                        // Map seq → event_id so we can associate the right event_id
-                        // with the contiguous checkpoint after it advances.
-                        let seq_to_id: HashMap<u64, Uuid> = rows
-                            .iter()
-                            .filter_map(|r| r.global_sequence.map(|gs| (gs as u64, r.id)))
-                            .collect();
-
-                        // Track whether any new events were processed in this
-                        // iteration. If all events were already in processed_ahead
-                        // (e.g., a gap is blocking checkpoint advancement but the
-                        // batch is full), we break to avoid an infinite hot loop
-                        // hammering the DB while waiting for gap_timeout to expire.
                         let mut processed_any = false;
-                        for row in rows {
+
+                        for row in &rows {
                             let event_seq = row.global_sequence.unwrap_or(0) as u64;
                             let event_id = row.id;
 
+                            // Skip events at or below this subscriber's checkpoint.
+                            if event_seq <= contiguous_before {
+                                continue;
+                            }
+
                             // Skip events already processed out-of-order.
-                            // Use a short-lived borrow so it's dropped before the await.
                             let already_processed = {
                                 let state = subscriber_states.get(&subscriber_id).unwrap();
                                 state.processed_ahead.contains(&event_seq)
@@ -646,11 +651,11 @@ where
                                 continue;
                             }
 
-                            // Deserialize event data. Undeserializable events (e.g.,
-                            // removed enum variants) are marked processed and skipped
-                            // so the checkpoint can advance past them.
+                            // Deserialize event data (clone the JSON value since
+                            // from_value consumes it and we share rows across subscribers).
                             let data = match row
                                 .data
+                                .clone()
                                 .map(|d| serde_json::from_value::<D>(d))
                                 .transpose()
                             {
@@ -658,16 +663,15 @@ where
                                 Err(e) => {
                                     warn!(
                                         "Skipping event {} (type: '{}', global_seq: {}) \
-                                                 for '{}': failed to deserialize: {}. \
-                                                 This is expected when event variants have been \
-                                                 removed. Advancing checkpoint past this event.",
+                                         for '{}': failed to deserialize: {}. \
+                                         This is expected when event variants have been \
+                                         removed. Advancing checkpoint past this event.",
                                         event_id, row.event_type, event_seq, subscriber_id, e
                                     );
-                                    let state = subscriber_states.get_mut(&subscriber_id).unwrap();
+                                    let state =
+                                        subscriber_states.get_mut(&subscriber_id).unwrap();
                                     state.processed_ahead.insert(event_seq);
                                     last_event_ids.insert(subscriber_id.clone(), event_id);
-                                    // Count skipped event toward batched checkpoint
-                                    // threshold so batch_size triggers correctly.
                                     match pending_checkpoints.get_mut(&subscriber_id) {
                                         Some(pending) => {
                                             pending.update(event_seq, event_id);
@@ -688,7 +692,7 @@ where
                                 id: event_id,
                                 stream_id: row.stream_id,
                                 stream_version: row.stream_version as u64,
-                                event_type: row.event_type,
+                                event_type: row.event_type.clone(),
                                 actor_id: row.actor_id,
                                 purger_id: row.purger_id,
                                 data,
@@ -700,13 +704,12 @@ where
                             });
 
                             log::debug!(
-                                "Applying event {} (seq {}) to projection '{}'",
+                                "Applying event {} (seq {}) to '{}'",
                                 event_id,
                                 event_seq,
                                 subscriber_id
                             );
 
-                            // Process with retry/DLQ. No state borrow held across await.
                             process_event_with_retry(
                                 projection,
                                 &event,
@@ -716,17 +719,12 @@ where
                             )
                             .await;
 
-                            // Mark as processed so advance_contiguous_checkpoint can
-                            // use it to advance through this sequence.
                             {
-                                let state = subscriber_states.get_mut(&subscriber_id).unwrap();
+                                let state =
+                                    subscriber_states.get_mut(&subscriber_id).unwrap();
                                 state.processed_ahead.insert(event_seq);
                             }
                             last_event_ids.insert(subscriber_id.clone(), event_id);
-                            // Count each newly-processed event toward the batched
-                            // checkpoint threshold so batch_size triggers correctly.
-                            // global_sequence is set to a safe contiguous position
-                            // below after advance_contiguous_checkpoint runs.
                             match pending_checkpoints.get_mut(&subscriber_id) {
                                 Some(pending) => {
                                     pending.update(event_seq, event_id);
@@ -741,12 +739,18 @@ where
                             processed_any = true;
                         }
 
-                        // Advance the contiguous checkpoint as far as possible.
-                        // This handles gaps from out-of-order commits and rolled-back
-                        // transactions (via the gap_timeout).
+                        if processed_any {
+                            any_subscriber_processed = true;
+                        }
+
+                        // Advance contiguous checkpoint for this subscriber.
                         {
                             let state = subscriber_states.get_mut(&subscriber_id).unwrap();
-                            advance_contiguous_checkpoint(state, &visible_seqs, config.gap_timeout);
+                            advance_contiguous_checkpoint(
+                                state,
+                                &visible_seqs,
+                                config.gap_timeout,
+                            );
                         }
 
                         let new_contiguous = subscriber_states
@@ -754,50 +758,43 @@ where
                             .unwrap()
                             .contiguous_checkpoint;
 
-                        // Only flush the pending checkpoint when it actually advanced to
-                        // a contiguous position. If there's a gap blocking advancement,
-                        // we must not persist a checkpoint that would skip unprocessed
-                        // events. Note: events_since_checkpoint is tracked per-event
-                        // in the for loop above for accurate batch_size triggering.
                         if new_contiguous > contiguous_before {
-                            // Associate the event_id at the new checkpoint position.
-                            // Falls back to the last known event_id when the checkpoint
-                            // advanced past a timed-out gap (no corresponding event).
                             let checkpoint_event_id = seq_to_id
                                 .get(&new_contiguous)
                                 .copied()
                                 .or_else(|| last_event_ids.get(&subscriber_id).copied())
                                 .unwrap_or_else(Uuid::nil);
 
-                            last_event_ids.insert(subscriber_id.clone(), checkpoint_event_id);
+                            last_event_ids
+                                .insert(subscriber_id.clone(), checkpoint_event_id);
+                            checkpoint_cache
+                                .insert(subscriber_id.clone(), new_contiguous);
 
-                            // Keep checkpoint_cache in sync with contiguous_checkpoint.
-                            // This mirrors the authoritative subscriber_states value so
-                            // future reads of checkpoint_cache are never stale.
-                            checkpoint_cache.insert(subscriber_id.clone(), new_contiguous);
-
-                            // Override global_sequence and event_id to the safe
-                            // contiguous position. events_since_checkpoint was already
-                            // incremented per-event in the for loop, so we must NOT
-                            // call update() here (that would double-count).
-                            if let Some(pending) = pending_checkpoints.get_mut(&subscriber_id) {
+                            if let Some(pending) =
+                                pending_checkpoints.get_mut(&subscriber_id)
+                            {
                                 pending.global_sequence = new_contiguous;
                                 pending.event_id = checkpoint_event_id;
                             } else {
-                                // No events were processed in this iteration (all
-                                // already in processed_ahead, e.g., gap timed out and
-                                // checkpoint advanced through them). Create an entry so
-                                // the flush check below can run.
                                 pending_checkpoints.insert(
                                     subscriber_id.clone(),
-                                    PendingCheckpoint::new(new_contiguous, checkpoint_event_id),
+                                    PendingCheckpoint::new(
+                                        new_contiguous,
+                                        checkpoint_event_id,
+                                    ),
                                 );
                             }
 
-                            if let Some(pending) = pending_checkpoints.get(&subscriber_id)
-                                && should_flush_checkpoint(pending, &config.checkpoint_mode)
+                            if let Some(pending) =
+                                pending_checkpoints.get(&subscriber_id)
+                                && should_flush_checkpoint(
+                                    pending,
+                                    &config.checkpoint_mode,
+                                )
                             {
-                                let pending = pending_checkpoints.remove(&subscriber_id).unwrap();
+                                let pending = pending_checkpoints
+                                    .remove(&subscriber_id)
+                                    .unwrap();
                                 if let Err(e) = flush_checkpoint(
                                     &checkpoint_pool,
                                     &subscriber_id,
@@ -810,20 +807,15 @@ where
                                         "Failed to flush checkpoint for '{}': {}",
                                         subscriber_id, e
                                     );
-                                    pending_checkpoints.insert(subscriber_id.clone(), pending);
+                                    pending_checkpoints
+                                        .insert(subscriber_id.clone(), pending);
                                 }
                             }
                         }
+                    }
 
-                        // Break if the batch wasn't full (caught up to the DB) OR if
-                        // no new events were processed this iteration. The latter
-                        // guards against an infinite hot loop: when a gap blocks
-                        // checkpoint advancement but the batch was full (events above
-                        // the gap already in processed_ahead), looping would just
-                        // re-query the same rows and skip them all again.
-                        if !batch_was_full || !processed_any {
-                            break;
-                        }
+                    if !batch_was_full || !any_subscriber_processed {
+                        break;
                     }
                 }
             }
