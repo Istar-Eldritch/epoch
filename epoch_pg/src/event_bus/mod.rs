@@ -790,61 +790,55 @@ where
                     let shared_visible = Arc::new(visible_seqs);
                     let shared_seq_to_id = Arc::new(seq_to_id);
 
-                    // Collect (priority, projection) pairs.
-                    let mut tagged: Vec<(u8, Arc<Mutex<dyn EventObserver<D>>>)> = Vec::new();
+                    // Collect (priority, subscriber_id, projection) tuples sequentially.
+                    // We hold projections_guard here, so inner per-subscriber locks are
+                    // acquired one at a time to read metadata.
+                    let mut tagged: Vec<(u8, String, Arc<Mutex<dyn EventObserver<D>>>)> = Vec::new();
                     for projection in projections_guard.iter() {
-                        let priority = projection.lock().await.priority();
-                        tagged.push((priority, projection.clone()));
+                        let guard = projection.lock().await;
+                        let priority = guard.priority();
+                        let sid = guard.subscriber_id().to_string();
+                        drop(guard);
+                        tagged.push((priority, sid, projection.clone()));
                     }
 
                     // Find distinct priorities in ascending order.
-                    let mut priorities: Vec<u8> = tagged.iter().map(|(p, _)| *p).collect();
+                    let mut priorities: Vec<u8> = tagged.iter().map(|(p, _, _)| *p).collect();
                     priorities.sort_unstable();
                     priorities.dedup();
 
                     for priority in priorities {
-                        let group: Vec<Arc<Mutex<dyn EventObserver<D>>>> = tagged
+                        // Build task inputs, deduplicating by subscriber_id.
+                        // If the same subscriber_id appears multiple times in projections
+                        // (e.g. registered by both core and web), only the first wins.
+                        // Without deduplication, the second occurrence would get
+                        // SubscriberState::new(0) from the remove fallback and reprocess
+                        // all historical events.
+                        let mut seen_sids = std::collections::HashSet::<String>::new();
+                        let task_inputs: Vec<_> = tagged
                             .iter()
-                            .filter(|(p, _)| *p == priority)
-                            .map(|(_, proj)| proj.clone())
-                            .collect();
-
-                        let futures: Vec<_> = group
-                            .into_iter()
-                            .map(|projection| {
-                                let subscriber_id = {
-                                    // We need the subscriber_id synchronously — extract it
-                                    // from the already-sorted tagged list.
-                                    // We'll retrieve it inside the async block via a separate lock.
-                                    projection.clone()
-                                };
-                                let rows_ref = shared_rows.clone();
-                                let visible_ref = shared_visible.clone();
-                                let seq_to_id_ref = shared_seq_to_id.clone();
-                                let config_ref = config.clone();
-                                let dlq_ref = dlq_pool.clone();
-                                let cp_ref = checkpoint_pool.clone();
-
-                                async move {
-                                    let sid = subscriber_id.lock().await.subscriber_id().to_string();
-                                    // We can't access the outer subscriber_states here since
-                                    // we're in a concurrent future. State extraction happens below.
-                                    (sid, subscriber_id, rows_ref, visible_ref, seq_to_id_ref, config_ref, dlq_ref, cp_ref)
-                                }
+                            .filter(|(p, sid, _)| *p == priority && seen_sids.insert(sid.clone()))
+                            .map(|(_, sid, proj)| {
+                                let state = subscriber_states
+                                    .remove(sid)
+                                    .unwrap_or_else(|| SubscriberState::new(0));
+                                let pending = pending_checkpoints.remove(sid);
+                                let last_id = last_event_ids.get(sid).copied();
+                                (
+                                    sid.clone(),
+                                    proj.clone(),
+                                    state,
+                                    pending,
+                                    last_id,
+                                    shared_rows.clone(),
+                                    shared_visible.clone(),
+                                    shared_seq_to_id.clone(),
+                                    config.clone(),
+                                    dlq_pool.clone(),
+                                    checkpoint_pool.clone(),
+                                )
                             })
                             .collect();
-
-                        // Resolve subscriber_ids first (sequential, cheap lock acquisition).
-                        let resolved = join_all(futures).await;
-
-                        // Now extract per-subscriber state and spawn concurrent tasks.
-                        let mut task_inputs = Vec::new();
-                        for (sid, proj, rows_ref, visible_ref, seq_to_id_ref, config_ref, dlq_ref, cp_ref) in resolved {
-                            let state = subscriber_states.remove(&sid).unwrap_or_else(|| SubscriberState::new(0));
-                            let pending = pending_checkpoints.remove(&sid);
-                            let last_id = last_event_ids.get(&sid).copied();
-                            task_inputs.push((sid, proj, state, pending, last_id, rows_ref, visible_ref, seq_to_id_ref, config_ref, dlq_ref, cp_ref));
-                        }
 
                         let outcomes = join_all(task_inputs.into_iter().map(
                             |(sid, proj, state, pending, last_id, rows_ref, visible_ref, seq_to_id_ref, config_ref, dlq_ref, cp_ref)| {
