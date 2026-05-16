@@ -32,6 +32,170 @@ use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
 use std::future::Future;
+use futures::future::join_all;
+
+/// Result of processing a single subscriber against one batch of events.
+struct SubscriberBatchOutcome {
+    subscriber_id: String,
+    state: SubscriberState,
+    pending_checkpoint: Option<PendingCheckpoint>,
+    last_event_id: Option<Uuid>,
+    cached_checkpoint: Option<u64>,
+    processed_any: bool,
+}
+
+/// Processes one subscriber against the pre-fetched batch of events.
+/// All per-subscriber state is owned, making this safe to run concurrently.
+async fn process_subscriber_for_batch<D>(
+    projection: Arc<Mutex<dyn EventObserver<D>>>,
+    subscriber_id: String,
+    mut state: SubscriberState,
+    mut pending_checkpoint: Option<PendingCheckpoint>,
+    last_event_id_in: Option<Uuid>,
+    rows: Arc<Vec<PgDBEvent>>,
+    visible_seqs: Arc<BTreeSet<u64>>,
+    seq_to_id: Arc<HashMap<u64, Uuid>>,
+    config: ReliableDeliveryConfig,
+    dlq_pool: PgPool,
+    checkpoint_pool: PgPool,
+) -> SubscriberBatchOutcome
+where
+    D: EventData + Send + Sync + 'static,
+{
+    let contiguous_before = state.contiguous_checkpoint;
+    let mut processed_any = false;
+    let mut last_event_id = last_event_id_in;
+
+    for row in rows.iter() {
+        let event_seq = row.global_sequence.unwrap_or(0) as u64;
+        let event_id = row.id;
+
+        if event_seq <= contiguous_before {
+            continue;
+        }
+
+        if state.processed_ahead.contains(&event_seq) {
+            last_event_id = Some(event_id);
+            continue;
+        }
+
+        let data = match row
+            .data
+            .clone()
+            .map(|d| serde_json::from_value::<D>(d))
+            .transpose()
+        {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(
+                    "Skipping event {} (type: '{}', global_seq: {}) \
+                     for '{}': failed to deserialize: {}. \
+                     This is expected when event variants have been \
+                     removed. Advancing checkpoint past this event.",
+                    event_id, row.event_type, event_seq, subscriber_id, e
+                );
+                state.processed_ahead.insert(event_seq);
+                last_event_id = Some(event_id);
+                match &mut pending_checkpoint {
+                    Some(p) => p.update(event_seq, event_id),
+                    None => pending_checkpoint = Some(PendingCheckpoint::new(event_seq, event_id)),
+                }
+                processed_any = true;
+                continue;
+            }
+        };
+
+        let event = Arc::new(Event::<D> {
+            id: event_id,
+            stream_id: row.stream_id,
+            stream_version: row.stream_version as u64,
+            event_type: row.event_type.clone(),
+            actor_id: row.actor_id,
+            purger_id: row.purger_id,
+            data,
+            created_at: row.created_at,
+            purged_at: row.purged_at,
+            global_sequence: Some(event_seq),
+            causation_id: row.causation_id,
+            correlation_id: row.correlation_id,
+        });
+
+        log::debug!(
+            "Applying event {} (seq {}) to '{}'",
+            event_id, event_seq, subscriber_id
+        );
+
+        process_event_with_retry(&projection, &event, &subscriber_id, &config, &dlq_pool).await;
+
+        state.processed_ahead.insert(event_seq);
+        last_event_id = Some(event_id);
+        match &mut pending_checkpoint {
+            Some(p) => p.update(event_seq, event_id),
+            None => pending_checkpoint = Some(PendingCheckpoint::new(event_seq, event_id)),
+        }
+        processed_any = true;
+    }
+
+    advance_contiguous_checkpoint(&mut state, &visible_seqs, config.gap_timeout);
+
+    let new_contiguous = state.contiguous_checkpoint;
+    let mut cached_checkpoint = None;
+
+    if new_contiguous > contiguous_before {
+        let checkpoint_event_id = seq_to_id
+            .get(&new_contiguous)
+            .copied()
+            .or(last_event_id)
+            .unwrap_or_else(Uuid::nil);
+
+        last_event_id = Some(checkpoint_event_id);
+        cached_checkpoint = Some(new_contiguous);
+
+        match &mut pending_checkpoint {
+            Some(p) => {
+                p.global_sequence = new_contiguous;
+                p.event_id = checkpoint_event_id;
+            }
+            None => {
+                pending_checkpoint =
+                    Some(PendingCheckpoint::new(new_contiguous, checkpoint_event_id));
+            }
+        }
+
+        // Flush checkpoint to DB if threshold reached.
+        let should_flush = pending_checkpoint
+            .as_ref()
+            .map(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
+            .unwrap_or(false);
+
+        if should_flush {
+            let pending = pending_checkpoint.take().unwrap();
+            let mut local_cache = HashMap::new();
+            match flush_checkpoint(&checkpoint_pool, &subscriber_id, &pending, &mut local_cache)
+                .await
+            {
+                Ok(()) => {
+                    if let Some(val) = local_cache.get(&subscriber_id) {
+                        cached_checkpoint = Some(*val);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to flush checkpoint for '{}': {}", subscriber_id, e);
+                    pending_checkpoint = Some(pending);
+                }
+            }
+        }
+    }
+
+    SubscriberBatchOutcome {
+        subscriber_id,
+        state,
+        pending_checkpoint,
+        last_event_id,
+        cached_checkpoint,
+        processed_any,
+    }
+}
 
 /// Represents an entry in the dead letter queue.
 ///
@@ -530,7 +694,7 @@ where
 
                 // NOTE: The projections lock is held while iterating and processing events.
                 // This means new subscribers cannot be added during event processing.
-                let mut projections_guard = projections.lock().await;
+                let projections_guard = projections.lock().await;
 
                 // Initialize per-subscriber state for any new subscribers.
                 for projection in projections_guard.iter() {
@@ -618,199 +782,96 @@ where
 
                     let mut any_subscriber_processed = false;
 
-                    // Process the shared batch for each subscriber in priority order.
-                    for projection in projections_guard.iter_mut() {
-                        let subscriber_id = {
-                            let guard = projection.lock().await;
-                            guard.subscriber_id().to_string()
-                        };
+                    // Process the shared batch with concurrent dispatch within each
+                    // priority group. Projections (priority 0) must complete before
+                    // sagas (priority 100) so read models are up-to-date when sagas
+                    // query them. Within a priority group, subscribers run concurrently.
+                    let shared_rows = Arc::new(rows);
+                    let shared_visible = Arc::new(visible_seqs);
+                    let shared_seq_to_id = Arc::new(seq_to_id);
 
-                        let contiguous_before = subscriber_states
-                            .get(&subscriber_id)
-                            .unwrap()
-                            .contiguous_checkpoint;
+                    // Collect (priority, projection) pairs.
+                    let mut tagged: Vec<(u8, Arc<Mutex<dyn EventObserver<D>>>)> = Vec::new();
+                    for projection in projections_guard.iter() {
+                        let priority = projection.lock().await.priority();
+                        tagged.push((priority, projection.clone()));
+                    }
 
-                        let mut processed_any = false;
+                    // Find distinct priorities in ascending order.
+                    let mut priorities: Vec<u8> = tagged.iter().map(|(p, _)| *p).collect();
+                    priorities.sort_unstable();
+                    priorities.dedup();
 
-                        for row in &rows {
-                            let event_seq = row.global_sequence.unwrap_or(0) as u64;
-                            let event_id = row.id;
+                    for priority in priorities {
+                        let group: Vec<Arc<Mutex<dyn EventObserver<D>>>> = tagged
+                            .iter()
+                            .filter(|(p, _)| *p == priority)
+                            .map(|(_, proj)| proj.clone())
+                            .collect();
 
-                            // Skip events at or below this subscriber's checkpoint.
-                            if event_seq <= contiguous_before {
-                                continue;
-                            }
+                        let futures: Vec<_> = group
+                            .into_iter()
+                            .map(|projection| {
+                                let subscriber_id = {
+                                    // We need the subscriber_id synchronously — extract it
+                                    // from the already-sorted tagged list.
+                                    // We'll retrieve it inside the async block via a separate lock.
+                                    projection.clone()
+                                };
+                                let rows_ref = shared_rows.clone();
+                                let visible_ref = shared_visible.clone();
+                                let seq_to_id_ref = shared_seq_to_id.clone();
+                                let config_ref = config.clone();
+                                let dlq_ref = dlq_pool.clone();
+                                let cp_ref = checkpoint_pool.clone();
 
-                            // Skip events already processed out-of-order.
-                            let already_processed = {
-                                let state = subscriber_states.get(&subscriber_id).unwrap();
-                                state.processed_ahead.contains(&event_seq)
-                            };
-                            if already_processed {
-                                last_event_ids.insert(subscriber_id.clone(), event_id);
-                                continue;
-                            }
-
-                            // Deserialize event data (clone the JSON value since
-                            // from_value consumes it and we share rows across subscribers).
-                            let data = match row
-                                .data
-                                .clone()
-                                .map(|d| serde_json::from_value::<D>(d))
-                                .transpose()
-                            {
-                                Ok(data) => data,
-                                Err(e) => {
-                                    warn!(
-                                        "Skipping event {} (type: '{}', global_seq: {}) \
-                                         for '{}': failed to deserialize: {}. \
-                                         This is expected when event variants have been \
-                                         removed. Advancing checkpoint past this event.",
-                                        event_id, row.event_type, event_seq, subscriber_id, e
-                                    );
-                                    let state =
-                                        subscriber_states.get_mut(&subscriber_id).unwrap();
-                                    state.processed_ahead.insert(event_seq);
-                                    last_event_ids.insert(subscriber_id.clone(), event_id);
-                                    match pending_checkpoints.get_mut(&subscriber_id) {
-                                        Some(pending) => {
-                                            pending.update(event_seq, event_id);
-                                        }
-                                        None => {
-                                            pending_checkpoints.insert(
-                                                subscriber_id.clone(),
-                                                PendingCheckpoint::new(event_seq, event_id),
-                                            );
-                                        }
-                                    }
-                                    processed_any = true;
-                                    continue;
+                                async move {
+                                    let sid = subscriber_id.lock().await.subscriber_id().to_string();
+                                    // We can't access the outer subscriber_states here since
+                                    // we're in a concurrent future. State extraction happens below.
+                                    (sid, subscriber_id, rows_ref, visible_ref, seq_to_id_ref, config_ref, dlq_ref, cp_ref)
                                 }
-                            };
+                            })
+                            .collect();
 
-                            let event = Arc::new(Event::<D> {
-                                id: event_id,
-                                stream_id: row.stream_id,
-                                stream_version: row.stream_version as u64,
-                                event_type: row.event_type.clone(),
-                                actor_id: row.actor_id,
-                                purger_id: row.purger_id,
-                                data,
-                                created_at: row.created_at,
-                                purged_at: row.purged_at,
-                                global_sequence: Some(event_seq),
-                                causation_id: row.causation_id,
-                                correlation_id: row.correlation_id,
-                            });
+                        // Resolve subscriber_ids first (sequential, cheap lock acquisition).
+                        let resolved = join_all(futures).await;
 
-                            log::debug!(
-                                "Applying event {} (seq {}) to '{}'",
-                                event_id,
-                                event_seq,
-                                subscriber_id
-                            );
-
-                            process_event_with_retry(
-                                projection,
-                                &event,
-                                &subscriber_id,
-                                &config,
-                                &dlq_pool,
-                            )
-                            .await;
-
-                            {
-                                let state =
-                                    subscriber_states.get_mut(&subscriber_id).unwrap();
-                                state.processed_ahead.insert(event_seq);
-                            }
-                            last_event_ids.insert(subscriber_id.clone(), event_id);
-                            match pending_checkpoints.get_mut(&subscriber_id) {
-                                Some(pending) => {
-                                    pending.update(event_seq, event_id);
-                                }
-                                None => {
-                                    pending_checkpoints.insert(
-                                        subscriber_id.clone(),
-                                        PendingCheckpoint::new(event_seq, event_id),
-                                    );
-                                }
-                            }
-                            processed_any = true;
+                        // Now extract per-subscriber state and spawn concurrent tasks.
+                        let mut task_inputs = Vec::new();
+                        for (sid, proj, rows_ref, visible_ref, seq_to_id_ref, config_ref, dlq_ref, cp_ref) in resolved {
+                            let state = subscriber_states.remove(&sid).unwrap_or_else(|| SubscriberState::new(0));
+                            let pending = pending_checkpoints.remove(&sid);
+                            let last_id = last_event_ids.get(&sid).copied();
+                            task_inputs.push((sid, proj, state, pending, last_id, rows_ref, visible_ref, seq_to_id_ref, config_ref, dlq_ref, cp_ref));
                         }
 
-                        if processed_any {
-                            any_subscriber_processed = true;
-                        }
-
-                        // Advance contiguous checkpoint for this subscriber.
-                        {
-                            let state = subscriber_states.get_mut(&subscriber_id).unwrap();
-                            advance_contiguous_checkpoint(
-                                state,
-                                &visible_seqs,
-                                config.gap_timeout,
-                            );
-                        }
-
-                        let new_contiguous = subscriber_states
-                            .get(&subscriber_id)
-                            .unwrap()
-                            .contiguous_checkpoint;
-
-                        if new_contiguous > contiguous_before {
-                            let checkpoint_event_id = seq_to_id
-                                .get(&new_contiguous)
-                                .copied()
-                                .or_else(|| last_event_ids.get(&subscriber_id).copied())
-                                .unwrap_or_else(Uuid::nil);
-
-                            last_event_ids
-                                .insert(subscriber_id.clone(), checkpoint_event_id);
-                            checkpoint_cache
-                                .insert(subscriber_id.clone(), new_contiguous);
-
-                            if let Some(pending) =
-                                pending_checkpoints.get_mut(&subscriber_id)
-                            {
-                                pending.global_sequence = new_contiguous;
-                                pending.event_id = checkpoint_event_id;
-                            } else {
-                                pending_checkpoints.insert(
-                                    subscriber_id.clone(),
-                                    PendingCheckpoint::new(
-                                        new_contiguous,
-                                        checkpoint_event_id,
-                                    ),
-                                );
-                            }
-
-                            if let Some(pending) =
-                                pending_checkpoints.get(&subscriber_id)
-                                && should_flush_checkpoint(
-                                    pending,
-                                    &config.checkpoint_mode,
+                        let outcomes = join_all(task_inputs.into_iter().map(
+                            |(sid, proj, state, pending, last_id, rows_ref, visible_ref, seq_to_id_ref, config_ref, dlq_ref, cp_ref)| {
+                                process_subscriber_for_batch(
+                                    proj, sid, state, pending, last_id,
+                                    rows_ref, visible_ref, seq_to_id_ref,
+                                    config_ref, dlq_ref, cp_ref,
                                 )
-                            {
-                                let pending = pending_checkpoints
-                                    .remove(&subscriber_id)
-                                    .unwrap();
-                                if let Err(e) = flush_checkpoint(
-                                    &checkpoint_pool,
-                                    &subscriber_id,
-                                    &pending,
-                                    &mut checkpoint_cache,
-                                )
-                                .await
-                                {
-                                    error!(
-                                        "Failed to flush checkpoint for '{}': {}",
-                                        subscriber_id, e
-                                    );
-                                    pending_checkpoints
-                                        .insert(subscriber_id.clone(), pending);
-                                }
+                            },
+                        ))
+                        .await;
+
+                        // Merge outcomes back into the state maps.
+                        for outcome in outcomes {
+                            if outcome.processed_any {
+                                any_subscriber_processed = true;
                             }
+                            if let Some(val) = outcome.cached_checkpoint {
+                                checkpoint_cache.insert(outcome.subscriber_id.clone(), val);
+                            }
+                            if let Some(id) = outcome.last_event_id {
+                                last_event_ids.insert(outcome.subscriber_id.clone(), id);
+                            }
+                            if let Some(p) = outcome.pending_checkpoint {
+                                pending_checkpoints.insert(outcome.subscriber_id.clone(), p);
+                            }
+                            subscriber_states.insert(outcome.subscriber_id, outcome.state);
                         }
                     }
 
