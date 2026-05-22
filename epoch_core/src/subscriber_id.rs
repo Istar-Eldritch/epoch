@@ -83,3 +83,15 @@ pub trait SubscriberId {
     /// The ID must be stable across deployments and restarts.
     fn subscriber_id(&self) -> &str;
 }
+
+/// Delegates [`SubscriberId`] through an `Arc` so `Arc<S>` can be used
+/// wherever `S: SubscriberId` is required (e.g. with [`SagaHandler`] and
+/// [`SagaAdapter`]).
+///
+/// [`SagaHandler`]: crate::saga::SagaHandler
+/// [`SagaAdapter`]: crate::saga::SagaAdapter
+impl<S: SubscriberId + ?Sized> SubscriberId for std::sync::Arc<S> {
+    fn subscriber_id(&self) -> &str {
+        (**self).subscriber_id()
+    }
+}

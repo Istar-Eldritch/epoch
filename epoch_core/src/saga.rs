@@ -176,6 +176,49 @@ where
     }
 }
 
+/// Blanket [`Saga`] implementation for `Arc<S>` where `S: Saga<ED>`.
+///
+/// This allows an `Arc`-wrapped saga to be used directly with [`SagaHandler`] and
+/// [`SagaAdapter`], enabling shared ownership across multiple bus subscriptions:
+///
+/// ```ignore
+/// let saga = Arc::new(MySaga::new(...));
+/// native_bus.subscribe(SagaHandler::new(saga.clone())).await?;
+/// foreign_bus.subscribe(SagaAdapter::new(saga.clone(), "saga:my:foreign", |e| ...)).await?;
+/// ```
+#[async_trait]
+impl<ED, S> Saga<ED> for Arc<S>
+where
+    ED: EventData + Send + Sync + 'static,
+    S: Saga<ED> + Send + Sync,
+    S::EventType: Sync,
+{
+    type State = S::State;
+    type StateStore = S::StateStore;
+    type SagaError = S::SagaError;
+    type EventType = S::EventType;
+
+    fn get_state_store(&self) -> Self::StateStore {
+        (**self).get_state_store()
+    }
+
+    async fn handle_event(
+        &self,
+        state: Self::State,
+        event: &Event<Self::EventType>,
+    ) -> Result<Option<Self::State>, Self::SagaError> {
+        (**self).handle_event(state, event).await
+    }
+
+    fn get_id_from_event(&self, event: &Event<Self::EventType>) -> Uuid {
+        (**self).get_id_from_event(event)
+    }
+
+    fn priority(&self) -> u8 {
+        (**self).priority()
+    }
+}
+
 /// A wrapper type that provides an [`EventObserver`] implementation for [`Saga`] types.
 ///
 /// Since Rust doesn't allow multiple blanket implementations of the same trait, and
@@ -300,7 +343,7 @@ where
     TargetEvent: EventData + Send + Sync + 'static,
     F: Fn(&SourceEvent) -> Option<TargetEvent> + Send + Sync,
 {
-    saga: S,
+    saga: Arc<S>,
     subscriber_id: String,
     converter: F,
     _marker: PhantomData<fn(SourceEvent) -> TargetEvent>,
@@ -315,15 +358,17 @@ where
 {
     /// Creates a new `SagaAdapter`.
     ///
-    /// * `saga` - The saga to wrap, shared via `Arc` so it can be subscribed
-    ///   to multiple buses.
+    /// * `saga` - `Arc`-wrapped saga shared across bus subscriptions. Both
+    ///   [`SagaHandler`] and `SagaAdapter` accept `Arc<S>` (via the blanket
+    ///   `Saga` impl for `Arc<S>`), so a single `Arc::new(saga)` can back
+    ///   any number of adapters without cloning internal state.
     /// * `subscriber_id` - Unique identifier for *this specific subscription*.
     ///   Used by the event bus to track an independent checkpoint per bus.
     ///   Convention: `"saga:<saga-name>:<source-bus-name>"`.
     /// * `converter` - Closure mapping the foreign bus's event variants into
     ///   the saga's native parent event type. Return `None` to skip events
     ///   the saga does not care about.
-    pub fn new(saga: S, subscriber_id: impl Into<String>, converter: F) -> Self {
+    pub fn new(saga: Arc<S>, subscriber_id: impl Into<String>, converter: F) -> Self {
         Self {
             saga,
             subscriber_id: subscriber_id.into(),
@@ -341,7 +386,7 @@ where
 impl<S, SourceEvent, TargetEvent, F> crate::SubscriberId
     for SagaAdapter<S, SourceEvent, TargetEvent, F>
 where
-    S: Saga<TargetEvent>,
+    S: Saga<TargetEvent> + Send + Sync,
     SourceEvent: EventData + Send + Sync + 'static,
     TargetEvent: EventData + Send + Sync + 'static,
     F: Fn(&SourceEvent) -> Option<TargetEvent> + Send + Sync,
@@ -384,7 +429,7 @@ where
             causation_id: event.causation_id,
             correlation_id: event.correlation_id,
         };
-        self.saga.process_event(&target_event).await?;
+        self.saga.as_ref().process_event(&target_event).await?;
         Ok(())
     }
 

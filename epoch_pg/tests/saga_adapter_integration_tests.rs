@@ -229,7 +229,7 @@ async fn saga_adapter_receives_events_from_foreign_bus() {
     let target_stream = Uuid::new_v4();
     let source_stream = Uuid::new_v4();
 
-    let saga = CounterSaga::new(&native_sub_id, saga_id);
+    let saga = Arc::new(CounterSaga::new(&native_sub_id, saga_id));
 
     target_bus
         .subscribe(SagaHandler::new(saga.clone()))
@@ -293,7 +293,7 @@ async fn saga_adapter_preserves_event_metadata_through_conversion() {
     let saga_id = Uuid::new_v4();
     let stream_id = Uuid::new_v4();
 
-    let saga = CounterSaga::new(format!("saga:meta:{}", tag), saga_id);
+    let saga = Arc::new(CounterSaga::new(format!("saga:meta:{}", tag), saga_id));
     source_bus
         .subscribe(SagaAdapter::new(
             saga.clone(),
@@ -350,7 +350,7 @@ async fn saga_adapter_advances_independent_checkpoints() {
     let target_stream = Uuid::new_v4();
     let source_stream = Uuid::new_v4();
 
-    let saga = CounterSaga::new(&native_sub_id, saga_id);
+    let saga = Arc::new(CounterSaga::new(&native_sub_id, saga_id));
     target_bus
         .subscribe(SagaHandler::new(saga.clone()))
         .await
@@ -425,7 +425,7 @@ async fn saga_adapter_resumes_from_checkpoint_after_restart() {
 
     // First run.
     {
-        let saga = CounterSaga::new(format!("saga:restart:{}", tag), saga_id);
+        let saga = Arc::new(CounterSaga::new(format!("saga:restart:{}", tag), saga_id));
         source_bus
             .subscribe(SagaAdapter::new(
                 saga.clone(),
@@ -463,7 +463,7 @@ async fn saga_adapter_resumes_from_checkpoint_after_restart() {
     let source_store2 = PgEventStore::new(pool.clone(), source_bus2.clone());
     source_bus2.setup_trigger().await.unwrap();
 
-    let saga2 = CounterSaga::new(format!("saga:restart:{}", tag), saga_id);
+    let saga2 = Arc::new(CounterSaga::new(format!("saga:restart:{}", tag), saga_id));
     source_bus2
         .subscribe(SagaAdapter::new(
             saga2.clone(),
