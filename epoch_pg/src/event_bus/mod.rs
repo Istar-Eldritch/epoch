@@ -322,6 +322,11 @@ where
         &self.pool
     }
 
+    /// Returns the LISTEN/NOTIFY channel name this bus is bound to.
+    pub fn channel_name(&self) -> &str {
+        &self.channel_name
+    }
+
     /// Reads all events across all streams since a given global sequence.
     ///
     /// This is used for catch-up processing when a subscriber needs to replay

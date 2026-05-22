@@ -3,6 +3,7 @@
 use crate::event::{EnumConversionError, Event, EventData};
 use crate::prelude::{EventObserver, StateStoreBackend};
 use async_trait::async_trait;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -235,5 +236,159 @@ where
     /// Delegates to the inner saga's [`Saga::priority`] method.
     fn priority(&self) -> u8 {
         self.0.priority()
+    }
+}
+
+/// Adapter that lets a [`Saga`] subscribe to a *foreign* event bus carrying a
+/// different parent event enum.
+///
+/// A saga is parameterized over a single parent event type (its "native" bus).
+/// When the saga also needs to react to events from a second bus whose parent
+/// enum is unrelated, wrap the saga in a `SagaAdapter` and register the
+/// adapter on the foreign bus. The adapter:
+///
+/// 1. Receives `Event<SourceEvent>` from the foreign bus.
+/// 2. Calls the user-supplied converter `Fn(&SourceEvent) -> Option<TargetEvent>`
+///    to produce data in the saga's native parent type. Returning `None`
+///    silently skips the event (the foreign bus's checkpoint still advances).
+/// 3. Rebuilds an `Event<TargetEvent>` preserving all metadata fields
+///    (`id`, `stream_id`, `stream_version`, `event_type`, `actor_id`,
+///    `purger_id`, `created_at`, `purged_at`, `global_sequence`,
+///    `causation_id`, `correlation_id`).
+/// 4. Delegates to [`Saga::process_event`] on the wrapped saga, which projects
+///    to the saga's `EventType` subset and runs `handle_event` as usual.
+///
+/// # Checkpointing
+///
+/// Each `SagaAdapter` instance carries its own `subscriber_id`, which the
+/// event bus uses to key its checkpoint row. The same saga can be subscribed
+/// to N buses by constructing N adapters with N distinct subscriber IDs;
+/// each subscription advances independently.
+///
+/// The wrapped saga's own `subscriber_id()` (used as the state-store key in
+/// the default `Saga::process_event` flow) is left untouched, so saga
+/// instances share state across all bus subscriptions.
+///
+/// # Example
+///
+/// ```ignore
+/// // BillingSaga is native to BillingEvent but also needs ComputeEvent
+/// // signals (e.g. MachineProvisioned).
+/// let saga = Arc::new(BillingSaga::new(/* ... */));
+///
+/// // Native bus: standard SagaHandler.
+/// billing_bus.subscribe(SagaHandler::new(saga.clone())).await?;
+///
+/// // Foreign bus: SagaAdapter with explicit subscriber id + converter.
+/// compute_bus
+///     .subscribe(SagaAdapter::new(
+///         saga.clone(),
+///         "saga:billing:compute-bus",
+///         |e: &ComputeEvent| match e {
+///             ComputeEvent::MachineProvisioned { pool_id, .. } => {
+///                 Some(BillingEvent::CapacityIncreased { pool_id: *pool_id })
+///             }
+///             _ => None,
+///         },
+///     ))
+///     .await?;
+/// ```
+pub struct SagaAdapter<S, SourceEvent, TargetEvent, F>
+where
+    S: Saga<TargetEvent>,
+    SourceEvent: EventData + Send + Sync + 'static,
+    TargetEvent: EventData + Send + Sync + 'static,
+    F: Fn(&SourceEvent) -> Option<TargetEvent> + Send + Sync,
+{
+    saga: S,
+    subscriber_id: String,
+    converter: F,
+    _marker: PhantomData<fn(SourceEvent) -> TargetEvent>,
+}
+
+impl<S, SourceEvent, TargetEvent, F> SagaAdapter<S, SourceEvent, TargetEvent, F>
+where
+    S: Saga<TargetEvent>,
+    SourceEvent: EventData + Send + Sync + 'static,
+    TargetEvent: EventData + Send + Sync + 'static,
+    F: Fn(&SourceEvent) -> Option<TargetEvent> + Send + Sync,
+{
+    /// Creates a new `SagaAdapter`.
+    ///
+    /// * `saga` - The saga to wrap, shared via `Arc` so it can be subscribed
+    ///   to multiple buses.
+    /// * `subscriber_id` - Unique identifier for *this specific subscription*.
+    ///   Used by the event bus to track an independent checkpoint per bus.
+    ///   Convention: `"saga:<saga-name>:<source-bus-name>"`.
+    /// * `converter` - Closure mapping the foreign bus's event variants into
+    ///   the saga's native parent event type. Return `None` to skip events
+    ///   the saga does not care about.
+    pub fn new(saga: S, subscriber_id: impl Into<String>, converter: F) -> Self {
+        Self {
+            saga,
+            subscriber_id: subscriber_id.into(),
+            converter,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns a reference to the inner saga.
+    pub fn inner(&self) -> &S {
+        &self.saga
+    }
+}
+
+impl<S, SourceEvent, TargetEvent, F> crate::SubscriberId
+    for SagaAdapter<S, SourceEvent, TargetEvent, F>
+where
+    S: Saga<TargetEvent>,
+    SourceEvent: EventData + Send + Sync + 'static,
+    TargetEvent: EventData + Send + Sync + 'static,
+    F: Fn(&SourceEvent) -> Option<TargetEvent> + Send + Sync,
+{
+    fn subscriber_id(&self) -> &str {
+        &self.subscriber_id
+    }
+}
+
+#[async_trait]
+impl<S, SourceEvent, TargetEvent, F> EventObserver<SourceEvent>
+    for SagaAdapter<S, SourceEvent, TargetEvent, F>
+where
+    S: Saga<TargetEvent> + Send + Sync,
+    SourceEvent: EventData + Send + Sync + 'static,
+    TargetEvent: EventData + Send + Sync + 'static,
+    F: Fn(&SourceEvent) -> Option<TargetEvent> + Send + Sync + 'static,
+{
+    async fn on_event(
+        &self,
+        event: Arc<Event<SourceEvent>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(source_data) = event.data.as_ref() else {
+            return Ok(());
+        };
+        let Some(target_data) = (self.converter)(source_data) else {
+            return Ok(());
+        };
+        let target_event = Event {
+            id: event.id,
+            stream_id: event.stream_id,
+            stream_version: event.stream_version,
+            event_type: event.event_type.clone(),
+            actor_id: event.actor_id,
+            purger_id: event.purger_id,
+            data: Some(target_data),
+            created_at: event.created_at,
+            purged_at: event.purged_at,
+            global_sequence: event.global_sequence,
+            causation_id: event.causation_id,
+            correlation_id: event.correlation_id,
+        };
+        self.saga.process_event(&target_event).await?;
+        Ok(())
+    }
+
+    fn priority(&self) -> u8 {
+        self.saga.priority()
     }
 }
