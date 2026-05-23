@@ -8,7 +8,8 @@ mod subscriber_state;
 
 pub(crate) use checkpoint::*;
 pub use config::{
-    CheckpointMode, DlqCallback, DlqInsertionInfo, InstanceMode, ReliableDeliveryConfig,
+    CheckpointMode, DispatchMode, DlqCallback, DlqInsertionInfo, InstanceMode,
+    ReliableDeliveryConfig,
 };
 pub(crate) use retry::{ProcessResult, process_event_with_retry};
 pub(crate) use subscriber_state::{SubscriberState, advance_contiguous_checkpoint};
@@ -24,10 +25,10 @@ use log::{error, info, warn};
 use serde::de::DeserializeOwned;
 use sqlx::Error as SqlxError;
 use sqlx::postgres::{PgListener, PgPool};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
@@ -237,6 +238,11 @@ pub enum PgEventBusError {
     /// An error occurred during JSON serialization/deserialization.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    /// A subscriber returned an error while processing an event in
+    /// `DispatchMode::Inline`. The inner error is whatever the observer
+    /// returned from `on_event`.
+    #[error("Inline subscriber dispatch failed: {0}")]
+    InlineDispatchError(Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Type alias for the projections collection to reduce type complexity.
@@ -266,6 +272,49 @@ pub enum PgEventBusError {
 /// happen at startup, the current design is sufficient.
 type Projections<D> = Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>>;
 
+tokio::task_local! {
+    /// Marks a task as currently draining the inline dispatch queue. When set,
+    /// any `publish()` call originating from inside a subscriber handler is
+    /// treated as re-entrant: the event is appended to the queue without
+    /// waiting, and the top-level `publish` drains it after the current handler
+    /// returns. Used only in `DispatchMode::Inline`.
+    static INLINE_DRAINING: ();
+}
+
+/// One entry in the inline dispatch queue: the event to process plus a
+/// notifier the drainer signals once every subscriber has handled it.
+struct InlineQueueEntry<D>
+where
+    D: EventData + Send + Sync,
+{
+    event: Arc<Event<D>>,
+    done: Arc<Notify>,
+}
+
+/// Per-bus state for the inline dispatcher. Wrapped in a `Mutex` so concurrent
+/// callers (from different tasks) serialize on enqueue / dequeue. The actual
+/// subscriber invocations happen outside this mutex so handlers can re-enter
+/// `publish` (which only touches the mutex briefly to append).
+struct InlineDispatchState<D>
+where
+    D: EventData + Send + Sync,
+{
+    queue: VecDeque<InlineQueueEntry<D>>,
+    in_progress: bool,
+}
+
+impl<D> Default for InlineDispatchState<D>
+where
+    D: EventData + Send + Sync,
+{
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            in_progress: false,
+        }
+    }
+}
+
 /// Internal state for managing the listener lifecycle.
 struct ListenerState {
     /// Handle to the spawned listener task.
@@ -286,6 +335,8 @@ where
     config: ReliableDeliveryConfig,
     /// Listener lifecycle state, set when `start_listener` is called.
     listener_state: Arc<Mutex<Option<ListenerState>>>,
+    /// Inline-dispatch queue. Unused in `DispatchMode::Async`.
+    inline_state: Arc<Mutex<InlineDispatchState<D>>>,
 }
 
 impl<D> PgEventBus<D>
@@ -309,6 +360,7 @@ where
             projections: Arc::new(Mutex::new(vec![])),
             config,
             listener_state: Arc::new(Mutex::new(None)),
+            inline_state: Arc::new(Mutex::new(InlineDispatchState::default())),
         }
     }
 
@@ -485,6 +537,17 @@ where
     /// event_bus.shutdown().await?;
     /// ```
     pub async fn start_listener(&self) -> Result<(), SqlxError> {
+        // In inline-dispatch mode there is no background listener: events are
+        // delivered to subscribers synchronously from `publish()`. Make this a
+        // no-op so existing call sites (production initialization, tests) work
+        // unchanged when they swap the dispatch mode.
+        if self.config.dispatch_mode == config::DispatchMode::Inline {
+            log::debug!(
+                "start_listener called on inline-dispatch bus: nothing to start, dispatch happens in publish()"
+            );
+            return Ok(());
+        }
+
         // Check if already started
         {
             let state = self.listener_state.lock().await;
@@ -1236,6 +1299,116 @@ where
 
         Ok(result.0)
     }
+
+    /// Synchronously dispatch `event` to every registered subscriber, in priority
+    /// order. Used only by `DispatchMode::Inline`.
+    ///
+    /// Re-entrance: if the current task is already draining this bus's inline
+    /// queue (i.e. we were called from inside a subscriber handler), the event
+    /// is appended to the queue and the call returns immediately. The top-level
+    /// drainer picks it up after the current handler returns, preserving causal
+    /// order without recursing into the subscriber mutex.
+    ///
+    /// Concurrent callers from other tasks serialize: the first one drains the
+    /// queue (its own event plus any cascade), later callers wait for their
+    /// individual event to be processed and then return.
+    pub(crate) async fn dispatch_inline(
+        &self,
+        event: Arc<Event<D>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Same-task re-entrance: we're already inside a drain on this task.
+        // Append and return; the outer drain will process this event.
+        if INLINE_DRAINING.try_with(|_| ()).is_ok() {
+            let mut state = self.inline_state.lock().await;
+            state.queue.push_back(InlineQueueEntry {
+                event,
+                done: Arc::new(Notify::new()),
+            });
+            return Ok(());
+        }
+
+        // Top-level (or cross-task) call. Either become the drainer or wait
+        // for the existing drainer to process our event.
+        let done = Arc::new(Notify::new());
+        let should_drive = {
+            let mut state = self.inline_state.lock().await;
+            state.queue.push_back(InlineQueueEntry {
+                event,
+                done: done.clone(),
+            });
+            if state.in_progress {
+                false
+            } else {
+                state.in_progress = true;
+                true
+            }
+        };
+
+        if !should_drive {
+            // Another task is draining. Wait for our entry to be processed.
+            done.notified().await;
+            return Ok(());
+        }
+
+        // We own the drain. Process the queue inside the INLINE_DRAINING scope
+        // so that any publish() calls from within subscriber handlers are
+        // recognized as re-entrant.
+        let projections = self.projections.clone();
+        let inline_state = self.inline_state.clone();
+        INLINE_DRAINING
+            .scope((), async move {
+                let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+                    loop {
+                        let entry = {
+                            let mut state = inline_state.lock().await;
+                            match state.queue.pop_front() {
+                                Some(e) => e,
+                                None => {
+                                    state.in_progress = false;
+                                    return Ok(());
+                                }
+                            }
+                        };
+
+                        // Snapshot the subscribers and sort by priority
+                        // (projections before sagas). We can drop the lock
+                        // before invoking handlers because re-entrant
+                        // subscribes are not supported during dispatch
+                        // (handlers may publish but not subscribe).
+                        let sorted: Vec<Arc<Mutex<dyn EventObserver<D>>>> = {
+                            let guard = projections.lock().await;
+                            let mut tagged: Vec<(u8, Arc<Mutex<dyn EventObserver<D>>>)> =
+                                Vec::with_capacity(guard.len());
+                            for p in guard.iter() {
+                                let priority = p.lock().await.priority();
+                                tagged.push((priority, p.clone()));
+                            }
+                            tagged.sort_by_key(|(prio, _)| *prio);
+                            tagged.into_iter().map(|(_, p)| p).collect()
+                        };
+
+                        for subscriber in sorted {
+                            let guard = subscriber.lock().await;
+                            if let Err(e) = guard.on_event(entry.event.clone()).await {
+                                // Notify waiters so they don't hang on error.
+                                entry.done.notify_one();
+                                let mut state = inline_state.lock().await;
+                                state.in_progress = false;
+                                state.queue.clear();
+                                return Err(e);
+                            }
+                        }
+
+                        entry.done.notify_one();
+                    }
+                }
+                .await;
+                result
+            })
+            .await?;
+
+        Ok(())
+    }
 }
 
 impl<D> EventBus for PgEventBus<D>
@@ -1245,14 +1418,21 @@ where
     type EventType = D;
     type Error = PgEventBusError;
 
-    /// This is NO-OP. Use the PGEventStore to push events to the events table. Subscribers to this
-    /// bus will receive the notifications
+    /// In `DispatchMode::Async` this is a no-op: events flow through the
+    /// event store -> trigger -> NOTIFY -> listener path. In
+    /// `DispatchMode::Inline` it walks subscribers synchronously.
     fn publish<'a>(
         &'a self,
-        _event: Arc<Event<Self::EventType>>,
+        event: Arc<Event<Self::EventType>>,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-        // This is a noop. Use the PgEventStore to add events to the event table.
-        Box::pin(async { Ok(()) })
+        match self.config.dispatch_mode {
+            config::DispatchMode::Async => Box::pin(async { Ok(()) }),
+            config::DispatchMode::Inline => Box::pin(async move {
+                self.dispatch_inline(event)
+                    .await
+                    .map_err(PgEventBusError::InlineDispatchError)
+            }),
+        }
     }
 
     fn subscribe<T>(
@@ -1267,10 +1447,23 @@ where
         let config = self.config.clone();
         let channel_name = self.channel_name.clone();
 
+        let inline_state = self.inline_state.clone();
         Box::pin(async move {
             // Wrap the projector in Arc<Mutex<>> for sharing
             let observer: Arc<Mutex<dyn EventObserver<Self::EventType>>> =
                 Arc::new(Mutex::new(projector));
+
+            // Inline dispatch: no LISTEN task, no NOTIFY channel, no catch-up.
+            // Just register the subscriber and return. Any events published
+            // before subscription are not replayed (intentional for tests).
+            if config.dispatch_mode == config::DispatchMode::Inline {
+                // Touch inline_state so the field isn't considered unused on
+                // the subscribe path; ensures the queue is initialized.
+                let _ = inline_state.lock().await;
+                let mut guard = projections.lock().await;
+                guard.push(observer);
+                return Ok(());
+            }
 
             // Get subscriber_id for catch-up
             let subscriber_id = {

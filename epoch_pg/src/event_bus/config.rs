@@ -51,6 +51,36 @@ pub trait DlqCallback: Send + Sync {
     async fn on_dlq_insertion(&self, info: DlqInsertionInfo);
 }
 
+/// How events are dispatched from the bus to subscribers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum DispatchMode {
+    /// Default. Events are persisted to the event store, the database trigger
+    /// fires `NOTIFY`, and a background listener task (started via
+    /// `start_listener`) reads new events and dispatches them to subscribers.
+    /// Suitable for production: decouples publishers from subscribers and
+    /// survives subscriber crashes via checkpoints + catch-up.
+    #[default]
+    Async,
+
+    /// Synchronous in-process dispatch. `publish()` walks the registered
+    /// subscribers directly in priority order. `start_listener` is a no-op
+    /// and `subscribe` skips catch-up.
+    ///
+    /// Re-entrant `publish` calls (events emitted from inside a subscriber
+    /// handler in the same task) are appended to a per-bus FIFO queue rather
+    /// than dispatched recursively — they are processed by the top-level
+    /// `publish` after the current handler returns. This avoids re-entrant
+    /// deadlocks on per-subscriber mutexes while preserving causal order and
+    /// the invariant "by the time the originating publish returns, every
+    /// cascade triggered by that event has been processed by every subscriber".
+    ///
+    /// Intended primarily for integration tests, where determinism matters
+    /// more than throughput and the indirection of NOTIFY/LISTEN is the
+    /// dominant source of timing-related flakiness.
+    Inline,
+}
+
 /// Configuration for reliable event delivery.
 ///
 /// This struct controls retry behavior, checkpointing strategy, and multi-instance coordination.
@@ -128,6 +158,9 @@ pub struct ReliableDeliveryConfig {
     ///
     /// Default: `None` (no callback)
     pub on_dlq_insertion: Option<Arc<dyn DlqCallback>>,
+
+    /// How events flow from publishers to subscribers. See [`DispatchMode`].
+    pub dispatch_mode: DispatchMode,
 }
 
 impl Default for ReliableDeliveryConfig {
@@ -142,6 +175,7 @@ impl Default for ReliableDeliveryConfig {
             catch_up_buffer_size: 10_000,
             gap_timeout: Duration::from_secs(5),
             on_dlq_insertion: None,
+            dispatch_mode: DispatchMode::default(),
         }
     }
 }
@@ -161,6 +195,7 @@ impl std::fmt::Debug for ReliableDeliveryConfig {
                 "on_dlq_insertion",
                 &self.on_dlq_insertion.as_ref().map(|_| "Some(<callback>)"),
             )
+            .field("dispatch_mode", &self.dispatch_mode)
             .finish()
     }
 }
@@ -292,6 +327,7 @@ mod tests {
             catch_up_buffer_size: 20_000,
             gap_timeout: Duration::from_secs(10),
             on_dlq_insertion: None,
+            dispatch_mode: DispatchMode::default(),
         };
 
         assert_eq!(config.max_retries, 5);
