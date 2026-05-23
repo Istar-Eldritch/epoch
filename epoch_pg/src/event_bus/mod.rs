@@ -32,8 +32,8 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
-use std::future::Future;
 use futures::future::join_all;
+use std::future::Future;
 
 /// Result of processing a single subscriber against one batch of events.
 struct SubscriberBatchOutcome {
@@ -123,7 +123,9 @@ where
 
         log::debug!(
             "Applying event {} (seq {}) to '{}'",
-            event_id, event_seq, subscriber_id
+            event_id,
+            event_seq,
+            subscriber_id
         );
 
         process_event_with_retry(&projection, &event, &subscriber_id, &config, &dlq_pool).await;
@@ -593,11 +595,7 @@ where
                 let mut sorted_info = Vec::new();
                 for p in guard.iter() {
                     let obs = p.lock().await;
-                    sorted_info.push(format!(
-                        "{}(p={})",
-                        obs.subscriber_id(),
-                        obs.priority()
-                    ));
+                    sorted_info.push(format!("{}(p={})", obs.subscriber_id(), obs.priority()));
                 }
                 log::debug!("Event bus: processing order after sort: {:?}", sorted_info);
             }
@@ -861,7 +859,8 @@ where
                     // Collect (priority, subscriber_id, projection) tuples sequentially.
                     // We hold projections_guard here, so inner per-subscriber locks are
                     // acquired one at a time to read metadata.
-                    let mut tagged: Vec<(u8, String, Arc<Mutex<dyn EventObserver<D>>>)> = Vec::new();
+                    let mut tagged: Vec<(u8, String, Arc<Mutex<dyn EventObserver<D>>>)> =
+                        Vec::new();
                     for projection in projections_guard.iter() {
                         let guard = projection.lock().await;
                         let priority = guard.priority();
@@ -909,11 +908,31 @@ where
                             .collect();
 
                         let outcomes = join_all(task_inputs.into_iter().map(
-                            |(sid, proj, state, pending, last_id, rows_ref, visible_ref, seq_to_id_ref, config_ref, dlq_ref, cp_ref)| {
+                            |(
+                                sid,
+                                proj,
+                                state,
+                                pending,
+                                last_id,
+                                rows_ref,
+                                visible_ref,
+                                seq_to_id_ref,
+                                config_ref,
+                                dlq_ref,
+                                cp_ref,
+                            )| {
                                 process_subscriber_for_batch(
-                                    proj, sid, state, pending, last_id,
-                                    rows_ref, visible_ref, seq_to_id_ref,
-                                    config_ref, dlq_ref, cp_ref,
+                                    proj,
+                                    sid,
+                                    state,
+                                    pending,
+                                    last_id,
+                                    rows_ref,
+                                    visible_ref,
+                                    seq_to_id_ref,
+                                    config_ref,
+                                    dlq_ref,
+                                    cp_ref,
                                 )
                             },
                         ))
