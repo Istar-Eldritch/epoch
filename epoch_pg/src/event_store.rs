@@ -16,13 +16,34 @@ use uuid::Uuid;
 pub struct PgEventStore<B: EventBus + Clone> {
     postgres: PgPool,
     bus: B,
+    events_table: String,
 }
 
 impl<B: EventBus + Clone> PgEventStore<B> {
-    /// Creates a new `PgEventStore`.
+    /// Creates a new `PgEventStore` writing to the default `epoch_events` table.
     pub fn new(postgres: PgPool, bus: B) -> Self {
         log::debug!("Creating a new PgEventStore");
-        Self { postgres, bus }
+        Self {
+            postgres,
+            bus,
+            events_table: "epoch_events".to_string(),
+        }
+    }
+
+    /// Creates a new `PgEventStore` writing to a custom events table.
+    pub fn with_table(postgres: PgPool, bus: B, events_table: impl Into<String>) -> Self {
+        let events_table = events_table.into();
+        log::debug!("Creating a new PgEventStore targeting table '{events_table}'");
+        Self {
+            postgres,
+            bus,
+            events_table,
+        }
+    }
+
+    /// Returns the name of the events table this store writes to.
+    pub fn events_table(&self) -> &str {
+        &self.events_table
     }
 
     /// Exposes the event store bus
@@ -67,14 +88,15 @@ impl<B: EventBus + Clone> PgEventStore<B> {
     {
         let mut stored_events = Vec::with_capacity(events.len());
 
+        let insert_sql = format!(
+            "INSERT INTO {} (id, stream_id, stream_version, event_type, data, \
+             created_at, actor_id, purger_id, purged_at, causation_id, correlation_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             RETURNING global_sequence",
+            self.events_table,
+        );
         for event in events {
-            let row: (i64,) = sqlx::query_as(
-                r#"
-                INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at, actor_id, purger_id, purged_at, causation_id, correlation_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                RETURNING global_sequence
-                "#,
-            )
+            let row: (i64,) = sqlx::query_as(&insert_sql)
             .bind(event.id)
             .bind(event.stream_id)
             .bind(TryInto::<i64>::try_into(event.stream_version).map_err(|e| {
@@ -248,27 +270,15 @@ where
         version: u64,
     ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
     {
+        let read_sql = format!(
+            "SELECT id, stream_id, stream_version, event_type, data, created_at, \
+             actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id \
+             FROM {} WHERE stream_id = $1 AND stream_version >= $2 \
+             ORDER BY stream_version ASC",
+            self.events_table,
+        );
         let stream = try_stream! {
-            let mut inner_stream = sqlx::query_as::<_, PgDBEvent>(
-                r#"
-                    SELECT
-                        id,
-                        stream_id,
-                        stream_version,
-                        event_type,
-                        data,
-                        created_at,
-                        actor_id,
-                        purger_id,
-                        purged_at,
-                        global_sequence,
-                        causation_id,
-                        correlation_id
-                    FROM epoch_events
-                    WHERE stream_id = $1 AND stream_version >= $2
-                    ORDER BY stream_version ASC
-                    "#,
-            )
+            let mut inner_stream = sqlx::query_as::<_, PgDBEvent>(&read_sql)
             .bind(stream_id)
             .bind(version as i64)
             .fetch(&self.postgres);
@@ -320,13 +330,14 @@ where
 
     async fn store_event(&self, event: Event<Self::EventType>) -> Result<(), Self::Error> {
         // Insert the event and get back the assigned global_sequence
-        let row: (i64,) = sqlx::query_as(
-                r#"
-                INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at, actor_id, purger_id, purged_at, causation_id, correlation_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                RETURNING global_sequence
-                "#,
-            )
+        let store_sql = format!(
+            "INSERT INTO {} (id, stream_id, stream_version, event_type, data, \
+             created_at, actor_id, purger_id, purged_at, causation_id, correlation_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             RETURNING global_sequence",
+            self.events_table,
+        );
+        let row: (i64,) = sqlx::query_as(&store_sql)
             .bind(event.id)
             .bind(event.stream_id)
             .bind(TryInto::<i64>::try_into(event.stream_version).map_err(|e| {
@@ -403,17 +414,13 @@ where
         &self,
         correlation_id: Uuid,
     ) -> Result<Vec<Event<Self::EventType>>, Self::Error> {
-        let rows = sqlx::query_as::<_, PgDBEvent>(
-            r#"
-            SELECT
-                id, stream_id, stream_version, event_type, data, created_at,
-                actor_id, purger_id, purged_at, global_sequence,
-                causation_id, correlation_id
-            FROM epoch_events
-            WHERE correlation_id = $1
-            ORDER BY global_sequence ASC
-            "#,
-        )
+        let correlation_sql = format!(
+            "SELECT id, stream_id, stream_version, event_type, data, created_at, \
+             actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id \
+             FROM {} WHERE correlation_id = $1 ORDER BY global_sequence ASC",
+            self.events_table,
+        );
+        let rows = sqlx::query_as::<_, PgDBEvent>(&correlation_sql)
         .bind(correlation_id)
         .fetch_all(&self.postgres)
         .await?;
@@ -458,16 +465,13 @@ where
         event_id: Uuid,
     ) -> Result<Vec<Event<Self::EventType>>, Self::Error> {
         // Fetch the starting event
-        let row = sqlx::query_as::<_, PgDBEvent>(
-            r#"
-            SELECT
-                id, stream_id, stream_version, event_type, data, created_at,
-                actor_id, purger_id, purged_at, global_sequence,
-                causation_id, correlation_id
-            FROM epoch_events
-            WHERE id = $1
-            "#,
-        )
+        let trace_sql = format!(
+            "SELECT id, stream_id, stream_version, event_type, data, created_at, \
+             actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id \
+             FROM {} WHERE id = $1",
+            self.events_table,
+        );
+        let row = sqlx::query_as::<_, PgDBEvent>(&trace_sql)
         .bind(event_id)
         .fetch_optional(&self.postgres)
         .await?;

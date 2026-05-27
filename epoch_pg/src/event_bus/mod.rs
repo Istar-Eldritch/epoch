@@ -381,6 +381,11 @@ where
         &self.channel_name
     }
 
+    /// Returns the name of the PostgreSQL table this bus reads events from.
+    pub fn events_table(&self) -> &str {
+        &self.config.events_table
+    }
+
     /// Reads all events across all streams since a given global sequence.
     ///
     /// This is used for catch-up processing when a subscriber needs to replay
@@ -400,27 +405,13 @@ where
         since_global_sequence: u64,
         limit: u32,
     ) -> Result<Vec<Event<D>>, SqlxError> {
-        let rows: Vec<PgDBEvent> = sqlx::query_as(
-            r#"
-            SELECT
-                id,
-                stream_id,
-                stream_version,
-                event_type,
-                data,
-                created_at,
-                actor_id,
-                purger_id,
-                purged_at,
-                global_sequence,
-                causation_id,
-                correlation_id
-            FROM epoch_events
-            WHERE global_sequence > $1
-            ORDER BY global_sequence ASC
-            LIMIT $2
-            "#,
-        )
+        let query = format!(
+            "SELECT id, stream_id, stream_version, event_type, data, created_at, \
+             actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id \
+             FROM {} WHERE global_sequence > $1 ORDER BY global_sequence ASC LIMIT $2",
+            self.config.events_table,
+        );
+        let rows: Vec<PgDBEvent> = sqlx::query_as(&query)
         .bind(since_global_sequence as i64)
         .bind(limit as i64)
         .fetch_all(&self.pool)
@@ -482,9 +473,10 @@ where
     pub async fn setup_trigger(&self) -> Result<(), SqlxError> {
         // Drop existing trigger if present
         sqlx::query(
-            r#"
-            DROP TRIGGER IF EXISTS epoch_event_bus_notify_trigger ON epoch_events;
-            "#,
+            &format!(
+                "DROP TRIGGER IF EXISTS epoch_event_bus_notify_trigger ON {};",
+                self.config.events_table,
+            ),
         )
         .execute(&self.pool)
         .await?;
@@ -492,12 +484,11 @@ where
         // Create the trigger that calls the function after an INSERT.
         // We escape single quotes in the channel name to prevent SQL injection.
         let create_trigger_query = format!(
-            r#"
-            CREATE TRIGGER epoch_event_bus_notify_trigger
-            AFTER INSERT ON epoch_events
-            FOR EACH ROW
-            EXECUTE FUNCTION epoch_notify_event('{}');
-            "#,
+            "CREATE TRIGGER epoch_event_bus_notify_trigger \
+             AFTER INSERT ON {} \
+             FOR EACH ROW \
+             EXECUTE FUNCTION epoch_notify_event('{}');",
+            self.config.events_table,
             self.channel_name.replace('\'', "''")
         );
 
@@ -805,18 +796,15 @@ where
                         .min()
                         .unwrap_or(0);
 
-                    let rows: Vec<PgDBEvent> = match sqlx::query_as(
-                        r#"
-                        SELECT
-                            id, stream_id, stream_version, event_type, data,
-                            created_at, actor_id, purger_id, purged_at,
-                            global_sequence, causation_id, correlation_id
-                        FROM epoch_events
-                        WHERE global_sequence > $1
-                        ORDER BY global_sequence ASC
-                        LIMIT $2
-                        "#,
-                    )
+                    let catchup_query = format!(
+                        "SELECT id, stream_id, stream_version, event_type, data, \
+                         created_at, actor_id, purger_id, purged_at, \
+                         global_sequence, causation_id, correlation_id \
+                         FROM {} WHERE global_sequence > $1 \
+                         ORDER BY global_sequence ASC LIMIT $2",
+                        config.events_table,
+                    );
+                    let rows: Vec<PgDBEvent> = match sqlx::query_as(&catchup_query)
                     .bind(min_checkpoint as i64)
                     .bind(config.catch_up_batch_size as i64)
                     .fetch_all(&checkpoint_pool)
@@ -1647,28 +1635,16 @@ where
             let mut checkpoint_cache: HashMap<String, u64> = HashMap::new();
 
             // Process catch-up events from the database
+            let subscriber_catchup_query = format!(
+                "SELECT id, stream_id, stream_version, event_type, data, \
+                 created_at, actor_id, purger_id, purged_at, \
+                 global_sequence, causation_id, correlation_id \
+                 FROM {} WHERE global_sequence > $1 \
+                 ORDER BY global_sequence ASC LIMIT $2",
+                config.events_table,
+            );
             loop {
-                let rows: Vec<PgDBEvent> = sqlx::query_as(
-                    r#"
-                    SELECT
-                        id,
-                        stream_id,
-                        stream_version,
-                        event_type,
-                        data,
-                        created_at,
-                        actor_id,
-                        purger_id,
-                        purged_at,
-                        global_sequence,
-                        causation_id,
-                        correlation_id
-                    FROM epoch_events
-                    WHERE global_sequence > $1
-                    ORDER BY global_sequence ASC
-                    LIMIT $2
-                    "#,
-                )
+                let rows: Vec<PgDBEvent> = sqlx::query_as(&subscriber_catchup_query)
                 .bind(current_sequence as i64)
                 .bind(config.catch_up_batch_size as i64)
                 .fetch_all(&pool)

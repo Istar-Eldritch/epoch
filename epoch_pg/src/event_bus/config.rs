@@ -161,6 +161,13 @@ pub struct ReliableDeliveryConfig {
 
     /// How events flow from publishers to subscribers. See [`DispatchMode`].
     pub dispatch_mode: DispatchMode,
+
+    /// Name of the PostgreSQL table used to store and read events.
+    ///
+    /// Defaults to `"epoch_events"`. Set this to a per-domain table name
+    /// (e.g. `"iam_events"`, `"billing_events"`) to route a bus at a
+    /// physically-separate event table.
+    pub events_table: String,
 }
 
 impl Default for ReliableDeliveryConfig {
@@ -176,6 +183,7 @@ impl Default for ReliableDeliveryConfig {
             gap_timeout: Duration::from_secs(5),
             on_dlq_insertion: None,
             dispatch_mode: DispatchMode::default(),
+            events_table: "epoch_events".to_string(),
         }
     }
 }
@@ -196,6 +204,7 @@ impl std::fmt::Debug for ReliableDeliveryConfig {
                 &self.on_dlq_insertion.as_ref().map(|_| "Some(<callback>)"),
             )
             .field("dispatch_mode", &self.dispatch_mode)
+            .field("events_table", &self.events_table)
             .finish()
     }
 }
@@ -328,6 +337,7 @@ mod tests {
             gap_timeout: Duration::from_secs(10),
             on_dlq_insertion: None,
             dispatch_mode: DispatchMode::default(),
+            events_table: "custom_events".to_string(),
         };
 
         assert_eq!(config.max_retries, 5);
