@@ -73,20 +73,22 @@ pub(crate) fn should_flush_checkpoint(pending: &PendingCheckpoint, mode: &Checkp
 /// `Batched` mode.
 pub(crate) async fn flush_checkpoint(
     pool: &PgPool,
+    bus_name: &str,
     subscriber_id: &str,
     pending: &PendingCheckpoint,
     checkpoint_cache: &mut HashMap<String, u64>,
 ) -> Result<(), SqlxError> {
     sqlx::query(
         r#"
-        INSERT INTO epoch_event_bus_checkpoints (subscriber_id, last_global_sequence, last_event_id, updated_at)
-        VALUES ($1, $2, $3, NOW())
-        ON CONFLICT (subscriber_id) DO UPDATE SET
+        INSERT INTO epoch_event_bus_checkpoints (bus_name, subscriber_id, last_global_sequence, last_event_id, updated_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (bus_name, subscriber_id) DO UPDATE SET
             last_global_sequence = EXCLUDED.last_global_sequence,
             last_event_id = EXCLUDED.last_event_id,
             updated_at = NOW()
         "#,
     )
+    .bind(bus_name)
     .bind(subscriber_id)
     .bind(pending.global_sequence as i64)
     .bind(pending.event_id)
@@ -110,6 +112,7 @@ pub(crate) async fn flush_checkpoint(
 /// in a background loop and will be retried on the next interval.
 pub(crate) async fn flush_expired_checkpoints(
     pool: &PgPool,
+    bus_name: &str,
     pending_checkpoints: &mut HashMap<String, PendingCheckpoint>,
     checkpoint_cache: &mut HashMap<String, u64>,
     mode: &CheckpointMode,
@@ -127,7 +130,8 @@ pub(crate) async fn flush_expired_checkpoints(
 
     for subscriber_id in expired {
         if let Some(pending) = pending_checkpoints.remove(&subscriber_id)
-            && let Err(e) = flush_checkpoint(pool, &subscriber_id, &pending, checkpoint_cache).await
+            && let Err(e) =
+                flush_checkpoint(pool, bus_name, &subscriber_id, &pending, checkpoint_cache).await
         {
             error!(
                 "Failed to flush expired checkpoint for '{}': {}",
@@ -146,13 +150,15 @@ pub(crate) async fn flush_expired_checkpoints(
 /// shutdown or reconnection scenarios where we want best-effort persistence.
 pub(crate) async fn flush_all_pending_checkpoints(
     pool: &PgPool,
+    bus_name: &str,
     pending_checkpoints: &mut HashMap<String, PendingCheckpoint>,
     checkpoint_cache: &mut HashMap<String, u64>,
 ) {
     let subscriber_ids: Vec<String> = pending_checkpoints.keys().cloned().collect();
     for subscriber_id in subscriber_ids {
         if let Some(pending) = pending_checkpoints.remove(&subscriber_id)
-            && let Err(e) = flush_checkpoint(pool, &subscriber_id, &pending, checkpoint_cache).await
+            && let Err(e) =
+                flush_checkpoint(pool, bus_name, &subscriber_id, &pending, checkpoint_cache).await
         {
             error!(
                 "Failed to flush checkpoint for '{}' during shutdown/reconnect: {}",

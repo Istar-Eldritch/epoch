@@ -174,8 +174,14 @@ where
         if should_flush {
             let pending = pending_checkpoint.take().unwrap();
             let mut local_cache = HashMap::new();
-            match flush_checkpoint(&checkpoint_pool, &subscriber_id, &pending, &mut local_cache)
-                .await
+            match flush_checkpoint(
+                &checkpoint_pool,
+                &config.events_table,
+                &subscriber_id,
+                &pending,
+                &mut local_cache,
+            )
+            .await
             {
                 Ok(()) => {
                     if let Some(val) = local_cache.get(&subscriber_id) {
@@ -629,6 +635,7 @@ where
                             );
                             flush_all_pending_checkpoints(
                                 &checkpoint_pool,
+                                &config.events_table,
                                 &mut pending_checkpoints,
                                 &mut checkpoint_cache,
                             )
@@ -688,6 +695,7 @@ where
                         // Periodic flush of expired checkpoints (for Batched mode)
                         flush_expired_checkpoints(
                             &checkpoint_pool,
+                            &config.events_table,
                             &mut pending_checkpoints,
                             &mut checkpoint_cache,
                             &config.checkpoint_mode,
@@ -700,6 +708,7 @@ where
                             info!("Shutdown signal received, flushing pending checkpoints...");
                             flush_all_pending_checkpoints(
                                 &checkpoint_pool,
+                                &config.events_table,
                                 &mut pending_checkpoints,
                                 &mut checkpoint_cache,
                             )
@@ -764,9 +773,10 @@ where
                             r#"
                             SELECT last_global_sequence
                             FROM epoch_event_bus_checkpoints
-                            WHERE subscriber_id = $1
+                            WHERE bus_name = $1 AND subscriber_id = $2
                             "#,
                         )
+                        .bind(&config.events_table)
                         .bind(&subscriber_id)
                         .fetch_optional(&checkpoint_pool)
                         .await
@@ -1026,9 +1036,10 @@ where
             r#"
             SELECT last_global_sequence
             FROM epoch_event_bus_checkpoints
-            WHERE subscriber_id = $1
+            WHERE bus_name = $1 AND subscriber_id = $2
             "#,
         )
+        .bind(&self.config.events_table)
         .bind(subscriber_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -1048,14 +1059,15 @@ where
     ) -> Result<(), SqlxError> {
         sqlx::query(
             r#"
-            INSERT INTO epoch_event_bus_checkpoints (subscriber_id, last_global_sequence, last_event_id, updated_at)
-            VALUES ($1, $2, $3, NOW())
-            ON CONFLICT (subscriber_id) DO UPDATE SET
+            INSERT INTO epoch_event_bus_checkpoints (bus_name, subscriber_id, last_global_sequence, last_event_id, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (bus_name, subscriber_id) DO UPDATE SET
                 last_global_sequence = EXCLUDED.last_global_sequence,
                 last_event_id = EXCLUDED.last_event_id,
                 updated_at = NOW()
             "#,
         )
+        .bind(&self.config.events_table)
         .bind(subscriber_id)
         .bind(global_sequence as i64)
         .bind(event_id)
@@ -1616,9 +1628,10 @@ where
                     r#"
                     SELECT last_global_sequence
                     FROM epoch_event_bus_checkpoints
-                    WHERE subscriber_id = $1
+                    WHERE bus_name = $1 AND subscriber_id = $2
                     "#,
                 )
+                .bind(&config.events_table)
                 .bind(&subscriber_id)
                 .fetch_optional(&pool)
                 .await?;
@@ -1698,6 +1711,7 @@ where
                                 let pending = pending_checkpoint.take().unwrap();
                                 if let Err(flush_err) = flush_checkpoint(
                                     &pool,
+                                    &config.events_table,
                                     &subscriber_id,
                                     &pending,
                                     &mut checkpoint_cache,
@@ -1752,7 +1766,7 @@ where
                     {
                         let pending = pending_checkpoint.take().unwrap();
                         if let Err(e) =
-                            flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache)
+                            flush_checkpoint(&pool, &config.events_table, &subscriber_id, &pending, &mut checkpoint_cache)
                                 .await
                         {
                             error!(
@@ -1785,7 +1799,7 @@ where
             // Flush any remaining pending checkpoint after catch-up
             if let Some(pending) = pending_checkpoint.take()
                 && let Err(e) =
-                    flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache).await
+                    flush_checkpoint(&pool, &config.events_table, &subscriber_id, &pending, &mut checkpoint_cache).await
             {
                 error!(
                     "Catch-up: failed to flush final checkpoint for '{}': {}",
@@ -1852,7 +1866,7 @@ where
                 {
                     let pending = pending_checkpoint.take().unwrap();
                     if let Err(e) =
-                        flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache)
+                        flush_checkpoint(&pool, &config.events_table, &subscriber_id, &pending, &mut checkpoint_cache)
                             .await
                     {
                         error!(
@@ -1879,7 +1893,7 @@ where
             // Flush any remaining pending checkpoint after buffer processing
             if let Some(pending) = pending_checkpoint.take()
                 && let Err(e) =
-                    flush_checkpoint(&pool, &subscriber_id, &pending, &mut checkpoint_cache).await
+                    flush_checkpoint(&pool, &config.events_table, &subscriber_id, &pending, &mut checkpoint_cache).await
             {
                 error!(
                     "Buffer processing: failed to flush final checkpoint for '{}': {}",
