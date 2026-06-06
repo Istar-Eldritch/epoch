@@ -1077,6 +1077,57 @@ where
         Ok(())
     }
 
+    /// Fast-forwards every currently-registered subscriber's checkpoint to the
+    /// current head of this bus (its maximum `global_sequence`).
+    ///
+    /// This is intended for bulk-loading / seeding scenarios that publish events
+    /// with [`DispatchMode::Inline`](crate::config::DispatchMode::Inline): the
+    /// read models are built synchronously inside each command, but no bus
+    /// checkpoints are written. Without fast-forwarding, a subsequently started
+    /// `Async` listener would re-process the entire history from sequence 0
+    /// (re-running projections and re-firing sagas, and potentially failing on
+    /// events whose referenced state has since been removed).
+    ///
+    /// Call this once, after all subscribers have been registered and all seed
+    /// events have been published. It upserts a checkpoint at the bus head for
+    /// each registered subscriber, so a later `Async` start resumes from head.
+    ///
+    /// No-op if the bus has no events yet.
+    pub async fn fast_forward_all_subscribers(&self) -> Result<(), SqlxError> {
+        // Read the current head (max global_sequence and its event id).
+        let head: Option<(i64, Uuid)> = sqlx::query_as(&format!(
+            "SELECT global_sequence, id FROM {} \
+             ORDER BY global_sequence DESC LIMIT 1",
+            self.config.events_table,
+        ))
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some((max_seq, last_event_id)) = head else {
+            // No events on this bus; nothing to fast-forward.
+            return Ok(());
+        };
+
+        // Snapshot the registered subscriber ids (avoid holding the lock across
+        // the awaited DB writes).
+        let subscriber_ids: Vec<String> = {
+            let guard = self.projections.lock().await;
+            let mut ids = Vec::with_capacity(guard.len());
+            for observer in guard.iter() {
+                let o = observer.lock().await;
+                ids.push(o.subscriber_id().to_string());
+            }
+            ids
+        };
+
+        for subscriber_id in subscriber_ids {
+            self.update_checkpoint(&subscriber_id, max_seq as u64, last_event_id)
+                .await?;
+        }
+
+        Ok(())
+    }
+
     /// Inserts an event into the dead letter queue after all retries have been exhausted.
     ///
     /// This records the failed event along with error information for later analysis
