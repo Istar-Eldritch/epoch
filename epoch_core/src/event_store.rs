@@ -69,6 +69,41 @@ pub trait EventStoreBackend: Send + Sync {
         Ok(())
     }
 
+    /// Returns the most recent event in the given stream, or `None` if the stream is empty.
+    ///
+    /// "Most recent" is defined as the event with the highest `stream_version` — i.e. the
+    /// last event that was appended to the stream identified by `stream_id`.
+    ///
+    /// Returns `Ok(None)` when the stream does not exist or contains no events.
+    ///
+    /// # Use Case
+    ///
+    /// This is useful for background tasks (e.g. a resuming process manager) that need to
+    /// re-link into an existing causation/correlation tree without re-reading the entire
+    /// stream. Pair the returned event's `id` with
+    /// [`Command::with_causation_id`](crate::aggregate::Command::with_causation_id) to
+    /// continue an existing causal chain.
+    ///
+    /// # Default Implementation
+    ///
+    /// The default implementation drains the stream returned by
+    /// [`read_events`](Self::read_events) and keeps the last yielded event. This is an
+    /// **O(N)** operation in the number of events in the stream. Backends that can answer
+    /// this query directly — for example via an indexed
+    /// `ORDER BY stream_version DESC LIMIT 1` query — **should override** this method to
+    /// provide O(1) performance.
+    async fn read_last_event(
+        &self,
+        stream_id: Uuid,
+    ) -> Result<Option<Event<Self::EventType>>, Self::Error> {
+        let mut stream = self.read_events(stream_id).await?;
+        let mut last = None;
+        while let Some(item) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+            last = Some(item?);
+        }
+        Ok(last)
+    }
+
     /// Returns all events sharing the given correlation ID, ordered by global sequence.
     ///
     /// This is a cross-stream query — it searches across all event streams for events
