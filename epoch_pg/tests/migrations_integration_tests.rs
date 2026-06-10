@@ -10,6 +10,10 @@ async fn teardown(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("Failed to drop checkpoint index");
+    sqlx::query("DROP TABLE IF EXISTS epoch_event_bus_gap_timeouts CASCADE")
+        .execute(pool)
+        .await
+        .expect("Failed to drop gap_timeouts table");
     sqlx::query("DROP TABLE IF EXISTS epoch_event_bus_dlq CASCADE")
         .execute(pool)
         .await
@@ -78,14 +82,14 @@ async fn test_migrator_runs_all_migrations() {
 
     // Run migrations
     let applied = migrator.run().await.expect("Should run migrations");
-    assert_eq!(applied, 8, "Should apply 8 migrations");
+    assert_eq!(applied, 9, "Should apply 9 migrations");
 
     // Verify current version
     let version = migrator
         .current_version()
         .await
         .expect("Should get version");
-    assert_eq!(version, 8, "Version should be 8 after all migrations");
+    assert_eq!(version, 9, "Version should be 9 after all migrations");
 
     // Verify epoch_events table exists
     let events_table: (i64,) = sqlx::query_as(
@@ -142,6 +146,22 @@ async fn test_migrator_runs_all_migrations() {
     .expect("Failed to query");
     assert_eq!(dlq_table.0, 1, "epoch_event_bus_dlq table should exist");
 
+    // Verify gap-timeout table exists
+    let gap_timeout_table: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) 
+        FROM information_schema.tables 
+        WHERE table_name = 'epoch_event_bus_gap_timeouts'
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to query");
+    assert_eq!(
+        gap_timeout_table.0, 1,
+        "epoch_event_bus_gap_timeouts table should exist"
+    );
+
     teardown(&pool).await;
 }
 
@@ -155,7 +175,7 @@ async fn test_migrator_is_idempotent() {
 
     // Run migrations first time
     let applied1 = migrator.run().await.expect("Should run migrations");
-    assert_eq!(applied1, 8, "Should apply 8 migrations first time");
+    assert_eq!(applied1, 9, "Should apply 9 migrations first time");
 
     // Run migrations second time
     let applied2 = migrator.run().await.expect("Should run migrations again");
@@ -168,12 +188,12 @@ async fn test_migrator_is_idempotent() {
         .expect("Should run migrations third time");
     assert_eq!(applied3, 0, "Should apply 0 migrations third time");
 
-    // Version should still be 8
+    // Version should still be 9
     let version = migrator
         .current_version()
         .await
         .expect("Should get version");
-    assert_eq!(version, 8, "Version should still be 8");
+    assert_eq!(version, 9, "Version should still be 9");
 
     teardown(&pool).await;
 }
@@ -188,7 +208,7 @@ async fn test_migrator_pending_returns_unapplied_migrations() {
 
     // Before running, all should be pending
     let pending = migrator.pending().await.expect("Should get pending");
-    assert_eq!(pending.len(), 8, "All 8 migrations should be pending");
+    assert_eq!(pending.len(), 9, "All 9 migrations should be pending");
 
     // Run migrations
     migrator.run().await.expect("Should run migrations");
@@ -221,7 +241,7 @@ async fn test_migrator_applied_returns_applied_migrations() {
 
     // After running, all should be applied
     let applied_after = migrator.applied().await.expect("Should get applied");
-    assert_eq!(applied_after.len(), 8, "All 8 migrations should be applied");
+    assert_eq!(applied_after.len(), 9, "All 9 migrations should be applied");
 
     // Verify the applied migrations have correct data
     assert_eq!(applied_after[0].version, 1);
@@ -248,6 +268,9 @@ async fn test_migrator_applied_returns_applied_migrations() {
 
     assert_eq!(applied_after[7].version, 8);
     assert_eq!(applied_after[7].name, "add_bus_name_to_checkpoints");
+
+    assert_eq!(applied_after[8].version, 9);
+    assert_eq!(applied_after[8].name, "create_gap_timeout_log");
 
     teardown(&pool).await;
 }
