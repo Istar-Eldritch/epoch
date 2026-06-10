@@ -1163,7 +1163,7 @@ where
     /// current head of this bus (its maximum `global_sequence`).
     ///
     /// This is intended for bulk-loading / seeding scenarios that publish events
-    /// with [`DispatchMode::Inline`](crate::config::DispatchMode::Inline): the
+    /// with [`DispatchMode::Inline`](crate::DispatchMode): the
     /// read models are built synchronously inside each command, but no bus
     /// checkpoints are written. Without fast-forwarding, a subsequently started
     /// `Async` listener would re-process the entire history from sequence 0
