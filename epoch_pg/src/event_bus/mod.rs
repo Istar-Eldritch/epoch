@@ -199,7 +199,21 @@ where
                         sub_id_task, bus_name_task, skipped_sequence, e
                     );
                 }
-                Ok(_) => {
+                Ok(insert_result) => {
+                    // Only invoke the callback when a NEW record was inserted.
+                    // `ON CONFLICT DO NOTHING` reports 0 affected rows when the
+                    // gap was already recorded (e.g. re-detection after a restart
+                    // before checkpoint flush, or a concurrent instance) — the
+                    // callback must fire exactly once per durable record.
+                    if insert_result.rows_affected() == 0 {
+                        log::debug!(
+                            "Gap timeout for '{}' on bus '{}' seq {} already recorded; skipping callback",
+                            sub_id_task,
+                            bus_name_task,
+                            skipped_sequence
+                        );
+                        return;
+                    }
                     if let Some(callback) = cb {
                         let info = GapTimeoutInfo {
                             bus_name: bus_name_task,

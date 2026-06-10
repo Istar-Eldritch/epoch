@@ -113,9 +113,11 @@ pub(crate) fn advance_contiguous_checkpoint(
             // `next` is not visible in the DB and not processed — this is a gap.
             // Either an uncommitted transaction or a rolled-back one.
             if let Some(first_seen) = state.gap_first_seen.get(&next) {
-                if first_seen.elapsed() > gap_timeout {
+                // Evaluate elapsed time once so the recorded duration is exactly
+                // the value the timeout decision was made on.
+                let gap_duration = first_seen.elapsed();
+                if gap_duration > gap_timeout {
                     // Gap has been observed long enough — assume rolled back
-                    let gap_duration = first_seen.elapsed();
                     log::debug!(
                         "Advancing past gap at seq {} (timed out after {:?})",
                         next,
