@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `EventStoreBackend::read_last_event(stream_id)` returning the most recent event of a
+  stream (`Option<Event>`), with a default implementation and efficient overrides in
+  `PgEventStore` and `InMemoryEventStore`
+- `Command::with_causation_id(uuid)` builder for threading causation when only the
+  causing event's ID is available
 - `CheckpointMode::Batched` for high-throughput scenarios with configurable batch size and max delay
 - `CheckpointMode::batched()` and `CheckpointMode::batched_default()` helper constructors
 - `InstanceMode::Coordinated` for multi-instance coordination using PostgreSQL advisory locks

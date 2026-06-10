@@ -35,6 +35,12 @@
 //! After the workflow completes, we query events using:
 //! - `read_events_by_correlation_id()` — all events sharing the trace ID
 //! - `trace_causation_chain()` — the direct causal path through a specific event
+//!
+//! A **recovery section** then demonstrates how a background task that holds
+//! only a stream ID (no live `Event` reference) can re-link into the same
+//! causal/correlation tree by calling `read_last_event()` to fetch the anchor
+//! event and using `Command::with_causation_id()` + `Command::with_correlation_id()`
+//! to thread the new event into the existing chain.
 
 use async_trait::async_trait;
 use epoch::prelude::*;
@@ -724,6 +730,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 ""
             };
             println!("  {arrow} {} [{}]{marker}", evt.event_type, evt.id);
+        }
+    }
+
+    // ========================================================================
+    // Recovery Task: re-linking into an existing causation chain
+    // ========================================================================
+    println!();
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  Recovery Task: re-linking into the causation chain");
+    println!("  (simulates a background job resuming via read_last_event)");
+    println!("═══════════════════════════════════════════════════════════════");
+    println!();
+
+    // A background task that holds only the stream ID — not a live Event
+    // reference — uses read_last_event() to find the anchor it needs to
+    // continue the causal chain without re-reading the entire stream.
+    if let Some(last_event) = event_store.read_last_event(order_id).await? {
+        let corr_id = last_event.correlation_id.unwrap_or(last_event.id);
+
+        println!("  Last event in the order stream:");
+        println!("    event id     = {}", last_event.id);
+        println!("    event type   = {}", last_event.event_type);
+        println!("    correlation  = {corr_id}");
+        println!();
+        println!("  Building recovery command:");
+        println!(
+            "    causation_id   ← last_event.id       = {}",
+            last_event.id
+        );
+        println!("    correlation_id ← last_event.corr_id  = {corr_id}");
+        println!();
+
+        // Key pattern: with_causation_id + with_correlation_id threads the
+        // recovery event into the same causal/correlation tree without
+        // requiring a full Event reference.
+        let recovery_notification_id = Uuid::new_v4();
+        let recovery_cmd = Command::new(
+            recovery_notification_id,
+            AppCommand::NotifyShipment { order_id },
+            None,
+            None,
+        )
+        .with_causation_id(last_event.id)
+        .with_correlation_id(corr_id);
+
+        notification_aggregate.handle(recovery_cmd).await?;
+
+        // Allow the saga to process the new event before querying
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Re-query the correlation tree — the recovery event should now appear
+        let updated_events = event_store.read_events_by_correlation_id(trace_id).await?;
+        println!(
+            "  Updated correlation tree: {} events now share correlation_id {trace_id}",
+            updated_events.len()
+        );
+        println!();
+        println!(
+            "  {:<4} {:<34} {:<38} {:<38}",
+            "#", "Event Type", "Event ID", "Causation ID"
+        );
+        println!("  {}", "─".repeat(114));
+        for (i, evt) in updated_events.iter().enumerate() {
+            let causation = evt
+                .causation_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "(none — root)".to_string());
+            println!(
+                "  {:<4} {:<34} {:<38} {:<38}",
+                i + 1,
+                evt.event_type,
+                evt.id,
+                causation,
+            );
         }
     }
 
