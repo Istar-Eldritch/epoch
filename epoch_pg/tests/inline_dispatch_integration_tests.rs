@@ -42,13 +42,13 @@ fn ev(stream_id: Uuid, version: u64, data: TestEvent) -> Event<TestEvent> {
         .unwrap()
 }
 
-async fn setup_inline() -> (
+async fn setup_inline() -> Option<(
     PgPool,
     PgEventBus<TestEvent>,
     PgEventStore<PgEventBus<TestEvent>>,
-) {
+)> {
     let _ = env_logger::builder().is_test(true).try_init();
-    let pool = common::get_pg_pool().await;
+    let pool = common::try_get_pg_pool().await?;
     Migrator::new(pool.clone()).run().await.expect("migrate");
 
     let channel = format!("inline_test_{}", Uuid::new_v4().simple());
@@ -60,7 +60,7 @@ async fn setup_inline() -> (
     let store = PgEventStore::new(pool.clone(), bus.clone());
     // start_listener is a no-op in Inline mode; call it to confirm.
     bus.start_listener().await.expect("noop start_listener");
-    (pool, bus, store)
+    Some((pool, bus, store))
 }
 
 /// A subscriber that records every event it sees, in order.
@@ -110,7 +110,9 @@ impl EventObserver<TestEvent> for Recorder {
 #[tokio::test]
 #[serial]
 async fn inline_mode_dispatches_synchronously_on_store_event() {
-    let (_pool, bus, store) = setup_inline().await;
+    let Some((_pool, bus, store)) = setup_inline().await else {
+        return;
+    };
 
     let (recorder, seen) = Recorder::new("inline:recorder:sync", 0);
     bus.subscribe(recorder).await.expect("subscribe");
@@ -130,7 +132,9 @@ async fn inline_mode_dispatches_synchronously_on_store_event() {
 #[tokio::test]
 #[serial]
 async fn inline_mode_honors_priority_order() {
-    let (_pool, bus, store) = setup_inline().await;
+    let Some((_pool, bus, store)) = setup_inline().await else {
+        return;
+    };
 
     let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
 
@@ -195,7 +199,9 @@ async fn inline_mode_queues_reentrant_publishes_instead_of_recursing() {
     // recursive dispatch this re-enters the subscriber's mutex while it is
     // still held processing A, deadlocking. The queue model must process A
     // first, return, then process B.
-    let (_pool, bus, store) = setup_inline().await;
+    let Some((_pool, bus, store)) = setup_inline().await else {
+        return;
+    };
 
     let stream_id = Uuid::new_v4();
     let store_arc = Arc::new(store);

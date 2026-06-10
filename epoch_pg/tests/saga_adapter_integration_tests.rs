@@ -153,15 +153,15 @@ impl Saga<TargetEvent> for CounterSaga {
 
 // === Shared setup: one DB, two buses with distinct channels ===
 
-async fn setup_two_buses() -> (
+async fn setup_two_buses() -> Option<(
     PgPool,
     PgEventBus<SourceEvent>,
     PgEventStore<PgEventBus<SourceEvent>>,
     PgEventBus<TargetEvent>,
     PgEventStore<PgEventBus<TargetEvent>>,
-) {
+)> {
     let _ = env_logger::builder().is_test(true).try_init();
-    let pool = common::get_pg_pool().await;
+    let pool = common::try_get_pg_pool().await?;
     Migrator::new(pool.clone()).run().await.unwrap();
 
     let source_channel = format!("src_{}", Uuid::new_v4().simple());
@@ -176,7 +176,7 @@ async fn setup_two_buses() -> (
     source_bus.setup_trigger().await.unwrap();
     target_bus.setup_trigger().await.unwrap();
 
-    (pool, source_bus, source_store, target_bus, target_store)
+    Some((pool, source_bus, source_store, target_bus, target_store))
 }
 
 fn target_event(stream_id: Uuid, ver: u64, saga_id: Uuid, value: i32) -> Event<TargetEvent> {
@@ -221,7 +221,10 @@ fn unique_tag() -> String {
 #[tokio::test]
 #[serial]
 async fn saga_adapter_receives_events_from_foreign_bus() {
-    let (_pool, source_bus, source_store, target_bus, target_store) = setup_two_buses().await;
+    let Some((_pool, source_bus, source_store, target_bus, target_store)) = setup_two_buses().await
+    else {
+        return;
+    };
     let tag = unique_tag();
     let native_sub_id = format!("saga:counter:{}", tag);
     let foreign_sub_id = format!("saga:counter:{}:source-bus", tag);
@@ -287,7 +290,11 @@ async fn saga_adapter_receives_events_from_foreign_bus() {
 #[tokio::test]
 #[serial]
 async fn saga_adapter_preserves_event_metadata_through_conversion() {
-    let (_pool, source_bus, source_store, _target_bus, _target_store) = setup_two_buses().await;
+    let Some((_pool, source_bus, source_store, _target_bus, _target_store)) =
+        setup_two_buses().await
+    else {
+        return;
+    };
     let tag = unique_tag();
     let foreign_sub_id = format!("saga:meta:{}:source-bus", tag);
     let saga_id = Uuid::new_v4();
@@ -342,7 +349,10 @@ async fn saga_adapter_preserves_event_metadata_through_conversion() {
 #[tokio::test]
 #[serial]
 async fn saga_adapter_advances_independent_checkpoints() {
-    let (pool, source_bus, source_store, target_bus, target_store) = setup_two_buses().await;
+    let Some((pool, source_bus, source_store, target_bus, target_store)) = setup_two_buses().await
+    else {
+        return;
+    };
     let tag = unique_tag();
     let native_sub_id = format!("saga:cp:{}", tag);
     let foreign_sub_id = format!("saga:cp:{}:source-bus", tag);
@@ -416,7 +426,9 @@ async fn saga_adapter_advances_independent_checkpoints() {
 #[tokio::test]
 #[serial]
 async fn saga_adapter_resumes_from_checkpoint_after_restart() {
-    let (pool, source_bus, source_store, _t_bus, _t_store) = setup_two_buses().await;
+    let Some((pool, source_bus, source_store, _t_bus, _t_store)) = setup_two_buses().await else {
+        return;
+    };
     let tag = unique_tag();
     let foreign_sub_id = format!("saga:restart:{}:source-bus", tag);
     let saga_id = Uuid::new_v4();

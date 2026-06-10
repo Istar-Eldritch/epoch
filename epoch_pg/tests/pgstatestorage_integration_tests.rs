@@ -64,8 +64,8 @@ impl PgState for TestState {
     }
 }
 
-async fn setup() -> (PgPool, PgStateStore<TestState>) {
-    let pool = common::get_pg_pool().await;
+async fn setup() -> Option<(PgPool, PgStateStore<TestState>)> {
+    let pool = common::try_get_pg_pool().await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS test_states (id UUID PRIMARY KEY, value TEXT NOT NULL)",
     )
@@ -73,7 +73,7 @@ async fn setup() -> (PgPool, PgStateStore<TestState>) {
     .await
     .expect("Failed to create table");
     let state_storage = PgStateStore::new(pool.clone());
-    (pool, state_storage)
+    Some((pool, state_storage))
 }
 
 async fn teardown(pool: &PgPool) {
@@ -86,7 +86,9 @@ async fn teardown(pool: &PgPool) {
 #[tokio::test]
 #[serial]
 async fn test_persist_and_get_state() {
-    let (pool, mut state_storage) = setup().await;
+    let Some((pool, mut state_storage)) = setup().await else {
+        return;
+    };
 
     let id = Uuid::new_v4();
     let state = TestState {
@@ -108,7 +110,9 @@ async fn test_persist_and_get_state() {
 #[tokio::test]
 #[serial]
 async fn test_update_state() {
-    let (pool, mut state_storage) = setup().await;
+    let Some((pool, mut state_storage)) = setup().await else {
+        return;
+    };
 
     let id = Uuid::new_v4();
     let initial_state = TestState {
@@ -138,7 +142,9 @@ async fn test_update_state() {
 #[tokio::test]
 #[serial]
 async fn test_delete_state() {
-    let (pool, mut state_storage) = setup().await;
+    let Some((pool, mut state_storage)) = setup().await else {
+        return;
+    };
 
     let id = Uuid::new_v4();
     let state = TestState {
@@ -162,7 +168,9 @@ async fn test_delete_state() {
 #[tokio::test]
 #[serial]
 async fn test_get_non_existent_state() {
-    let (pool, state_storage) = setup().await;
+    let Some((pool, state_storage)) = setup().await else {
+        return;
+    };
 
     let id = Uuid::new_v4();
     let retrieved_state = state_storage.get_state(id).await.unwrap();

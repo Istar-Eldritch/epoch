@@ -103,13 +103,13 @@ impl EventApplicator<TestEventData> for TestProjection {
 
 impl Projection<TestEventData> for TestProjection {}
 
-async fn setup() -> (
+async fn setup() -> Option<(
     PgPool,
     PgEventBus<TestEventData>,
     PgEventStore<PgEventBus<TestEventData>>,
-) {
+)> {
     let _ = env_logger::builder().is_test(true).try_init();
-    let pool = common::get_pg_pool().await;
+    let pool = common::try_get_pg_pool().await?;
 
     // Run migrations to set up the schema
     Migrator::new(pool.clone())
@@ -143,20 +143,24 @@ async fn setup() -> (
         .await
         .expect("Failed to start event bus listener");
 
-    (pool, event_bus, event_store)
+    Some((pool, event_bus, event_store))
 }
 
 #[tokio::test]
 #[serial]
 async fn test_setup_with_migrations() {
-    let (_pool, _event_bus, _event_store) = setup().await;
+    let Some((_pool, _event_bus, _event_store)) = setup().await else {
+        return;
+    };
     // If setup completes without panicking, migrations and event bus setup was successful
 }
 
 #[tokio::test]
 #[serial]
 async fn test_subscribe_and_event_propagation() {
-    let (_pool, event_bus, event_store) = setup().await;
+    let Some((_pool, event_bus, event_store)) = setup().await else {
+        return;
+    };
 
     let projection = TestProjection::new();
     let projection_events = projection.get_state_store().clone();
@@ -196,7 +200,9 @@ async fn test_subscribe_and_event_propagation() {
 #[tokio::test]
 #[serial]
 async fn test_noop_publish() {
-    let (pool, event_bus, _event_store) = setup().await;
+    let Some((pool, event_bus, _event_store)) = setup().await else {
+        return;
+    };
 
     let projection = TestProjection::new();
     let projection_events = projection.get_state_store().clone();
@@ -230,7 +236,9 @@ async fn test_noop_publish() {
 #[tokio::test]
 #[serial]
 async fn test_event_data_deserialization_failure() {
-    let (pool, event_bus, _event_store) = setup().await;
+    let Some((pool, event_bus, _event_store)) = setup().await else {
+        return;
+    };
 
     let projection = TestProjection::new();
     let projection_events = projection.get_state_store().clone();
@@ -334,7 +342,9 @@ async fn test_event_data_deserialization_failure() {
 #[tokio::test]
 #[serial]
 async fn test_multiple_subscribers() {
-    let (_pool, event_bus, event_store) = setup().await;
+    let Some((_pool, event_bus, event_store)) = setup().await else {
+        return;
+    };
 
     let projection1 = TestProjection::new();
     let projection_events1 = projection1.get_state_store().clone();
@@ -385,7 +395,9 @@ async fn test_multiple_subscribers() {
 #[tokio::test]
 #[serial]
 async fn test_event_bus_notification_includes_global_sequence() {
-    let (_pool, event_bus, event_store) = setup().await;
+    let Some((_pool, event_bus, event_store)) = setup().await else {
+        return;
+    };
 
     let projection = TestProjection::new();
     let projection_events = projection.get_state_store().clone();
@@ -428,7 +440,9 @@ async fn test_event_bus_notification_includes_global_sequence() {
 #[tokio::test]
 #[serial]
 async fn test_migrations_create_checkpoint_table() {
-    let (pool, event_bus, _event_store) = setup().await;
+    let Some((pool, event_bus, _event_store)) = setup().await else {
+        return;
+    };
 
     // Verify that the checkpoint table exists
     let result: (i64,) = sqlx::query_as(
@@ -472,7 +486,9 @@ async fn test_migrations_create_checkpoint_table() {
 #[tokio::test]
 #[serial]
 async fn test_checkpoint_read_returns_none_for_new_subscriber() {
-    let (_pool, event_bus, _event_store) = setup().await;
+    let Some((_pool, event_bus, _event_store)) = setup().await else {
+        return;
+    };
 
     let checkpoint = event_bus
         .get_checkpoint("projection:nonexistent")
@@ -490,7 +506,9 @@ async fn test_checkpoint_read_returns_none_for_new_subscriber() {
 #[tokio::test]
 #[serial]
 async fn test_checkpoint_write_and_read_roundtrip() {
-    let (_pool, event_bus, _event_store) = setup().await;
+    let Some((_pool, event_bus, _event_store)) = setup().await else {
+        return;
+    };
 
     let subscriber_id = "projection:test-roundtrip";
     let global_sequence = 42u64;
@@ -520,7 +538,9 @@ async fn test_checkpoint_write_and_read_roundtrip() {
 #[tokio::test]
 #[serial]
 async fn test_checkpoint_update_is_upsert() {
-    let (_pool, event_bus, _event_store) = setup().await;
+    let Some((_pool, event_bus, _event_store)) = setup().await else {
+        return;
+    };
 
     let subscriber_id = "projection:test-upsert";
     let event_id1 = Uuid::new_v4();
@@ -556,7 +576,9 @@ async fn test_checkpoint_update_is_upsert() {
 #[tokio::test]
 #[serial]
 async fn test_checkpoint_updated_after_successful_event_processing() {
-    let (_pool, event_bus, event_store) = setup().await;
+    let Some((_pool, event_bus, event_store)) = setup().await else {
+        return;
+    };
 
     let projection = TestProjection::new();
     let subscriber_id = projection.subscriber_id().to_string();
@@ -624,7 +646,9 @@ async fn test_checkpoint_updated_after_successful_event_processing() {
 #[tokio::test]
 #[serial]
 async fn test_read_all_events_since_returns_events_after_sequence() {
-    let (_pool, event_bus, event_store) = setup().await;
+    let Some((_pool, event_bus, event_store)) = setup().await else {
+        return;
+    };
 
     // Get current max sequence to establish baseline
     let baseline_events = event_bus
@@ -699,7 +723,9 @@ async fn test_read_all_events_since_returns_events_after_sequence() {
 #[tokio::test]
 #[serial]
 async fn test_read_all_events_since_with_baseline_returns_new_events() {
-    let (_pool, event_bus, event_store) = setup().await;
+    let Some((_pool, event_bus, event_store)) = setup().await else {
+        return;
+    };
 
     // Get current max sequence to establish baseline
     let baseline_events = event_bus
@@ -734,7 +760,9 @@ async fn test_read_all_events_since_with_baseline_returns_new_events() {
 #[tokio::test]
 #[serial]
 async fn test_subscribe_catches_up_on_missed_events() {
-    let (_pool, event_bus, event_store) = setup().await;
+    let Some((_pool, event_bus, event_store)) = setup().await else {
+        return;
+    };
 
     // Store 3 events BEFORE subscribing
     let stream_id = Uuid::new_v4();
@@ -778,7 +806,9 @@ async fn test_subscribe_catches_up_on_missed_events() {
 #[tokio::test]
 #[serial]
 async fn test_subscribe_deduplicates_events_during_catchup() {
-    let (_pool, event_bus, event_store) = setup().await;
+    let Some((_pool, event_bus, event_store)) = setup().await else {
+        return;
+    };
 
     // Store event 1 before subscribing
     let stream_id = Uuid::new_v4();
@@ -842,7 +872,9 @@ async fn test_subscribe_deduplicates_events_during_catchup() {
 #[tokio::test]
 #[serial]
 async fn test_catchup_with_batching() {
-    let (pool, event_bus, event_store) = setup().await;
+    let Some((pool, event_bus, event_store)) = setup().await else {
+        return;
+    };
 
     // Create event bus with small batch size for testing
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
@@ -909,7 +941,9 @@ async fn test_catchup_with_batching() {
 #[tokio::test]
 #[serial]
 async fn test_migrations_create_dlq_table() {
-    let (pool, _event_bus, _event_store) = setup().await;
+    let Some((pool, _event_bus, _event_store)) = setup().await else {
+        return;
+    };
 
     // Verify that the DLQ table exists
     let result: (i64,) = sqlx::query_as(
@@ -962,7 +996,9 @@ async fn test_migrations_create_dlq_table() {
 #[tokio::test]
 #[serial]
 async fn test_dlq_insert_and_retrieve() {
-    let (_pool, event_bus, _event_store) = setup().await;
+    let Some((_pool, event_bus, _event_store)) = setup().await else {
+        return;
+    };
 
     let subscriber_id = format!("projection:test-dlq:{}", Uuid::new_v4());
     let event_id = Uuid::new_v4();
@@ -992,7 +1028,9 @@ async fn test_dlq_insert_and_retrieve() {
 #[tokio::test]
 #[serial]
 async fn test_dlq_upsert_updates_existing_entry() {
-    let (_pool, event_bus, _event_store) = setup().await;
+    let Some((_pool, event_bus, _event_store)) = setup().await else {
+        return;
+    };
 
     let subscriber_id = format!("projection:test-dlq-upsert:{}", Uuid::new_v4());
     let event_id = Uuid::new_v4();
@@ -1029,7 +1067,9 @@ async fn test_dlq_upsert_updates_existing_entry() {
 #[tokio::test]
 #[serial]
 async fn test_advisory_lock_acquisition() {
-    let (_pool, event_bus, _event_store) = setup().await;
+    let Some((_pool, event_bus, _event_store)) = setup().await else {
+        return;
+    };
 
     let subscriber_id = format!("projection:test-lock:{}", Uuid::new_v4());
 
@@ -1050,7 +1090,9 @@ async fn test_advisory_lock_acquisition() {
 #[tokio::test]
 #[serial]
 async fn test_advisory_lock_can_be_acquired_by_different_subscribers() {
-    let (_pool, event_bus, _event_store) = setup().await;
+    let Some((_pool, event_bus, _event_store)) = setup().await else {
+        return;
+    };
 
     let subscriber_id1 = format!("projection:test-lock-1:{}", Uuid::new_v4());
     let subscriber_id2 = format!("projection:test-lock-2:{}", Uuid::new_v4());
@@ -1081,7 +1123,9 @@ async fn test_advisory_lock_can_be_acquired_by_different_subscribers() {
 #[tokio::test]
 #[serial]
 async fn test_multiple_subscribers_have_independent_checkpoints() {
-    let (_pool, event_bus, event_store) = setup().await;
+    let Some((_pool, event_bus, event_store)) = setup().await else {
+        return;
+    };
 
     // Create two different projections with different subscriber_ids
     // We'll simulate this by manually updating checkpoints
@@ -1135,7 +1179,9 @@ async fn test_multiple_subscribers_have_independent_checkpoints() {
 #[serial]
 async fn test_coordinated_mode_acquires_lock_on_subscribe() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
 
     Migrator::new(pool.clone())
         .run()
@@ -1205,7 +1251,9 @@ async fn test_coordinated_mode_acquires_lock_on_subscribe() {
 #[serial]
 async fn test_coordinated_mode_skips_subscribe_if_lock_held() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
 
     Migrator::new(pool.clone())
         .run()
@@ -1308,7 +1356,9 @@ async fn test_coordinated_mode_skips_subscribe_if_lock_held() {
 #[serial]
 async fn test_coordinated_mode_allows_different_subscribers_on_same_instance() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
 
     Migrator::new(pool.clone())
         .run()
@@ -1388,7 +1438,9 @@ async fn test_coordinated_mode_allows_different_subscribers_on_same_instance() {
 #[serial]
 async fn test_batched_checkpoint_flushes_at_batch_size() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
 
     Migrator::new(pool.clone())
         .run()
@@ -1474,7 +1526,9 @@ async fn test_batched_checkpoint_flushes_at_batch_size() {
 #[serial]
 async fn test_batched_checkpoint_flushes_at_max_delay() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
 
     Migrator::new(pool.clone())
         .run()
@@ -1550,7 +1604,9 @@ async fn test_batched_checkpoint_flushes_at_max_delay() {
 #[serial]
 async fn test_batched_checkpoint_during_catchup() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
 
     Migrator::new(pool.clone())
         .run()
@@ -1637,7 +1693,9 @@ async fn test_batched_checkpoint_during_catchup() {
 async fn test_synchronous_checkpoint_still_works() {
     // Verify that synchronous mode (default) still works correctly
     let _ = env_logger::builder().is_test(true).try_init();
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
 
     Migrator::new(pool.clone())
         .run()
@@ -1703,9 +1761,9 @@ async fn test_synchronous_checkpoint_still_works() {
 // ============================================================================
 
 /// Helper to create an event bus without starting the listener
-async fn setup_without_listener() -> (PgPool, PgEventBus<TestEventData>) {
+async fn setup_without_listener() -> Option<(PgPool, PgEventBus<TestEventData>)> {
     let _ = env_logger::builder().is_test(true).try_init();
-    let pool = common::get_pg_pool().await;
+    let pool = common::try_get_pg_pool().await?;
 
     Migrator::new(pool.clone())
         .run()
@@ -1715,13 +1773,15 @@ async fn setup_without_listener() -> (PgPool, PgEventBus<TestEventData>) {
     let channel_name = format!("test_channel_{}", Uuid::new_v4().simple());
     let event_bus = PgEventBus::new(pool.clone(), channel_name);
 
-    (pool, event_bus)
+    Some((pool, event_bus))
 }
 
 #[tokio::test]
 #[serial]
 async fn test_is_running_returns_false_before_start() {
-    let (_pool, event_bus) = setup_without_listener().await;
+    let Some((_pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
 
     assert!(
         !event_bus.is_running().await,
@@ -1732,7 +1792,9 @@ async fn test_is_running_returns_false_before_start() {
 #[tokio::test]
 #[serial]
 async fn test_is_running_returns_true_after_start() {
-    let (_pool, event_bus) = setup_without_listener().await;
+    let Some((_pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
 
     event_bus
         .setup_trigger()
@@ -1756,7 +1818,9 @@ async fn test_is_running_returns_true_after_start() {
 #[tokio::test]
 #[serial]
 async fn test_shutdown_stops_listener() {
-    let (_pool, event_bus) = setup_without_listener().await;
+    let Some((_pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
 
     event_bus
         .setup_trigger()
@@ -1784,7 +1848,9 @@ async fn test_shutdown_stops_listener() {
 #[tokio::test]
 #[serial]
 async fn test_shutdown_without_start_returns_error() {
-    let (_pool, event_bus) = setup_without_listener().await;
+    let Some((_pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
 
     let result = event_bus.shutdown().await;
     assert!(
@@ -1796,7 +1862,9 @@ async fn test_shutdown_without_start_returns_error() {
 #[tokio::test]
 #[serial]
 async fn test_start_listener_is_idempotent() {
-    let (_pool, event_bus) = setup_without_listener().await;
+    let Some((_pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
 
     event_bus
         .setup_trigger()
@@ -1830,7 +1898,9 @@ async fn test_shutdown_flushes_batched_checkpoints() {
     use std::time::Duration;
 
     let _ = env_logger::builder().is_test(true).try_init();
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
 
     Migrator::new(pool.clone())
         .run()
@@ -1944,7 +2014,9 @@ async fn test_catch_up_buffer_size_config() {
 #[tokio::test]
 #[serial]
 async fn test_out_of_order_notify_both_events_processed() {
-    let (pool, event_bus, _event_store) = setup().await;
+    let Some((pool, event_bus, _event_store)) = setup().await else {
+        return;
+    };
 
     let projection = TestProjection::new();
     let projection_events = projection.get_state_store().clone();
@@ -2093,7 +2165,9 @@ async fn test_out_of_order_notify_both_events_processed() {
 #[tokio::test]
 #[serial]
 async fn test_rolled_back_transaction_gap_resolved() {
-    let (pool, _event_bus, _event_store) = setup().await;
+    let Some((pool, _event_bus, _event_store)) = setup().await else {
+        return;
+    };
 
     // Create event bus with short gap_timeout for testing
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
@@ -2225,7 +2299,9 @@ async fn test_rolled_back_transaction_gap_resolved() {
 #[tokio::test]
 #[serial]
 async fn test_burst_concurrent_events_all_processed() {
-    let (_pool, event_bus, event_store) = setup().await;
+    let Some((_pool, event_bus, event_store)) = setup().await else {
+        return;
+    };
 
     let projection = TestProjection::new();
     let projection_events = projection.get_state_store().clone();
@@ -2275,7 +2351,9 @@ async fn test_burst_concurrent_events_all_processed() {
 #[tokio::test]
 #[serial]
 async fn test_multiple_subscribers_out_of_order() {
-    let (pool, event_bus, _event_store) = setup().await;
+    let Some((pool, event_bus, _event_store)) = setup().await else {
+        return;
+    };
 
     let projection1 = TestProjection::new();
     let projection_events1 = projection1.get_state_store().clone();
@@ -2384,7 +2462,9 @@ async fn test_multiple_subscribers_out_of_order() {
 #[tokio::test]
 #[serial]
 async fn test_catchup_plus_realtime_handoff_no_loss() {
-    let (_pool, event_bus, event_store) = setup().await;
+    let Some((_pool, event_bus, event_store)) = setup().await else {
+        return;
+    };
 
     let stream_id = Uuid::new_v4();
 
@@ -2444,7 +2524,9 @@ async fn test_catchup_plus_realtime_handoff_no_loss() {
 #[serial]
 async fn test_batched_checkpoint_with_gap_tracking() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
 
     Migrator::new(pool.clone())
         .run()
@@ -2530,7 +2612,9 @@ async fn test_batched_checkpoint_with_gap_tracking() {
 #[tokio::test]
 #[serial]
 async fn test_undeserializable_event_advances_past() {
-    let (pool, event_bus, _event_store) = setup().await;
+    let Some((pool, event_bus, _event_store)) = setup().await else {
+        return;
+    };
 
     let projection = TestProjection::new();
     let subscriber_id = projection.subscriber_id().to_string();
@@ -2638,7 +2722,9 @@ async fn test_undeserializable_event_advances_past() {
 #[serial]
 async fn test_graceful_shutdown_flushes_subscriber_states() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
 
     Migrator::new(pool.clone())
         .run()

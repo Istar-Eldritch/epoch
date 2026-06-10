@@ -18,8 +18,8 @@ enum TestEventData {
 
 use futures_util::StreamExt;
 
-async fn setup() -> (PgPool, PgEventStore<InMemoryEventBus<TestEventData>>) {
-    let pool = common::get_pg_pool().await;
+async fn setup() -> Option<(PgPool, PgEventStore<InMemoryEventBus<TestEventData>>)> {
+    let pool = common::try_get_pg_pool().await?;
 
     // Run migrations to set up the schema
     Migrator::new(pool.clone())
@@ -29,13 +29,15 @@ async fn setup() -> (PgPool, PgEventStore<InMemoryEventBus<TestEventData>>) {
 
     let event_bus = InMemoryEventBus::new();
     let event_store = PgEventStore::new(pool.clone(), event_bus);
-    (pool, event_store)
+    Some((pool, event_store))
 }
 
 #[tokio::test]
 #[serial]
 async fn test_store_event() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     let event = Event::<TestEventData>::builder()
         .id(Uuid::new_v4())
@@ -70,7 +72,9 @@ async fn test_store_event() {
 #[tokio::test]
 #[serial]
 async fn test_read_events() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     let stream_id = Uuid::new_v4();
 
@@ -121,7 +125,9 @@ async fn test_read_events() {
 #[tokio::test]
 #[serial]
 async fn test_read_events_since() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     let stream_id = Uuid::new_v4();
 
@@ -185,7 +191,9 @@ async fn test_read_events_since() {
 #[tokio::test]
 #[serial]
 async fn test_migrations_create_global_sequence_column() {
-    let (pool, _event_store) = setup().await;
+    let Some((pool, _event_store)) = setup().await else {
+        return;
+    };
 
     // Verify that the global_sequence column exists
     let result: (i64,) = sqlx::query_as(
@@ -239,7 +247,9 @@ async fn test_migrations_create_global_sequence_column() {
 #[tokio::test]
 #[serial]
 async fn test_migrator_is_idempotent() {
-    let (pool, _event_store) = setup().await;
+    let Some((pool, _event_store)) = setup().await else {
+        return;
+    };
 
     // Run migrations again - should not error and return 0 applied
     let applied = Migrator::new(pool.clone())
@@ -261,7 +271,9 @@ async fn test_migrator_is_idempotent() {
 #[tokio::test]
 #[serial]
 async fn test_store_event_assigns_global_sequence() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     let stream_id = Uuid::new_v4();
     let event = Event::<TestEventData>::builder()
@@ -293,7 +305,9 @@ async fn test_store_event_assigns_global_sequence() {
 #[tokio::test]
 #[serial]
 async fn test_global_sequence_is_monotonically_increasing() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     let stream_id1 = Uuid::new_v4();
     let stream_id2 = Uuid::new_v4();
@@ -359,7 +373,9 @@ async fn test_global_sequence_is_monotonically_increasing() {
 #[tokio::test]
 #[serial]
 async fn test_read_events_includes_global_sequence() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     let stream_id = Uuid::new_v4();
     let event = Event::<TestEventData>::builder()
@@ -387,7 +403,9 @@ async fn test_read_events_includes_global_sequence() {
 #[tokio::test]
 #[serial]
 async fn test_store_events_batch() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     let stream_id = Uuid::new_v4();
 
@@ -422,7 +440,9 @@ async fn test_store_events_batch() {
 #[tokio::test]
 #[serial]
 async fn test_store_events_empty_batch() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     // Empty batch should succeed without error
     event_store.store_events(Vec::new()).await.unwrap();
@@ -431,7 +451,9 @@ async fn test_store_events_empty_batch() {
 #[tokio::test]
 #[serial]
 async fn test_store_events_global_sequence_is_sequential() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     let stream_id = Uuid::new_v4();
 
@@ -472,7 +494,9 @@ async fn test_store_events_global_sequence_is_sequential() {
 #[tokio::test]
 #[serial]
 async fn test_store_events_in_tx_with_state() {
-    let (pool, event_store) = setup().await;
+    let Some((pool, event_store)) = setup().await else {
+        return;
+    };
 
     let stream_id = Uuid::new_v4();
 
@@ -525,7 +549,9 @@ async fn test_store_events_in_tx_with_state() {
 #[tokio::test]
 #[serial]
 async fn test_store_events_in_tx_rollback() {
-    let (pool, event_store) = setup().await;
+    let Some((pool, event_store)) = setup().await else {
+        return;
+    };
 
     let stream_id = Uuid::new_v4();
 
@@ -561,7 +587,9 @@ async fn test_store_events_in_tx_rollback() {
 #[tokio::test]
 #[serial]
 async fn test_read_events_by_correlation_id() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     let correlation_id = Uuid::new_v4();
     let stream_a = Uuid::new_v4();
@@ -608,7 +636,9 @@ async fn test_read_events_by_correlation_id() {
 #[tokio::test]
 #[serial]
 async fn test_read_events_by_correlation_id_empty() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     let events = event_store
         .read_events_by_correlation_id(Uuid::new_v4())
@@ -621,7 +651,9 @@ async fn test_read_events_by_correlation_id_empty() {
 #[tokio::test]
 #[serial]
 async fn test_read_events_by_correlation_id_ordered_by_global_sequence() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     let correlation_id = Uuid::new_v4();
     let stream_a = Uuid::new_v4();
@@ -685,7 +717,9 @@ async fn test_read_events_by_correlation_id_ordered_by_global_sequence() {
 #[tokio::test]
 #[serial]
 async fn test_trace_causation_chain() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     let correlation_id = Uuid::new_v4();
     let stream_a = Uuid::new_v4();
@@ -744,7 +778,9 @@ async fn test_trace_causation_chain() {
 #[tokio::test]
 #[serial]
 async fn test_trace_causation_chain_not_found() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     let chain = event_store
         .trace_causation_chain(Uuid::new_v4())
@@ -757,7 +793,9 @@ async fn test_trace_causation_chain_not_found() {
 #[tokio::test]
 #[serial]
 async fn test_trace_causation_chain_excludes_sibling() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     let correlation_id = Uuid::new_v4();
     let stream_a = Uuid::new_v4();
@@ -815,7 +853,9 @@ async fn test_trace_causation_chain_excludes_sibling() {
 #[tokio::test]
 #[serial]
 async fn test_read_last_event_returns_latest() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     let stream_id = Uuid::new_v4();
     let correlation_id = Uuid::new_v4();
@@ -892,7 +932,9 @@ async fn test_read_last_event_returns_latest() {
 #[tokio::test]
 #[serial]
 async fn test_read_last_event_empty_stream_returns_none() {
-    let (_pool, event_store) = setup().await;
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
 
     // A fresh, never-written stream ID must return Ok(None), not an error.
     let result = event_store.read_last_event(Uuid::new_v4()).await.unwrap();

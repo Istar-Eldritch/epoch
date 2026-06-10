@@ -1,6 +1,15 @@
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::time::Duration;
 
+/// Loads `epoch_pg/.env` if it exists.
+///
+/// Uses `CARGO_MANIFEST_DIR` so the lookup is always relative to the crate
+/// root, regardless of where `cargo test` is invoked from.
+fn load_env() {
+    let env_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
+    dotenvy::from_path(env_path).ok();
+}
+
 /// Ensures the test database exists, creating it if necessary.
 ///
 /// This function:
@@ -52,16 +61,46 @@ async fn ensure_test_database_exists(database_url: &str) -> Result<(), Box<dyn s
 
 /// Returns the test database URL.
 ///
-/// Defaults to `epoch_pg_test` database to avoid conflicts with other projects.
-/// Override with `DATABASE_URL` environment variable.
+/// Resolution order:
+/// 1. `DATABASE_URL` environment variable (already set in the process)
+/// 2. `epoch_pg/.env` file (loaded via `dotenvy`)
+/// 3. Hard-coded fallback: `postgres://postgres:postgres@localhost:5432/epoch_pg_test`
+///
+/// Copy `.env.example` to `.env` and adjust `POSTGRES_PORT` / `DATABASE_URL`
+/// to avoid conflicts with other Postgres instances on your machine.
 pub fn database_url() -> String {
+    load_env();
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/epoch_pg_test".to_string())
+}
+
+/// Tries to get a connection pool to the test database.
+///
+/// Returns `None` when Postgres is not reachable, allowing tests to skip
+/// gracefully in environments without a database.
+#[allow(dead_code)]
+pub async fn try_get_pg_pool() -> Option<PgPool> {
+    let database_url = database_url();
+
+    if let Err(e) = ensure_test_database_exists(&database_url).await {
+        eprintln!(
+            "Warning: Could not ensure test database exists: {}. Attempting to connect anyway...",
+            e
+        );
+    }
+
+    PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&database_url)
+        .await
+        .ok()
 }
 
 /// Gets a connection pool to the test database.
 ///
 /// Automatically creates the database if it doesn't exist.
+#[allow(dead_code)]
 pub async fn get_pg_pool() -> PgPool {
     let database_url = database_url();
 

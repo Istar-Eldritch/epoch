@@ -43,7 +43,9 @@ async fn teardown(pool: &PgPool) {
 #[tokio::test]
 #[serial]
 async fn test_migrator_creates_tracking_table() {
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
     teardown(&pool).await;
 
     let migrator = Migrator::new(pool.clone());
@@ -75,7 +77,9 @@ async fn test_migrator_creates_tracking_table() {
 #[tokio::test]
 #[serial]
 async fn test_migrator_runs_all_migrations() {
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
     teardown(&pool).await;
 
     let migrator = Migrator::new(pool.clone());
@@ -168,7 +172,9 @@ async fn test_migrator_runs_all_migrations() {
 #[tokio::test]
 #[serial]
 async fn test_migrator_is_idempotent() {
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
     teardown(&pool).await;
 
     let migrator = Migrator::new(pool.clone());
@@ -201,7 +207,9 @@ async fn test_migrator_is_idempotent() {
 #[tokio::test]
 #[serial]
 async fn test_migrator_pending_returns_unapplied_migrations() {
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
     teardown(&pool).await;
 
     let migrator = Migrator::new(pool.clone());
@@ -223,7 +231,9 @@ async fn test_migrator_pending_returns_unapplied_migrations() {
 #[tokio::test]
 #[serial]
 async fn test_migrator_applied_returns_applied_migrations() {
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
     teardown(&pool).await;
 
     let migrator = Migrator::new(pool.clone());
@@ -278,7 +288,9 @@ async fn test_migrator_applied_returns_applied_migrations() {
 #[tokio::test]
 #[serial]
 async fn test_migrator_records_checksums() {
-    let pool = common::get_pg_pool().await;
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
     teardown(&pool).await;
 
     let migrator = Migrator::new(pool.clone());

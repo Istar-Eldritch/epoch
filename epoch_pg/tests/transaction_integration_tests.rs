@@ -284,8 +284,8 @@ impl_pg_transactional_aggregate! {
 // Test Setup
 // =============================================================================
 
-async fn setup() -> (PgPool, Arc<CounterAggregate>) {
-    let pool = common::get_pg_pool().await;
+async fn setup() -> Option<(PgPool, Arc<CounterAggregate>)> {
+    let pool = common::try_get_pg_pool().await?;
 
     // Run epoch migrations
     Migrator::new(pool.clone())
@@ -309,7 +309,7 @@ async fn setup() -> (PgPool, Arc<CounterAggregate>) {
     let event_store = PgEventStore::new(pool.clone(), event_bus);
     let aggregate = Arc::new(CounterAggregate::new(pool.clone(), event_store));
 
-    (pool, aggregate)
+    Some((pool, aggregate))
 }
 
 async fn teardown(pool: &PgPool) {
@@ -326,7 +326,9 @@ async fn teardown(pool: &PgPool) {
 #[tokio::test]
 #[serial]
 async fn test_transaction_commit_persists_events_and_state() {
-    let (pool, aggregate) = setup().await;
+    let Some((pool, aggregate)) = setup().await else {
+        return;
+    };
 
     let id = Uuid::new_v4();
 
@@ -388,7 +390,9 @@ async fn test_transaction_commit_persists_events_and_state() {
 #[tokio::test]
 #[serial]
 async fn test_transaction_rollback_discards_changes() {
-    let (pool, aggregate) = setup().await;
+    let Some((pool, aggregate)) = setup().await else {
+        return;
+    };
 
     let id = Uuid::new_v4();
 
@@ -427,7 +431,9 @@ async fn test_transaction_rollback_discards_changes() {
 #[tokio::test]
 #[serial]
 async fn test_transaction_multiple_handles_version_continuity() {
-    let (pool, aggregate) = setup().await;
+    let Some((pool, aggregate)) = setup().await else {
+        return;
+    };
 
     let id = Uuid::new_v4();
 
@@ -502,7 +508,9 @@ async fn test_transaction_multiple_handles_version_continuity() {
 #[tokio::test]
 #[serial]
 async fn test_transaction_error_during_handle_allows_rollback() {
-    let (pool, aggregate) = setup().await;
+    let Some((pool, aggregate)) = setup().await else {
+        return;
+    };
 
     let id = Uuid::new_v4();
 
@@ -555,7 +563,9 @@ async fn test_transaction_error_during_handle_allows_rollback() {
 #[tokio::test]
 #[serial]
 async fn test_batch_seeding_performance() {
-    let (pool, aggregate) = setup().await;
+    let Some((pool, aggregate)) = setup().await else {
+        return;
+    };
 
     let num_counters = 100;
 
@@ -683,7 +693,9 @@ async fn test_batch_seeding_performance() {
 async fn test_concurrent_transactions_isolation() {
     use tokio::sync::Barrier;
 
-    let (pool, aggregate) = setup().await;
+    let Some((pool, aggregate)) = setup().await else {
+        return;
+    };
 
     let id = Uuid::new_v4();
 
@@ -769,7 +781,9 @@ async fn test_concurrent_transactions_isolation() {
 #[tokio::test]
 #[serial]
 async fn test_drop_without_commit_is_implicit_rollback() {
-    let (pool, aggregate) = setup().await;
+    let Some((pool, aggregate)) = setup().await else {
+        return;
+    };
 
     let id = Uuid::new_v4();
 
@@ -803,7 +817,9 @@ async fn test_drop_without_commit_is_implicit_rollback() {
 #[tokio::test]
 #[serial]
 async fn test_pending_event_count() {
-    let (pool, aggregate) = setup().await;
+    let Some((pool, aggregate)) = setup().await else {
+        return;
+    };
 
     let id = Uuid::new_v4();
 
