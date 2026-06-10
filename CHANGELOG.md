@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Gap-timeout observability** (`epoch_pg`) — when a subscriber's checkpoint is
+  advanced past a missing `global_sequence` due to `gap_timeout`, the event bus now:
+  - Emits a `WARN` log with `bus_name`, `subscriber_id`, `skipped_sequence`, and
+    `gap_duration` for immediate operational visibility.
+  - Persists a durable record to the new `epoch_event_bus_gap_timeouts` table
+    (migration m009, fire-and-forget detached task — does **not** block checkpoint
+    advancement).
+  - Invokes the optional `on_gap_timeout` callback (see `GapTimeoutCallback` /
+    `GapTimeoutInfo`) after a new record is persisted (exactly once per durable
+    record), enabling metrics counters, alerting, and custom recovery actions.
+- `GapTimeoutCallback` trait and `GapTimeoutInfo` struct (`epoch_pg`) — the
+  callback counterpart to `DlqCallback`; set via
+  `ReliableDeliveryConfig::on_gap_timeout`.
+- `GapTimeoutEntry` struct (`epoch_pg`) — represents one row in
+  `epoch_event_bus_gap_timeouts`, returned by `list_gap_timeouts`.
+- `PgEventBus::list_gap_timeouts(subscriber_id, unresolved_only, offset, limit)` —
+  paginated query for gap-timeout records scoped to this bus; supports optional
+  per-subscriber filter and `unresolved_only` flag.
+- `PgEventBus::resolve_gap_timeout(id, resolved_by, resolution_notes)` — marks a
+  gap-timeout record as resolved; returns `true` on success, `false` if already
+  resolved or not found (idempotent second call).
+- Migration `m009_create_gap_timeout_log` — creates the
+  `epoch_event_bus_gap_timeouts` table with a `UNIQUE (bus_name, subscriber_id,
+  skipped_sequence)` constraint (making the recording insert idempotent), a
+  sequence index, and a partial unresolved index.
+- `GapTimeoutCallback`, `GapTimeoutInfo`, `GapTimeoutEntry` are re-exported from
+  `epoch_pg` (and transitively from `epoch`).
+- Integration tests can require a live database with `EPOCH_REQUIRE_DB=1`
+  (`epoch_pg`) — turns the graceful "skip when Postgres is unreachable" behaviour
+  into a hard failure, for CI environments where skipping would mask
+  misconfiguration.
 - `EventStoreBackend::read_last_event(stream_id)` returning the most recent event of a
   stream (`Option<Event>`), with a default implementation and efficient overrides in
   `PgEventStore` and `InMemoryEventStore`
@@ -39,6 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING**: `Saga::EventType` now requires `TryFrom<&ED, Error = EnumConversionError>` instead of `TryFrom<ED>`
 - `InMemoryEventStore` now stores events as `Arc<Event<D>>` internally for efficient sharing
 - Internal event conversion now uses `to_subset_event_ref()` for better performance
+- **Source-compat note**: `ReliableDeliveryConfig` (`epoch_pg`) gains the new
+  `on_gap_timeout: Option<Arc<dyn GapTimeoutCallback>>` field (defaults to `None`).
+  Code that constructs `ReliableDeliveryConfig` using struct-literal syntax (rather than
+  `..Default::default()`) must add `on_gap_timeout: None` to the literal.
 
 ### Removed
 
