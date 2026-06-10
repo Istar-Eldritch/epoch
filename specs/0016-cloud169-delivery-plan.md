@@ -279,18 +279,26 @@ baseline test count from P-2 is preserved or increased.
 
 ---
 
-## 7. Suggested Commit Sequence
+## 7. Phase Table
 
-| # | Commit | WUs |
-|---|--------|-----|
-| 1 | `feat(pg): return SkippedGap from gap-timeout advancement` | WU-1 |
-| 2 | `feat(pg): add GapTimeoutCallback and on_gap_timeout config` | WU-2 |
-| 3 | `feat(pg): add m009 gap-timeout log table` | WU-3 |
-| 4 | `feat(pg): record gap timeouts with WARN log, durable insert, callback` | WU-4 |
-| 5 | `feat(pg): add list_gap_timeouts and resolve_gap_timeout APIs` | WU-5, WU-6 |
-| 6 | `feat(pg): re-export gap-timeout public types` | WU-7 |
-| 7 | `test(pg): integration tests for gap-timeout observability` | WU-8 |
-| 8 | `docs(pg): changelog + rustdoc for gap-timeout observability` | WU-9 |
+The pipeline parses this table to drive `/implement`. Each phase maps to one or more
+work units from §4 and keeps implementation details in the work-unit sections above.
+
+| Phase | Focus | Effort | Difficulty |
+|-------|-------|--------|------------|
+| Phase 1 | Pure gap-timeout detection return value | Small | standard |
+| Phase 2 | Gap-timeout callback configuration and info types | Small | standard |
+| Phase 3 | Durable gap-timeout log migration | Small | standard |
+| Phase 4 | Gap-timeout recording, WARN logging, and callback dispatch | Medium | standard |
+| Phase 5 | Gap-timeout query and resolution APIs | Medium | standard |
+| Phase 6 | Public re-exports for gap-timeout types | Small | standard |
+| Phase 7 | Integration coverage for gap-timeout observability | Medium | hard |
+| Phase 8 | Documentation, changelog, and snapshot-fencing follow-up | Small | standard |
+
+Suggested commit sequence: Phase 1 maps to WU-1, Phase 2 to WU-2, Phase 3 to WU-3,
+Phase 4 to WU-4, Phase 5 to WU-5/WU-6, Phase 6 to WU-7, Phase 7 to WU-8, and Phase 8
+to WU-9. Use `feat(pg)` for implementation commits, `test(pg)` for integration-test
+coverage, and `docs(pg)` for documentation/changelog work.
 
 (WU-1 and WU-4 may be developed together to avoid a temporary return-value discard; see
 the note in WU-1.)
