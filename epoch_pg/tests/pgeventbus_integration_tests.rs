@@ -1989,8 +1989,6 @@ async fn test_out_of_order_notify_both_events_processed() {
     //   (both visible), processes N, advances checkpoint past both.
     let pool_a = pool.clone();
     let task_a = {
-        let event_a_id = event_a_id;
-        let stream_id = stream_id;
         let event_a_data = event_a_data.clone();
         tokio::spawn(async move {
             let mut tx = pool_a.begin().await.expect("tx A: begin");
@@ -2022,8 +2020,6 @@ async fn test_out_of_order_notify_both_events_processed() {
     // immediately, so its NOTIFY fires before Task A's NOTIFY.
     let pool_b = pool.clone();
     let task_b = {
-        let event_b_id = event_b_id;
-        let stream_id = stream_id;
         let event_b_data = event_b_data.clone();
         tokio::spawn(async move {
             // Small delay ensures Task A's INSERT has already executed (and
@@ -2369,7 +2365,7 @@ async fn test_multiple_subscribers_out_of_order() {
             .get_state(stream_id)
             .await
             .unwrap()
-            .expect(&format!("{} should have received events", label));
+            .unwrap_or_else(|| panic!("{} should have received events", label));
         let ids: Vec<Uuid> = events.0.iter().map(|e| e.id).collect();
         assert_eq!(
             events.0.len(),
