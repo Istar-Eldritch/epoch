@@ -78,23 +78,69 @@ pub fn database_url() -> String {
 ///
 /// Returns `None` when Postgres is not reachable, allowing tests to skip
 /// gracefully in environments without a database.
+///
+/// # Strict mode (CI)
+///
+/// Skipping silently can mask a misconfigured CI pipeline: every integration
+/// test "passes" without ever touching the database. Set `EPOCH_REQUIRE_DB=1`
+/// to turn an unreachable database into a hard test failure instead of a skip.
 #[allow(dead_code)]
 pub async fn try_get_pg_pool() -> Option<PgPool> {
-    let database_url = database_url();
+    try_get_pg_pool_at(&database_url()).await
+}
 
-    if let Err(e) = ensure_test_database_exists(&database_url).await {
+/// Like [`try_get_pg_pool`], but connects to a dedicated database named
+/// `db_name` on the same Postgres server as the configured test database.
+///
+/// Use this for **destructive** test suites — e.g. the migration tests, which
+/// `DROP` every epoch table to exercise migrations from scratch.
+/// `cargo test --workspace` runs test binaries as parallel processes, and
+/// `#[serial]` only serializes tests *within* one binary; a destructive suite
+/// sharing the default test database races every other integration binary.
+#[allow(dead_code)]
+pub async fn try_get_pg_pool_for_db(db_name: &str) -> Option<PgPool> {
+    let mut url = match url::Url::parse(&database_url()) {
+        Ok(url) => url,
+        Err(e) => {
+            eprintln!("Skipping test: invalid DATABASE_URL ({e})");
+            return None;
+        }
+    };
+    url.set_path(&format!("/{db_name}"));
+    try_get_pg_pool_at(url.as_str()).await
+}
+
+async fn try_get_pg_pool_at(database_url: &str) -> Option<PgPool> {
+    if let Err(e) = ensure_test_database_exists(database_url).await {
         eprintln!(
             "Warning: Could not ensure test database exists: {}. Attempting to connect anyway...",
             e
         );
     }
 
-    PgPoolOptions::new()
+    let pool = PgPoolOptions::new()
         .max_connections(10)
         .acquire_timeout(Duration::from_secs(5))
-        .connect(&database_url)
-        .await
-        .ok()
+        .connect(database_url)
+        .await;
+
+    match pool {
+        Ok(pool) => Some(pool),
+        Err(e) => {
+            if std::env::var("EPOCH_REQUIRE_DB").is_ok_and(|v| v == "1") {
+                panic!(
+                    "EPOCH_REQUIRE_DB=1 but Postgres is unreachable at {database_url}: {e}. \
+                     Integration tests must not be skipped in this environment."
+                );
+            }
+            eprintln!(
+                "Skipping test: Postgres unavailable ({e}). \
+                 Set DATABASE_URL (or epoch_pg/.env) to reach a running instance, \
+                 or EPOCH_REQUIRE_DB=1 to make this a failure."
+            );
+            None
+        }
+    }
 }
 
 /// Gets a connection pool to the test database.

@@ -1,3 +1,13 @@
+//! Migration integration tests.
+//!
+//! These tests are **destructive**: every test drops all epoch tables (see
+//! [`teardown`]) to exercise the migrator from a clean slate. They therefore
+//! run against a dedicated database (`epoch_pg_test_migrations`) instead of
+//! the shared test database — `cargo test --workspace` runs test binaries as
+//! parallel processes, and `#[serial]` only serializes within one binary, so
+//! dropping tables in the shared database would race the other integration
+//! suites.
+
 mod common;
 
 use epoch_pg::migrations::Migrator;
@@ -43,7 +53,7 @@ async fn teardown(pool: &PgPool) {
 #[tokio::test]
 #[serial]
 async fn test_migrator_creates_tracking_table() {
-    let Some(pool) = common::try_get_pg_pool().await else {
+    let Some(pool) = common::try_get_pg_pool_for_db("epoch_pg_test_migrations").await else {
         return;
     };
     teardown(&pool).await;
@@ -77,7 +87,7 @@ async fn test_migrator_creates_tracking_table() {
 #[tokio::test]
 #[serial]
 async fn test_migrator_runs_all_migrations() {
-    let Some(pool) = common::try_get_pg_pool().await else {
+    let Some(pool) = common::try_get_pg_pool_for_db("epoch_pg_test_migrations").await else {
         return;
     };
     teardown(&pool).await;
@@ -172,7 +182,7 @@ async fn test_migrator_runs_all_migrations() {
 #[tokio::test]
 #[serial]
 async fn test_migrator_is_idempotent() {
-    let Some(pool) = common::try_get_pg_pool().await else {
+    let Some(pool) = common::try_get_pg_pool_for_db("epoch_pg_test_migrations").await else {
         return;
     };
     teardown(&pool).await;
@@ -207,7 +217,7 @@ async fn test_migrator_is_idempotent() {
 #[tokio::test]
 #[serial]
 async fn test_migrator_pending_returns_unapplied_migrations() {
-    let Some(pool) = common::try_get_pg_pool().await else {
+    let Some(pool) = common::try_get_pg_pool_for_db("epoch_pg_test_migrations").await else {
         return;
     };
     teardown(&pool).await;
@@ -231,7 +241,7 @@ async fn test_migrator_pending_returns_unapplied_migrations() {
 #[tokio::test]
 #[serial]
 async fn test_migrator_applied_returns_applied_migrations() {
-    let Some(pool) = common::try_get_pg_pool().await else {
+    let Some(pool) = common::try_get_pg_pool_for_db("epoch_pg_test_migrations").await else {
         return;
     };
     teardown(&pool).await;
@@ -288,7 +298,7 @@ async fn test_migrator_applied_returns_applied_migrations() {
 #[tokio::test]
 #[serial]
 async fn test_migrator_records_checksums() {
-    let Some(pool) = common::try_get_pg_pool().await else {
+    let Some(pool) = common::try_get_pg_pool_for_db("epoch_pg_test_migrations").await else {
         return;
     };
     teardown(&pool).await;
