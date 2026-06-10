@@ -138,6 +138,41 @@ where
         self
     }
 
+    /// Explicitly sets the causation ID by UUID, without requiring a full [`Event`] reference.
+    ///
+    /// Use this in background tasks or process managers that have resumed from storage
+    /// and need to re-link into an existing causation chain. The UUID is typically the
+    /// `id` of the last event processed before the task was persisted.
+    ///
+    /// Prefer [`caused_by()`](Self::caused_by) over this method when you have a full
+    /// [`Event`] in scope — `caused_by` sets both `causation_id` and `correlation_id` in
+    /// one call, making it harder to accidentally orphan an event from its correlation tree.
+    ///
+    /// When you only have the event ID (e.g., after calling
+    /// `EventStoreBackend::read_last_event()`), pair this method with
+    /// [`with_correlation_id()`](Self::with_correlation_id) to preserve the full chain:
+    ///
+    /// ```ignore
+    /// // In a recovering background task
+    /// if let Some(last_event) = event_store.read_last_event(stream_id).await? {
+    ///     let cmd = Command::new(stream_id, ResumeProcessing { .. }, None, None)
+    ///         .with_causation_id(last_event.id)
+    ///         .with_correlation_id(
+    ///             last_event.correlation_id.unwrap_or(last_event.id)
+    ///         );
+    ///     aggregate.handle(cmd).await?;
+    /// }
+    /// ```
+    ///
+    /// # Last-write-wins
+    ///
+    /// Calling this method multiple times, or after `caused_by`, always takes the most
+    /// recent value. Only `causation_id` is affected; `correlation_id` is never touched.
+    pub fn with_causation_id(mut self, causation_id: Uuid) -> Self {
+        self.causation_id = Some(causation_id);
+        self
+    }
+
     /// Transforms this command's data to a subset type.
     ///
     /// Used to convert from a general command type to a specific aggregate's command type.

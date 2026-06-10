@@ -92,6 +92,83 @@ fn command_with_correlation_id_sets_explicit_correlation() {
 }
 
 #[test]
+fn with_causation_id_sets_causation_only() {
+    let causation_id = Uuid::new_v4();
+
+    let cmd = Command::<TestCommand, ()>::new(Uuid::new_v4(), TestCommand::DoSomething, None, None)
+        .with_causation_id(causation_id);
+
+    assert_eq!(cmd.causation_id, Some(causation_id));
+    assert_eq!(cmd.correlation_id, None);
+}
+
+#[test]
+fn with_causation_id_chains_with_correlation_id() {
+    let causation_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
+
+    // Apply causation first, then correlation
+    let cmd1 =
+        Command::<TestCommand, ()>::new(Uuid::new_v4(), TestCommand::DoSomething, None, None)
+            .with_causation_id(causation_id)
+            .with_correlation_id(correlation_id);
+
+    assert_eq!(cmd1.causation_id, Some(causation_id));
+    assert_eq!(cmd1.correlation_id, Some(correlation_id));
+
+    // Apply correlation first, then causation
+    let cmd2 =
+        Command::<TestCommand, ()>::new(Uuid::new_v4(), TestCommand::DoSomething, None, None)
+            .with_correlation_id(correlation_id)
+            .with_causation_id(causation_id);
+
+    assert_eq!(cmd2.causation_id, Some(causation_id));
+    assert_eq!(cmd2.correlation_id, Some(correlation_id));
+}
+
+#[test]
+fn with_causation_id_overwrites_previous_value() {
+    let first_causation_id = Uuid::new_v4();
+    let second_causation_id = Uuid::new_v4();
+
+    // Second with_causation_id call wins (last-write-wins)
+    let cmd1 =
+        Command::<TestCommand, ()>::new(Uuid::new_v4(), TestCommand::DoSomething, None, None)
+            .with_causation_id(first_causation_id)
+            .with_causation_id(second_causation_id);
+
+    assert_eq!(cmd1.causation_id, Some(second_causation_id));
+
+    // with_causation_id after caused_by overwrites the causation_id set by caused_by
+    let event_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
+    let event = Event::<TestEvent> {
+        id: event_id,
+        stream_id: Uuid::new_v4(),
+        stream_version: 1,
+        event_type: "SomethingDone".to_string(),
+        actor_id: None,
+        purger_id: None,
+        data: Some(TestEvent::SomethingDone),
+        created_at: chrono::Utc::now(),
+        purged_at: None,
+        global_sequence: Some(1),
+        correlation_id: Some(correlation_id),
+        causation_id: None,
+    };
+
+    let cmd2 =
+        Command::<TestCommand, ()>::new(Uuid::new_v4(), TestCommand::DoSomething, None, None)
+            .caused_by(&event)
+            .with_causation_id(second_causation_id);
+
+    // with_causation_id wins over caused_by for causation_id (last-write-wins)
+    assert_eq!(cmd2.causation_id, Some(second_causation_id));
+    // correlation_id from caused_by is preserved (not touched by with_causation_id)
+    assert_eq!(cmd2.correlation_id, Some(correlation_id));
+}
+
+#[test]
 fn command_to_subset_preserves_causation() {
     let correlation_id = Uuid::new_v4();
     let causation_id = Uuid::new_v4();
