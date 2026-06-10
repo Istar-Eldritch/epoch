@@ -58,8 +58,9 @@ pub mod state_store;
 
 pub use aggregate::*;
 pub use event_bus::{
-    CheckpointMode, DispatchMode, DlqCallback, DlqEntry, DlqInsertionInfo, InstanceMode,
-    PgEventBus, PgEventBusError, ReliableDeliveryConfig,
+    CheckpointMode, DispatchMode, DlqCallback, DlqEntry, DlqInsertionInfo, GapTimeoutCallback,
+    GapTimeoutEntry, GapTimeoutInfo, InstanceMode, PgEventBus, PgEventBusError,
+    ReliableDeliveryConfig,
 };
 pub use event_store::*;
 pub use migrations::{AppliedMigration, Migration, MigrationError, Migrator};

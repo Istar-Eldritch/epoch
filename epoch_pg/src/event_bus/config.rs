@@ -51,6 +51,56 @@ pub trait DlqCallback: Send + Sync {
     async fn on_dlq_insertion(&self, info: DlqInsertionInfo);
 }
 
+/// Information about a gap that was advanced past due to timeout.
+///
+/// Passed to the [`GapTimeoutCallback`] after the gap-timeout record has been
+/// persisted to `epoch_event_bus_gap_timeouts`. Use this to increment metrics
+/// counters, trigger alerts, or drive recovery workflows.
+#[derive(Debug, Clone)]
+pub struct GapTimeoutInfo {
+    /// The bus on which the gap occurred (the configured `events_table`,
+    /// consistent with the `bus_name` used by checkpoints).
+    pub bus_name: String,
+    /// The subscriber whose checkpoint advanced past the gap.
+    pub subscriber_id: String,
+    /// The `global_sequence` that was skipped.
+    pub skipped_sequence: u64,
+    /// How long the gap was observed before the timeout fired.
+    pub gap_duration: Duration,
+}
+
+/// Callback invoked when a subscriber's checkpoint is advanced past a gap
+/// due to timeout.
+///
+/// Use this to increment metrics counters or trigger alerts. Implementations
+/// should be lightweight. The callback fires after the gap-timeout record has
+/// been persisted; errors or panics inside the callback are isolated in a
+/// detached task and do **not** affect checkpoint advancement — the gap is
+/// always skipped regardless of callback outcome.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use epoch_pg::{GapTimeoutCallback, GapTimeoutInfo};
+/// use async_trait::async_trait;
+///
+/// struct AlertCallback;
+///
+/// #[async_trait]
+/// impl GapTimeoutCallback for AlertCallback {
+///     async fn on_gap_timeout(&self, info: GapTimeoutInfo) {
+///         log::warn!("Gap timeout on bus '{}' for subscriber '{}': seq {} skipped after {:?}",
+///             info.bus_name, info.subscriber_id, info.skipped_sequence, info.gap_duration);
+///     }
+/// }
+/// ```
+#[async_trait]
+pub trait GapTimeoutCallback: Send + Sync {
+    /// Called after a gap-timeout record has been persisted to
+    /// `epoch_event_bus_gap_timeouts`.
+    async fn on_gap_timeout(&self, info: GapTimeoutInfo);
+}
+
 /// How events are dispatched from the bus to subscribers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -159,6 +209,18 @@ pub struct ReliableDeliveryConfig {
     /// Default: `None` (no callback)
     pub on_dlq_insertion: Option<Arc<dyn DlqCallback>>,
 
+    /// Optional callback invoked when a gap is advanced past due to timeout.
+    ///
+    /// Fires after the gap-timeout record has been persisted to
+    /// `epoch_event_bus_gap_timeouts`. Use this to increment metrics counters,
+    /// trigger alerts, or drive recovery workflows.
+    ///
+    /// Errors from the callback are logged but do not affect checkpoint
+    /// advancement — the gap is always skipped regardless of callback outcome.
+    ///
+    /// Default: `None` (no callback)
+    pub on_gap_timeout: Option<Arc<dyn GapTimeoutCallback>>,
+
     /// How events flow from publishers to subscribers. See [`DispatchMode`].
     pub dispatch_mode: DispatchMode,
 
@@ -182,6 +244,7 @@ impl Default for ReliableDeliveryConfig {
             catch_up_buffer_size: 10_000,
             gap_timeout: Duration::from_secs(5),
             on_dlq_insertion: None,
+            on_gap_timeout: None,
             dispatch_mode: DispatchMode::default(),
             events_table: "epoch_events".to_string(),
         }
@@ -202,6 +265,10 @@ impl std::fmt::Debug for ReliableDeliveryConfig {
             .field(
                 "on_dlq_insertion",
                 &self.on_dlq_insertion.as_ref().map(|_| "Some(<callback>)"),
+            )
+            .field(
+                "on_gap_timeout",
+                &self.on_gap_timeout.as_ref().map(|_| "Some(<callback>)"),
             )
             .field("dispatch_mode", &self.dispatch_mode)
             .field("events_table", &self.events_table)
@@ -336,6 +403,7 @@ mod tests {
             catch_up_buffer_size: 20_000,
             gap_timeout: Duration::from_secs(10),
             on_dlq_insertion: None,
+            on_gap_timeout: None,
             dispatch_mode: DispatchMode::default(),
             events_table: "custom_events".to_string(),
         };
@@ -347,6 +415,7 @@ mod tests {
         assert_eq!(config.catch_up_buffer_size, 20_000);
         assert_eq!(config.gap_timeout, Duration::from_secs(10));
         assert!(config.on_dlq_insertion.is_none());
+        assert!(config.on_gap_timeout.is_none());
     }
 
     #[test]
@@ -453,6 +522,93 @@ mod tests {
     }
 
     #[test]
+    fn on_gap_timeout_defaults_to_none() {
+        let config = ReliableDeliveryConfig::default();
+        assert!(config.on_gap_timeout.is_none());
+    }
+
+    #[test]
+    fn gap_timeout_callback_can_be_set() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct CountingCallback {
+            count: AtomicU32,
+        }
+
+        #[async_trait]
+        impl GapTimeoutCallback for CountingCallback {
+            async fn on_gap_timeout(&self, _info: GapTimeoutInfo) {
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let callback = Arc::new(CountingCallback {
+            count: AtomicU32::new(0),
+        });
+
+        let config = ReliableDeliveryConfig {
+            on_gap_timeout: Some(callback.clone()),
+            ..Default::default()
+        };
+
+        assert!(config.on_gap_timeout.is_some());
+    }
+
+    #[tokio::test]
+    async fn gap_timeout_callback_can_be_invoked() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct CountingCallback {
+            count: AtomicU32,
+        }
+
+        #[async_trait]
+        impl GapTimeoutCallback for CountingCallback {
+            async fn on_gap_timeout(&self, info: GapTimeoutInfo) {
+                assert_eq!(info.bus_name, "epoch_events");
+                assert_eq!(info.subscriber_id, "saga:test");
+                assert_eq!(info.skipped_sequence, 42);
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let callback = Arc::new(CountingCallback {
+            count: AtomicU32::new(0),
+        });
+
+        callback
+            .on_gap_timeout(GapTimeoutInfo {
+                bus_name: "epoch_events".to_string(),
+                subscriber_id: "saga:test".to_string(),
+                skipped_sequence: 42,
+                gap_duration: Duration::from_secs(6),
+            })
+            .await;
+
+        assert_eq!(callback.count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn gap_timeout_info_fields() {
+        let info = GapTimeoutInfo {
+            bus_name: "my_bus".to_string(),
+            subscriber_id: "projection:orders".to_string(),
+            skipped_sequence: 99,
+            gap_duration: Duration::from_secs(7),
+        };
+
+        assert_eq!(info.bus_name, "my_bus");
+        assert_eq!(info.subscriber_id, "projection:orders");
+        assert_eq!(info.skipped_sequence, 99);
+        assert_eq!(info.gap_duration, Duration::from_secs(7));
+
+        // Clone works
+        let cloned = info.clone();
+        assert_eq!(info.bus_name, cloned.bus_name);
+        assert_eq!(info.skipped_sequence, cloned.skipped_sequence);
+    }
+
+    #[test]
     fn on_dlq_insertion_can_be_set() {
         use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -517,17 +673,30 @@ mod tests {
         let debug_str = format!("{:?}", config_without);
         assert!(debug_str.contains("None"));
 
-        struct NoopCallback;
+        struct NoopDlqCallback;
         #[async_trait]
-        impl DlqCallback for NoopCallback {
+        impl DlqCallback for NoopDlqCallback {
             async fn on_dlq_insertion(&self, _info: DlqInsertionInfo) {}
         }
 
-        let config_with = ReliableDeliveryConfig {
-            on_dlq_insertion: Some(Arc::new(NoopCallback)),
+        let config_with_dlq = ReliableDeliveryConfig {
+            on_dlq_insertion: Some(Arc::new(NoopDlqCallback)),
             ..Default::default()
         };
-        let debug_str = format!("{:?}", config_with);
+        let debug_str = format!("{:?}", config_with_dlq);
+        assert!(debug_str.contains("<callback>"));
+
+        struct NoopGapCallback;
+        #[async_trait]
+        impl GapTimeoutCallback for NoopGapCallback {
+            async fn on_gap_timeout(&self, _info: GapTimeoutInfo) {}
+        }
+
+        let config_with_gap = ReliableDeliveryConfig {
+            on_gap_timeout: Some(Arc::new(NoopGapCallback)),
+            ..Default::default()
+        };
+        let debug_str = format!("{:?}", config_with_gap);
         assert!(debug_str.contains("<callback>"));
     }
 

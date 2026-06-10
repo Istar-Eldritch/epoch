@@ -8,8 +8,8 @@ mod subscriber_state;
 
 pub(crate) use checkpoint::*;
 pub use config::{
-    CheckpointMode, DispatchMode, DlqCallback, DlqInsertionInfo, InstanceMode,
-    ReliableDeliveryConfig,
+    CheckpointMode, DispatchMode, DlqCallback, DlqInsertionInfo, GapTimeoutCallback,
+    GapTimeoutInfo, InstanceMode, ReliableDeliveryConfig,
 };
 pub(crate) use retry::{ProcessResult, process_event_with_retry};
 pub(crate) use subscriber_state::{SubscriberState, advance_contiguous_checkpoint};
@@ -154,7 +154,65 @@ where
         processed_any = true;
     }
 
-    advance_contiguous_checkpoint(&mut state, &visible_seqs, config.gap_timeout);
+    let skipped_gaps = advance_contiguous_checkpoint(&mut state, &visible_seqs, config.gap_timeout);
+
+    // For each gap the checkpoint advanced past due to timeout: emit a WARN log,
+    // then fire-and-forget a task that persists the record and invokes the callback.
+    // Neither the log nor the DB write gate checkpoint advancement (NFR-1).
+    for gap in skipped_gaps {
+        let bus_name = config.events_table.clone();
+        let sub_id = subscriber_id.clone();
+        warn!(
+            "Gap timeout: advancing '{}' on bus '{}' past missing seq {} after {:?} \
+             — if the writing transaction later commits, the event will NOT be \
+             delivered to this subscriber (recorded in epoch_event_bus_gap_timeouts)",
+            sub_id, bus_name, gap.skipped_sequence, gap.gap_duration
+        );
+
+        let pool = checkpoint_pool.clone();
+        let cb = config.on_gap_timeout.clone();
+        let skipped_sequence = gap.skipped_sequence;
+        let gap_duration = gap.gap_duration;
+        let bus_name_task = bus_name.clone();
+        let sub_id_task = sub_id.clone();
+
+        tokio::spawn(async move {
+            let result = sqlx::query(
+                r#"
+                INSERT INTO epoch_event_bus_gap_timeouts
+                    (bus_name, subscriber_id, skipped_sequence, gap_duration_ms)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (bus_name, subscriber_id, skipped_sequence) DO NOTHING
+                "#,
+            )
+            .bind(&bus_name_task)
+            .bind(&sub_id_task)
+            .bind(skipped_sequence as i64)
+            .bind(gap_duration.as_millis() as i64)
+            .execute(&pool)
+            .await;
+
+            match result {
+                Err(e) => {
+                    error!(
+                        "Failed to record gap timeout for '{}' on bus '{}' seq {}: {}",
+                        sub_id_task, bus_name_task, skipped_sequence, e
+                    );
+                }
+                Ok(_) => {
+                    if let Some(callback) = cb {
+                        let info = GapTimeoutInfo {
+                            bus_name: bus_name_task,
+                            subscriber_id: sub_id_task,
+                            skipped_sequence,
+                            gap_duration,
+                        };
+                        callback.on_gap_timeout(info).await;
+                    }
+                }
+            }
+        });
+    }
 
     let new_contiguous = state.contiguous_checkpoint;
     let mut cached_checkpoint = None;
@@ -249,6 +307,38 @@ pub struct DlqEntry {
     /// Identifier of the operator/system that resolved the entry
     pub resolved_by: Option<String>,
     /// Free-form notes about the resolution
+    pub resolution_notes: Option<String>,
+}
+
+/// A recorded gap-timeout: a global sequence a subscriber's checkpoint advanced past
+/// because the gap did not fill within [`ReliableDeliveryConfig::gap_timeout`].
+///
+/// These records are stored in `epoch_event_bus_gap_timeouts` and can be queried
+/// via [`PgEventBus::list_gap_timeouts`]. If the skipped sequence later turns out
+/// to have committed (use
+/// `SELECT g.* FROM epoch_event_bus_gap_timeouts g
+///  JOIN epoch_events e ON e.global_sequence = g.skipped_sequence`
+/// to detect this), the operator can replay the event and then call
+/// [`PgEventBus::resolve_gap_timeout`] to mark the record as resolved.
+#[derive(Debug, Clone)]
+pub struct GapTimeoutEntry {
+    /// Unique identifier for the record.
+    pub id: Uuid,
+    /// The bus (events table) on which the gap occurred.
+    pub bus_name: String,
+    /// The subscriber whose checkpoint advanced past the gap.
+    pub subscriber_id: String,
+    /// The `global_sequence` that was skipped.
+    pub skipped_sequence: u64,
+    /// How long the gap was observed before the timeout fired, in milliseconds.
+    pub gap_duration_ms: i64,
+    /// When the skip was recorded.
+    pub timed_out_at: chrono::DateTime<chrono::Utc>,
+    /// When the record was manually resolved (None if unresolved).
+    pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Identifier of the operator/system that resolved the record.
+    pub resolved_by: Option<String>,
+    /// Free-form notes about the resolution.
     pub resolution_notes: Option<String>,
 }
 
@@ -1318,6 +1408,172 @@ where
         Ok(result.rows_affected())
     }
 
+    /// Lists gap-timeout records for this bus.
+    ///
+    /// Each row represents a `global_sequence` that a subscriber's checkpoint was advanced
+    /// past because the gap did not fill within [`ReliableDeliveryConfig::gap_timeout`]. The
+    /// records are scoped to this bus's `events_table` (the `bus_name` column).
+    ///
+    /// # Arguments
+    ///
+    /// * `subscriber_id` - Restrict results to one subscriber, or `None` for all subscribers
+    ///   on this bus.
+    /// * `unresolved_only` - When `true`, only rows with `resolved_at IS NULL` are returned.
+    /// * `offset` - Number of rows to skip (for pagination).
+    /// * `limit` - Maximum number of rows to return.
+    ///
+    /// # Returns
+    ///
+    /// A vector of gap-timeout entries ordered by `timed_out_at` ascending (oldest first).
+    pub async fn list_gap_timeouts(
+        &self,
+        subscriber_id: Option<&str>,
+        unresolved_only: bool,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<GapTimeoutEntry>, SqlxError> {
+        // Build the query dynamically based on optional filters.
+        // Using sqlx's query builder would be cleaner for truly dynamic queries;
+        // here we enumerate the four combinations for clarity and type safety.
+        let bus_name = &self.config.events_table;
+        use sqlx::Row;
+
+        let rows = match (subscriber_id, unresolved_only) {
+            (Some(sub), true) => {
+                sqlx::query(
+                    r#"
+                    SELECT id, bus_name, subscriber_id, skipped_sequence, gap_duration_ms,
+                           timed_out_at, resolved_at, resolved_by, resolution_notes
+                    FROM epoch_event_bus_gap_timeouts
+                    WHERE bus_name = $1
+                      AND subscriber_id = $2
+                      AND resolved_at IS NULL
+                    ORDER BY timed_out_at ASC
+                    OFFSET $3 LIMIT $4
+                    "#,
+                )
+                .bind(bus_name)
+                .bind(sub)
+                .bind(offset as i64)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(sub), false) => {
+                sqlx::query(
+                    r#"
+                    SELECT id, bus_name, subscriber_id, skipped_sequence, gap_duration_ms,
+                           timed_out_at, resolved_at, resolved_by, resolution_notes
+                    FROM epoch_event_bus_gap_timeouts
+                    WHERE bus_name = $1
+                      AND subscriber_id = $2
+                    ORDER BY timed_out_at ASC
+                    OFFSET $3 LIMIT $4
+                    "#,
+                )
+                .bind(bus_name)
+                .bind(sub)
+                .bind(offset as i64)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, true) => {
+                sqlx::query(
+                    r#"
+                    SELECT id, bus_name, subscriber_id, skipped_sequence, gap_duration_ms,
+                           timed_out_at, resolved_at, resolved_by, resolution_notes
+                    FROM epoch_event_bus_gap_timeouts
+                    WHERE bus_name = $1
+                      AND resolved_at IS NULL
+                    ORDER BY timed_out_at ASC
+                    OFFSET $2 LIMIT $3
+                    "#,
+                )
+                .bind(bus_name)
+                .bind(offset as i64)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, false) => {
+                sqlx::query(
+                    r#"
+                    SELECT id, bus_name, subscriber_id, skipped_sequence, gap_duration_ms,
+                           timed_out_at, resolved_at, resolved_by, resolution_notes
+                    FROM epoch_event_bus_gap_timeouts
+                    WHERE bus_name = $1
+                    ORDER BY timed_out_at ASC
+                    OFFSET $2 LIMIT $3
+                    "#,
+                )
+                .bind(bus_name)
+                .bind(offset as i64)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|row| GapTimeoutEntry {
+                id: row.get("id"),
+                bus_name: row.get("bus_name"),
+                subscriber_id: row.get("subscriber_id"),
+                skipped_sequence: row.get::<i64, _>("skipped_sequence") as u64,
+                gap_duration_ms: row.get("gap_duration_ms"),
+                timed_out_at: row.get("timed_out_at"),
+                resolved_at: row.get("resolved_at"),
+                resolved_by: row.get("resolved_by"),
+                resolution_notes: row.get("resolution_notes"),
+            })
+            .collect())
+    }
+
+    /// Marks a gap-timeout record as resolved.
+    ///
+    /// Use this after confirming the skipped sequence came from a rolled-back
+    /// transaction (no action needed) or after replaying the late-committed event
+    /// through other means. Records the operator identity and optional notes for
+    /// audit purposes.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The UUID of the gap-timeout record to resolve.
+    /// * `resolved_by` - Identifier of the operator or system performing the resolution.
+    /// * `resolution_notes` - Optional free-form notes describing the resolution action.
+    ///
+    /// # Returns
+    ///
+    /// `true` if a record was updated (i.e., an unresolved record with the given `id`
+    /// existed), `false` if no matching unresolved record was found (already resolved
+    /// or id does not exist).
+    pub async fn resolve_gap_timeout(
+        &self,
+        id: Uuid,
+        resolved_by: &str,
+        resolution_notes: Option<&str>,
+    ) -> Result<bool, SqlxError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE epoch_event_bus_gap_timeouts
+            SET resolved_at = NOW(),
+                resolved_by = $2,
+                resolution_notes = $3
+            WHERE id = $1
+              AND resolved_at IS NULL
+            "#,
+        )
+        .bind(id)
+        .bind(resolved_by)
+        .bind(resolution_notes)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Attempts to acquire an advisory lock for a subscriber.
     ///
     /// This is used for multi-instance coordination in `InstanceMode::Coordinated`.
@@ -2019,5 +2275,33 @@ mod tests {
         assert_eq!(entry.retry_count, 3);
         assert!(entry.error_message.is_some());
         assert!(entry.resolved_at.is_none());
+    }
+
+    #[test]
+    fn gap_timeout_entry_structure() {
+        let entry = GapTimeoutEntry {
+            id: Uuid::new_v4(),
+            bus_name: "epoch_events".to_string(),
+            subscriber_id: "projection:orders".to_string(),
+            skipped_sequence: 99,
+            gap_duration_ms: 6250,
+            timed_out_at: chrono::Utc::now(),
+            resolved_at: None,
+            resolved_by: None,
+            resolution_notes: None,
+        };
+
+        assert_eq!(entry.bus_name, "epoch_events");
+        assert_eq!(entry.subscriber_id, "projection:orders");
+        assert_eq!(entry.skipped_sequence, 99);
+        assert_eq!(entry.gap_duration_ms, 6250);
+        assert!(entry.resolved_at.is_none());
+        assert!(entry.resolved_by.is_none());
+        assert!(entry.resolution_notes.is_none());
+
+        // Clone works
+        let cloned = entry.clone();
+        assert_eq!(entry.bus_name, cloned.bus_name);
+        assert_eq!(entry.skipped_sequence, cloned.skipped_sequence);
     }
 }

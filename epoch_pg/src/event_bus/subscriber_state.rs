@@ -9,6 +9,20 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 use tokio::time::Instant;
 
+/// Describes a single gap that was advanced past due to timeout.
+///
+/// One entry is returned per sequence the checkpoint skipped because the gap
+/// exceeded [`ReliableDeliveryConfig::gap_timeout`]. The caller is responsible
+/// for logging, persisting, and invoking any callbacks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkippedGap {
+    /// The `global_sequence` that was skipped.
+    pub skipped_sequence: u64,
+    /// How long the gap was observed before the timeout fired
+    /// (`first_seen.elapsed()` at the moment of the skip; always > `gap_timeout`).
+    pub gap_duration: Duration,
+}
+
 /// Tracks per-subscriber processing state for gap-aware checkpoint advancement.
 ///
 /// Instead of a simple "last seen sequence" counter, this struct maintains:
@@ -77,7 +91,8 @@ pub(crate) fn advance_contiguous_checkpoint(
     state: &mut SubscriberState,
     visible_seqs: &BTreeSet<u64>,
     gap_timeout: Duration,
-) {
+) -> Vec<SkippedGap> {
+    let mut skipped = Vec::new();
     loop {
         let next = state.contiguous_checkpoint + 1;
 
@@ -100,11 +115,16 @@ pub(crate) fn advance_contiguous_checkpoint(
             if let Some(first_seen) = state.gap_first_seen.get(&next) {
                 if first_seen.elapsed() > gap_timeout {
                     // Gap has been observed long enough — assume rolled back
-                    log::info!(
+                    let gap_duration = first_seen.elapsed();
+                    log::debug!(
                         "Advancing past gap at seq {} (timed out after {:?})",
                         next,
-                        gap_timeout
+                        gap_duration
                     );
+                    skipped.push(SkippedGap {
+                        skipped_sequence: next,
+                        gap_duration,
+                    });
                     state.gap_first_seen.remove(&next);
                     state.contiguous_checkpoint = next;
                     continue;
@@ -123,6 +143,7 @@ pub(crate) fn advance_contiguous_checkpoint(
         // This case means the caller hasn't processed `next` yet — stop.
         break;
     }
+    skipped
 }
 
 #[cfg(test)]
@@ -148,7 +169,7 @@ mod tests {
     #[test]
     fn advance_contiguous_no_gaps() {
         // checkpoint=5, processed_ahead={6,7,8}, visible=[6,7,8]
-        // Should advance to 8
+        // Should advance to 8 and return empty Vec
         let mut state = SubscriberState::new(5);
         state.processed_ahead.insert(6);
         state.processed_ahead.insert(7);
@@ -157,10 +178,14 @@ mod tests {
         let visible: BTreeSet<u64> = [6, 7, 8].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
+        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
 
         assert_eq!(state.contiguous_checkpoint, 8);
         assert!(state.processed_ahead.is_empty());
+        assert!(
+            skipped.is_empty(),
+            "no gaps timed out, so Vec must be empty"
+        );
     }
 
     #[test]
@@ -173,10 +198,14 @@ mod tests {
         let visible: BTreeSet<u64> = [7, 8].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
+        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
 
         assert_eq!(state.contiguous_checkpoint, 5);
         assert!(state.gap_first_seen.contains_key(&6));
+        assert!(
+            skipped.is_empty(),
+            "gap not yet timed out, so Vec must be empty"
+        );
     }
 
     #[test]
@@ -184,6 +213,7 @@ mod tests {
         // checkpoint=5, visible=[7,8], gap at 6 aged past timeout
         // processed_ahead={7,8} (already processed)
         // Should advance past gap at 6, then through 7 and 8 → checkpoint=8
+        // Should return Vec with SkippedGap for seq 6
         let mut state = SubscriberState::new(5);
         state.processed_ahead.insert(7);
         state.processed_ahead.insert(8);
@@ -196,11 +226,20 @@ mod tests {
         let visible: BTreeSet<u64> = [7, 8].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
+        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
 
         assert_eq!(state.contiguous_checkpoint, 8);
         assert!(state.processed_ahead.is_empty());
         assert!(!state.gap_first_seen.contains_key(&6));
+        // Exactly one gap was skipped
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].skipped_sequence, 6);
+        assert!(
+            skipped[0].gap_duration >= gap_timeout,
+            "gap_duration {:?} should be >= gap_timeout {:?}",
+            skipped[0].gap_duration,
+            gap_timeout
+        );
     }
 
     #[test]
@@ -214,10 +253,11 @@ mod tests {
         let visible: BTreeSet<u64> = [6, 7, 8].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
+        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
 
         assert_eq!(state.contiguous_checkpoint, 6);
         assert!(!state.processed_ahead.contains(&6));
+        assert!(skipped.is_empty());
     }
 
     #[test]
@@ -232,10 +272,11 @@ mod tests {
         let visible: BTreeSet<u64> = [6, 7, 8].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
+        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
 
         assert_eq!(state.contiguous_checkpoint, 8);
         assert!(state.processed_ahead.is_empty());
+        assert!(skipped.is_empty());
     }
 
     #[test]
@@ -247,11 +288,12 @@ mod tests {
         let visible: BTreeSet<u64> = [8, 10].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
+        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
 
         assert_eq!(state.contiguous_checkpoint, 5);
         assert!(state.gap_first_seen.contains_key(&6));
         // 7 is not recorded yet because we stopped at 6
+        assert!(skipped.is_empty());
     }
 
     #[test]
@@ -267,12 +309,13 @@ mod tests {
         let visible: BTreeSet<u64> = [7, 8].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
+        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
 
         assert_eq!(state.contiguous_checkpoint, 5);
         // 7 and 8 should remain in processed_ahead since we couldn't advance past 6
         assert!(state.processed_ahead.contains(&7));
         assert!(state.processed_ahead.contains(&8));
+        assert!(skipped.is_empty(), "gap not timed out, Vec must be empty");
     }
 
     #[test]
@@ -288,10 +331,11 @@ mod tests {
         let visible: BTreeSet<u64> = BTreeSet::new();
         let gap_timeout = Duration::from_secs(5);
 
-        advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
+        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
 
         assert_eq!(state.contiguous_checkpoint, 6);
         assert!(state.processed_ahead.is_empty());
+        assert!(skipped.is_empty());
     }
 
     #[test]
@@ -299,7 +343,7 @@ mod tests {
         // Simulate a gap at 6 that was recorded, then 6 gets processed
         // checkpoint=5, processed_ahead={6, 7}, gap_first_seen has 6
         // visible=[6, 7]
-        // Advancing should clear gap_first_seen for 6
+        // Advancing should clear gap_first_seen for 6 (gap filled, not skipped)
         let mut state = SubscriberState::new(5);
         state.processed_ahead.insert(6);
         state.processed_ahead.insert(7);
@@ -308,11 +352,13 @@ mod tests {
         let visible: BTreeSet<u64> = [6, 7].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
+        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
 
         assert_eq!(state.contiguous_checkpoint, 7);
         assert!(!state.gap_first_seen.contains_key(&6));
         assert!(state.processed_ahead.is_empty());
+        // Gap filled (not timed out) — no SkippedGap entries
+        assert!(skipped.is_empty(), "gap filled normally, Vec must be empty");
     }
 
     #[test]
@@ -320,6 +366,7 @@ mod tests {
         // checkpoint=5, visible=[9,10], processed_ahead={9,10}
         // gaps at 6,7,8 all timed out
         // Should advance through all timed-out gaps and then through processed_ahead
+        // Returns SkippedGap entries for 6, 7, 8 in ascending order
         let mut state = SubscriberState::new(5);
         state.processed_ahead.insert(9);
         state.processed_ahead.insert(10);
@@ -332,10 +379,26 @@ mod tests {
         let visible: BTreeSet<u64> = [9, 10].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
+        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout);
 
         assert_eq!(state.contiguous_checkpoint, 10);
         assert!(state.processed_ahead.is_empty());
         assert!(state.gap_first_seen.is_empty());
+        // All three gaps should be in the returned Vec
+        assert_eq!(skipped.len(), 3);
+        let seqs: Vec<u64> = skipped.iter().map(|s| s.skipped_sequence).collect();
+        assert_eq!(
+            seqs,
+            vec![6, 7, 8],
+            "skipped sequences should be in ascending order"
+        );
+        for sg in &skipped {
+            assert!(
+                sg.gap_duration >= gap_timeout,
+                "gap_duration {:?} should be >= gap_timeout {:?}",
+                sg.gap_duration,
+                gap_timeout
+            );
+        }
     }
 }
