@@ -2787,3 +2787,598 @@ async fn test_graceful_shutdown_flushes_subscriber_states() {
         "Checkpoint should be flushed on graceful shutdown with subscriber states"
     );
 }
+
+// ============================================================================
+// Gap-timeout observability integration tests (spec 0016 / CLOUD-169)
+//
+// These tests exercise the durable gap-timeout machinery end-to-end: when a
+// subscriber's checkpoint advances past a permanent hole in `global_sequence`
+// after `gap_timeout`, a record is written to `epoch_event_bus_gap_timeouts`,
+// the `on_gap_timeout` callback fires, and operators can list/resolve records.
+//
+// All tests are `#[serial]`, use a short `gap_timeout`, fresh `Uuid::new_v4()`
+// stream IDs, and scope every assertion to their own randomly-generated
+// subscriber ID so that they remain idempotent across repeated runs and never
+// observe records produced by sibling tests (NFR-5).
+// ============================================================================
+
+use epoch_pg::event_bus::{GapTimeoutCallback, GapTimeoutEntry, GapTimeoutInfo};
+use std::time::Duration as GapDuration;
+
+/// Inserts a committed event for `stream_id` and returns its assigned
+/// `global_sequence`.
+async fn insert_committed_event(
+    pool: &PgPool,
+    stream_id: Uuid,
+    version: i64,
+    value: &str,
+) -> (Uuid, i64) {
+    let id = Uuid::new_v4();
+    let data = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: value.to_string(),
+    }))
+    .unwrap();
+    let seq: i64 = sqlx::query_scalar(
+        r#"INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at)
+           VALUES ($1, $2, $3, 'MyEvent', $4, NOW())
+           RETURNING global_sequence"#,
+    )
+    .bind(id)
+    .bind(stream_id)
+    .bind(version)
+    .bind(&data)
+    .fetch_one(pool)
+    .await
+    .expect("insert committed event");
+    (id, seq)
+}
+
+/// Creates a deterministic, permanent hole in `global_sequence` for `stream_id`.
+///
+/// Commits an event before the gap (seq N), consumes the next sequence value
+/// (N+1) inside a transaction that is rolled back (so N+1 never commits — the
+/// permanent gap), then commits an event after the gap (N+2). Because the
+/// integration suite runs `#[serial]`, no other writer interleaves, so the
+/// rolled-back transaction is guaranteed to own the missing sequence.
+///
+/// Returns `(before_event_id, skipped_sequence, after_event_id)`.
+async fn create_sequence_gap(pool: &PgPool, stream_id: Uuid) -> (Uuid, u64, Uuid) {
+    let (before_id, _before_seq) = insert_committed_event(pool, stream_id, 1, "gap_before").await;
+
+    // A rolled-back transaction consumes the next sequence value, which will
+    // never commit — producing a permanent hole the subscriber must skip.
+    let skipped_seq: i64 = {
+        let mut tx = pool.begin().await.expect("begin rollback tx");
+        let data = serde_json::to_value(Some(TestEventData::TestEvent {
+            value: "rolled_back".to_string(),
+        }))
+        .unwrap();
+        let seq: i64 = sqlx::query_scalar(
+            r#"INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at)
+               VALUES ($1, $2, 2, 'MyEvent', $3, NOW())
+               RETURNING global_sequence"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(stream_id)
+        .bind(&data)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("insert rolled-back event");
+        tx.rollback().await.expect("rollback gap tx");
+        seq
+    };
+
+    let (after_id, _after_seq) = insert_committed_event(pool, stream_id, 3, "gap_after").await;
+
+    (before_id, skipped_seq as u64, after_id)
+}
+
+/// Builds and starts a `PgEventBus` with the given config, subscribes a fresh
+/// `TestProjection`, and returns the bus, the subscriber's ID, and its state
+/// store for assertions.
+async fn start_gap_test_bus(
+    pool: &PgPool,
+    config: epoch_pg::event_bus::ReliableDeliveryConfig,
+) -> (
+    PgEventBus<TestEventData>,
+    String,
+    InMemoryStateStore<TestState>,
+) {
+    let channel_name = format!("test_gap_obs_{}", Uuid::new_v4().simple());
+    let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup event bus trigger");
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start event bus listener");
+
+    let projection = TestProjection::new();
+    let subscriber_id = projection.subscriber_id().to_string();
+    let projection_events = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe projection");
+
+    // Let catch-up and buffer setup complete before producing the gap.
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    (event_bus, subscriber_id, projection_events)
+}
+
+/// Polls `list_gap_timeouts` until a record for `skipped_sequence` appears for
+/// `subscriber_id`, or the bounded retry window elapses.
+async fn poll_for_gap_record(
+    event_bus: &PgEventBus<TestEventData>,
+    subscriber_id: &str,
+    skipped_sequence: u64,
+) -> Option<GapTimeoutEntry> {
+    for _ in 0..24 {
+        let entries = event_bus
+            .list_gap_timeouts(Some(subscriber_id), false, 0, 50)
+            .await
+            .expect("Failed to list gap timeouts");
+        if let Some(entry) = entries
+            .into_iter()
+            .find(|e| e.skipped_sequence == skipped_sequence)
+        {
+            return Some(entry);
+        }
+        tokio::time::sleep(GapDuration::from_millis(250)).await;
+    }
+    None
+}
+
+#[tokio::test]
+#[serial]
+async fn test_gap_timeout_inserts_record() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_millis(500),
+        ..Default::default()
+    };
+    let (event_bus, subscriber_id, projection_events) = start_gap_test_bus(&pool, config).await;
+
+    let stream_id = Uuid::new_v4();
+    let (before_id, skipped_seq, after_id) = create_sequence_gap(&pool, stream_id).await;
+
+    let entry = poll_for_gap_record(&event_bus, &subscriber_id, skipped_seq)
+        .await
+        .expect("a gap-timeout record should be inserted for the skipped sequence");
+
+    // The record captures bus, subscriber, sequence, and an elapsed duration that
+    // is at least the configured gap_timeout (AC-2).
+    assert_eq!(entry.subscriber_id, subscriber_id);
+    assert_eq!(entry.bus_name, "epoch_events");
+    assert_eq!(entry.skipped_sequence, skipped_seq);
+    assert!(
+        entry.resolved_at.is_none(),
+        "record should start unresolved"
+    );
+    assert!(
+        entry.gap_duration_ms >= 500,
+        "gap_duration_ms ({}) should be >= gap_timeout (500ms)",
+        entry.gap_duration_ms
+    );
+
+    // The checkpoint advanced past the gap, so both committed events were
+    // delivered despite the hole (NFR-1: recording never gates advancement).
+    let state = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("Should have received events around the gap");
+    let received_ids: Vec<Uuid> = state.0.iter().map(|e| e.id).collect();
+    assert!(
+        received_ids.contains(&before_id),
+        "event before the gap must be delivered"
+    );
+    assert!(
+        received_ids.contains(&after_id),
+        "event after the gap must be delivered once the gap times out"
+    );
+
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("Failed to get checkpoint");
+    assert!(
+        matches!(checkpoint, Some(seq) if seq >= skipped_seq),
+        "checkpoint ({checkpoint:?}) should have advanced past the skipped sequence {skipped_seq}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_event_committed_after_gap_timeout_is_reported_as_skipped() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_millis(500),
+        ..Default::default()
+    };
+    let (event_bus, subscriber_id, projection_events) = start_gap_test_bus(&pool, config).await;
+
+    let stream_id = Uuid::new_v4();
+    let (_before_id, skipped_seq, _after_id) = create_sequence_gap(&pool, stream_id).await;
+
+    // Wait for the gap to time out and be recorded.
+    let _entry = poll_for_gap_record(&event_bus, &subscriber_id, skipped_seq)
+        .await
+        .expect("gap-timeout record should exist before the late commit");
+
+    // Now the "late" event commits at the previously-skipped global_sequence —
+    // simulating a transaction that was actually still in flight. Because the
+    // checkpoint already advanced past it, it must NOT be delivered.
+    let late_id = Uuid::new_v4();
+    let late_data = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: "late_commit".to_string(),
+    }))
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO epoch_events
+               (id, stream_id, stream_version, event_type, data, created_at, global_sequence)
+           VALUES ($1, $2, 2, 'MyEvent', $3, NOW(), $4)"#,
+    )
+    .bind(late_id)
+    .bind(stream_id)
+    .bind(&late_data)
+    .bind(skipped_seq as i64)
+    .execute(&pool)
+    .await
+    .expect("insert late-committed event at the skipped sequence");
+
+    // Give the listener ample time to (not) deliver the late event.
+    tokio::time::sleep(GapDuration::from_millis(1500)).await;
+
+    let state = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("Should have received the surrounding events");
+    let received_ids: Vec<Uuid> = state.0.iter().map(|e| e.id).collect();
+    assert!(
+        !received_ids.contains(&late_id),
+        "the late-committed event at the skipped sequence must NOT be delivered to this subscriber"
+    );
+
+    // ...but the skip is visibly reported: the durable record persists (AC-4).
+    let entries = event_bus
+        .list_gap_timeouts(Some(&subscriber_id), false, 0, 50)
+        .await
+        .expect("Failed to list gap timeouts");
+    assert!(
+        entries.iter().any(|e| e.skipped_sequence == skipped_seq),
+        "the gap-timeout record for the skipped sequence must remain queryable"
+    );
+
+    // Clean up the late event so it does not pollute later tests.
+    sqlx::query("DELETE FROM epoch_events WHERE id = $1")
+        .bind(late_id)
+        .execute(&pool)
+        .await
+        .expect("cleanup late event");
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_gap_timeout_callback_is_invoked() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    #[derive(Default)]
+    struct RecordingGapCallback {
+        infos: std::sync::Mutex<Vec<GapTimeoutInfo>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GapTimeoutCallback for RecordingGapCallback {
+        async fn on_gap_timeout(&self, info: GapTimeoutInfo) {
+            self.infos.lock().unwrap().push(info);
+        }
+    }
+
+    let callback = Arc::new(RecordingGapCallback::default());
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_millis(500),
+        on_gap_timeout: Some(callback.clone()),
+        ..Default::default()
+    };
+    let (event_bus, subscriber_id, _projection_events) = start_gap_test_bus(&pool, config).await;
+
+    let stream_id = Uuid::new_v4();
+    let (_before_id, skipped_seq, _after_id) = create_sequence_gap(&pool, stream_id).await;
+
+    // Wait for the durable record (the callback fires after persistence).
+    poll_for_gap_record(&event_bus, &subscriber_id, skipped_seq)
+        .await
+        .expect("gap-timeout record should exist");
+
+    // Poll for the callback to fire for this subscriber's skipped sequence.
+    let mut matching: Vec<GapTimeoutInfo> = Vec::new();
+    for _ in 0..24 {
+        matching = callback
+            .infos
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| i.subscriber_id == subscriber_id && i.skipped_sequence == skipped_seq)
+            .cloned()
+            .collect();
+        if !matching.is_empty() {
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(250)).await;
+    }
+
+    assert_eq!(
+        matching.len(),
+        1,
+        "on_gap_timeout must fire exactly once for the skipped sequence (got {})",
+        matching.len()
+    );
+    let info = &matching[0];
+    assert_eq!(info.bus_name, "epoch_events");
+    assert_eq!(info.subscriber_id, subscriber_id);
+    assert_eq!(info.skipped_sequence, skipped_seq);
+    assert!(
+        info.gap_duration >= GapDuration::from_millis(500),
+        "callback gap_duration ({:?}) should be >= gap_timeout (500ms)",
+        info.gap_duration
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_list_gap_timeouts_returns_entries() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_millis(500),
+        ..Default::default()
+    };
+    let (event_bus, subscriber_id, _projection_events) = start_gap_test_bus(&pool, config).await;
+
+    let stream_id = Uuid::new_v4();
+    let (_before_id, skipped_seq, _after_id) = create_sequence_gap(&pool, stream_id).await;
+
+    poll_for_gap_record(&event_bus, &subscriber_id, skipped_seq)
+        .await
+        .expect("gap-timeout record should exist");
+
+    // Listing scoped to this subscriber returns the record (AC-2).
+    let all = event_bus
+        .list_gap_timeouts(Some(&subscriber_id), false, 0, 50)
+        .await
+        .expect("Failed to list gap timeouts");
+    assert!(
+        all.iter().any(|e| e.skipped_sequence == skipped_seq),
+        "list_gap_timeouts should return the recorded skip"
+    );
+
+    // The unresolved filter also returns it while it is unresolved.
+    let unresolved = event_bus
+        .list_gap_timeouts(Some(&subscriber_id), true, 0, 50)
+        .await
+        .expect("Failed to list unresolved gap timeouts");
+    assert!(
+        unresolved.iter().any(|e| e.skipped_sequence == skipped_seq),
+        "unresolved listing should include the unresolved record"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_resolve_gap_timeout_marks_resolved() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_millis(500),
+        ..Default::default()
+    };
+    let (event_bus, subscriber_id, _projection_events) = start_gap_test_bus(&pool, config).await;
+
+    let stream_id = Uuid::new_v4();
+    let (_before_id, skipped_seq, _after_id) = create_sequence_gap(&pool, stream_id).await;
+
+    let entry = poll_for_gap_record(&event_bus, &subscriber_id, skipped_seq)
+        .await
+        .expect("gap-timeout record should exist");
+
+    // Resolving an unresolved record succeeds (FR-9).
+    let resolved = event_bus
+        .resolve_gap_timeout(entry.id, "operator", Some("rolled back"))
+        .await
+        .expect("Failed to resolve gap timeout");
+    assert!(
+        resolved,
+        "resolving an unresolved record should return true"
+    );
+
+    // It drops out of the unresolved listing...
+    let unresolved = event_bus
+        .list_gap_timeouts(Some(&subscriber_id), true, 0, 50)
+        .await
+        .expect("Failed to list unresolved gap timeouts");
+    assert!(
+        !unresolved.iter().any(|e| e.id == entry.id),
+        "a resolved record should not appear in the unresolved listing"
+    );
+
+    // ...but is still present overall, now carrying resolution metadata.
+    let all = event_bus
+        .list_gap_timeouts(Some(&subscriber_id), false, 0, 50)
+        .await
+        .expect("Failed to list gap timeouts");
+    let resolved_entry = all
+        .iter()
+        .find(|e| e.id == entry.id)
+        .expect("resolved record should still be queryable");
+    assert!(resolved_entry.resolved_at.is_some());
+    assert_eq!(resolved_entry.resolved_by.as_deref(), Some("operator"));
+    assert_eq!(
+        resolved_entry.resolution_notes.as_deref(),
+        Some("rolled back")
+    );
+
+    // Resolving the same record again is a no-op.
+    let second = event_bus
+        .resolve_gap_timeout(entry.id, "operator", Some("again"))
+        .await
+        .expect("Failed to resolve gap timeout again");
+    assert!(
+        !second,
+        "resolving an already-resolved record should return false"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_no_gap_timeout_record_on_in_order_events() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_millis(500),
+        ..Default::default()
+    };
+    let (event_bus, subscriber_id, projection_events) = start_gap_test_bus(&pool, config).await;
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    let stream_id = Uuid::new_v4();
+    for i in 1..=5u64 {
+        event_store
+            .store_event(new_event(stream_id, i, &format!("in_order_{i}")))
+            .await
+            .expect("Failed to store event");
+    }
+
+    // Wait well beyond gap_timeout so any (spurious) gap would have fired.
+    tokio::time::sleep(GapDuration::from_millis(2000)).await;
+
+    let state = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("Should have received events");
+    assert_eq!(state.0.len(), 5, "all in-order events should be delivered");
+
+    let entries = event_bus
+        .list_gap_timeouts(Some(&subscriber_id), false, 0, 50)
+        .await
+        .expect("Failed to list gap timeouts");
+    assert!(
+        entries.is_empty(),
+        "in-order delivery must not produce any gap-timeout records, got {entries:?}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_gap_timeout_record_insert_is_idempotent() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // Re-recording the same (bus_name, subscriber_id, skipped_sequence) is a
+    // no-op thanks to the UNIQUE constraint + ON CONFLICT DO NOTHING (NFR-6).
+    let subscriber_id = format!("projection:idem:{}", Uuid::new_v4());
+    let bus_name = "epoch_events";
+    let skipped_seq = 1i64;
+
+    for _ in 0..2 {
+        sqlx::query(
+            r#"INSERT INTO epoch_event_bus_gap_timeouts
+                   (bus_name, subscriber_id, skipped_sequence, gap_duration_ms)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (bus_name, subscriber_id, skipped_sequence) DO NOTHING"#,
+        )
+        .bind(bus_name)
+        .bind(&subscriber_id)
+        .bind(skipped_seq)
+        .bind(500i64)
+        .execute(&pool)
+        .await
+        .expect("insert gap-timeout record");
+    }
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM epoch_event_bus_gap_timeouts WHERE subscriber_id = $1",
+    )
+    .bind(&subscriber_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count gap-timeout records");
+    assert_eq!(
+        count, 1,
+        "duplicate inserts for the same key must collapse to a single row"
+    );
+
+    // Clean up this test's row.
+    sqlx::query("DELETE FROM epoch_event_bus_gap_timeouts WHERE subscriber_id = $1")
+        .bind(&subscriber_id)
+        .execute(&pool)
+        .await
+        .expect("cleanup idempotency row");
+}
