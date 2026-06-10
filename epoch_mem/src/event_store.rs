@@ -253,6 +253,30 @@ where
         Ok(events)
     }
 
+    /// Returns the most recent event in the given stream in O(1) time.
+    ///
+    /// This override provides O(1) performance by looking up the last event ID
+    /// directly from the `stream_events` index without scanning the full stream.
+    ///
+    /// Prefer [`caused_by`](epoch_core::aggregate::Command::caused_by) when a full
+    /// `Event` reference is already in scope. Use this method paired with
+    /// [`Command::with_causation_id`](epoch_core::aggregate::Command::with_causation_id)
+    /// when a background task needs to re-link into an existing causation chain
+    /// without loading the entire stream.
+    async fn read_last_event(
+        &self,
+        stream_id: Uuid,
+    ) -> Result<Option<Event<Self::EventType>>, Self::Error> {
+        let data = self.data.lock().await;
+        let event = data
+            .stream_events
+            .get(&stream_id)
+            .and_then(|ids| ids.last())
+            .and_then(|id| data.events.get(id))
+            .map(|arc| (**arc).clone());
+        Ok(event)
+    }
+
     async fn trace_causation_chain(
         &self,
         event_id: Uuid,
@@ -1068,6 +1092,64 @@ mod tests {
         let chain = store.trace_causation_chain(event.id).await.unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].id, event.id);
+    }
+
+    #[tokio::test]
+    async fn read_last_event_returns_latest_event() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let store = InMemoryEventStore::new(bus);
+        let stream_id = Uuid::new_v4();
+        let correlation_id = Uuid::new_v4();
+
+        let event1 = new_correlated_event(stream_id, 1, "first", correlation_id, None);
+        let event2 = new_correlated_event(stream_id, 2, "second", correlation_id, Some(event1.id));
+        let event3 = new_correlated_event(stream_id, 3, "third", correlation_id, Some(event2.id));
+
+        store.store_event(event1.clone()).await.unwrap();
+        store.store_event(event2.clone()).await.unwrap();
+        store.store_event(event3.clone()).await.unwrap();
+
+        let last = store.read_last_event(stream_id).await.unwrap();
+        assert!(last.is_some());
+        let last = last.unwrap();
+        assert_eq!(last.id, event3.id);
+        assert_eq!(last.correlation_id, Some(correlation_id));
+        assert_eq!(last.causation_id, Some(event2.id));
+    }
+
+    #[tokio::test]
+    async fn read_last_event_returns_none_for_unknown_stream() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let store = InMemoryEventStore::new(bus);
+        let unknown_stream_id = Uuid::new_v4();
+
+        let result = store.read_last_event(unknown_stream_id).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_last_event_isolated_per_stream() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let store = InMemoryEventStore::new(bus);
+        let stream_a = Uuid::new_v4();
+        let stream_b = Uuid::new_v4();
+
+        let event_a1 = new_event(stream_a, 1, "a1");
+        let event_a2 = new_event(stream_a, 2, "a2");
+        let event_b1 = new_event(stream_b, 1, "b1");
+
+        store.store_event(event_a1.clone()).await.unwrap();
+        store.store_event(event_a2.clone()).await.unwrap();
+        store.store_event(event_b1.clone()).await.unwrap();
+
+        let last_a = store.read_last_event(stream_a).await.unwrap();
+        let last_b = store.read_last_event(stream_b).await.unwrap();
+
+        assert!(last_a.is_some());
+        assert_eq!(last_a.unwrap().id, event_a2.id);
+
+        assert!(last_b.is_some());
+        assert_eq!(last_b.unwrap().id, event_b1.id);
     }
 
     #[tokio::test]
