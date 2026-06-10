@@ -97,32 +97,26 @@ impl<B: EventBus + Clone> PgEventStore<B> {
         );
         for event in events {
             let row: (i64,) = sqlx::query_as(&insert_sql)
-            .bind(event.id)
-            .bind(event.stream_id)
-            .bind(TryInto::<i64>::try_into(event.stream_version).map_err(|e| {
-                PgEventStoreError::DBError::<B::Error>(sqlx::error::Error::InvalidArgument(
-                    format!(
-                        "stream_version {} is too large to fit in i64: {}",
-                        event.stream_version, e
-                    ),
-                ))
-            })?)
-            .bind(event.event_type.to_string())
-            .bind(
-                event
-                    .data
-                    .as_ref()
-                    .map(serde_json::to_value)
-                    .transpose()?,
-            )
-            .bind(event.created_at)
-            .bind(event.actor_id)
-            .bind(event.purger_id)
-            .bind(event.purged_at)
-            .bind(event.causation_id)
-            .bind(event.correlation_id)
-            .fetch_one(&mut **tx)
-            .await?;
+                .bind(event.id)
+                .bind(event.stream_id)
+                .bind(TryInto::<i64>::try_into(event.stream_version).map_err(|e| {
+                    PgEventStoreError::DBError::<B::Error>(sqlx::error::Error::InvalidArgument(
+                        format!(
+                            "stream_version {} is too large to fit in i64: {}",
+                            event.stream_version, e
+                        ),
+                    ))
+                })?)
+                .bind(event.event_type.to_string())
+                .bind(event.data.as_ref().map(serde_json::to_value).transpose()?)
+                .bind(event.created_at)
+                .bind(event.actor_id)
+                .bind(event.purger_id)
+                .bind(event.purged_at)
+                .bind(event.causation_id)
+                .bind(event.correlation_id)
+                .fetch_one(&mut **tx)
+                .await?;
 
             stored_events.push(Event {
                 id: event.id,
@@ -193,6 +187,50 @@ pub struct PgDBEvent {
     pub causation_id: Option<Uuid>,
     /// A shared identifier tying together all events in a causal tree.
     pub correlation_id: Option<Uuid>,
+}
+
+/// Converts a [`PgDBEvent`] row into a domain [`Event`].
+///
+/// This is the single source of truth for the `PgDBEvent` → `Event` builder
+/// sequence shared by `read_events_since`, `read_events_by_correlation_id`,
+/// `trace_causation_chain`, and `read_last_event`. Optional metadata
+/// (`global_sequence`, `causation_id`, `correlation_id`) is only threaded onto
+/// the builder when present on the row.
+fn pg_db_event_to_event<D, BE>(entry: PgDBEvent) -> Result<Event<D>, PgEventStoreError<BE>>
+where
+    D: EventData + DeserializeOwned,
+    BE: std::error::Error,
+{
+    let data: Option<D> = entry
+        .data
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(PgEventStoreError::DeserializeEventError::<BE>)?;
+
+    let mut builder = Event::<D>::builder()
+        .id(entry.id)
+        .stream_id(entry.stream_id)
+        .stream_version(entry.stream_version.try_into().unwrap())
+        .event_type(entry.event_type)
+        .created_at(entry.created_at)
+        .data(data);
+
+    // Add global_sequence if present
+    if let Some(gs) = entry.global_sequence {
+        builder = builder.global_sequence(gs as u64);
+    }
+
+    // Add causation/correlation if present
+    if let Some(cid) = entry.causation_id {
+        builder = builder.causation_id(cid);
+    }
+    if let Some(cid) = entry.correlation_id {
+        builder = builder.correlation_id(cid);
+    }
+
+    builder
+        .build()
+        .map_err(PgEventStoreError::BuildEventError::<BE>)
 }
 
 /// A postgres based event stream.
@@ -286,36 +324,7 @@ where
             while let Some(row) = inner_stream.next().await {
                 let entry: PgDBEvent = row.map_err(PgEventStoreError::DBError::<B::Error>)?;
 
-                let data: Option<B::EventType> = entry
-                    .data
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .map_err(PgEventStoreError::DeserializeEventError::<B::Error>)?;
-
-                let mut builder = Event::<B::EventType>::builder()
-                    .id(entry.id)
-                    .stream_id(entry.stream_id)
-                    .stream_version(entry.stream_version.try_into().unwrap())
-                    .event_type(entry.event_type)
-                    .created_at(entry.created_at)
-                    .data(data);
-
-                // Add global_sequence if present
-                if let Some(gs) = entry.global_sequence {
-                    builder = builder.global_sequence(gs as u64);
-                }
-
-                // Add causation/correlation if present
-                if let Some(cid) = entry.causation_id {
-                    builder = builder.causation_id(cid);
-                }
-                if let Some(cid) = entry.correlation_id {
-                    builder = builder.correlation_id(cid);
-                }
-
-                let event = builder
-                    .build()
-                    .map_err(PgEventStoreError::BuildEventError::<B::Error>)?;
+                let event = pg_db_event_to_event::<B::EventType, B::Error>(entry)?;
                 yield event;
             }
         };
@@ -347,13 +356,7 @@ where
                 )))
             })?)
             .bind(event.event_type.to_string())
-            .bind(
-                event
-                    .data
-                    .as_ref()
-                    .map(serde_json::to_value)
-                    .transpose()?,
-            )
+            .bind(event.data.as_ref().map(serde_json::to_value).transpose()?)
             .bind(event.created_at)
             .bind(event.actor_id)
             .bind(event.purger_id)
@@ -410,6 +413,33 @@ where
         self.publish_events(stored_events).await
     }
 
+    /// Returns the most recent event of the given stream via a single indexed query.
+    ///
+    /// Overrides the default O(N) trait implementation with an
+    /// `ORDER BY stream_version DESC LIMIT 1` query served by the
+    /// `UNIQUE (stream_id, stream_version)` index, fetching at most one row.
+    /// Returns `Ok(None)` when the stream is empty or does not exist.
+    async fn read_last_event(
+        &self,
+        stream_id: Uuid,
+    ) -> Result<Option<Event<Self::EventType>>, Self::Error> {
+        let last_sql = format!(
+            "SELECT id, stream_id, stream_version, event_type, data, created_at, \
+             actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id \
+             FROM {} WHERE stream_id = $1 ORDER BY stream_version DESC LIMIT 1",
+            self.events_table,
+        );
+        let row: Option<PgDBEvent> = sqlx::query_as(&last_sql)
+            .bind(stream_id)
+            .fetch_optional(&self.postgres)
+            .await?;
+
+        let Some(entry) = row else {
+            return Ok(None);
+        };
+        Ok(Some(pg_db_event_to_event::<B::EventType, B::Error>(entry)?))
+    }
+
     async fn read_events_by_correlation_id(
         &self,
         correlation_id: Uuid,
@@ -421,40 +451,13 @@ where
             self.events_table,
         );
         let rows = sqlx::query_as::<_, PgDBEvent>(&correlation_sql)
-        .bind(correlation_id)
-        .fetch_all(&self.postgres)
-        .await?;
+            .bind(correlation_id)
+            .fetch_all(&self.postgres)
+            .await?;
 
         let mut events = Vec::with_capacity(rows.len());
         for entry in rows {
-            let data: Option<B::EventType> = entry
-                .data
-                .map(serde_json::from_value)
-                .transpose()
-                .map_err(PgEventStoreError::DeserializeEventError::<B::Error>)?;
-
-            let mut builder = Event::<B::EventType>::builder()
-                .id(entry.id)
-                .stream_id(entry.stream_id)
-                .stream_version(entry.stream_version.try_into().unwrap())
-                .event_type(entry.event_type)
-                .created_at(entry.created_at)
-                .data(data);
-
-            if let Some(gs) = entry.global_sequence {
-                builder = builder.global_sequence(gs as u64);
-            }
-            if let Some(cid) = entry.causation_id {
-                builder = builder.causation_id(cid);
-            }
-            if let Some(cid) = entry.correlation_id {
-                builder = builder.correlation_id(cid);
-            }
-
-            let event = builder
-                .build()
-                .map_err(PgEventStoreError::BuildEventError::<B::Error>)?;
-            events.push(event);
+            events.push(pg_db_event_to_event::<B::EventType, B::Error>(entry)?);
         }
 
         Ok(events)
@@ -472,9 +475,9 @@ where
             self.events_table,
         );
         let row = sqlx::query_as::<_, PgDBEvent>(&trace_sql)
-        .bind(event_id)
-        .fetch_optional(&self.postgres)
-        .await?;
+            .bind(event_id)
+            .fetch_optional(&self.postgres)
+            .await?;
 
         let entry = match row {
             Some(entry) => entry,
@@ -485,30 +488,7 @@ where
         let correlation_id = match entry.correlation_id {
             Some(cid) => cid,
             None => {
-                let data: Option<B::EventType> = entry
-                    .data
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .map_err(PgEventStoreError::DeserializeEventError::<B::Error>)?;
-
-                let mut builder = Event::<B::EventType>::builder()
-                    .id(entry.id)
-                    .stream_id(entry.stream_id)
-                    .stream_version(entry.stream_version.try_into().unwrap())
-                    .event_type(entry.event_type)
-                    .created_at(entry.created_at)
-                    .data(data);
-
-                if let Some(gs) = entry.global_sequence {
-                    builder = builder.global_sequence(gs as u64);
-                }
-                if let Some(cid) = entry.causation_id {
-                    builder = builder.causation_id(cid);
-                }
-
-                let event = builder
-                    .build()
-                    .map_err(PgEventStoreError::BuildEventError::<B::Error>)?;
+                let event = pg_db_event_to_event::<B::EventType, B::Error>(entry)?;
                 return Ok(vec![event]);
             }
         };

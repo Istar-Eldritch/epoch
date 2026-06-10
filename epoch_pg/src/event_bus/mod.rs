@@ -45,6 +45,18 @@ struct SubscriberBatchOutcome {
     processed_any: bool,
 }
 
+/// Shared, batch-level context passed to every concurrent per-subscriber task.
+/// Grouping these fields avoids exceeding the function-argument limit while
+/// keeping each `Arc` clone cheap.
+struct BatchContext {
+    rows: Arc<Vec<PgDBEvent>>,
+    visible_seqs: Arc<BTreeSet<u64>>,
+    seq_to_id: Arc<HashMap<u64, Uuid>>,
+    config: ReliableDeliveryConfig,
+    dlq_pool: PgPool,
+    checkpoint_pool: PgPool,
+}
+
 /// Processes one subscriber against the pre-fetched batch of events.
 /// All per-subscriber state is owned, making this safe to run concurrently.
 async fn process_subscriber_for_batch<D>(
@@ -53,16 +65,19 @@ async fn process_subscriber_for_batch<D>(
     mut state: SubscriberState,
     mut pending_checkpoint: Option<PendingCheckpoint>,
     last_event_id_in: Option<Uuid>,
-    rows: Arc<Vec<PgDBEvent>>,
-    visible_seqs: Arc<BTreeSet<u64>>,
-    seq_to_id: Arc<HashMap<u64, Uuid>>,
-    config: ReliableDeliveryConfig,
-    dlq_pool: PgPool,
-    checkpoint_pool: PgPool,
+    ctx: BatchContext,
 ) -> SubscriberBatchOutcome
 where
     D: EventData + Send + Sync + 'static,
 {
+    let BatchContext {
+        rows,
+        visible_seqs,
+        seq_to_id,
+        config,
+        dlq_pool,
+        checkpoint_pool,
+    } = ctx;
     let contiguous_before = state.contiguous_checkpoint;
     let mut processed_any = false;
     let mut last_event_id = last_event_id_in;
@@ -418,10 +433,10 @@ where
             self.config.events_table,
         );
         let rows: Vec<PgDBEvent> = sqlx::query_as(&query)
-        .bind(since_global_sequence as i64)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await?;
+            .bind(since_global_sequence as i64)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
 
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
@@ -478,12 +493,10 @@ where
     /// This method is idempotent - it will drop and recreate the trigger if it exists.
     pub async fn setup_trigger(&self) -> Result<(), SqlxError> {
         // Drop existing trigger if present
-        sqlx::query(
-            &format!(
-                "DROP TRIGGER IF EXISTS epoch_event_bus_notify_trigger ON {};",
-                self.config.events_table,
-            ),
-        )
+        sqlx::query(&format!(
+            "DROP TRIGGER IF EXISTS epoch_event_bus_notify_trigger ON {};",
+            self.config.events_table,
+        ))
         .execute(&self.pool)
         .await?;
 
@@ -815,10 +828,10 @@ where
                         config.events_table,
                     );
                     let rows: Vec<PgDBEvent> = match sqlx::query_as(&catchup_query)
-                    .bind(min_checkpoint as i64)
-                    .bind(config.catch_up_batch_size as i64)
-                    .fetch_all(&checkpoint_pool)
-                    .await
+                        .bind(min_checkpoint as i64)
+                        .bind(config.catch_up_batch_size as i64)
+                        .fetch_all(&checkpoint_pool)
+                        .await
                     {
                         Ok(rows) => rows,
                         Err(e) => {
@@ -857,8 +870,7 @@ where
                     // Collect (priority, subscriber_id, projection) tuples sequentially.
                     // We hold projections_guard here, so inner per-subscriber locks are
                     // acquired one at a time to read metadata.
-                    let mut tagged: Vec<(u8, String, Arc<Mutex<dyn EventObserver<D>>>)> =
-                        Vec::new();
+                    let mut tagged = Vec::new();
                     for projection in projections_guard.iter() {
                         let guard = projection.lock().await;
                         let priority = guard.priority();
@@ -895,42 +907,22 @@ where
                                     state,
                                     pending,
                                     last_id,
-                                    shared_rows.clone(),
-                                    shared_visible.clone(),
-                                    shared_seq_to_id.clone(),
-                                    config.clone(),
-                                    dlq_pool.clone(),
-                                    checkpoint_pool.clone(),
+                                    BatchContext {
+                                        rows: shared_rows.clone(),
+                                        visible_seqs: shared_visible.clone(),
+                                        seq_to_id: shared_seq_to_id.clone(),
+                                        config: config.clone(),
+                                        dlq_pool: dlq_pool.clone(),
+                                        checkpoint_pool: checkpoint_pool.clone(),
+                                    },
                                 )
                             })
                             .collect();
 
                         let outcomes = join_all(task_inputs.into_iter().map(
-                            |(
-                                sid,
-                                proj,
-                                state,
-                                pending,
-                                last_id,
-                                rows_ref,
-                                visible_ref,
-                                seq_to_id_ref,
-                                config_ref,
-                                dlq_ref,
-                                cp_ref,
-                            )| {
+                            |(sid, proj, state, pending, last_id, batch_ctx)| {
                                 process_subscriber_for_batch(
-                                    proj,
-                                    sid,
-                                    state,
-                                    pending,
-                                    last_id,
-                                    rows_ref,
-                                    visible_ref,
-                                    seq_to_id_ref,
-                                    config_ref,
-                                    dlq_ref,
-                                    cp_ref,
+                                    proj, sid, state, pending, last_id, batch_ctx,
                                 )
                             },
                         ))
@@ -1447,8 +1439,7 @@ where
                         // (handlers may publish but not subscribe).
                         let sorted: Vec<Arc<Mutex<dyn EventObserver<D>>>> = {
                             let guard = projections.lock().await;
-                            let mut tagged: Vec<(u8, Arc<Mutex<dyn EventObserver<D>>>)> =
-                                Vec::with_capacity(guard.len());
+                            let mut tagged = Vec::with_capacity(guard.len());
                             for p in guard.iter() {
                                 let priority = p.lock().await.priority();
                                 tagged.push((priority, p.clone()));
@@ -1709,10 +1700,10 @@ where
             );
             loop {
                 let rows: Vec<PgDBEvent> = sqlx::query_as(&subscriber_catchup_query)
-                .bind(current_sequence as i64)
-                .bind(config.catch_up_batch_size as i64)
-                .fetch_all(&pool)
-                .await?;
+                    .bind(current_sequence as i64)
+                    .bind(config.catch_up_batch_size as i64)
+                    .fetch_all(&pool)
+                    .await?;
 
                 if rows.is_empty() {
                     break;
@@ -1816,9 +1807,14 @@ where
                         && should_flush_checkpoint(pending, &config.checkpoint_mode)
                     {
                         let pending = pending_checkpoint.take().unwrap();
-                        if let Err(e) =
-                            flush_checkpoint(&pool, &config.events_table, &subscriber_id, &pending, &mut checkpoint_cache)
-                                .await
+                        if let Err(e) = flush_checkpoint(
+                            &pool,
+                            &config.events_table,
+                            &subscriber_id,
+                            &pending,
+                            &mut checkpoint_cache,
+                        )
+                        .await
                         {
                             error!(
                                 "Catch-up: failed to flush checkpoint for '{}': {}",
@@ -1849,8 +1845,14 @@ where
 
             // Flush any remaining pending checkpoint after catch-up
             if let Some(pending) = pending_checkpoint.take()
-                && let Err(e) =
-                    flush_checkpoint(&pool, &config.events_table, &subscriber_id, &pending, &mut checkpoint_cache).await
+                && let Err(e) = flush_checkpoint(
+                    &pool,
+                    &config.events_table,
+                    &subscriber_id,
+                    &pending,
+                    &mut checkpoint_cache,
+                )
+                .await
             {
                 error!(
                     "Catch-up: failed to flush final checkpoint for '{}': {}",
@@ -1916,9 +1918,14 @@ where
                     && should_flush_checkpoint(pending, &config.checkpoint_mode)
                 {
                     let pending = pending_checkpoint.take().unwrap();
-                    if let Err(e) =
-                        flush_checkpoint(&pool, &config.events_table, &subscriber_id, &pending, &mut checkpoint_cache)
-                            .await
+                    if let Err(e) = flush_checkpoint(
+                        &pool,
+                        &config.events_table,
+                        &subscriber_id,
+                        &pending,
+                        &mut checkpoint_cache,
+                    )
+                    .await
                     {
                         error!(
                             "Buffer processing: failed to flush checkpoint for '{}': {}",
@@ -1943,8 +1950,14 @@ where
 
             // Flush any remaining pending checkpoint after buffer processing
             if let Some(pending) = pending_checkpoint.take()
-                && let Err(e) =
-                    flush_checkpoint(&pool, &config.events_table, &subscriber_id, &pending, &mut checkpoint_cache).await
+                && let Err(e) = flush_checkpoint(
+                    &pool,
+                    &config.events_table,
+                    &subscriber_id,
+                    &pending,
+                    &mut checkpoint_cache,
+                )
+                .await
             {
                 error!(
                     "Buffer processing: failed to flush final checkpoint for '{}': {}",
