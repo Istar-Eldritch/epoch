@@ -811,3 +811,90 @@ async fn test_trace_causation_chain_excludes_sibling() {
     assert_eq!(chain[0].id, event_a.id);
     assert_eq!(chain[1].id, event_b.id);
 }
+
+#[tokio::test]
+#[serial]
+async fn test_read_last_event_returns_latest() {
+    let (_pool, event_store) = setup().await;
+
+    let stream_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
+
+    // Store three events v1..v3 with correlation/causation set.
+    let event1 = Event::<TestEventData>::builder()
+        .id(Uuid::new_v4())
+        .stream_id(stream_id)
+        .stream_version(1)
+        .event_type("TestEvent1".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "v1".to_string(),
+        }))
+        .correlation_id(correlation_id)
+        .build()
+        .unwrap();
+
+    let event2 = Event::<TestEventData>::builder()
+        .id(Uuid::new_v4())
+        .stream_id(stream_id)
+        .stream_version(2)
+        .event_type("TestEvent2".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "v2".to_string(),
+        }))
+        .correlation_id(correlation_id)
+        .causation_id(event1.id)
+        .build()
+        .unwrap();
+
+    let event3 = Event::<TestEventData>::builder()
+        .id(Uuid::new_v4())
+        .stream_id(stream_id)
+        .stream_version(3)
+        .event_type("TestEvent3".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "v3".to_string(),
+        }))
+        .correlation_id(correlation_id)
+        .causation_id(event2.id)
+        .build()
+        .unwrap();
+
+    event_store.store_event(event1.clone()).await.unwrap();
+    event_store.store_event(event2.clone()).await.unwrap();
+    event_store.store_event(event3.clone()).await.unwrap();
+
+    let last = event_store
+        .read_last_event(stream_id)
+        .await
+        .unwrap()
+        .expect("stream should have a last event");
+
+    // The returned event must be the highest-version event with full metadata.
+    assert_eq!(last.id, event3.id);
+    assert_eq!(last.stream_id, stream_id);
+    assert_eq!(last.stream_version, 3);
+    assert_eq!(last.event_type, event3.event_type);
+    assert_eq!(last.data, event3.data);
+    assert_eq!(last.correlation_id, Some(correlation_id));
+    assert_eq!(last.causation_id, Some(event2.id));
+    // Postgres stores timestamps at microsecond precision, so compare at that
+    // granularity rather than the nanosecond precision of the in-memory value.
+    assert_eq!(
+        last.created_at.timestamp_micros(),
+        event3.created_at.timestamp_micros()
+    );
+    assert!(
+        last.global_sequence.is_some(),
+        "global_sequence should be populated by read_last_event"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_read_last_event_empty_stream_returns_none() {
+    let (_pool, event_store) = setup().await;
+
+    // A fresh, never-written stream ID must return Ok(None), not an error.
+    let result = event_store.read_last_event(Uuid::new_v4()).await.unwrap();
+    assert!(result.is_none());
+}
