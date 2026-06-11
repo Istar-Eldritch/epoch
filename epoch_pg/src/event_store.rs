@@ -589,8 +589,7 @@ mod tests {
             correlation_id: None,
         };
 
-        let result =
-            pg_db_event_to_event::<TestEvent, std::convert::Infallible>(entry);
+        let result = pg_db_event_to_event::<TestEvent, std::convert::Infallible>(entry);
         assert!(
             matches!(result, Err(PgEventStoreError::InvalidStreamVersion(-1))),
             "expected InvalidStreamVersion(-1), got: {:?}",

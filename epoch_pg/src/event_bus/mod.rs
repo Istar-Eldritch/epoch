@@ -253,8 +253,8 @@ where
         }
 
         // Flush checkpoint to DB if threshold reached.
-        if let Some(pending) = pending_checkpoint
-            .take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
+        if let Some(pending) =
+            pending_checkpoint.take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
         {
             let mut local_cache = HashMap::new();
             match flush_checkpoint(
@@ -2022,13 +2022,13 @@ where
                                     &mut checkpoint_cache,
                                 )
                                 .await
-                                {
-                                    error!(
-                                        "Catch-up: failed to flush checkpoint for '{}': {}",
-                                        subscriber_id, flush_err
-                                    );
-                                    pending_checkpoint = Some(pending);
-                                }
+                            {
+                                error!(
+                                    "Catch-up: failed to flush checkpoint for '{}': {}",
+                                    subscriber_id, flush_err
+                                );
+                                pending_checkpoint = Some(pending);
+                            }
                             continue;
                         }
                     };
@@ -2075,14 +2075,14 @@ where
                             &mut checkpoint_cache,
                         )
                         .await
-                        {
-                            error!(
-                                "Catch-up: failed to flush checkpoint for '{}': {}",
-                                subscriber_id, e
-                            );
-                            // Re-insert pending checkpoint for retry
-                            pending_checkpoint = Some(pending);
-                        }
+                    {
+                        error!(
+                            "Catch-up: failed to flush checkpoint for '{}': {}",
+                            subscriber_id, e
+                        );
+                        // Re-insert pending checkpoint for retry
+                        pending_checkpoint = Some(pending);
+                    }
 
                     current_sequence = event_global_seq;
                     total_caught_up += 1;
@@ -2183,14 +2183,14 @@ where
                         &mut checkpoint_cache,
                     )
                     .await
-                    {
-                        error!(
-                            "Buffer processing: failed to flush checkpoint for '{}': {}",
-                            subscriber_id, e
-                        );
-                        // Re-insert pending checkpoint for retry
-                        pending_checkpoint = Some(pending);
-                    }
+                {
+                    error!(
+                        "Buffer processing: failed to flush checkpoint for '{}': {}",
+                        subscriber_id, e
+                    );
+                    // Re-insert pending checkpoint for retry
+                    pending_checkpoint = Some(pending);
+                }
 
                 current_sequence = event_global_seq;
                 processed_from_buffer += 1;
