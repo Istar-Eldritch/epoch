@@ -967,7 +967,9 @@ async fn test_store_event_larger_than_pg_notify_limit_succeeds() {
         .stream_id(stream_id)
         .stream_version(1)
         .event_type("TestEvent".to_string())
-        .data(Some(TestEventData::TestEvent { value: large_value.clone() }))
+        .data(Some(TestEventData::TestEvent {
+            value: large_value.clone(),
+        }))
         .build()
         .unwrap();
 

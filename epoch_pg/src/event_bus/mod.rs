@@ -1850,8 +1850,7 @@ where
             // The buffer uses a bounded mpsc channel to apply backpressure when full,
             // preventing memory exhaustion during extended catch-up periods.
             let buffer_size = config.catch_up_buffer_size;
-            let (buffer_tx, mut buffer_rx) =
-                tokio::sync::mpsc::channel::<(Uuid, u64)>(buffer_size);
+            let (buffer_tx, mut buffer_rx) = tokio::sync::mpsc::channel::<(Uuid, u64)>(buffer_size);
 
             // Start a temporary listener to buffer events during catch-up
             let buffer_listener_pool = pool.clone();
@@ -2161,50 +2160,49 @@ where
                     // Deserialize, mirroring the catch-up loop's skip-on-error
                     // behaviour: undeserializable variants advance the checkpoint
                     // rather than looping forever.
-                    let data: Option<Self::EventType> =
-                        match row.data.map(serde_json::from_value).transpose() {
-                            Ok(d) => d,
-                            Err(e) => {
-                                warn!(
-                                    "Buffer processing: skipping event {} (type: '{}', \
+                    let data: Option<Self::EventType> = match row
+                        .data
+                        .map(serde_json::from_value)
+                        .transpose()
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(
+                                "Buffer processing: skipping event {} (type: '{}', \
                                      global_seq: {}) for '{}': failed to deserialize: {}. \
                                      Advancing checkpoint past this event.",
-                                    event_id,
-                                    row.event_type,
-                                    event_global_seq,
-                                    subscriber_id,
-                                    e
-                                );
+                                event_id, row.event_type, event_global_seq, subscriber_id, e
+                            );
 
-                                match &mut pending_checkpoint {
-                                    Some(pending) => pending.update(event_global_seq, event_id),
-                                    None => {
-                                        pending_checkpoint =
-                                            Some(PendingCheckpoint::new(event_global_seq, event_id))
-                                    }
+                            match &mut pending_checkpoint {
+                                Some(pending) => pending.update(event_global_seq, event_id),
+                                None => {
+                                    pending_checkpoint =
+                                        Some(PendingCheckpoint::new(event_global_seq, event_id))
                                 }
-                                if let Some(pending) = pending_checkpoint
-                                    .take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
-                                    && let Err(e) = flush_checkpoint(
-                                        &pool,
-                                        &config.events_table,
-                                        &subscriber_id,
-                                        &pending,
-                                        &mut checkpoint_cache,
-                                    )
-                                    .await
-                                {
-                                    error!(
-                                        "Buffer processing: failed to flush checkpoint for '{}': {}",
-                                        subscriber_id, e
-                                    );
-                                    pending_checkpoint = Some(pending);
-                                }
-
-                                current_sequence = event_global_seq;
-                                continue;
                             }
-                        };
+                            if let Some(pending) = pending_checkpoint
+                                .take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
+                                && let Err(e) = flush_checkpoint(
+                                    &pool,
+                                    &config.events_table,
+                                    &subscriber_id,
+                                    &pending,
+                                    &mut checkpoint_cache,
+                                )
+                                .await
+                            {
+                                error!(
+                                    "Buffer processing: failed to flush checkpoint for '{}': {}",
+                                    subscriber_id, e
+                                );
+                                pending_checkpoint = Some(pending);
+                            }
+
+                            current_sequence = event_global_seq;
+                            continue;
+                        }
+                    };
 
                     let event = Arc::new(Event {
                         id: row.id,
@@ -2221,14 +2219,9 @@ where
                         correlation_id: row.correlation_id,
                     });
 
-                    let result = process_event_with_retry(
-                        &observer,
-                        &event,
-                        &subscriber_id,
-                        &config,
-                        &pool,
-                    )
-                    .await;
+                    let result =
+                        process_event_with_retry(&observer, &event, &subscriber_id, &config, &pool)
+                            .await;
 
                     // Track pending checkpoint for batched mode
                     match &mut pending_checkpoint {

@@ -96,14 +96,14 @@ async fn test_migrator_runs_all_migrations() {
 
     // Run migrations
     let applied = migrator.run().await.expect("Should run migrations");
-    assert_eq!(applied, 9, "Should apply 9 migrations");
+    assert_eq!(applied, 10, "Should apply 10 migrations");
 
     // Verify current version
     let version = migrator
         .current_version()
         .await
         .expect("Should get version");
-    assert_eq!(version, 9, "Version should be 9 after all migrations");
+    assert_eq!(version, 10, "Version should be 10 after all migrations");
 
     // Verify epoch_events table exists
     let events_table: (i64,) = sqlx::query_as(
@@ -191,7 +191,7 @@ async fn test_migrator_is_idempotent() {
 
     // Run migrations first time
     let applied1 = migrator.run().await.expect("Should run migrations");
-    assert_eq!(applied1, 9, "Should apply 9 migrations first time");
+    assert_eq!(applied1, 10, "Should apply 10 migrations first time");
 
     // Run migrations second time
     let applied2 = migrator.run().await.expect("Should run migrations again");
@@ -204,12 +204,12 @@ async fn test_migrator_is_idempotent() {
         .expect("Should run migrations third time");
     assert_eq!(applied3, 0, "Should apply 0 migrations third time");
 
-    // Version should still be 9
+    // Version should still be 10
     let version = migrator
         .current_version()
         .await
         .expect("Should get version");
-    assert_eq!(version, 9, "Version should still be 9");
+    assert_eq!(version, 10, "Version should still be 10");
 
     teardown(&pool).await;
 }
@@ -226,7 +226,7 @@ async fn test_migrator_pending_returns_unapplied_migrations() {
 
     // Before running, all should be pending
     let pending = migrator.pending().await.expect("Should get pending");
-    assert_eq!(pending.len(), 9, "All 9 migrations should be pending");
+    assert_eq!(pending.len(), 10, "All 10 migrations should be pending");
 
     // Run migrations
     migrator.run().await.expect("Should run migrations");
@@ -261,7 +261,11 @@ async fn test_migrator_applied_returns_applied_migrations() {
 
     // After running, all should be applied
     let applied_after = migrator.applied().await.expect("Should get applied");
-    assert_eq!(applied_after.len(), 9, "All 9 migrations should be applied");
+    assert_eq!(
+        applied_after.len(),
+        10,
+        "All 10 migrations should be applied"
+    );
 
     // Verify the applied migrations have correct data
     assert_eq!(applied_after[0].version, 1);
@@ -291,6 +295,9 @@ async fn test_migrator_applied_returns_applied_migrations() {
 
     assert_eq!(applied_after[8].version, 9);
     assert_eq!(applied_after[8].name, "create_gap_timeout_log");
+
+    assert_eq!(applied_after[9].version, 10);
+    assert_eq!(applied_after[9].name, "strip_data_from_notify_payload");
 
     teardown(&pool).await;
 }
