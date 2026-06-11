@@ -35,6 +35,17 @@ use uuid::Uuid;
 use futures::future::join_all;
 use std::future::Future;
 
+/// Minimal notification payload — identity/wake signal only.
+///
+/// Mirrors the keys emitted by `epoch_notify_event()` after migration m010.
+/// Full event data is always fetched from the database, so only the fields
+/// needed to identify which events arrived during catch-up are deserialized.
+#[derive(Debug, serde::Deserialize)]
+struct NotifyPayload {
+    id: Uuid,
+    global_sequence: Option<i64>,
+}
+
 /// Result of processing a single subscriber against one batch of events.
 struct SubscriberBatchOutcome {
     subscriber_id: String,
@@ -1840,7 +1851,7 @@ where
             // preventing memory exhaustion during extended catch-up periods.
             let buffer_size = config.catch_up_buffer_size;
             let (buffer_tx, mut buffer_rx) =
-                tokio::sync::mpsc::channel::<Event<Self::EventType>>(buffer_size);
+                tokio::sync::mpsc::channel::<(Uuid, u64)>(buffer_size);
 
             // Start a temporary listener to buffer events during catch-up
             let buffer_listener_pool = pool.clone();
@@ -1886,33 +1897,16 @@ where
                 loop {
                     match tokio::time::timeout(Duration::from_millis(100), listener.recv()).await {
                         Ok(Ok(notification)) => {
-                            let payload = notification.payload();
-                            if let Ok(db_event) = serde_json::from_str::<PgDBEvent>(payload)
-                                && let Ok(data) = db_event
-                                    .data
-                                    .map(|d| serde_json::from_value::<Self::EventType>(d))
-                                    .transpose()
+                            if let Ok(payload) =
+                                serde_json::from_str::<NotifyPayload>(notification.payload())
                             {
-                                let event = Event {
-                                    id: db_event.id,
-                                    stream_id: db_event.stream_id,
-                                    stream_version: db_event.stream_version as u64,
-                                    event_type: db_event.event_type,
-                                    actor_id: db_event.actor_id,
-                                    purger_id: db_event.purger_id,
-                                    data,
-                                    created_at: db_event.created_at,
-                                    purged_at: db_event.purged_at,
-                                    global_sequence: db_event.global_sequence.map(|gs| gs as u64),
-                                    causation_id: db_event.causation_id,
-                                    correlation_id: db_event.correlation_id,
-                                };
+                                let global_seq = payload.global_sequence.unwrap_or(0) as u64;
                                 // Send to bounded channel - will apply backpressure if full
-                                if buffer_tx.send(event).await.is_err() {
+                                if buffer_tx.send((payload.id, global_seq)).await.is_err() {
                                     // Receiver dropped, catch-up is complete
                                     break;
                                 }
-                                log::debug!("Buffered event during catch-up: {:?}", db_event.id);
+                                log::debug!("Buffered event during catch-up: {:?}", payload.id);
                             }
                         }
                         Ok(Err(_)) => {
@@ -2129,78 +2123,152 @@ where
             // Stop the buffer listener
             buffer_handle.abort();
 
-            // Drain and process buffered events with deduplication.
+            // Drain the buffer to find the highest sequence seen during catch-up.
             // Close the receiver to signal the sender to stop.
             buffer_rx.close();
-            let mut buffered_events = Vec::new();
-            while let Some(event) = buffer_rx.recv().await {
-                buffered_events.push(event);
+            let mut max_buffered_seq = current_sequence;
+            let mut buffered_count = 0usize;
+            while let Some((_id, global_seq)) = buffer_rx.recv().await {
+                buffered_count += 1;
+                if global_seq > max_buffered_seq {
+                    max_buffered_seq = global_seq;
+                }
             }
 
-            let buffered_count = buffered_events.len();
             let mut processed_from_buffer = 0u64;
 
-            for event in buffered_events {
-                let event_global_seq = event.global_sequence.unwrap_or(0);
+            // Only query if at least one buffered event is newer than our checkpoint.
+            // The `global_sequence > current_sequence` predicate also performs the
+            // dedup that the old in-memory loop did explicitly.
+            if max_buffered_seq > current_sequence {
+                let rows: Vec<PgDBEvent> = sqlx::query_as(&format!(
+                    "SELECT id, stream_id, stream_version, event_type, data, \
+                     created_at, actor_id, purger_id, purged_at, \
+                     global_sequence, causation_id, correlation_id \
+                     FROM {} WHERE global_sequence > $1 AND global_sequence <= $2 \
+                     ORDER BY global_sequence ASC",
+                    config.events_table,
+                ))
+                .bind(current_sequence as i64)
+                .bind(max_buffered_seq as i64)
+                .fetch_all(&pool)
+                .await?;
 
-                // Deduplicate: skip events we've already processed during catch-up
-                if event_global_seq <= current_sequence {
-                    log::debug!(
-                        "Skipping buffered event {} (seq {} <= checkpoint {})",
-                        event.id,
-                        event_global_seq,
-                        current_sequence
-                    );
-                    continue;
-                }
+                for row in rows {
+                    let event_global_seq = row.global_sequence.unwrap_or(0) as u64;
+                    let event_id = row.id;
 
-                let event_id = event.id;
-                let event = Arc::new(event);
+                    // Deserialize, mirroring the catch-up loop's skip-on-error
+                    // behaviour: undeserializable variants advance the checkpoint
+                    // rather than looping forever.
+                    let data: Option<Self::EventType> =
+                        match row.data.map(serde_json::from_value).transpose() {
+                            Ok(d) => d,
+                            Err(e) => {
+                                warn!(
+                                    "Buffer processing: skipping event {} (type: '{}', \
+                                     global_seq: {}) for '{}': failed to deserialize: {}. \
+                                     Advancing checkpoint past this event.",
+                                    event_id,
+                                    row.event_type,
+                                    event_global_seq,
+                                    subscriber_id,
+                                    e
+                                );
 
-                let result =
-                    process_event_with_retry(&observer, &event, &subscriber_id, &config, &pool)
-                        .await;
+                                match &mut pending_checkpoint {
+                                    Some(pending) => pending.update(event_global_seq, event_id),
+                                    None => {
+                                        pending_checkpoint =
+                                            Some(PendingCheckpoint::new(event_global_seq, event_id))
+                                    }
+                                }
+                                if let Some(pending) = pending_checkpoint
+                                    .take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
+                                    && let Err(e) = flush_checkpoint(
+                                        &pool,
+                                        &config.events_table,
+                                        &subscriber_id,
+                                        &pending,
+                                        &mut checkpoint_cache,
+                                    )
+                                    .await
+                                {
+                                    error!(
+                                        "Buffer processing: failed to flush checkpoint for '{}': {}",
+                                        subscriber_id, e
+                                    );
+                                    pending_checkpoint = Some(pending);
+                                }
 
-                // Track pending checkpoint for batched mode
-                match &mut pending_checkpoint {
-                    Some(pending) => {
-                        pending.update(event_global_seq, event_id);
-                    }
-                    None => {
-                        pending_checkpoint =
-                            Some(PendingCheckpoint::new(event_global_seq, event_id));
-                    }
-                }
+                                current_sequence = event_global_seq;
+                                continue;
+                            }
+                        };
 
-                // Check if we should flush the checkpoint
-                if let Some(pending) = pending_checkpoint
-                    .take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
-                    && let Err(e) = flush_checkpoint(
-                        &pool,
-                        &config.events_table,
+                    let event = Arc::new(Event {
+                        id: row.id,
+                        stream_id: row.stream_id,
+                        stream_version: row.stream_version as u64,
+                        event_type: row.event_type,
+                        actor_id: row.actor_id,
+                        purger_id: row.purger_id,
+                        data,
+                        created_at: row.created_at,
+                        purged_at: row.purged_at,
+                        global_sequence: Some(event_global_seq),
+                        causation_id: row.causation_id,
+                        correlation_id: row.correlation_id,
+                    });
+
+                    let result = process_event_with_retry(
+                        &observer,
+                        &event,
                         &subscriber_id,
-                        &pending,
-                        &mut checkpoint_cache,
+                        &config,
+                        &pool,
                     )
-                    .await
-                {
-                    error!(
-                        "Buffer processing: failed to flush checkpoint for '{}': {}",
-                        subscriber_id, e
-                    );
-                    // Re-insert pending checkpoint for retry
-                    pending_checkpoint = Some(pending);
-                }
+                    .await;
 
-                current_sequence = event_global_seq;
-                processed_from_buffer += 1;
+                    // Track pending checkpoint for batched mode
+                    match &mut pending_checkpoint {
+                        Some(pending) => pending.update(event_global_seq, event_id),
+                        None => {
+                            pending_checkpoint =
+                                Some(PendingCheckpoint::new(event_global_seq, event_id))
+                        }
+                    }
 
-                if let ProcessResult::Success = result {
-                    log::debug!(
-                        "Processed buffered event {} for '{}'",
-                        event_id,
-                        subscriber_id
-                    );
+                    // Check if we should flush the checkpoint
+                    if let Some(pending) = pending_checkpoint
+                        .take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
+                        && let Err(e) = flush_checkpoint(
+                            &pool,
+                            &config.events_table,
+                            &subscriber_id,
+                            &pending,
+                            &mut checkpoint_cache,
+                        )
+                        .await
+                    {
+                        error!(
+                            "Buffer processing: failed to flush checkpoint for '{}': {}",
+                            subscriber_id, e
+                        );
+                        // Re-insert pending checkpoint for retry
+                        pending_checkpoint = Some(pending);
+                    }
+
+                    current_sequence = event_global_seq;
+                    processed_from_buffer += 1;
+
+                    if let ProcessResult::Success = result {
+                        log::debug!(
+                            "Processed buffered event {} for '{}'",
+                            event_id,
+                            subscriber_id
+                        );
+                    }
                 }
             }
 
@@ -2223,10 +2291,12 @@ where
 
             if buffered_count > 0 {
                 info!(
-                    "Processed {} buffered events for '{}' ({} deduplicated), checkpoint now at {}",
-                    processed_from_buffer,
+                    "Drained {} buffered notifications for '{}', processed {} events up to \
+                     sequence {}, checkpoint now at {}",
+                    buffered_count,
                     subscriber_id,
-                    buffered_count as u64 - processed_from_buffer,
+                    processed_from_buffer,
+                    max_buffered_seq,
                     current_sequence
                 );
             }
@@ -2253,6 +2323,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notify_payload_parses_slim_trigger_json() {
+        // Exact shape emitted by `epoch_notify_event()` after migration m010.
+        let id = Uuid::new_v4();
+        let json = format!(
+            r#"{{
+                "id": "{id}",
+                "stream_id": "stream-1",
+                "stream_version": 7,
+                "event_type": "OrderPlaced",
+                "actor_id": "actor-1",
+                "global_sequence": 42,
+                "created_at": "2026-06-11T00:00:00Z"
+            }}"#
+        );
+
+        let payload: NotifyPayload =
+            serde_json::from_str(&json).expect("slim payload should deserialize");
+
+        assert_eq!(payload.id, id);
+        assert_eq!(payload.global_sequence, Some(42));
+    }
 
     #[test]
     fn dlq_entry_structure() {
