@@ -253,13 +253,9 @@ where
         }
 
         // Flush checkpoint to DB if threshold reached.
-        let should_flush = pending_checkpoint
-            .as_ref()
-            .map(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
-            .unwrap_or(false);
-
-        if should_flush {
-            let pending = pending_checkpoint.take().unwrap();
+        if let Some(pending) = pending_checkpoint
+            .take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
+        {
             let mut local_cache = HashMap::new();
             match flush_checkpoint(
                 &checkpoint_pool,
@@ -772,8 +768,7 @@ where
                                             channel_name
                                         );
                                         reconnect_delay = Duration::from_secs(1); // Reset delay on successful connection
-                                        listener_option = Some(l);
-                                        listener_option.as_mut().unwrap()
+                                        listener_option.insert(l)
                                     }
                                     Err(e) => {
                                         error!(
@@ -2017,11 +2012,9 @@ where
                                         Some(PendingCheckpoint::new(event_global_seq, event_id));
                                 }
                             }
-                            if let Some(ref pending) = pending_checkpoint
-                                && should_flush_checkpoint(pending, &config.checkpoint_mode)
-                            {
-                                let pending = pending_checkpoint.take().unwrap();
-                                if let Err(flush_err) = flush_checkpoint(
+                            if let Some(pending) = pending_checkpoint
+                                .take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
+                                && let Err(flush_err) = flush_checkpoint(
                                     &pool,
                                     &config.events_table,
                                     &subscriber_id,
@@ -2036,7 +2029,6 @@ where
                                     );
                                     pending_checkpoint = Some(pending);
                                 }
-                            }
                             continue;
                         }
                     };
@@ -2073,11 +2065,9 @@ where
                     }
 
                     // Check if we should flush the checkpoint
-                    if let Some(ref pending) = pending_checkpoint
-                        && should_flush_checkpoint(pending, &config.checkpoint_mode)
-                    {
-                        let pending = pending_checkpoint.take().unwrap();
-                        if let Err(e) = flush_checkpoint(
+                    if let Some(pending) = pending_checkpoint
+                        .take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
+                        && let Err(e) = flush_checkpoint(
                             &pool,
                             &config.events_table,
                             &subscriber_id,
@@ -2093,7 +2083,6 @@ where
                             // Re-insert pending checkpoint for retry
                             pending_checkpoint = Some(pending);
                         }
-                    }
 
                     current_sequence = event_global_seq;
                     total_caught_up += 1;
@@ -2184,11 +2173,9 @@ where
                 }
 
                 // Check if we should flush the checkpoint
-                if let Some(ref pending) = pending_checkpoint
-                    && should_flush_checkpoint(pending, &config.checkpoint_mode)
-                {
-                    let pending = pending_checkpoint.take().unwrap();
-                    if let Err(e) = flush_checkpoint(
+                if let Some(pending) = pending_checkpoint
+                    .take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
+                    && let Err(e) = flush_checkpoint(
                         &pool,
                         &config.events_table,
                         &subscriber_id,
@@ -2204,7 +2191,6 @@ where
                         // Re-insert pending checkpoint for retry
                         pending_checkpoint = Some(pending);
                     }
-                }
 
                 current_sequence = event_global_seq;
                 processed_from_buffer += 1;

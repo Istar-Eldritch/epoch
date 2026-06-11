@@ -210,7 +210,10 @@ where
     let mut builder = Event::<D>::builder()
         .id(entry.id)
         .stream_id(entry.stream_id)
-        .stream_version(entry.stream_version.try_into().unwrap())
+        .stream_version(
+            u64::try_from(entry.stream_version)
+                .map_err(|_| PgEventStoreError::InvalidStreamVersion::<BE>(entry.stream_version))?,
+        )
         .event_type(entry.event_type)
         .created_at(entry.created_at)
         .data(data);
@@ -282,6 +285,9 @@ where
     /// Errors building the event from the db representation
     #[error("Build event error: {0}")]
     BuildEventError(#[from] epoch_core::event::EventBuilderError),
+    /// A stored `stream_version` is negative and cannot be converted to `u64` (data corruption)
+    #[error("Invalid stream_version {0}: value is negative (data corruption)")]
+    InvalidStreamVersion(i64),
 }
 
 #[async_trait]
@@ -554,6 +560,42 @@ mod tests {
         let parsed: PgDBEvent = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed.global_sequence, None);
+    }
+
+    #[test]
+    fn pg_db_event_to_event_rejects_negative_stream_version() {
+        // A corrupt row with a negative stream_version must produce a typed error,
+        // not a panic. Regression test for CLOUD-170.
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+        struct TestEvent;
+        impl epoch_core::event::EventData for TestEvent {
+            fn event_type(&self) -> &'static str {
+                "TestEvent"
+            }
+        }
+
+        let entry = PgDBEvent {
+            id: Uuid::new_v4(),
+            stream_id: Uuid::new_v4(),
+            stream_version: -1,
+            actor_id: None,
+            event_type: "TestEvent".to_string(),
+            data: None,
+            created_at: chrono::Utc::now(),
+            purger_id: None,
+            purged_at: None,
+            global_sequence: None,
+            causation_id: None,
+            correlation_id: None,
+        };
+
+        let result =
+            pg_db_event_to_event::<TestEvent, std::convert::Infallible>(entry);
+        assert!(
+            matches!(result, Err(PgEventStoreError::InvalidStreamVersion(-1))),
+            "expected InvalidStreamVersion(-1), got: {:?}",
+            result
+        );
     }
 
     #[test]
