@@ -165,7 +165,11 @@ where
         processed_any = true;
     }
 
-    let skipped_gaps = advance_contiguous_checkpoint(&mut state, &visible_seqs, config.gap_timeout);
+    // Phase 2 stub: pass `None` (fencing unavailable) so behaviour is identical to
+    // the legacy timeout-only resolver. Phase 3 threads the real per-batch snapshot
+    // through `BatchContext` and partitions the result by `SkipReason`.
+    let skipped_gaps =
+        advance_contiguous_checkpoint(&mut state, &visible_seqs, config.gap_timeout, None);
 
     // Emit a single batched WARN log summarising all gaps before the per-gap
     // fire-and-forget persistence/callback tasks run. This avoids N×subscriber
