@@ -156,18 +156,34 @@ where
 
     let skipped_gaps = advance_contiguous_checkpoint(&mut state, &visible_seqs, config.gap_timeout);
 
-    // For each gap the checkpoint advanced past due to timeout: emit a WARN log,
-    // then fire-and-forget a task that persists the record and invokes the callback.
-    // Neither the log nor the DB write gate checkpoint advancement (NFR-1).
+    // Emit a single batched WARN log summarising all gaps before the per-gap
+    // fire-and-forget persistence/callback tasks run. This avoids N×subscriber
+    // identical warnings when many sequences time out at once (e.g. after a
+    // deployment restart). See CLOUD-109.
+    if !skipped_gaps.is_empty() {
+        let bus_name = &config.events_table;
+        let gaps_summary = skipped_gaps
+            .iter()
+            .map(|gap| format!("seq {} ({:?})", gap.skipped_sequence, gap.gap_duration))
+            .collect::<Vec<_>>()
+            .join(", ");
+        warn!(
+            "Gap timeout: advancing '{}' on bus '{}' past {} missing sequence(s) — {} \
+             — if any writing transaction later commits, the event will NOT be \
+             delivered to this subscriber (recorded in epoch_event_bus_gap_timeouts)",
+            subscriber_id,
+            bus_name,
+            skipped_gaps.len(),
+            gaps_summary
+        );
+    }
+
+    // For each gap the checkpoint advanced past due to timeout, fire-and-forget
+    // a task that persists the record and invokes the callback. Neither the log
+    // nor the DB write gates checkpoint advancement (NFR-1).
     for gap in skipped_gaps {
         let bus_name = config.events_table.clone();
         let sub_id = subscriber_id.clone();
-        warn!(
-            "Gap timeout: advancing '{}' on bus '{}' past missing seq {} after {:?} \
-             — if the writing transaction later commits, the event will NOT be \
-             delivered to this subscriber (recorded in epoch_event_bus_gap_timeouts)",
-            sub_id, bus_name, gap.skipped_sequence, gap.gap_duration
-        );
 
         let pool = checkpoint_pool.clone();
         let cb = config.on_gap_timeout.clone();
