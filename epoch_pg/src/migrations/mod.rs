@@ -36,6 +36,7 @@ mod m006_add_dlq_resolution_columns;
 mod m007_add_causation_columns;
 mod m008_add_bus_name_to_checkpoints;
 mod m009_create_gap_timeout_log;
+mod m010_strip_data_from_notify_payload;
 
 use m001_create_events_table::CreateEventsTable;
 use m002_add_global_sequence::AddGlobalSequence;
@@ -46,6 +47,7 @@ use m006_add_dlq_resolution_columns::AddDlqResolutionColumns;
 use m007_add_causation_columns::AddCausationColumns;
 use m008_add_bus_name_to_checkpoints::AddBusNameToCheckpoints;
 use m009_create_gap_timeout_log::CreateGapTimeoutLog;
+use m010_strip_data_from_notify_payload::StripDataFromNotifyPayload;
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -76,7 +78,15 @@ const MIGRATIONS: &[&dyn Migration] = &[
     &AddCausationColumns,
     &AddBusNameToCheckpoints,
     &CreateGapTimeoutLog,
+    &StripDataFromNotifyPayload,
 ];
+
+/// The number of registered migrations in the `MIGRATIONS` registry.
+///
+/// Exported so integration tests can assert against the actual count instead
+/// of duplicating a hardcoded number that drifts whenever a new migration is
+/// added.
+pub const MIGRATION_COUNT: usize = MIGRATIONS.len();
 
 /// Errors that can occur during migration operations.
 #[derive(Debug, thiserror::Error)]

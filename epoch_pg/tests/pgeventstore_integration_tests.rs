@@ -940,3 +940,58 @@ async fn test_read_last_event_empty_stream_returns_none() {
     let result = event_store.read_last_event(Uuid::new_v4()).await.unwrap();
     assert!(result.is_none());
 }
+
+/// CLOUD-155 acceptance test: storing an event whose JSON data exceeds the
+/// PostgreSQL `pg_notify` 8 000-byte limit must succeed without rolling back
+/// the INSERT.
+///
+/// Before migration m010, `epoch_notify_event()` embedded the full `data`
+/// column in the NOTIFY payload. A payload > 8 KB caused `pg_notify` to error
+/// inside the `AFTER INSERT` trigger, rolling back the INSERT so the event was
+/// never persisted. After m010, the payload carries only identity metadata, so
+/// the trigger succeeds regardless of event data size.
+#[tokio::test]
+#[serial]
+async fn test_store_event_larger_than_pg_notify_limit_succeeds() {
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
+
+    // Build a value that is well above the 8 000-byte pg_notify limit when
+    // serialised to JSON.  10 000 'x' characters → ~10 KB of JSON string.
+    let large_value = "x".repeat(10_000);
+
+    let stream_id = Uuid::new_v4();
+    let event = Event::<TestEventData>::builder()
+        .id(Uuid::new_v4())
+        .stream_id(stream_id)
+        .stream_version(1)
+        .event_type("TestEvent".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: large_value.clone(),
+        }))
+        .build()
+        .unwrap();
+
+    // This must NOT return an error (previously it would roll back the INSERT
+    // because pg_notify would fail on the oversized payload).
+    event_store
+        .store_event(event.clone())
+        .await
+        .expect("storing an event with > 8 KB data should succeed after m010");
+
+    // Verify the event is durably stored with all data intact.
+    let read_back = event_store
+        .read_last_event(stream_id)
+        .await
+        .expect("read_last_event should succeed")
+        .expect("event should exist after store");
+
+    assert_eq!(read_back.id, event.id);
+    assert_eq!(read_back.stream_id, stream_id);
+    assert_eq!(read_back.stream_version, 1);
+    assert_eq!(
+        read_back.data,
+        Some(TestEventData::TestEvent { value: large_value })
+    );
+}
