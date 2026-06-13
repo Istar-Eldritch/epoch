@@ -96,8 +96,8 @@ filled by an in-flight transaction, rather than guessing on a wall-clock timer.
 | `advance_contiguous_checkpoint(state, visible_seqs, gap_timeout) -> Vec<SkippedGap>` is pure, sync, DB-free; the timeout branch builds `SkippedGap`; `gap_first_seen: HashMap<u64, Instant>` records when each gap was first seen | `subscriber_state.rs:90-150` | The fence decision must stay pure. Pass the current snapshot bounds **in**; record the fence boundary in the gap tracker; keep all DB/log/callback side-effects in the caller |
 | Sole production caller is `process_subscriber_for_batch`; it already owns `config`, `checkpoint_pool`, `subscriber_id`, emits the batched `WARN`, and fire-and-forgets the `epoch_event_bus_gap_timeouts` insert + `on_gap_timeout` callback | `mod.rs:62-260` | All new side-effects (record only *backstop* skips) live here; no new plumbing to reach a pool |
 | Main listener loop builds `rows` then `visible_seqs: BTreeSet<u64>` from one batched catch-up query, wraps them in `Arc`, and passes a `BatchContext` to each concurrent subscriber task | `mod.rs:937-1045` | Query the current snapshot **once per batch that has active or newly-detected gaps** here and thread it through `BatchContext`; cheap (one round trip only when needed) |
-| `BatchContext { rows, visible_seqs, seq_to_id, config, dlq_pool, checkpoint_pool }` | `mod.rs:51-58` | Add `snapshot: Option<TxidSnapshot>` |
-| `PgEventBus::new` / `with_table`; listener clones `self.pool` into `listener_pool`/`checkpoint_pool`/`dlq_pool` | `mod.rs:467-513, 688-690` | Use the fixed PG13+ snapshot SQL; no server-version detection needed |
+| `BatchContext { rows, visible_seqs, seq_to_id, config, dlq_pool, checkpoint_pool }` | `mod.rs:62-69` | Add `snapshot: Option<TxidSnapshot>` |
+| `PgEventBus::new` / `with_table`; listener clones `self.pool` into `listener_pool`/`checkpoint_pool`/`dlq_pool` | `mod.rs:478-524, 699-701` | Use the fixed PG13+ snapshot SQL; no server-version detection needed |
 | CLOUD-169 already shipped: `GapTimeoutInfo`, `GapTimeoutCallback`, `on_gap_timeout`, `SkippedGap`, `GapTimeoutEntry`, `list_gap_timeouts`, `resolve_gap_timeout`, migration m009 | `config.rs`, `subscriber_state.rs`, `mod.rs:340-1650`, `m009_create_gap_timeout_log.rs` | Reuse the recording/callback path verbatim for **backstop** skips only |
 | Latest migration on `main` is **m010** (`strip_data_from_notify_payload`). `MIGRATION_COUNT` auto-tracks the registry length in `migrations/mod.rs` | `migrations/mod.rs`, `epoch_pg/tests/migrations_integration_tests.rs` | This work is **m011** (`add_txid_to_events`). Adding it to `MIGRATIONS` automatically updates `MIGRATION_COUNT`; tests only need an `applied_after[10]` assertion for the new migration (version 11). |
 | `migrations_integration_tests.rs` asserts the count via `MIGRATION_COUNT` and per-version `applied_after[i]` name checks | `epoch_pg/tests/migrations_integration_tests.rs` | Only add the `applied_after[10]` name/version check for `add_txid_to_events` (version 11). |
@@ -175,9 +175,10 @@ data loss) once a later snapshot satisfies `xmin ≥ fence_xmax`, because:
    *before* the transaction that claimed the already-visible `N+1` claimed its value
    (`nextval` is monotonic). Because `global_sequence` is populated by an inline
    column `DEFAULT nextval(...)` with the default `CACHE 1`, the writer of `N` (if
-   it exists) stamped the row and obtained its `xid` in the same atomic INSERT; by
-   the time `N+1` is visible and the gap is first observed, that writer's `xid` is
-   already assigned and is `< fence_xmax`.
+   it exists) will have stamped its `xid` on the row during its INSERT. The gap is
+   only *observed* after `N+1` has committed — a full separate transaction lifecycle
+   later — so by that time the writer of `N`'s `xid` is already assigned and is
+   `< fence_xmax`.
 2. `xmin ≥ fence_xmax` means **every** transaction with `xid < fence_xmax` has now
    completed. So `N`'s writer (if it existed) is done.
 3. `N` is *still* not visible, therefore that writer **aborted** (rolled back), or
@@ -313,7 +314,7 @@ pub(crate) struct TxidSnapshot {
 ```
 
 In the main loop, immediately after the catch-up `rows`/`visible_seqs` are built
-(`mod.rs:965`), determine whether any subscriber has **active or newly-detected
+(`mod.rs:976`), determine whether any subscriber has **active or newly-detected
 gaps** in this batch. Query the snapshot only when:
 
 - `snapshot_fencing` is enabled (§5.6), **and**
@@ -461,10 +462,12 @@ The caller (`mod.rs:157-260`) now branches on `SkipReason`:
   snapshot's `xmin < fence_xmax` at backstop time), an **additional `WARN`** noting
   that the fence was persistently pinned — include the current `xmin` and
   `fence_xmax` values so operators can identify the offending long-running session via
-  `pg_stat_activity` (OQ-3). Then fire-and-forget the `INSERT … ON CONFLICT DO
-  NOTHING` + `on_gap_timeout` callback per gap, unchanged from the CLOUD-169 path.
+  `pg_stat_activity` (OQ-3). If `BatchContext.snapshot` is `None` at the backstop batch
+  (snapshot query errored that batch), skip the persistent-pin WARN — `xmin` is
+  unavailable. Then fire-and-forget the `INSERT … ON CONFLICT DO NOTHING` +
+  `on_gap_timeout` callback per gap, unchanged from the CLOUD-169 path.
 - Wire the `BatchContext.snapshot` through into the `advance_contiguous_checkpoint`
-  call at `mod.rs:157`.
+  call at `mod.rs:168`.
 
 ### 5.6 Config
 
@@ -627,7 +630,8 @@ used). No changes to `epoch_core`/`epoch_mem`/`epoch_derive`.
 | `fence_cleared_when_xmin_passed_fence_xmax` | First call (snapshot A) records `fence_xmax`; second call with `xmin >= fence_xmax` returns one `SkippedGap { reason: FenceCleared }` and advances |
 | `fence_holds_when_xmin_below_fence_xmax` | With `xmin < fence_xmax` and elapsed `< gap_timeout`, returns empty `Vec` and checkpoint unchanged (held) |
 | `fence_held_then_backstop_fires` | `xmin < fence_xmax` but elapsed `> gap_timeout` ⇒ `SkipReason::TimeoutBackstop` |
-| `fence_xmax_none_only_resolves_via_backstop` | First observation with `snapshot = None` stamps `fence_xmax = None`; later `Some` snapshot does not fence-clear; only backstop resolves |
+| `fence_xmax_backfilled_when_snapshot_arrives_late` | First observation with `snapshot = None` stamps `fence_xmax = None`; on a later batch where `Some(snapshot)` is available, `fence_xmax` is lazily backfilled to `snap.xmax`; once `xmin >= backfilled xmax` the gap resolves as `FenceCleared` |
+| `fence_snapshot_never_available_resolves_via_backstop` | All batches pass `snapshot = None`; gap never gets a `fence_xmax`; after `gap_timeout` elapses it resolves as `TimeoutBackstop` |
 | `gap_fills_normally_no_skip` (extend) | Writer commits ⇒ sequence enters `processed_ahead` ⇒ no `SkippedGap` of any reason |
 
 ### 10.2 Unit tests — `config.rs`
