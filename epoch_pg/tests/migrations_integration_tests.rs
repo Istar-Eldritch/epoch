@@ -315,6 +315,9 @@ async fn test_migrator_applied_returns_applied_migrations() {
     assert_eq!(applied_after[9].version, 10);
     assert_eq!(applied_after[9].name, "strip_data_from_notify_payload");
 
+    assert_eq!(applied_after[10].version, 11);
+    assert_eq!(applied_after[10].name, "add_txid_to_events");
+
     teardown(&pool).await;
 }
 
