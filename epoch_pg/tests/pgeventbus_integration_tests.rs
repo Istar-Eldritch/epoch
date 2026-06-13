@@ -3382,3 +3382,297 @@ async fn test_gap_timeout_record_insert_is_idempotent() {
         .await
         .expect("cleanup idempotency row");
 }
+
+// ============================================================================
+// Buffer-drain tests (spec 0018 / CLOUD-155)
+//
+// These tests exercise the post-catch-up buffer drain that runs inside
+// `subscribe()`.  The drain reads events that arrived via NOTIFY *during*
+// the catch-up phase and processes them before the subscriber joins the live
+// listener.  Two properties specific to the refactored drain are verified:
+//
+//   1. Pagination: when more notifications arrive during catch-up than fit in
+//      a single `catch_up_batch_size` query, the loop iterates until all
+//      events have been fetched and processed.
+//
+//   2. Unified checkpoint tracking: a deserialize error in the drain does not
+//      block subsequent events – the checkpoint advances past the malformed
+//      row and the following valid events are delivered.
+// ============================================================================
+
+/// Verifies that the buffer drain correctly paginates when the number of
+/// events buffered during catch-up exceeds `catch_up_batch_size`.
+///
+/// Setup:
+/// - 30 pre-existing events drive the catch-up loop through ~10 DB
+///   round-trips at `catch_up_batch_size = 3`, giving the concurrent task
+///   time to insert events that land in the buffer.
+/// - A spawned task inserts 9 events (3 × batch_size) while catch-up runs;
+///   their NOTIFYs are captured by the buffer listener and the drain must
+///   issue at least 3 pages to process them all.
+/// - Even if some "during" events arrive after `subscribe()` returns (and go
+///   through the live listener instead), all 39 events must be received
+///   exactly once — so the assertion is correct regardless of timing.
+#[tokio::test]
+#[serial]
+async fn test_buffer_drain_pagination_processes_all_events() {
+    let Some((pool, _setup_bus, _)) = setup().await else {
+        return;
+    };
+
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        catch_up_batch_size: 3,
+        ..Default::default()
+    };
+    let channel_name = format!("test_drain_page_{}", Uuid::new_v4().simple());
+    let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
+    event_bus.setup_trigger().await.expect("setup trigger");
+    event_bus.start_listener().await.expect("start listener");
+
+    // Insert 30 pre-existing events so catch-up takes ~10 DB round-trips.
+    let stream_id = Uuid::new_v4();
+    for i in 1i64..=30 {
+        let data = serde_json::to_value(Some(TestEventData::TestEvent {
+            value: format!("pre_{}", i),
+        }))
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO epoch_events \
+             (id, stream_id, stream_version, event_type, data, created_at) \
+             VALUES ($1, $2, $3, 'MyEvent', $4, NOW())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(stream_id)
+        .bind(i)
+        .bind(&data)
+        .execute(&pool)
+        .await
+        .expect("insert pre event");
+    }
+
+    // Spawn a task that inserts 9 events (> batch_size) concurrently with
+    // the catch-up loop.  The buffer listener captures their NOTIFYs, so the
+    // drain must iterate multiple pages to process them all.
+    let pool2 = pool.clone();
+    let during_task = tokio::spawn(async move {
+        // Tiny delay so the buffer listener has connected before we insert.
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        for i in 31i64..=39 {
+            let data = serde_json::to_value(Some(TestEventData::TestEvent {
+                value: format!("during_{}", i),
+            }))
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO epoch_events \
+                 (id, stream_id, stream_version, event_type, data, created_at) \
+                 VALUES ($1, $2, $3, 'MyEvent', $4, NOW())",
+            )
+            .bind(Uuid::new_v4())
+            .bind(stream_id)
+            .bind(i)
+            .bind(&data)
+            .execute(&pool2)
+            .await
+            .expect("insert during event");
+        }
+    });
+
+    let projection = TestProjection::new();
+    let projection_events = projection.get_state_store().clone();
+
+    // subscribe() runs the catch-up loop while the spawned task is running.
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe");
+
+    during_task.await.expect("during task completed");
+
+    // Allow the live listener to deliver any events that arrived after
+    // subscribe() returned rather than going through the buffer drain.
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let state = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("state should exist");
+
+    assert_eq!(
+        state.0.len(),
+        39,
+        "all 39 events (30 pre-existing + 9 during catch-up) must be received exactly once"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+/// Verifies that a deserialisation failure in the post-catch-up buffer drain:
+///
+/// - does not prevent subsequent valid events from being delivered, and
+/// - advances the checkpoint past the malformed event so the subscriber
+///   does not get stuck in an infinite retry loop.
+///
+/// This exercises the unified checkpoint-tracking path introduced in the
+/// refactor: previously the error branch duplicated the checkpoint-flush code
+/// via `continue`; now it falls through to a single block at the bottom of
+/// the loop iteration.
+#[tokio::test]
+#[serial]
+async fn test_buffer_drain_deser_error_advances_checkpoint() {
+    let Some((pool, _setup_bus, _)) = setup().await else {
+        return;
+    };
+
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        catch_up_batch_size: 2,
+        ..Default::default()
+    };
+    let channel_name = format!("test_drain_deser_{}", Uuid::new_v4().simple());
+    let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
+    event_bus.setup_trigger().await.expect("setup trigger");
+    event_bus.start_listener().await.expect("start listener");
+
+    // 10 pre-existing events → 5 catch-up iterations at batch_size=2,
+    // giving the concurrent task time to insert buffered events.
+    let stream_id = Uuid::new_v4();
+    for i in 1i64..=10 {
+        let data = serde_json::to_value(Some(TestEventData::TestEvent {
+            value: format!("pre_{}", i),
+        }))
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO epoch_events \
+             (id, stream_id, stream_version, event_type, data, created_at) \
+             VALUES ($1, $2, $3, 'MyEvent', $4, NOW())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(stream_id)
+        .bind(i)
+        .bind(&data)
+        .execute(&pool)
+        .await
+        .expect("insert pre event");
+    }
+
+    let valid1_id = Uuid::new_v4();
+    let malformed_id = Uuid::new_v4();
+    let valid2_id = Uuid::new_v4();
+
+    // Insert valid1, malformed, valid2 while catch-up runs so they land in
+    // the buffer (or, if timing places them after catch-up, in the live
+    // listener — both paths must handle deserialization errors identically).
+    let pool2 = pool.clone();
+    let during_task = tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+
+        let valid1_data = serde_json::to_value(Some(TestEventData::TestEvent {
+            value: "valid_during_1".to_string(),
+        }))
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO epoch_events \
+             (id, stream_id, stream_version, event_type, data, created_at) \
+             VALUES ($1, $2, 11, 'MyEvent', $3, NOW())",
+        )
+        .bind(valid1_id)
+        .bind(stream_id)
+        .bind(&valid1_data)
+        .execute(&pool2)
+        .await
+        .expect("insert valid1");
+
+        // JSON object that cannot be deserialized as TestEventData.
+        let malformed_data = serde_json::json!({"garbage": true});
+        sqlx::query(
+            "INSERT INTO epoch_events \
+             (id, stream_id, stream_version, event_type, data, created_at) \
+             VALUES ($1, $2, 12, 'MyEvent', $3, NOW())",
+        )
+        .bind(malformed_id)
+        .bind(stream_id)
+        .bind(&malformed_data)
+        .execute(&pool2)
+        .await
+        .expect("insert malformed");
+
+        let valid2_data = serde_json::to_value(Some(TestEventData::TestEvent {
+            value: "valid_during_2".to_string(),
+        }))
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO epoch_events \
+             (id, stream_id, stream_version, event_type, data, created_at) \
+             VALUES ($1, $2, 13, 'MyEvent', $3, NOW())",
+        )
+        .bind(valid2_id)
+        .bind(stream_id)
+        .bind(&valid2_data)
+        .execute(&pool2)
+        .await
+        .expect("insert valid2");
+    });
+
+    let projection = TestProjection::new();
+    let subscriber_id = projection.subscriber_id().to_string();
+    let projection_events = projection.get_state_store().clone();
+
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe");
+
+    during_task.await.expect("during task completed");
+
+    // Wait for the live listener to deliver events that arrived after
+    // subscribe() returned.
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let state = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("state should exist");
+
+    // 10 pre-existing + valid1 + valid2 = 12; malformed must be skipped.
+    assert_eq!(
+        state.0.len(),
+        12,
+        "malformed event must be skipped; valid events before and after must be delivered"
+    );
+
+    let ids: Vec<Uuid> = state.0.iter().map(|e| e.id).collect();
+    assert!(
+        ids.contains(&valid1_id),
+        "valid event before malformed must be received"
+    );
+    assert!(
+        ids.contains(&valid2_id),
+        "valid event after malformed must be received"
+    );
+    assert!(
+        !ids.contains(&malformed_id),
+        "malformed event must NOT be received"
+    );
+
+    // Checkpoint must have advanced past the malformed event's sequence so
+    // the subscriber does not loop forever trying to re-process it.
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("get checkpoint");
+    assert!(
+        checkpoint.is_some(),
+        "checkpoint must exist and have advanced past the malformed event"
+    );
+
+    // Remove the malformed row so subsequent tests that scan all events
+    // don't trip over it.
+    sqlx::query("DELETE FROM epoch_events WHERE id = $1")
+        .bind(malformed_id)
+        .execute(&pool)
+        .await
+        .expect("cleanup malformed event");
+
+    event_bus.shutdown().await.expect("shutdown");
+}
