@@ -81,6 +81,13 @@ const MIGRATIONS: &[&dyn Migration] = &[
     &StripDataFromNotifyPayload,
 ];
 
+/// The number of registered migrations in the `MIGRATIONS` registry.
+///
+/// Exported so integration tests can assert against the actual count instead
+/// of duplicating a hardcoded number that drifts whenever a new migration is
+/// added.
+pub const MIGRATION_COUNT: usize = MIGRATIONS.len();
+
 /// Errors that can occur during migration operations.
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationError {
