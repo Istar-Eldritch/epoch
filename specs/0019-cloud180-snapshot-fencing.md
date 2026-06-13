@@ -95,26 +95,27 @@ filled by an in-flight transaction, rather than guessing on a wall-clock timer.
 | Two event INSERT paths: `store_events_in_tx` and `store_event`, both with an explicit column list | `event_store.rs:91-99`, `event_store.rs:348-355` | Populate `txid` via a **column `DEFAULT`** so neither INSERT statement (nor custom `events_table` routing) needs editing |
 | `advance_contiguous_checkpoint(state, visible_seqs, gap_timeout) -> Vec<SkippedGap>` is pure, sync, DB-free; the timeout branch builds `SkippedGap`; `gap_first_seen: HashMap<u64, Instant>` records when each gap was first seen | `subscriber_state.rs:90-150` | The fence decision must stay pure. Pass the current snapshot bounds **in**; record the fence boundary in the gap tracker; keep all DB/log/callback side-effects in the caller |
 | Sole production caller is `process_subscriber_for_batch`; it already owns `config`, `checkpoint_pool`, `subscriber_id`, emits the batched `WARN`, and fire-and-forgets the `epoch_event_bus_gap_timeouts` insert + `on_gap_timeout` callback | `mod.rs:62-260` | All new side-effects (record only *backstop* skips) live here; no new plumbing to reach a pool |
-| Main listener loop builds `rows` then `visible_seqs: BTreeSet<u64>` from one batched catch-up query, wraps them in `Arc`, and passes a `BatchContext` to each concurrent subscriber task | `mod.rs:937-1045` | Query the current snapshot **once per batch** here and thread it through `BatchContext`; cheap (one round trip per poll) |
+| Main listener loop builds `rows` then `visible_seqs: BTreeSet<u64>` from one batched catch-up query, wraps them in `Arc`, and passes a `BatchContext` to each concurrent subscriber task | `mod.rs:937-1045` | Query the current snapshot **once per batch that has active or newly-detected gaps** here and thread it through `BatchContext`; cheap (one round trip only when needed) |
 | `BatchContext { rows, visible_seqs, seq_to_id, config, dlq_pool, checkpoint_pool }` | `mod.rs:51-58` | Add `snapshot: Option<TxidSnapshot>` |
-| `PgEventBus::new` / `with_table`; listener clones `self.pool` into `listener_pool`/`checkpoint_pool`/`dlq_pool` | `mod.rs:467-513, 688-690` | Detect server version once at listener start from `checkpoint_pool` |
+| `PgEventBus::new` / `with_table`; listener clones `self.pool` into `listener_pool`/`checkpoint_pool`/`dlq_pool` | `mod.rs:467-513, 688-690` | Use the fixed PG13+ snapshot SQL; no server-version detection needed |
 | CLOUD-169 already shipped: `GapTimeoutInfo`, `GapTimeoutCallback`, `on_gap_timeout`, `SkippedGap`, `GapTimeoutEntry`, `list_gap_timeouts`, `resolve_gap_timeout`, migration m009 | `config.rs`, `subscriber_state.rs`, `mod.rs:340-1650`, `m009_create_gap_timeout_log.rs` | Reuse the recording/callback path verbatim for **backstop** skips only |
-| Latest migration on `main` is **m009** (`create_gap_timeout_log`, version 9). Spec 0018 (CLOUD-155) reserves **m010** | `migrations/mod.rs:42,74`, `specs/0018-...md` | This work is **m011** assuming CLOUD-155 lands first (§3.1, §11) |
-| `migrations_integration_tests.rs` asserts the count via **hard-coded `9`** in `test_migrator_runs_all_migrations`, `test_migrator_is_idempotent`, `test_migrator_pending_...`, `test_migrator_applied_...` (and per-version `applied_after[i]` name checks) | `epoch_pg/tests/migrations_integration_tests.rs` | These constants must be bumped (see §9 / Note); there is **no** `MIGRATION_COUNT` constant in the tree today |
+| Latest migration on `main` is **m010** (`strip_data_from_notify_payload`). `MIGRATION_COUNT` auto-tracks the registry length in `migrations/mod.rs` | `migrations/mod.rs`, `epoch_pg/tests/migrations_integration_tests.rs` | This work is **m011** (`add_txid_to_events`). Adding it to `MIGRATIONS` automatically updates `MIGRATION_COUNT`; tests only need an `applied_after[10]` assertion for the new migration (version 11). |
+| `migrations_integration_tests.rs` asserts the count via `MIGRATION_COUNT` and per-version `applied_after[i]` name checks | `epoch_pg/tests/migrations_integration_tests.rs` | Only add the `applied_after[10]` name/version check for `add_txid_to_events` (version 11). |
 | `ReliableDeliveryConfig` has a manual `Debug` and an **exhaustive** construction test `reliable_delivery_config_can_be_customized` (no `..Default::default()`) | `config.rs:255-275, 397-419` | Adding a config field requires updating `Default`, the `Debug` impl, and that test |
 | Public re-exports of event-bus config/types | `lib.rs:60-63`, `event_bus/mod.rs:9-15` | Add any new public type to both lists |
 | Integration harness: `#[serial]` + `#[tokio::test]`, fresh `Uuid::new_v4()` stream IDs, short `gap_timeout` via `ReliableDeliveryConfig` | `epoch_pg/tests/pgeventbus_integration_tests.rs` | New tests follow these conventions |
 
-### 3.1 Migration numbering & dependency on CLOUD-155
+### 3.1 Migration numbering
 
 `epoch_pg`'s migrator is **forward-only** and applies migrations strictly by
-ascending `version()` (`migrations/mod.rs`). Spec 0018 (CLOUD-155) defines m010
-(`strip_data_from_notify_payload`). This spec therefore claims **version 11**
-(`m011_add_txid_to_events`). The `migrations_are_in_order` test only requires
-strictly-increasing versions (gaps tolerated), so even if CLOUD-155 has not landed
-the registry remains valid, but **CLOUD-180 should land after CLOUD-155**. If
-CLOUD-180 ships first, renumber to m010 and let CLOUD-155 become m011 (see Open
-Question OQ-1).
+ascending `version()` (`migrations/mod.rs`). CLOUD-155's m010
+(`strip_data_from_notify_payload`) is already merged to `main`, so this spec claims
+**version 11** (`m011_add_txid_to_events`). Because `MIGRATION_COUNT` tracks
+`MIGRATIONS.len()` automatically, adding m011 requires no manual count updates
+beyond adding the new migration to the registry.
+
+The only test adjustment needed is an `applied_after[10]` name/version assertion
+for `add_txid_to_events` in `migrations_integration_tests.rs`.
 
 ---
 
@@ -131,7 +132,10 @@ WRITER (any INSERT path)                 READER (per-batch, main listener loop)
 └──────────────────────────────┘   advance_contiguous_checkpoint(state, visible, gap_timeout, snapshot)
                                     ┌─────────────────────────────────────────────────────┐
                                     │ gap at N (N+1 visible, N not visible):                │
-                                    │  • first time → record (first_seen, fence_xmax=xmax)  │
+                                    │  • first time → record (first_seen, fence_xmax =      │
+                                    │    snapshot.map(|s| s.xmax))  // None if unavailable  │
+                                    │  • else, LAZY BACKFILL: if fence_xmax is None and a   │
+                                    │    snapshot is now available, set it to snap.xmax     │
                                     │  • else, FENCE: xmin ≥ fence_xmax ?                    │
                                     │      yes → every txn open at detection has finished   │
                                     │            and N still missing ⇒ PERMANENT gap        │
@@ -168,10 +172,12 @@ captured at that instant. The gap is provably **permanent** (safe to skip with n
 data loss) once a later snapshot satisfies `xmin ≥ fence_xmax`, because:
 
 1. The transaction that could fill `N` (if any) must have claimed `nextval = N`
-   *before* the transaction that claimed the already-visible `N+1` claimed its
-   value (`nextval` is monotonic). So that writer had **begun** by the time `N+1`
-   was assigned, which is at-or-before our detection snapshot ⇒ its `xid <
-   fence_xmax`.
+   *before* the transaction that claimed the already-visible `N+1` claimed its value
+   (`nextval` is monotonic). Because `global_sequence` is populated by an inline
+   column `DEFAULT nextval(...)` with the default `CACHE 1`, the writer of `N` (if
+   it exists) stamped the row and obtained its `xid` in the same atomic INSERT; by
+   the time `N+1` is visible and the gap is first observed, that writer's `xid` is
+   already assigned and is `< fence_xmax`.
 2. `xmin ≥ fence_xmax` means **every** transaction with `xid < fence_xmax` has now
    completed. So `N`'s writer (if it existed) is done.
 3. `N` is *still* not visible, therefore that writer **aborted** (rolled back), or
@@ -278,6 +284,12 @@ before the store/bus is returned to the caller. On error, log a `warn!` and
 continue — fencing degrades to timeout-only for that table (§7.4), consistent with
 G-5. **Not called for the default `epoch_events` table** (covered by m011).
 
+> **Non-transactional note.** The three statements are executed sequentially on a
+> single pooled connection (not wrapped in an explicit transaction). Any insert that
+> lands between `ADD COLUMN` and `SET DEFAULT` will have `txid = NULL`, which is
+> treated as globally committed (§7.1) and does not affect fence correctness. The
+> window is negligible in practice (milliseconds at startup).
+
 ### 5.2 Reader-side: snapshot acquisition
 
 No server-version detection needed — PG13+ is the only supported target.
@@ -301,10 +313,17 @@ pub(crate) struct TxidSnapshot {
 ```
 
 In the main loop, immediately after the catch-up `rows`/`visible_seqs` are built
-(`mod.rs:965`), query the snapshot **conditionally** (OQ-4): skip the round trip
-entirely when fencing is disabled (`snapshot_fencing = false`, §5.6) **or** when no
-subscriber has active gaps (`gap_first_seen` is empty for all subscribers in this
-batch). Query only when at least one subscriber has a tracked gap:
+(`mod.rs:965`), determine whether any subscriber has **active or newly-detected
+gaps** in this batch. Query the snapshot only when:
+
+- `snapshot_fencing` is enabled (§5.6), **and**
+- at least one subscriber either (a) already had entries in `gap_first_seen` before
+  this batch, or (b) newly observed a gap in this batch.
+
+The simplest implementation: after all subscribers' `advance_contiguous_checkpoint`
+observations have been processed, if any new gap was created *or* any existing gap
+remains, query the snapshot on the same batch and store it in `BatchContext`. On
+subsequent batches the presence of existing gaps triggers the query automatically.
 
 ```sql
 SELECT pg_snapshot_xmin(s)::text::bigint AS xmin,
@@ -312,10 +331,12 @@ SELECT pg_snapshot_xmin(s)::text::bigint AS xmin,
 FROM pg_current_snapshot() s
 ```
 
-A new gap observed for the first time in the current batch receives `fence_xmax =
-None` (no snapshot yet); the snapshot is then queried on the **next** batch when
-`gap_first_seen` is non-empty. This means the first hold of a brand-new gap is
-always conservative (no fence-clear possible on first observation), which is correct.
+A gap observed for the first time in a batch where the snapshot was **not**
+queried (because the gap is brand-new) receives `fence_xmax = None`. It will be
+backfilled lazily on the next batch that has a snapshot (see §5.4). A gap that
+appears concurrently with an already-existing gap gets its `fence_xmax` from the
+same batch's snapshot. This keeps the common no-gap path at zero extra round trips
+while ensuring every gap eventually receives a real fence boundary.
 
 Bind the result into `Option<TxidSnapshot>` and place it on `BatchContext`. On query
 error: `log::warn!` once and pass `None` (graceful fallback to timeout-only, §7.4).
@@ -361,6 +382,7 @@ pub(crate) struct SkippedGap {
     pub skipped_sequence: u64,
     pub gap_duration: Duration,
     pub reason: SkipReason,   // NEW
+    pub fence_xmax: Option<u64>, // NEW: the boundary that was (or should have been) used to fence this gap
 }
 ```
 
@@ -386,21 +408,29 @@ at `subscriber_state.rs:114-138`):
 ```text
 entry = gap_first_seen.get(next)
 if entry is None:
-    // first observation: stamp time + fence boundary
+    // first observation: stamp time + fence boundary (may be None if no snapshot this batch)
     gap_first_seen.insert(next, GapObservation {
         first_seen: Instant::now(),
         fence_xmax: snapshot.map(|s| s.xmax),
     })
     break    // hold; re-evaluate next batch
 else:
+    // LAZY BACKFILL: if we didn't have a snapshot at first observation, capture one now
+    if entry.fence_xmax.is_none() {
+        if let Some(snap) = snapshot {
+            entry.fence_xmax = Some(snap.xmax);
+        }
+    }
+
     // FENCE (fast path): can we PROVE the gap is permanent?
     if let (Some(snap), Some(fence_xmax)) = (snapshot, entry.fence_xmax):
         if snap.xmin >= fence_xmax:
-            push SkippedGap { next, first_seen.elapsed(), FenceCleared }
+            push SkippedGap { next, first_seen.elapsed(), reason: FenceCleared, fence_xmax: Some(fence_xmax) }
             gap_first_seen.remove(next); contiguous_checkpoint = next; continue
     // BACKSTOP: fence not (yet) cleared, or fencing unavailable
     if entry.first_seen.elapsed() > gap_timeout:
-        push SkippedGap { next, first_seen.elapsed(), TimeoutBackstop }
+        let fence_xmax = entry.fence_xmax;
+        push SkippedGap { next, first_seen.elapsed(), reason: TimeoutBackstop, fence_xmax }
         gap_first_seen.remove(next); contiguous_checkpoint = next; continue
     break    // hold; in-flight writer may still commit
 ```
@@ -427,12 +457,12 @@ The caller (`mod.rs:157-260`) now branches on `SkipReason`:
   sequences. **No** `WARN`, **no** `epoch_event_bus_gap_timeouts` insert, **no**
   callback (these are expected, lossless rollbacks).
 - **`TimeoutBackstop`**: the batched CLOUD-169 `WARN` plus, if fencing was active and
-  the fence did not clear (i.e. `fence_xmax` is `Some` and `xmin < fence_xmax` at
-  backstop time), an **additional `WARN`** noting that the fence was persistently
-  pinned — include the current `xmin` and `fence_xmax` values so operators can
-  identify the offending long-running session via `pg_stat_activity` (OQ-3). Then
-  fire-and-forget the `INSERT … ON CONFLICT DO NOTHING` + `on_gap_timeout` callback
-  per gap, unchanged from the CLOUD-169 path.
+  the fence did not clear (i.e. `skipped_gap.fence_xmax` is `Some` and the current
+  snapshot's `xmin < fence_xmax` at backstop time), an **additional `WARN`** noting
+  that the fence was persistently pinned — include the current `xmin` and
+  `fence_xmax` values so operators can identify the offending long-running session via
+  `pg_stat_activity` (OQ-3). Then fire-and-forget the `INSERT … ON CONFLICT DO
+  NOTHING` + `on_gap_timeout` callback per gap, unchanged from the CLOUD-169 path.
 - Wire the `BatchContext.snapshot` through into the `advance_contiguous_checkpoint`
   call at `mod.rs:157`.
 
@@ -515,16 +545,15 @@ session via `pg_stat_activity` or `pg_prepared_xacts`.
   `fence_xmax`, we *held* — we never skip a still-fenced gap, so the late commit is
   simply picked up on a subsequent batch (gap fills). No race window where a fenced
   gap is skipped.
-- **`fence_xmax` captured with `None` then snapshot later available:** the gap was
-  first seen while fencing was unavailable (`fence_xmax = None`), so it can only ever
-  be resolved by the backstop, even if later batches have a snapshot. This is
-  conservative (favours holding/timeout over an unproven fast-skip) and bounded by
-  `gap_timeout`. A gap re-observed after a checkpoint reset starts a fresh
-  observation with a current `fence_xmax`.
-- **Sequence cache gaps (`CACHE > 1`, crash):** a sequence value may be *burned* —
-  never assigned to any committed row and never to an in-flight one. The fence
-  clears it as `FenceCleared` once `xmin >= fence_xmax` (no writer holds it). Correct
-  and lossless.
+- **`fence_xmax` captured with `None` on first observation:** a brand-new gap may be
+  observed in a batch where no snapshot was queried (zero extra round-trip cost in the
+  common no-gap case). It receives `fence_xmax = None` initially and is **lazily
+  backfilled** on the next batch that has a snapshot (see §5.4). Once backfilled, it
+  fences and clears normally. If the snapshot never becomes available, the gap is
+  resolved only by the backstop, which is conservative and bounded by `gap_timeout`.
+- **Sequence cache gaps:** with the default `CACHE 1` sequence, a value may be
+  *burned* only due to a crash/rollback. The fence clears it as `FenceCleared` once
+  `xmin >= fence_xmax` (no writer holds it). Correct and lossless.
 - **Clock vs. xid:** the backstop uses the monotonic `tokio::time::Instant` already
   in `gap_first_seen` (no wall-clock); the fence uses xid arithmetic only. The two
   mechanisms are independent.
@@ -558,7 +587,7 @@ normally read the primary; documented as a note, not a code path.)
 | FR-6 | A fence-cleared (proven-rolled-back) gap is skipped as `FenceCleared` with **no** `WARN`/record/callback | Unit + §10 `test_rolled_back_gap_fence_clears_without_record` |
 | FR-7 | A gap pinned past `gap_timeout` is skipped as `TimeoutBackstop` and recorded via CLOUD-169 (`WARN` + row + callback) | §10 `test_pinned_gap_resolves_via_backstop` |
 | FR-8 | `snapshot_fencing` config field defaults to `true`; `false` reverts to timeout-only; `Default`/`Debug`/exhaustive-test updated | `config.rs` unit tests |
-| FR-9 | Snapshot query failure or missing primitives degrades to timeout-only without panic | Code review + unit (None path) |
+| FR-9 | Snapshot query failure or unavailable snapshot degrades to timeout-only without panic | Code review + unit (None path) |
 | FR-10 | `ensure_txid_column` is called at `PgEventStore::with_table` and `PgEventBus` init for custom tables; failure degrades gracefully | Integration test with custom table name |
 | FR-11 | Rustdoc on all new public/`pub(crate)` items; `cargo clippy --workspace -- -D warnings` and `cargo fmt --check` clean | CI |
 
@@ -574,20 +603,17 @@ normally read the primary; documented as a note, not a code path.)
 | `epoch_pg/src/event_bus/mod.rs` | Add `ensure_txid_column` helper; call it during `PgEventBus` init for custom tables; add `snapshot` to `BatchContext`; conditional per-batch snapshot query (PG13+); thread snapshot into `advance_contiguous_checkpoint`; partition `SkippedGap` by `SkipReason`; persistent-pin `WARN`; update backstop `WARN` wording |
 | `epoch_pg/src/event_bus/subscriber_state.rs` | Add `TxidSnapshot`, `SkipReason`, `GapObservation`; change `SkippedGap` (add `reason`), `gap_first_seen` value type, and `advance_contiguous_checkpoint` signature + fence logic; extend unit tests |
 | `epoch_pg/src/event_bus/config.rs` | Add `snapshot_fencing: bool`; update `Default`, `Debug`, exhaustive-construction test; add unit tests |
-| `epoch_pg/tests/migrations_integration_tests.rs` | Bump hard-coded migration count `9 → 11` in the four count assertions; add `applied_after[9]`/`[10]` name/version checks (`strip_data_from_notify_payload` at 10, `add_txid_to_events` at 11); extend `teardown` to drop the `txid` index if needed |
+| `epoch_pg/tests/migrations_integration_tests.rs` | Add `applied_after[10]` name/version check for `add_txid_to_events` (version 11). Because `MIGRATION_COUNT` auto-tracks `MIGRATIONS.len()`, no hard-coded count literals need changing. |
 | `epoch_pg/tests/pgeventbus_integration_tests.rs` | New integration tests (§10) |
 | `CHANGELOG.md` | Unreleased entry: snapshot fencing (m011 `txid` column, reader fence, `snapshot_fencing` config, custom-table auto-migration, PG13+ requirement); note the exhaustive-construction source change |
 
 No new dependencies (`sqlx`, `tokio`, `async_trait`, `chrono`, `uuid`, `log` already
 used). No changes to `epoch_core`/`epoch_mem`/`epoch_derive`.
 
-> **Note on migration count:** the task brief mentioned a `MIGRATION_COUNT`
-> constant, but the tree at the time of writing hard-codes `9` in
-> `migrations_integration_tests.rs`. This spec bumps the literals to `11`
-> (assuming CLOUD-155's m010 is present). If a `MIGRATION_COUNT` constant has since
-> been introduced, update that single constant instead. If CLOUD-155 is **not** yet
-> merged when CLOUD-180 lands, the count becomes `10` and m011 must be renumbered to
-> m010 (OQ-1).
+> **Note on migration count:** `MIGRATION_COUNT` in `migrations/mod.rs` tracks
+> `MIGRATIONS.len()` automatically. Adding m011 to the registry updates the count
+> for all consumers and tests; no hard-coded literals need to be bumped. The only
+> test edit is adding an `applied_after[10]` assertion for the new migration.
 
 ---
 
@@ -625,6 +651,7 @@ to the test's own subscriber id. These map directly to the issue's required test
 | `test_rolled_back_gap_fence_clears_without_record` | Open tx A, INSERT to claim `N`, **ROLLBACK**; commit `N+1`; with no other long transactions open, assert the subscriber advances past `N` (delivers `N+1`) **without** any `gap_timeout` row (fence cleared, not backstop) | G-2 / FR-6 |
 | `test_pinned_gap_resolves_via_backstop` | Open an **unrelated** sentinel tx (e.g. `SELECT txid_current()` then idle) to pin `xmin`; in another tx claim `N` then **ROLLBACK**; commit `N+1`; with a short `gap_timeout` assert a `epoch_event_bus_gap_timeouts` row eventually appears for the skipped `N` (backstop fired despite fencing) and `on_gap_timeout` fires once; then release the sentinel | **Issue test (b)** / G-3 / FR-7 |
 | `test_fencing_disabled_uses_timeout` | `snapshot_fencing = false`, short `gap_timeout`: an in-flight gap is skipped via timeout and recorded (legacy behaviour) | FR-8 |
+| `test_ensure_txid_column_on_custom_table` | Create a custom events table via `PgEventStore::with_table`, assert the `txid` column exists and has the correct DEFAULT, insert an event and verify `txid IS NOT NULL`; also test graceful degradation by invoking the helper on a non-existent table and asserting it returns `Err` without panicking | FR-10 |
 | `test_no_gap_timeout_record_on_in_order_events` (reuse from spec 0016) | In-order publishing produces zero gap rows of either reason | Regression |
 
 > Sequence-hole construction reuses the spec 0016 harness technique (`setval` /
@@ -649,18 +676,15 @@ acceptance) depends on Phase 3. Each phase follows TDD (red → green → refact
 ### Phase 1 — Migration m011 `txid` column + registry + migration tests
 
 - **Goal:** Add the nullable `txid BIGINT` column with `pg_current_xact_id()` DEFAULT and
-  partial index; register it; bump the migration-count assertions.
+  partial index; register it; add the `applied_after[10]` migration test assertion.
 - **Create:** `epoch_pg/src/migrations/m011_add_txid_to_events.rs` (`AddTxidToEvents`,
   `version() -> 11`, `name() -> "add_txid_to_events"`, `up()` per §5.1).
 - **Modify:** `migrations/mod.rs` (declare/import/append); `migrations_integration_tests.rs`
-  (count `9 → 11`, add applied-name checks for versions 10 & 11); add
-  `ensure_txid_column` helper to `event_bus/mod.rs` and wire into `PgEventStore::with_table`
-  + `PgEventBus` init (`event_store.rs`, `event_bus/mod.rs`).
-- **Out of bounds:** no fence/subscriber-state changes; no `down()`.
+  (add `applied_after[10]` name/version check for version 11).
+- **Out of bounds:** no `event_bus`/`event_store` changes; no `down()`.
 - **Exit:** `cargo test -p epoch_pg migrations::tests` and the migration integration
   suite pass; a fresh DB shows `txid` on `epoch_events`; a new insert populates it.
-- **Effort:** S. **Difficulty:** standard. **Depends on:** CLOUD-155 m010 ideally
-  present (OQ-1).
+- **Effort:** S. **Difficulty:** standard. **Depends on:** none (m010 is already on `main`).
 
 ### Phase 2 — Pure snapshot fence in `subscriber_state.rs`
 
@@ -677,16 +701,20 @@ acceptance) depends on Phase 3. Each phase follows TDD (red → green → refact
 
 ### Phase 3 — Reader wiring in `mod.rs`
 
-- **Goal:** Acquire the per-batch snapshot using PG13+ SQL (§5.3); add `snapshot`
-  to `BatchContext`; thread it into `advance_contiguous_checkpoint`; partition results
-  by `SkipReason` so only `TimeoutBackstop` is recorded; update the backstop `WARN`.
-- **Modify:** `event_bus/mod.rs` (struct/loop/caller).
+- **Goal:** Acquire the per-batch snapshot using PG13+ SQL only when active or
+  newly-detected gaps exist (§5.3); add `snapshot` to `BatchContext`; thread it into
+  `advance_contiguous_checkpoint`; partition results by `SkipReason` so only
+  `TimeoutBackstop` is recorded; update the backstop `WARN`; add `ensure_txid_column`
+  helper to `event_bus/mod.rs` and wire it into `PgEventStore::with_table` and
+  `PgEventBus` init (`event_store.rs`).
+- **Modify:** `event_bus/mod.rs` (struct/loop/caller/helper + custom-table wiring);
+  `event_store.rs` (call helper in `with_table`).
 - **Out of bounds:** no change to the CLOUD-169 insert/callback SQL itself (reused);
   no change to catch-up buffer logic.
 - **Exit:** crate compiles; `cargo test -p epoch_pg` (non-DB) green; manual/inline
   trace confirms `FenceCleared` is silent and `TimeoutBackstop` records.
-- **Effort:** M. **Difficulty:** hard (snapshot acquisition + version branch + must
-  not regress concurrency/checkpoint flow). **Depends on:** Phase 2 (and Phase 1 for
+- **Effort:** M. **Difficulty:** hard (conditional snapshot acquisition + must not
+  regress concurrency/checkpoint flow). **Depends on:** Phase 2 (and Phase 1 for
   the column at runtime).
 
 ### Phase 4 — Config flag, integration tests, lint, acceptance
@@ -738,9 +766,10 @@ acceptance) depends on Phase 3. Each phase follows TDD (red → green → refact
     },
     {
       "phase": 3,
-      "focus": "Reader wiring: pg13 detection, per-batch snapshot query, BatchContext.snapshot, SkipReason partitioning",
+      "focus": "Reader wiring: conditional per-batch snapshot query (PG13+), BatchContext.snapshot, SkipReason partitioning, ensure_txid_column helper + custom-table wiring",
       "files": [
-        "epoch_pg/src/event_bus/mod.rs"
+        "epoch_pg/src/event_bus/mod.rs",
+        "epoch_pg/src/event_store.rs"
       ],
       "effort": "M",
       "difficulty": "hard",
