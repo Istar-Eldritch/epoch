@@ -36,6 +36,10 @@ async fn teardown(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("Failed to drop events table");
+    sqlx::query("DROP TABLE IF EXISTS epoch_events_legacy CASCADE")
+        .execute(pool)
+        .await
+        .expect("Failed to drop legacy events table");
     sqlx::query("DROP TABLE IF EXISTS _epoch_migrations CASCADE")
         .execute(pool)
         .await
