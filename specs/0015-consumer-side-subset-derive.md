@@ -1,15 +1,16 @@
-# Specification: Consumer-Side Subset Derive (`#[derive(SubsetOf)]`)
+# Spec 0015 — Consumer-Side Subset Derive `#[derive(SubsetOf)]` (CLOUD-174)
 
-**Document ID:** 0015 (CLOUD-174)
 **Status:** Proposed
 **Created:** 2026-06-14
-**Author:** AI Agent
+**Timestamp:** 2606140000
 **Crate:** `epoch_derive`
-**Motivation:** The existing producer-side `#[subset_enum]` attribute macro requires modifying the *original* (superset) enum to declare every subset. This does not work when the superset enum lives in a crate the consumer does not own (or does not want to edit). As a result `#[subset_enum]` has been effectively abandoned: catacloud now hand-writes mirror enums plus manual `TryFrom`/closure boilerplate at ~10 `SagaAdapter::new` call sites. This spec proposes a *consumer-side* derive macro that lets a downstream crate declare a subset enum in its own crate and have the conversions generated automatically.
+**Commit scope:** `feat(derive)` / concept scope `aggregate`
 
 ---
 
 ## Problem Statement
+
+> The existing producer-side `#[subset_enum]` attribute macro requires modifying the *original* (superset) enum to declare every subset. This does not work when the superset enum lives in a crate the consumer does not own. As a result `#[subset_enum]` has been effectively abandoned: catacloud now hand-writes mirror enums plus manual `TryFrom`/closure boilerplate at ~10 `SagaAdapter::new` call sites. This spec proposes a *consumer-side* derive macro that lets a downstream crate declare a subset enum in its own crate and have the conversions generated automatically.
 
 ### How `#[subset_enum]` works today (producer-side)
 
@@ -71,18 +72,37 @@ impl TryFrom<&AppEvent> for MachineSagaEvent {
 
 This is pure boilerplate, error-prone (field-by-field cloning, wrong error strings), and must be kept in sync with the superset by hand.
 
-## Goals
+## Requirements
 
-1. Allow a consumer to declare a subset enum **in their own crate** and derive all conversions, without touching the superset crate.
-2. Generate the same conversion surface `#[subset_enum]` produces, so the result drops directly into `Saga::EventType` / `Event::to_subset_event_ref` and `SagaAdapter::new`.
-3. Provide a compile-time guarantee that the subset structurally matches the superset (variant names and field shapes), so drift is caught by the compiler rather than at runtime.
-4. Keep `#[subset_enum]` working (no breaking changes); the new macro is additive.
+- **R1.** A consumer crate must be able to declare a subset enum with `#[derive(SubsetOf)]` + `#[subset_of(path::to::Super)]` without modifying the superset crate.
+- **R2.** The macro must generate `From<Sub> for Super`, `TryFrom<Super> for Sub`, and `TryFrom<&Super> for Sub` — the same three impls produced by `#[subset_enum]` — so the subset satisfies the `Saga::EventType` bound (`for<'a> TryFrom<&'a ED, Error = EnumConversionError>`).
+- **R3.** Structural mismatches between the declared subset and the real superset (wrong variant name, wrong field name, wrong field type) must be caught at compile time, not at runtime.
+- **R4.** All three field kinds must be supported: unit, tuple, and struct variants.
+- **R5.** `#[subset_enum]` must continue to work unchanged (purely additive).
+- **R6.** No new `Cargo.toml` dependencies are required.
+- **R7.** All public items must have rustdoc comments. `cargo clippy -- -D warnings` must pass.
 
-## Non-Goals
+## Success Criteria
 
-- Generating the subset enum *definition* from the superset (impossible consumer-side — see "Key Design Constraint"). The consumer writes the enum body themselves.
-- Replacing or deprecating `#[subset_enum]` in this change.
-- Cross-crate variant *discovery* / reflection. Proc macros cannot read another type's definition.
+- [ ] `#[derive(SubsetOf)]` on a consumer enum generates all three `From`/`TryFrom` impls.
+- [ ] The generated `TryFrom<&Super>` satisfies the `Saga::EventType` bound (verified by a generic function in the integration test).
+- [ ] Excluded variants produce `Err(EnumConversionError)` with the variant's `event_type()` name.
+- [ ] Structural mismatches (bad variant name, bad field) produce a compile error (trybuild or compile-fail test).
+- [ ] `cargo test -p epoch_derive` passes with zero failures.
+- [ ] `cargo clippy -p epoch_derive -- -D warnings` passes with zero warnings.
+
+## Scope & Boundaries
+
+**In scope:**
+- New `SubsetOf` derive macro in `epoch_derive`.
+- Unit tests (prettyplease round-trip) and integration tests for the derive.
+- A usage example `epoch_derive/examples/subset_of.rs`.
+
+**Out of scope:**
+- Generating the subset enum body from the superset (impossible consumer-side; the consumer writes the enum body themselves).
+- Replacing or deprecating `#[subset_enum]`.
+- Cross-crate variant discovery / reflection.
+- Any changes to `epoch_core`.
 
 ## Key Design Constraint
 
@@ -188,59 +208,77 @@ All three field kinds are supported, exactly as in `subset.rs`:
 
 Tuple binders use the `__field{i}` naming scheme already used in `subset.rs` to avoid collisions.
 
-## Implementation Plan (TDD)
+## Codebase Map
 
-All new code lives in `epoch_derive`. Follows the structure of the existing `subset.rs` and `projection.rs`.
+| Location | Symbol | Role in this work |
+|----------|--------|-------------------|
+| `epoch_derive/src/lib.rs:1` | module list + exports | Add `mod subset_of;` and `#[proc_macro_derive(SubsetOf, attributes(subset_of))]` |
+| `epoch_derive/src/subset.rs:1` | `subset_enum_impl_internal` | Reference pattern for field-binding logic, `prettyplease` test harness |
+| `epoch_derive/src/projection.rs:1` | `subscriber_id_impl` | Reference for `split_for_impl`, struct rejection, fully-qualified `::epoch_core::` paths |
+| `epoch_core/src/event.rs:431` | `EnumConversionError` | Error type emitted by generated `TryFrom` impls |
+| `epoch_core/src/event.rs:155` | `Event::to_subset_event_ref` | Consumer of `TryFrom<&ED, Error = EnumConversionError>` — ensures contract is correct |
+| `epoch_core/src/saga.rs:98` | `Saga::EventType` assoc. type | The bound the generated `TryFrom<&Super>` must satisfy |
+| `epoch_derive/tests/subscriber_id_tests.rs:1` | integration test module | Pattern for `epoch_derive` integration tests |
+| `epoch_derive/examples/subset.rs:1` | producer-side example | Companion for the new consumer-side example |
 
-### Step 1 — New module skeleton
-- Add `mod subset_of;` to `epoch_derive/src/lib.rs`.
-- Export a derive macro:
-  ```rust
-  #[proc_macro_derive(SubsetOf, attributes(subset_of))]
-  pub fn subset_of(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
-      subset_of::subset_of_impl(item)
-  }
-  ```
-- Create `epoch_derive/src/subset_of.rs` with `subset_of_impl` (public, `proc_macro::TokenStream`) delegating to an internal `subset_of_impl_internal(proc_macro2::TokenStream) -> proc_macro2::TokenStream` so it can be unit-tested with the `prettyplease` round-trip harness used in `subset.rs`.
+**Files to create:**
+- `epoch_derive/src/subset_of.rs` — macro implementation + unit tests
+- `epoch_derive/tests/subset_of_tests.rs` — integration tests
+- `epoch_derive/examples/subset_of.rs` — usage example
 
-### Step 2 — Parse input
-- Parse the item as `syn::ItemEnum` (reject structs/unions with `syn::Error::new_spanned(..).to_compile_error()`, mirroring `projection.rs`).
-- Locate the `#[subset_of(...)]` attribute and parse its single argument as a `syn::Path` (the superset type path). Error clearly if the attribute is missing or malformed (`expected #[subset_of(PathToSupersetEnum)]`).
+---
 
-### Step 3 — Generate `From<Sub> for Super` (failing test first)
-- Write a unit test asserting the generated `From` body for a mixed unit/tuple/struct subset.
-- Implement variant iteration reusing the field-binding logic patterns from `subset.rs` (unit / `Unnamed` / `Named`).
+## Implementation Plan
 
-### Step 4 — Generate `TryFrom<Super>` and `TryFrom<&Super>`
-- Unit tests asserting both impls, including the wildcard `other => Err(..)` arm and per-field `.clone()` in the reference impl.
-- Implement using `EventData::event_type(&other)` for the error's first argument and the subset enum name string for the second.
+All new code lives in `epoch_derive`. Follows the structure of `subset.rs` and `projection.rs`. TDD throughout: write a failing test, implement to pass, refactor.
 
-### Step 5 — Generics & visibility
-- Thread the enum's generics through the `impl` blocks via `split_for_impl()` (as in `projection.rs`) so generic subset enums work.
-- The macro emits only `impl` blocks (it does not re-emit the enum), so the consumer's own `vis`/attributes are untouched.
+### Phase 1: Skeleton, attribute parser, and `From<Sub> for Super`
 
-### Step 6 — Integration tests
-- Add `epoch_derive/tests/subset_of_tests.rs` (pattern: `epoch_derive/tests/subscriber_id_tests.rs`) defining a real superset enum (with `#[derive(EventData)]`) in one module and a `#[derive(SubsetOf)]` subset in another, then assert:
-  - `AppEvent::from(sub)` round-trips.
-  - `MachineSagaEvent::try_from(&app_event)` returns `Ok` for matched variants and `Err(EnumConversionError)` for excluded ones.
-  - Owned `try_from` parity.
-  - The subset satisfies `for<'a> TryFrom<&'a AppEvent, Error = EnumConversionError>` (compile-time assertion via a generic function bound) so it is usable as `Saga::EventType`.
-- Add an end-to-end test wiring the derived subset into a `Saga` + `SagaHandler`/`SagaAdapter` to confirm it drops in where the hand-written mirror enums currently sit.
+Boot the module, parse `#[subset_of(Path)]`, and generate the `From` direction.
 
-### Step 7 — Example & docs
-- Add `epoch_derive/examples/subset_of.rs` mirroring `examples/subset.rs` but consumer-side (superset defined separately, subset deriving `SubsetOf`).
-- Rustdoc on the `SubsetOf` proc-macro export (matching the `SubscriberId` doc style), explicitly stating: superset must implement `EventData`; field types must be `Clone`; structural mismatches are compile errors.
+**Scope:**
+- Modify: `epoch_derive/src/lib.rs:1` (`mod` list + proc-macro exports) — add `mod subset_of;` and the `SubsetOf` derive export
+- Create: `epoch_derive/src/subset_of.rs` — `subset_of_impl` / `subset_of_impl_internal`, attribute parser, `From<Sub> for Super` codegen, and prettyplease unit tests for all three field kinds (unit / tuple / struct)
+- Out of bounds: `TryFrom` generation, integration tests, generics, docs
+
+**Entry conditions:** None.
+**Exit criteria:** `cargo test -p epoch_derive` passes; the `From` unit tests cover unit, tuple, and struct variants.
+
+### Phase 2: `TryFrom<Super>` and `TryFrom<&Super>` with wildcard error arm
+
+Generate the two `TryFrom` impls (owned and reference), including the wildcard excluded-variant arm using `EventData::event_type()` and per-field `.clone()` in the reference impl. This is the core contract that satisfies `Saga::EventType`.
+
+**Scope:**
+- Modify: `epoch_derive/src/subset_of.rs` — extend `subset_of_impl_internal` with `TryFrom<Super>` and `TryFrom<&Super>` codegen; add prettyplease unit tests for both impls including wildcard arm and clone behaviour
+- Out of bounds: generics, integration tests, example, docs
+
+**Entry conditions:** Phase 1 complete and passing.
+**Exit criteria:** `cargo test -p epoch_derive` passes; unit tests cover owned + reference conversions for all field kinds and the wildcard arm error message.
+
+### Phase 3: Generics, integration tests, example, and rustdoc
+
+Thread generics through `impl` blocks via `split_for_impl()`; wire up integration tests including the `Saga::EventType` compile-time assertion; add example and rustdoc.
+
+**Scope:**
+- Modify: `epoch_derive/src/subset_of.rs` — add `split_for_impl()` support; add rustdoc on `subset_of_impl`
+- Modify: `epoch_derive/src/lib.rs` — add rustdoc on the `SubsetOf` export (mirror `SubscriberId` style)
+- Create: `epoch_derive/tests/subset_of_tests.rs` — integration test with `#[derive(EventData)]` superset + `#[derive(SubsetOf)]` subset; `Saga::EventType` bound assertion via generic function; round-trip `From`/`TryFrom` assertions
+- Create: `epoch_derive/examples/subset_of.rs` — consumer-side usage example (superset in separate module, subset deriving `SubsetOf`)
+- Out of bounds: any `epoch_core` changes; `#[subset_enum]` modifications
+
+**Entry conditions:** Phase 2 complete and passing.
+**Exit criteria:** `cargo test -p epoch_derive` passes; `cargo clippy -p epoch_derive -- -D warnings` passes; generic subset enums compile; the `Saga::EventType` assertion compiles.
 
 ## Files Affected
 
 | File | Change |
 |---|---|
-| `epoch_derive/src/lib.rs` | Add `mod subset_of;` and the `#[proc_macro_derive(SubsetOf, attributes(subset_of))]` export. |
+| `epoch_derive/src/lib.rs` | Add `mod subset_of;` and the `#[proc_macro_derive(SubsetOf, attributes(subset_of))]` export + rustdoc. |
 | `epoch_derive/src/subset_of.rs` | **New.** Macro implementation + unit tests. |
 | `epoch_derive/tests/subset_of_tests.rs` | **New.** Integration tests. |
 | `epoch_derive/examples/subset_of.rs` | **New.** Consumer-side usage example. |
 | `epoch_derive/src/subset.rs` | Unchanged (kept for back-compat). |
-| `epoch_core/*` | No changes required — `EnumConversionError`, `EventData::event_type`, `to_subset_event_ref`, and the `Saga::EventType` bound already exist. |
+| `epoch_core/*` | No changes required. |
 
 No new dependencies (reuses `syn`, `quote`, `proc-macro2`; `prettyplease` already a dev-dependency).
 
@@ -269,7 +307,50 @@ No new dependencies (reuses `syn`, `quote`, `proc-macro2`; `prettyplease` alread
 3. **A blanket generic `Subset` trait with runtime matching.** Loses the compile-time structural guarantee and the zero-cost field-level clone behaviour; rejected.
 4. **Do nothing.** Consumers keep hand-writing mirror enums (current catacloud state) — the boilerplate and drift risk this ticket exists to remove.
 
+## Risks & Mitigations
+
+| Risk | Mitigation |
+|---|---|
+| Consumer declares a variant with wrong field shape — silent `_ => Err` at runtime | `From<Sub> for Super` arm uses the declared field names directly; wrong name → compile error |
+| `EventData::event_type()` error string differs from `#[subset_enum]`'s `"Super::Variant"` literal | Documented as a known difference; variant is still uniquely identified |
+| Consumers with generic subset enums hit `split_for_impl` edge cases | Phase 3 includes explicit generic test coverage |
+
 ## Open Questions
 
-1. **Error string parity:** Is `"<event_type>"` an acceptable error variant name, or should the macro accept an optional `#[subset_of(Super, error_name = "...")]`? (Default: ship the simpler `event_type()`-based message.)
-2. **Optional explicit-variant escape hatch:** Should `#[subset_of(Super)]` support an attribute to skip generating the owned `TryFrom<Super>` (some consumers only need the `&` form)? (Default: always generate all three for parity.)
+- [ ] **Error string parity:** Is `"<event_type>"` an acceptable error variant name, or should the macro accept an optional `#[subset_of(Super, error_name = "...")]`? (Default: ship the simpler `event_type()`-based message.)
+- [ ] **Optional escape hatch:** Should `#[subset_of(Super)]` support an attribute to skip generating the owned `TryFrom<Super>` (some consumers only need the `&` form)? (Default: always generate all three for parity.)
+
+## References
+
+- Linear issue: [CLOUD-174](https://linear.app/catallactical/issue/CLOUD-174)
+- Existing implementation: `epoch_derive/src/subset.rs` (producer-side `#[subset_enum]`)
+- Consumed by: `epoch_core/src/saga.rs:98` (`Saga::EventType` bound)
+
+---
+
+## Phases (JSON)
+
+```json
+{
+  "phases": [
+    {
+      "phase": 1,
+      "focus": "Skeleton, attribute parser, and From<Sub> for Super",
+      "effort": "S",
+      "difficulty": "standard"
+    },
+    {
+      "phase": 2,
+      "focus": "TryFrom<Super> and TryFrom<&Super> with wildcard error arm",
+      "effort": "M",
+      "difficulty": "hard"
+    },
+    {
+      "phase": 3,
+      "focus": "Generics, integration tests, example, and rustdoc",
+      "effort": "M",
+      "difficulty": "standard"
+    }
+  ]
+}
+```
