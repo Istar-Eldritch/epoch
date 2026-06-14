@@ -323,6 +323,130 @@ async fn test_migrator_applied_returns_applied_migrations() {
 
 #[tokio::test]
 #[serial]
+async fn test_m011_skips_when_epoch_events_renamed() {
+    // Reproduces the post-R28-cutover failure: `epoch_events` renamed to
+    // `epoch_events_legacy` before m011 is applied. The migration must succeed
+    // as a no-op instead of aborting with `relation "epoch_events" does not exist`.
+    let Some(pool) = common::try_get_pg_pool_for_db("epoch_pg_test_migrations").await else {
+        return;
+    };
+    teardown(&pool).await;
+
+    let migrator = Migrator::new(pool.clone());
+
+    // Apply all migrations on a clean DB (m011 runs normally, adds txid).
+    migrator
+        .run()
+        .await
+        .expect("Initial migration run should succeed");
+
+    // Simulate the R28 cutover **after** m011 has run, then roll back m011's
+    // tracking record so the migrator will attempt to re-apply it.
+    sqlx::query("DROP INDEX IF EXISTS idx_epoch_events_txid")
+        .execute(&pool)
+        .await
+        .expect("Drop txid index");
+    sqlx::query("ALTER TABLE epoch_events DROP COLUMN IF EXISTS txid")
+        .execute(&pool)
+        .await
+        .expect("Drop txid column");
+    sqlx::query("ALTER TABLE epoch_events RENAME TO epoch_events_legacy")
+        .execute(&pool)
+        .await
+        .expect("Rename epoch_events → epoch_events_legacy");
+    sqlx::query("DELETE FROM _epoch_migrations WHERE version = 11")
+        .execute(&pool)
+        .await
+        .expect("Remove m011 tracking record");
+
+    // This is the assertion that fails with the unfixed migration:
+    // `relation "epoch_events" does not exist` → MigrationFailed.
+    migrator
+        .run()
+        .await
+        .expect("m011 must succeed as a no-op when epoch_events does not exist");
+
+    // m011 should now be re-recorded as applied.
+    let applied_after = migrator.applied().await.expect("Should get applied");
+    let m011_applied = applied_after.iter().any(|m| m.version == 11);
+    assert!(
+        m011_applied,
+        "m011 should be recorded as applied after the no-op run"
+    );
+
+    // No `epoch_events` should have been (re-)created.
+    let epoch_events_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('epoch_events') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("to_regclass query");
+    assert!(
+        !epoch_events_exists,
+        "epoch_events must not be recreated by the no-op migration"
+    );
+
+    // The renamed table must still be intact.
+    let legacy_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'epoch_events_legacy')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("legacy table check");
+    assert!(
+        legacy_exists,
+        "epoch_events_legacy should still exist after the no-op run"
+    );
+
+    // Cleanup: drop the legacy table so teardown() can proceed cleanly.
+    sqlx::query("DROP TABLE IF EXISTS epoch_events_legacy CASCADE")
+        .execute(&pool)
+        .await
+        .expect("Drop epoch_events_legacy");
+    teardown(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_m011_adds_txid_column_when_table_present() {
+    // Regression test: on a normal (non-cutover) database, m011 must still add
+    // the txid column, its DEFAULT, and the partial index.
+    let Some(pool) = common::try_get_pg_pool_for_db("epoch_pg_test_migrations").await else {
+        return;
+    };
+    teardown(&pool).await;
+
+    let migrator = Migrator::new(pool.clone());
+    migrator.run().await.expect("Migration run should succeed");
+
+    // Assert the txid column exists on epoch_events.
+    let col_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (\
+            SELECT 1 FROM information_schema.columns \
+            WHERE table_name = 'epoch_events' AND column_name = 'txid'\
+        )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("Column existence check");
+    assert!(
+        col_exists,
+        "txid column should exist on epoch_events after m011"
+    );
+
+    // Assert the partial index exists.
+    let idx_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_epoch_events_txid')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("Index existence check");
+    assert!(idx_exists, "idx_epoch_events_txid should exist after m011");
+
+    teardown(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
 async fn test_migrator_records_checksums() {
     let Some(pool) = common::try_get_pg_pool_for_db("epoch_pg_test_migrations").await else {
         return;
