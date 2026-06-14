@@ -4,10 +4,16 @@
 //! and behaves correctly against a real superset enum defined in the same crate,
 //! covering all three field kinds: struct variants, unit variants, and tuple variants.
 
-use epoch_derive::SubsetOf;
+use epoch_core::event::EventData;
+use epoch_derive::{EventData, SubsetOf};
+use serde::{Deserialize, Serialize};
 
 /// Concrete superset enum used throughout these tests.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Implements [`EventData`] because the generated `TryFrom` impls call
+/// `EventData::event_type()` in their wildcard (excluded-variant) arm.
+/// `EventData` requires `Serialize + DeserializeOwned`, hence the serde derives.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, EventData)]
 pub enum AppEvent {
     /// Struct variant.
     UserCreated { id: String, name: String },
