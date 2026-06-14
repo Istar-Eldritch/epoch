@@ -79,8 +79,9 @@ This is pure boilerplate, error-prone (field-by-field cloning, wrong error strin
 - **R3.** Structural mismatches between the declared subset and the real superset (wrong variant name, wrong field name, wrong field type) must be caught at compile time, not at runtime.
 - **R4.** All three field kinds must be supported: unit, tuple, and struct variants.
 - **R5.** `#[subset_enum]` must continue to work unchanged (purely additive).
-- **R6.** No new `Cargo.toml` dependencies are required.
+- **R6.** No new runtime `Cargo.toml` dependencies are required. `trybuild` may be added as a dev-dependency for compile-fail tests.
 - **R7.** All public items must have rustdoc comments. `cargo clippy -- -D warnings` must pass.
+- **R8.** Applying `#[derive(SubsetOf)]` to a non-enum item (struct, union, etc.) must produce a clear compile-time error.
 
 ## Success Criteria
 
@@ -88,6 +89,8 @@ This is pure boilerplate, error-prone (field-by-field cloning, wrong error strin
 - [ ] The generated `TryFrom<&Super>` satisfies the `Saga::EventType` bound (verified by a generic function in the integration test).
 - [ ] Excluded variants produce `Err(EnumConversionError)` with the variant's `event_type()` name.
 - [ ] Structural mismatches (bad variant name, bad field) produce a compile error (trybuild or compile-fail test).
+- [ ] Applying `#[derive(SubsetOf)]` to a non-enum item produces a clear compile error (compile-fail test).
+- [ ] Missing or malformed `#[subset_of(...)]` attribute produces a clear compile error (compile-fail test).
 - [ ] `cargo test -p epoch_derive` passes with zero failures.
 - [ ] `cargo clippy -p epoch_derive -- -D warnings` passes with zero warnings.
 
@@ -113,6 +116,7 @@ The consequence: the macro generates conversions purely from the variants the co
 - If the consumer declares `MachineReleased { machine_id: Uuid }` but the superset's variant is `MachineReleased { id: Uuid }`, the generated `Original::MachineReleased { machine_id }` pattern fails to compile (no field `machine_id`).
 - If the consumer names a variant that doesn't exist on the superset, `Original::NoSuchVariant` fails to compile.
 - Field *type* mismatches surface as ordinary type errors in the generated body.
+- **An included variant must declare exactly the same fields (by name, order, and type) as the corresponding superset variant.** Partial-field subsetting (keeping only some fields of a variant) is not supported — this matches `#[subset_enum]`'s behaviour, because `From<Sub> for Super` constructs `Super::Variant { all_declared_fields }` and missing fields would fail to compile.
 
 This gives the same safety as producer-side generation, just enforced at the consumer's compile step.
 
@@ -152,6 +156,7 @@ impl ::core::convert::From<MachineSagaEvent> for AppEvent {
 }
 
 // 2. Owned conversion (parity with #[subset_enum]).
+#[allow(unreachable_patterns)]
 impl ::core::convert::TryFrom<AppEvent> for MachineSagaEvent {
     type Error = ::epoch_core::event::EnumConversionError;
     fn try_from(value: AppEvent) -> ::core::result::Result<Self, Self::Error> {
@@ -170,6 +175,7 @@ impl ::core::convert::TryFrom<AppEvent> for MachineSagaEvent {
 
 // 3. Reference conversion — the one Saga::EventType requires.
 //    Clones only the matched variant's fields.
+#[allow(unreachable_patterns)]
 impl ::core::convert::TryFrom<&AppEvent> for MachineSagaEvent {
     type Error = ::epoch_core::event::EnumConversionError;
     fn try_from(value: &AppEvent) -> ::core::result::Result<Self, Self::Error> {
@@ -194,6 +200,8 @@ Notes:
 - `EnumConversionError` is referenced fully-qualified (`::epoch_core::event::EnumConversionError`) so the consumer is not required to `use` it — matching the `::epoch_core::SubscriberId` convention in `epoch_derive/src/projection.rs`. (The legacy `#[subset_enum]` relies on a bare import; the new macro intentionally improves on this.)
 - The reference impl clones matched fields (`.clone()`), identical to `#[subset_enum]`'s behaviour. Field types must therefore be `Clone` — already guaranteed since they are `EventData` fields.
 - The error message variant name is obtained via `EventData::event_type()` rather than a literal, because the wildcard arm has no static knowledge of which excluded variant matched. This is a deliberate, minor difference from `#[subset_enum]`, whose error string is e.g. `"AppEvent::NewSession"`; the consumer-side message is `"NewSession"` (the event type). This is acceptable for a "wrong subset" diagnostic.
+- Because the macro does not know the superset's full variant set, both `TryFrom` impls are annotated with `#[allow(unreachable_patterns)]`. If the consumer happens to include every superset variant, the wildcard arm becomes unreachable; without the allow, `cargo clippy -- -D warnings` would fail. The attribute is harmless when the wildcard is reachable.
+- The superset path (`AppEvent` in the example, or `some_upstream_crate::events::AppEvent`) is emitted **verbatim** in the generated `impl` blocks. It may be a concrete path or a generic path such as `some_upstream_crate::events::Event<Domain>`; the macro does not inspect or rewrite it. Generic supersets are therefore supported as long as the resulting path resolves in the consumer crate.
 - `EventData` for the subset is **not** generated by this macro; the consumer adds `#[derive(EventData)]` (already available). This keeps responsibilities separated and mirrors how `#[subset_enum]` interacts with `EventData`.
 
 ### Variant field shapes
@@ -234,40 +242,43 @@ All new code lives in `epoch_derive`. Follows the structure of `subset.rs` and `
 
 ### Phase 1: Skeleton, attribute parser, and `From<Sub> for Super`
 
-Boot the module, parse `#[subset_of(Path)]`, and generate the `From` direction.
+Boot the module, parse `#[subset_of(Path)]`, reject non-enum items and malformed attributes with a clear `syn::Error`, and generate the `From` direction.
 
 **Scope:**
 - Modify: `epoch_derive/src/lib.rs:1` (`mod` list + proc-macro exports) — add `mod subset_of;` and the `SubsetOf` derive export
 - Create: `epoch_derive/src/subset_of.rs` — `subset_of_impl` / `subset_of_impl_internal`, attribute parser, `From<Sub> for Super` codegen, and prettyplease unit tests for all three field kinds (unit / tuple / struct)
+- Create: `epoch_derive/tests/compile_pass.rs` (or a doc-test in `subset_of.rs`) — minimal compile-check test that verifies the generated `From` body compiles against a real superset enum
+  - Parser: parse the input as `syn::DeriveInput` and match on `Data::Enum`; if the input is a struct or union, emit a clear `syn::Error` with a message like `expected enum type, found struct/union` (following the `projection.rs` pattern).
+  - Attribute extraction: find the single `#[subset_of(...)]` attribute; if missing or malformed, emit `syn::Error::new_spanned` with a clear message such as `expected #[subset_of(PathToSupersetEnum)]`.
 - Out of bounds: `TryFrom` generation, integration tests, generics, docs
 
 **Entry conditions:** None.
-**Exit criteria:** `cargo test -p epoch_derive` passes; the `From` unit tests cover unit, tuple, and struct variants.
+**Exit criteria:** `cargo test -p epoch_derive` passes; the `From` unit tests cover unit, tuple, and struct variants. A minimal compile-check test (e.g. in `tests/compile_pass.rs` or as a doc-test) proves the generated `From` body actually compiles against a real superset enum, catching orphan-rule and path-resolution errors early. Add `trybuild = "1.0"` to `epoch_derive/Cargo.toml` dev-dependencies to support the compile-fail tests scheduled in Phase 3.
 
 ### Phase 2: `TryFrom<Super>` and `TryFrom<&Super>` with wildcard error arm
 
-Generate the two `TryFrom` impls (owned and reference), including the wildcard excluded-variant arm using `EventData::event_type()` and per-field `.clone()` in the reference impl. This is the core contract that satisfies `Saga::EventType`.
+Generate the two `TryFrom` impls (owned and reference), including the wildcard excluded-variant arm using `EventData::event_type()` and per-field `.clone()` in the reference impl. This is the core contract that satisfies `Saga::EventType`. Emit `#[allow(unreachable_patterns)]` on both `TryFrom` impls so that a subset which happens to cover every superset variant still passes `cargo clippy -- -D warnings`.
 
 **Scope:**
-- Modify: `epoch_derive/src/subset_of.rs` — extend `subset_of_impl_internal` with `TryFrom<Super>` and `TryFrom<&Super>` codegen; add prettyplease unit tests for both impls including wildcard arm and clone behaviour
+- Modify: `epoch_derive/src/subset_of.rs` — extend `subset_of_impl_internal` with `TryFrom<Super>` and `TryFrom<&Super>` codegen; add prettyplease unit tests for both impls including wildcard arm and clone behaviour; include an all-variants-included unit test to verify the `#[allow(unreachable_patterns)]` is present
 - Out of bounds: generics, integration tests, example, docs
 
 **Entry conditions:** Phase 1 complete and passing.
-**Exit criteria:** `cargo test -p epoch_derive` passes; unit tests cover owned + reference conversions for all field kinds and the wildcard arm error message.
+**Exit criteria:** `cargo test -p epoch_derive` passes; unit tests cover owned + reference conversions for all field kinds and the wildcard arm error message; the all-variants unit test confirms `#[allow(unreachable_patterns)]` is emitted in the generated tokens.
 
 ### Phase 3: Generics, integration tests, example, and rustdoc
 
-Thread generics through `impl` blocks via `split_for_impl()`; wire up integration tests including the `Saga::EventType` compile-time assertion; add example and rustdoc.
+Thread the *subset's* generics through the `impl` blocks via `split_for_impl()`; use the superset path as-is (it may be concrete or generic). Wire up integration tests including the `Saga::EventType` compile-time assertion; add example and rustdoc.
 
 **Scope:**
-- Modify: `epoch_derive/src/subset_of.rs` — add `split_for_impl()` support; add rustdoc on `subset_of_impl`
+- Modify: `epoch_derive/src/subset_of.rs` — add `split_for_impl()` support for the subset's generics; add rustdoc on `subset_of_impl`
 - Modify: `epoch_derive/src/lib.rs` — add rustdoc on the `SubsetOf` export (mirror `SubscriberId` style)
-- Create: `epoch_derive/tests/subset_of_tests.rs` — integration test with `#[derive(EventData)]` superset + `#[derive(SubsetOf)]` subset; `Saga::EventType` bound assertion via generic function; round-trip `From`/`TryFrom` assertions
+- Create: `epoch_derive/tests/subset_of_tests.rs` — integration test with `#[derive(EventData)]` superset + `#[derive(SubsetOf)]` subset; `Saga::EventType` bound assertion via generic function; round-trip `From`/`TryFrom` assertions; an all-variants-included smoke test; a generic subset enum test; compile-fail tests for non-enum input and missing/malformed `#[subset_of(...)]` attribute
 - Create: `epoch_derive/examples/subset_of.rs` — consumer-side usage example (superset in separate module, subset deriving `SubsetOf`)
 - Out of bounds: any `epoch_core` changes; `#[subset_enum]` modifications
 
 **Entry conditions:** Phase 2 complete and passing.
-**Exit criteria:** `cargo test -p epoch_derive` passes; `cargo clippy -p epoch_derive -- -D warnings` passes; generic subset enums compile; the `Saga::EventType` assertion compiles.
+**Exit criteria:** `cargo test -p epoch_derive` passes; `cargo clippy -p epoch_derive -- -D warnings` passes; generic subset enums compile; a generic superset path compiles; the `Saga::EventType` assertion compiles.
 
 ## Files Affected
 
@@ -278,9 +289,10 @@ Thread generics through `impl` blocks via `split_for_impl()`; wire up integratio
 | `epoch_derive/tests/subset_of_tests.rs` | **New.** Integration tests. |
 | `epoch_derive/examples/subset_of.rs` | **New.** Consumer-side usage example. |
 | `epoch_derive/src/subset.rs` | Unchanged (kept for back-compat). |
+| `epoch_derive/Cargo.toml` | Add `trybuild` to dev-dependencies for compile-fail tests. |
 | `epoch_core/*` | No changes required. |
 
-No new dependencies (reuses `syn`, `quote`, `proc-macro2`; `prettyplease` already a dev-dependency).
+No new runtime dependencies (reuses `syn`, `quote`, `proc-macro2`; `prettyplease` already a dev-dependency). `trybuild` is added as a dev-dependency for compile-fail tests.
 
 ## Backward Compatibility
 
