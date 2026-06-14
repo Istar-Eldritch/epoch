@@ -409,6 +409,27 @@ mod tests {
         assert_eq!(config.catch_up_batch_size, 100);
         assert_eq!(config.catch_up_buffer_size, 10_000);
         assert_eq!(config.gap_timeout, Duration::from_secs(5));
+        assert!(config.snapshot_fencing);
+    }
+
+    #[test]
+    fn snapshot_fencing_defaults_to_true() {
+        let config = ReliableDeliveryConfig::default();
+        assert!(
+            config.snapshot_fencing,
+            "snapshot fencing should be enabled by default (CLOUD-180)"
+        );
+    }
+
+    #[test]
+    fn snapshot_fencing_can_be_disabled() {
+        let config = ReliableDeliveryConfig {
+            snapshot_fencing: false,
+            ..Default::default()
+        };
+        assert!(!config.snapshot_fencing);
+        // Other defaults unchanged.
+        assert_eq!(config.gap_timeout, Duration::from_secs(5));
     }
 
     #[test]
@@ -720,6 +741,30 @@ mod tests {
         };
         let debug_str = format!("{:?}", config_with_gap);
         assert!(debug_str.contains("<callback>"));
+    }
+
+    #[test]
+    fn config_debug_shows_snapshot_fencing() {
+        let config = ReliableDeliveryConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(
+            debug_str.contains("snapshot_fencing"),
+            "Debug output should render the snapshot_fencing field"
+        );
+        assert!(
+            debug_str.contains("snapshot_fencing: true"),
+            "Debug output should show the default snapshot_fencing value"
+        );
+
+        let disabled = ReliableDeliveryConfig {
+            snapshot_fencing: false,
+            ..Default::default()
+        };
+        let disabled_str = format!("{:?}", disabled);
+        assert!(
+            disabled_str.contains("snapshot_fencing: false"),
+            "Debug output should reflect a disabled snapshot_fencing value"
+        );
     }
 
     #[tokio::test]

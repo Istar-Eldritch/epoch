@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Snapshot fencing for gap resolution** (`epoch_pg`, CLOUD-180) — the event-bus
+  gap resolver now *proves* whether a `global_sequence` gap can still be filled by
+  an in-flight transaction instead of guessing on a wall-clock timer:
+  - Migration `m011_add_txid_to_events` adds a nullable `txid BIGINT` column to
+    `epoch_events` with a `DEFAULT (pg_current_xact_id()::text::bigint)` (PostgreSQL
+    **13+** only) and a partial index. Existing rows keep `NULL` (no backfill, no
+    table rewrite).
+  - The reader queries the current transaction-id snapshot
+    (`pg_snapshot_xmin/xmax(pg_current_snapshot())`) **once per batch that has
+    active or newly-detected gaps** and *holds* the checkpoint for a gap whose
+    writer is still in-flight until it commits (gap fills) or aborts (gap proven
+    permanent — advanced as `FenceCleared`, silently, with no record).
+  - `gap_timeout` is demoted to a **backstop**: it still fires (and records via the
+    CLOUD-169 machinery, plus a dedicated persistent-pin `WARN` with the current
+    `xmin`/`fence_xmax`) for pathological cases where the fence cannot clear
+    (abandoned prepared transactions, `idle-in-transaction` sessions pinning `xmin`).
+  - `ReliableDeliveryConfig::snapshot_fencing` (defaults to `true`) toggles the
+    feature; `false` reverts to the legacy timeout-only resolver. Fencing also
+    auto-disables for a batch if the snapshot query fails or the `txid` primitives
+    are unavailable — degrading gracefully without panics.
+  - `PgEventStore::with_table` (and `PgEventBus` init for a custom `events_table`)
+    auto-migrates the custom table at startup via an idempotent
+    `ADD COLUMN IF NOT EXISTS` + `SET DEFAULT` + `CREATE INDEX IF NOT EXISTS`; on
+    failure it logs a `warn!` and degrades to timeout-only for that table.
+  - **PostgreSQL 13+ is now the minimum supported version** for the event bus
+    (uses the `pg_current_xact_id` / `pg_current_snapshot` epoch-extended id APIs).
 - **Gap-timeout observability** (`epoch_pg`) — when a subscriber's checkpoint is
   advanced past a missing `global_sequence` due to `gap_timeout`, the event bus now:
   - Emits a `WARN` log with `bus_name`, `subscriber_id`, `skipped_sequence`, and
@@ -74,6 +100,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `on_gap_timeout: Option<Arc<dyn GapTimeoutCallback>>` field (defaults to `None`).
   Code that constructs `ReliableDeliveryConfig` using struct-literal syntax (rather than
   `..Default::default()`) must add `on_gap_timeout: None` to the literal.
+- **Source-compat note**: `ReliableDeliveryConfig` (`epoch_pg`) gains the new
+  `snapshot_fencing: bool` field (defaults to `true`). Code that constructs
+  `ReliableDeliveryConfig` using struct-literal syntax (rather than
+  `..Default::default()`) must add `snapshot_fencing: true` (or `false`) to the literal.
 
 ### Removed
 
