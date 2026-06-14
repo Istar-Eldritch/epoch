@@ -459,3 +459,18 @@ will fail the contract test.
 | `epoch_pg/tests/store_events_atomicity_integration_tests.rs` | **New** — DB-gated contract test |
 | `epoch_core/tests/store_events_atomicity_contract_test.rs` | **New** — non-atomic backend double regression test |
 | `CHANGELOG` | Breaking-change entry (§9) |
+
+---
+
+## Phases (JSON)
+
+```json
+{
+  "phases": [
+    { "phase": 1, "focus": "Core change: remove default store_events(), add testing feature + contract test helper", "effort": "S", "difficulty": "hard" },
+    { "phase": 2, "focus": "Wire contract tests in epoch_mem, epoch_pg, and NonAtomicBackend regression test", "effort": "M", "difficulty": "standard" },
+    { "phase": 3, "focus": "CHANGELOG, migration note, final fmt/clippy/test gates", "effort": "XS", "difficulty": "standard" }
+  ]
+}
+```
+
