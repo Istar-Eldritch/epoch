@@ -13,7 +13,7 @@
 ## 1. Problem Statement
 
 The default implementation of `EventStoreBackend::store_events()` in
-`epoch_core/src/event_store.rs:65-78` loops over `store_event()` per event:
+`epoch_core/src/event_store.rs:65-70` loops over `store_event()` per event:
 
 ```rust
 async fn store_events(&self, events: Vec<Event<Self::EventType>>) -> Result<(), Self::Error> {
@@ -36,7 +36,7 @@ The two first-party backends already override this method correctly:
   `Mutex` guard: validate every event's `stream_version` first, then commit all
   events, then publish after releasing the lock. Storage is atomic; publishing is
   best-effort post-commit (acceptable for event sourcing — see §6).
-- **`epoch_pg/src/event_store.rs:424-435`** — a real PostgreSQL transaction: `BEGIN`,
+- **`epoch_pg/src/event_store.rs:424-434`** — a real PostgreSQL transaction: `BEGIN`,
   `store_events_in_tx()`, `COMMIT`, then `publish_events()`. Truly atomic on the
   storage side.
 
@@ -101,13 +101,12 @@ The discovery listed three options:
 - **Document the contract** on the trait method (G-2).
 
 Option 3 (contiguity validation) is explicitly rejected as the *primary* mechanism:
-it is a partial fix and would live in backends anyway. The contract test already
-covers the contiguity-mismatch scenario as its failure trigger.
+it is a partial fix and would live in backends anyway. The contract test now uses a
+**duplicate `stream_version`** as its failure trigger, which both first-party backends
+reject and which reliably exposes partial writes in non-atomic implementations.
 
-> **Reviewer decision point:** if breaking the trait is undesirable even at 0.1.0, the
-> fallback is to *keep* the default but change its body to **unconditionally fail**
-> (e.g. `unimplemented!`-style error) — but that defers the failure to runtime rather
-> than compile time and is strictly worse than removal. Removal is recommended.
+Removal is the chosen approach. At workspace version 0.1.0 (pre-1.0), this is an
+acceptable breaking change — see §9 for migration guidance.
 
 ---
 
@@ -210,7 +209,7 @@ use uuid::Uuid;
 ///
 /// The helper:
 /// 1. seeds version 1 with a single `store_event`,
-/// 2. submits a batch `[v2, v3, v5]` whose third event skips version 4,
+/// 2. submits a batch `[v2, v3, v3]` whose third event duplicates `v3`,
 /// 3. asserts the batch is rejected (`Err`), and
 /// 4. asserts the stream still contains exactly the one seeded event — proving
 ///    no event from the failed batch was persisted.
@@ -245,12 +244,12 @@ pub async fn verify_store_events_atomicity<B>(
     let bad_batch = vec![
         make_event(stream_id, 2), // ok
         make_event(stream_id, 3), // ok
-        make_event(stream_id, 5), // gap: skips 4 -> must abort whole batch
+        make_event(stream_id, 3), // duplicate of stream_version, 3 -> must abort whole batch
     ];
     let result = backend.store_events(bad_batch).await;
     assert!(
         result.is_err(),
-        "store_events with a mid-batch version gap must return Err"
+        "store_events with a mid-batch duplicate stream_version must return Err"
     );
 
     let mut stream = backend
@@ -285,10 +284,11 @@ pub async fn verify_store_events_atomicity<B>(
 }
 ```
 
-> The contract test induces the partial failure via a **`stream_version` gap**, which
-> every backend that enforces optimistic concurrency (both first-party backends do)
-> will reject. This is the realistic, deterministic failure mode for batch writes and
-> needs no fault injection.
+> The contract test induces the partial failure via a **mid-batch duplicate
+> `stream_version`**. Every backend that enforces optimistic concurrency rejects it:
+> `epoch_mem` detects the mismatch in its sequential version check, and `epoch_pg`
+> detects it via the `UNIQUE (stream_id, stream_version)` constraint. This is the
+> realistic, deterministic failure mode for batch writes and needs no fault injection.
 
 ### 5.3 `epoch_mem` — Wire the contract test in
 
@@ -324,11 +324,38 @@ existing `epoch_core` dependency path (currently `epoch_pg` pulls `epoch_core`
 transitively via `epoch_mem`; add an explicit dev-dependency on `epoch_core` with the
 `testing` feature).
 
-Add a `#[serial_test::serial]`, DB-gated integration test (matching the existing
+Add a `#[serial_test::serial]`, DB-gated integration test in
+`epoch_pg/tests/store_events_atomicity_integration_tests.rs` (matching the existing
 `epoch_pg` integration-test harness) that constructs a `PgEventStore` against a clean
 table and calls `verify_store_events_atomicity`.
 
-### 5.5 `epoch_core/src/lib.rs` — exports
+### 5.6 `epoch_core/tests/store_events_atomicity_contract_test.rs` — Non-atomic backend double
+
+Add a committed regression test that proves `verify_store_events_atomicity` catches
+non-atomic implementations. The test defines a minimal `NonAtomicBackend` whose
+`store_events` is exactly the naive per-event loop, then calls the helper and
+expects it to panic/fail.
+
+This satisfies AC-3's requirement that the helper *fails* for a non-atomic
+`store_events()`, without relying on a manual, uncommitted revert step.
+
+```rust
+#[tokio::test]
+#[should_panic(expected = "after a rejected batch the stream must contain only the seeded event")]
+async fn verify_store_events_atomicity_detects_non_atomic_backend() {
+    let backend = NonAtomicBackend::new();
+    epoch_core::testing::verify_store_events_atomicity(backend, |stream_id, version| {
+        // ... build Event<TestEvent> ...
+    }).await;
+}
+```
+
+The `NonAtomicBackend` stores events in a `Mutex<Vec<Event<TestEvent>>>` and
+implements `store_events` by looping `store_event`, mirroring old default behavior.
+Because it has no optimistic-concurrency check beyond appending, the helper's
+bad batch leaks the first two events and the assertion panics.
+
+### 5.7 `epoch_core/src/lib.rs` — exports
 
 No change to `prelude` (the `testing` module is intentionally **not** in the prelude —
 it is opt-in via the feature flag and referenced by full path).
@@ -359,9 +386,10 @@ Following the repository TDD convention (red → green → refactor):
    the `testing` feature in `Cargo.toml` + `lib.rs`. Add the `epoch_mem` integration
    test that calls it. Run `cargo test -p epoch_mem` — it passes (mem is already
    atomic), confirming the helper is correctly wired.
-2. **(red→proof)** Temporarily revert `epoch_mem`'s override to the naive loop and
-   confirm the helper **fails** (proving it actually catches non-atomicity), then
-   restore the override. *(Manual verification step; not committed.)*
+2. **(red)** Add `epoch_core/tests/store_events_atomicity_contract_test.rs` with a
+   `NonAtomicBackend` whose `store_events` loops `store_event`. The test should
+   **fail** (panic) because the helper detects non-atomicity. This proves AC-3 and
+   provides regression protection.
 3. **(green)** Remove the default body from `EventStoreBackend::store_events()` and
    update the trait docs (§5.1). Run `cargo build -p epoch_core` — confirm it fails
    *only* for any backend lacking an override (both first-party backends already
@@ -425,5 +453,6 @@ will fail the contract test.
 | `epoch_mem/Cargo.toml` | Dev-dependency `epoch_core` with `features = ["testing"]` |
 | `epoch_mem/tests/store_events_atomicity_tests.rs` | **New** — runs the contract test |
 | `epoch_pg/Cargo.toml` | Dev-dependency `epoch_core` with `features = ["testing"]` |
-| `epoch_pg/tests/` | **New** DB-gated test running the contract test |
+| `epoch_pg/tests/store_events_atomicity_integration_tests.rs` | **New** — DB-gated contract test |
+| `epoch_core/tests/store_events_atomicity_contract_test.rs` | **New** — non-atomic backend double regression test |
 | `CHANGELOG` | Breaking-change entry (§9) |
