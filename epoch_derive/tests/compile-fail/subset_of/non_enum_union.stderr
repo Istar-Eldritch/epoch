@@ -1,0 +1,5 @@
+error: SubsetOf can only be derived for enums, found union
+ --> tests/compile-fail/subset_of/non_enum_union.rs:5:7
+  |
+5 | union BadUnion {
+  |       ^^^^^^^^

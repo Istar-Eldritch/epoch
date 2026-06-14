@@ -1,0 +1,25 @@
+error[E0559]: variant `AppEvent::X` has no field named `wrong_field`
+  --> tests/compile-fail/subset_of/bad_field_name.rs:17:9
+   |
+17 |     X { wrong_field: String },
+   |         ^^^^^^^^^^^ `AppEvent::X` does not have this field
+   |
+   = note: all struct fields are already assigned
+
+error[E0026]: variant `AppEvent::X` does not have a field named `wrong_field`
+  --> tests/compile-fail/subset_of/bad_field_name.rs:17:9
+   |
+17 |     X { wrong_field: String },
+   |         ^^^^^^^^^^^ variant `AppEvent::X` does not have this field
+
+error: pattern requires `..` due to inaccessible fields
+  --> tests/compile-fail/subset_of/bad_field_name.rs:14:10
+   |
+14 | #[derive(SubsetOf)]
+   |          ^^^^^^^^
+   |
+   = note: this error originates in the derive macro `SubsetOf` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: ignore the inaccessible and unused fields
+   |
+17 |     X { wrong_field, ..: String },
+   |                    ++++

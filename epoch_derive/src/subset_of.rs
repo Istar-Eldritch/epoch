@@ -153,7 +153,7 @@ fn subset_of_impl_internal(input: TokenStream) -> TokenStream {
                     let field_names: Vec<_> = fields
                         .named
                         .iter()
-                        .map(|f| f.ident.as_ref().unwrap())
+                        .map(|f| f.ident.as_ref().expect("named fields always have idents"))
                         .collect();
                     quote! {
                         #sub_name::#variant_name { #(#field_names),* } => #super_path::#variant_name { #(#field_names),* },
@@ -189,7 +189,7 @@ fn subset_of_impl_internal(input: TokenStream) -> TokenStream {
                     let field_names: Vec<_> = fields
                         .named
                         .iter()
-                        .map(|f| f.ident.as_ref().unwrap())
+                        .map(|f| f.ident.as_ref().expect("named fields always have idents"))
                         .collect();
                     quote! {
                         #super_path::#variant_name { #(#field_names),* } => ::core::result::Result::Ok(#sub_name::#variant_name { #(#field_names),* }),
@@ -226,7 +226,7 @@ fn subset_of_impl_internal(input: TokenStream) -> TokenStream {
                     let field_names: Vec<_> = fields
                         .named
                         .iter()
-                        .map(|f| f.ident.as_ref().unwrap())
+                        .map(|f| f.ident.as_ref().expect("named fields always have idents"))
                         .collect();
                     let cloned_fields: Vec<_> = field_names
                         .iter()

@@ -28,6 +28,11 @@ pub fn subset_enum(
 /// (variant name, field names, field types) is enforced by the Rust compiler when it
 /// type-checks the generated match bodies against the real superset definition.
 ///
+/// Because the generated `impl From<YourSubset> for Super` places your local subset as
+/// a type parameter, the orphan rule is satisfied even when `Super` is a foreign type.
+/// The superset variants and their fields must be publicly constructible, since the
+/// generated `From` body constructs them directly.
+///
 /// # Basic Usage
 ///
 /// ```ignore
@@ -62,6 +67,17 @@ pub fn subset_enum(
 ///     MachineReleased { machine_id: uuid::Uuid },
 /// }
 /// ```
+///
+/// **Generic supersets.** When the superset path includes generic parameters, use
+/// turbofish syntax: `#[subset_of(Super::<DomainType>)]` — plain angle brackets
+/// (`Super<DomainType>`) do not parse in attribute arguments.
+///
+/// # Limitations
+///
+/// Supersets marked `#[non_exhaustive]`, or whose variants have non-public fields,
+/// will fail to compile because the generated `From` body constructs superset
+/// variants directly. This is caught at compile time; for such supersets, continue
+/// using hand-written conversions.
 ///
 /// # Generic Subset Enums
 ///

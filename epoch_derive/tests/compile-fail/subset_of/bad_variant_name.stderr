@@ -1,0 +1,20 @@
+error[E0599]: no variant or associated item named `Z` found for enum `AppEvent` in the current scope
+  --> tests/compile-fail/subset_of/bad_variant_name.rs:19:5
+   |
+ 9 |       pub enum AppEvent {
+   |       ----------------- variant or associated item `Z` not found for this enum
+...
+16 |   #[subset_of(super_mod::AppEvent)]
+   |  _____________-
+17 | | enum BadSubset {
+18 | |     A,
+19 | |     Z, // Z does not exist on AppEvent
+   | |    -^ variant or associated item not found in `AppEvent`
+   | |____|
+   |
+   |
+help: there is a variant with a similar name
+   |
+19 -     Z, // Z does not exist on AppEvent
+19 +     A, // Z does not exist on AppEvent
+   |
