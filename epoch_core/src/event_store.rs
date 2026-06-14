@@ -65,7 +65,7 @@ pub trait EventStoreBackend: Send + Sync {
     ///
     /// # Verifying Your Implementation
     ///
-    /// Use [`crate::testing::verify_store_events_atomicity`] in your backend's test
+    /// Use `crate::testing::verify_store_events_atomicity` in your backend's test
     /// suite to assert this contract holds.
     ///
     /// [`read_events`]: Self::read_events
