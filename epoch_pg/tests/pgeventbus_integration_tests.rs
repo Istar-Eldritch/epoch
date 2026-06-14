@@ -2878,12 +2878,20 @@ async fn create_sequence_gap(pool: &PgPool, stream_id: Uuid) -> (Uuid, u64, Uuid
 /// store for assertions.
 async fn start_gap_test_bus(
     pool: &PgPool,
-    config: epoch_pg::event_bus::ReliableDeliveryConfig,
+    mut config: epoch_pg::event_bus::ReliableDeliveryConfig,
 ) -> (
     PgEventBus<TestEventData>,
     String,
     InMemoryStateStore<TestState>,
 ) {
+    // These CLOUD-169 observability tests construct their gaps with *committed*
+    // rolled-back transactions, so under the CLOUD-180 default (`snapshot_fencing
+    // = true`) the resolver would prove the gap permanent and skip it as
+    // `FenceCleared` — without recording a gap-timeout row. To keep exercising
+    // the backstop recording machinery they intentionally target the legacy
+    // timeout-only path. The fence-aware behaviour is covered separately by the
+    // dedicated CLOUD-180 integration tests.
+    config.snapshot_fencing = false;
     let channel_name = format!("test_gap_obs_{}", Uuid::new_v4().simple());
     let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
     event_bus

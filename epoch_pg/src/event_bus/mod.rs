@@ -12,7 +12,9 @@ pub use config::{
     GapTimeoutInfo, InstanceMode, ReliableDeliveryConfig,
 };
 pub(crate) use retry::{ProcessResult, process_event_with_retry};
-pub(crate) use subscriber_state::{SubscriberState, advance_contiguous_checkpoint};
+pub(crate) use subscriber_state::{
+    SkipReason, SubscriberState, TxidSnapshot, advance_contiguous_checkpoint,
+};
 
 #[cfg(test)]
 pub use retry::calculate_retry_delay_no_jitter;
@@ -66,6 +68,67 @@ struct BatchContext {
     config: ReliableDeliveryConfig,
     dlq_pool: PgPool,
     checkpoint_pool: PgPool,
+    /// The transaction-id snapshot captured once for this batch (CLOUD-180), or
+    /// `None` when fencing is disabled, no gaps were active, or the snapshot
+    /// query failed (graceful timeout-only fallback for the batch).
+    snapshot: Option<TxidSnapshot>,
+}
+
+/// Ensures the `txid` column (CLOUD-180 snapshot fencing) exists on `table` with
+/// the correct `pg_current_xact_id()` default and a partial index.
+///
+/// Idempotent — safe to call on every startup. The three statements all use
+/// `IF NOT EXISTS` / `SET DEFAULT`, so `ADD COLUMN` is a metadata-only operation
+/// (no table rewrite) on PG13+. Intended for **custom** events tables; the
+/// default `epoch_events` table is covered by migration m011.
+///
+/// On error the caller should `warn!` and continue: fencing simply degrades to
+/// timeout-only for that table.
+pub(crate) async fn ensure_txid_column(pool: &PgPool, table: &str) -> Result<(), SqlxError> {
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS txid BIGINT"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ALTER COLUMN txid SET DEFAULT (pg_current_xact_id()::text::bigint)"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_{table}_txid ON {table} (txid) WHERE txid IS NOT NULL"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Queries the reader session's current transaction-id snapshot bounds (PG13+).
+///
+/// Returns `None` (with a single `warn!`) on query failure so the caller can
+/// gracefully fall back to timeout-only gap resolution for the batch.
+async fn query_txid_snapshot(pool: &PgPool) -> Option<TxidSnapshot> {
+    let result = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT pg_snapshot_xmin(s)::text::bigint AS xmin, \
+         pg_snapshot_xmax(s)::text::bigint AS xmax \
+         FROM pg_current_snapshot() s",
+    )
+    .fetch_one(pool)
+    .await;
+    match result {
+        Ok((xmin, xmax)) => Some(TxidSnapshot {
+            xmin: xmin as u64,
+            xmax: xmax as u64,
+        }),
+        Err(e) => {
+            warn!(
+                "Failed to query txid snapshot for gap fencing; \
+                 falling back to timeout-only resolution for this batch: {}",
+                e
+            );
+            None
+        }
+    }
 }
 
 /// Processes one subscriber against the pre-fetched batch of events.
@@ -88,6 +151,7 @@ where
         config,
         dlq_pool,
         checkpoint_pool,
+        snapshot,
     } = ctx;
     let contiguous_before = state.contiguous_checkpoint;
     let mut processed_any = false;
@@ -165,19 +229,45 @@ where
         processed_any = true;
     }
 
-    // Phase 2 stub: pass `None` (fencing unavailable) so behaviour is identical to
-    // the legacy timeout-only resolver. Phase 3 threads the real per-batch snapshot
-    // through `BatchContext` and partitions the result by `SkipReason`.
+    // CLOUD-180: thread the per-batch snapshot into the pure resolver. With
+    // `None` (fencing disabled/unavailable) this is byte-for-byte the legacy
+    // timeout-only resolver.
     let skipped_gaps =
-        advance_contiguous_checkpoint(&mut state, &visible_seqs, config.gap_timeout, None);
+        advance_contiguous_checkpoint(&mut state, &visible_seqs, config.gap_timeout, snapshot);
 
-    // Emit a single batched WARN log summarising all gaps before the per-gap
-    // fire-and-forget persistence/callback tasks run. This avoids N×subscriber
-    // identical warnings when many sequences time out at once (e.g. after a
-    // deployment restart). See CLOUD-109.
-    if !skipped_gaps.is_empty() {
+    // Partition by reason: `FenceCleared` skips are expected, lossless rollbacks
+    // (writer aborted / burned sequence) and are only debug-logged. Only
+    // `TimeoutBackstop` skips carry potential data loss and are recorded via the
+    // CLOUD-169 machinery.
+    let (fence_cleared, timeout_backstop): (Vec<_>, Vec<_>) = skipped_gaps
+        .into_iter()
+        .partition(|gap| gap.reason == SkipReason::FenceCleared);
+
+    // Fence-cleared gaps are proven permanent with no data loss: a single debug
+    // line, no WARN / record / callback.
+    if !fence_cleared.is_empty() {
+        let gaps_summary = fence_cleared
+            .iter()
+            .map(|gap| format!("seq {} ({:?})", gap.skipped_sequence, gap.gap_duration))
+            .collect::<Vec<_>>()
+            .join(", ");
+        log::debug!(
+            "Snapshot fence cleared for '{}' on bus '{}': advancing past {} \
+             proven-permanent (rolled-back / burned) sequence(s) — {} — no data loss",
+            subscriber_id,
+            config.events_table,
+            fence_cleared.len(),
+            gaps_summary
+        );
+    }
+
+    // Emit a single batched WARN log summarising all backstop gaps before the
+    // per-gap fire-and-forget persistence/callback tasks run. This avoids
+    // N×subscriber identical warnings when many sequences time out at once (e.g.
+    // after a deployment restart). See CLOUD-109.
+    if !timeout_backstop.is_empty() {
         let bus_name = &config.events_table;
-        let gaps_summary = skipped_gaps
+        let gaps_summary = timeout_backstop
             .iter()
             .map(|gap| format!("seq {} ({:?})", gap.skipped_sequence, gap.gap_duration))
             .collect::<Vec<_>>()
@@ -188,15 +278,36 @@ where
              delivered to this subscriber (recorded in epoch_event_bus_gap_timeouts)",
             subscriber_id,
             bus_name,
-            skipped_gaps.len(),
+            timeout_backstop.len(),
             gaps_summary
         );
+
+        // Persistent-pin diagnostic (OQ-3): when fencing was active but the fence
+        // never cleared (an old transaction is pinning `xmin` past `fence_xmax`),
+        // emit a dedicated WARN with the current `xmin`/`fence_xmax` so operators
+        // can identify the offending long-running session via pg_stat_activity /
+        // pg_prepared_xacts. Skipped when no snapshot was available this batch.
+        if let Some(snap) = snapshot {
+            for gap in &timeout_backstop {
+                if let Some(fence_xmax) = gap.fence_xmax
+                    && snap.xmin < fence_xmax
+                {
+                    warn!(
+                        "Gap timeout backstop fired for '{}' on bus '{}' seq {} while the \
+                         snapshot fence was still pinned (xmin {} < fence_xmax {}); an \
+                         in-flight transaction may still be holding this sequence — inspect \
+                         pg_stat_activity / pg_prepared_xacts for the offending session",
+                        subscriber_id, bus_name, gap.skipped_sequence, snap.xmin, fence_xmax
+                    );
+                }
+            }
+        }
     }
 
-    // For each gap the checkpoint advanced past due to timeout, fire-and-forget
-    // a task that persists the record and invokes the callback. Neither the log
-    // nor the DB write gates checkpoint advancement (NFR-1).
-    for gap in skipped_gaps {
+    // For each backstop gap the checkpoint advanced past, fire-and-forget a task
+    // that persists the record and invokes the callback. Neither the log nor the
+    // DB write gates checkpoint advancement (NFR-1).
+    for gap in timeout_backstop {
         let bus_name = config.events_table.clone();
         let sub_id = subscriber_id.clone();
 
@@ -623,6 +734,20 @@ where
     ///
     /// This method is idempotent - it will drop and recreate the trigger if it exists.
     pub async fn setup_trigger(&self) -> Result<(), SqlxError> {
+        // CLOUD-180: ensure the `txid` column exists on a custom events table so
+        // snapshot-fencing forensics work. The default `epoch_events` table is
+        // covered by migration m011, so it is skipped here. Failure degrades to
+        // timeout-only fencing for this table (G-5), so we only warn.
+        if self.config.events_table != "epoch_events"
+            && let Err(e) = ensure_txid_column(&self.pool, &self.config.events_table).await
+        {
+            warn!(
+                "Failed to ensure txid column on custom events table '{}'; \
+                 snapshot fencing degrades to timeout-only for this bus: {}",
+                self.config.events_table, e
+            );
+        }
+
         // Drop existing trigger if present
         sqlx::query(&format!(
             "DROP TRIGGER IF EXISTS epoch_event_bus_notify_trigger ON {};",
@@ -997,6 +1122,23 @@ where
                     let shared_visible = Arc::new(visible_seqs);
                     let shared_seq_to_id = Arc::new(seq_to_id);
 
+                    // CLOUD-180: acquire the transaction-id snapshot once per batch,
+                    // but only when fencing is enabled and at least one subscriber
+                    // already has an active gap (OQ-4). Brand-new gaps detected in
+                    // this batch get a `fence_xmax = None` observation and are
+                    // backfilled on the next batch (which will now see an active
+                    // gap and query the snapshot). This keeps the common no-gap
+                    // path at zero extra round trips.
+                    let batch_snapshot = if config.snapshot_fencing
+                        && subscriber_states
+                            .values()
+                            .any(|s| !s.gap_first_seen.is_empty())
+                    {
+                        query_txid_snapshot(&checkpoint_pool).await
+                    } else {
+                        None
+                    };
+
                     // Collect (priority, subscriber_id, projection) tuples sequentially.
                     // We hold projections_guard here, so inner per-subscriber locks are
                     // acquired one at a time to read metadata.
@@ -1044,6 +1186,7 @@ where
                                         config: config.clone(),
                                         dlq_pool: dlq_pool.clone(),
                                         checkpoint_pool: checkpoint_pool.clone(),
+                                        snapshot: batch_snapshot,
                                     },
                                 )
                             })

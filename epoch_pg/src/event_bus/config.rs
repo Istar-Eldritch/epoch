@@ -230,6 +230,24 @@ pub struct ReliableDeliveryConfig {
     /// (e.g. `"iam_events"`, `"billing_events"`) to route a bus at a
     /// physically-separate event table.
     pub events_table: String,
+
+    /// Whether to use PostgreSQL snapshot fencing (CLOUD-180) when resolving
+    /// sequence gaps.
+    ///
+    /// When `true` (default), the gap resolver queries the current transaction
+    /// snapshot and only advances the checkpoint past a gap once it can prove no
+    /// in-flight transaction can still fill it. The [`gap_timeout`] then acts
+    /// only as a backstop for pathological cases (e.g. abandoned prepared
+    /// transactions).
+    ///
+    /// When `false`, the resolver reverts to the legacy `gap_timeout`-only
+    /// behaviour. Fencing also auto-disables for a batch if the snapshot query
+    /// fails or the `txid` primitives are unavailable.
+    ///
+    /// Default: `true`
+    ///
+    /// [`gap_timeout`]: Self::gap_timeout
+    pub snapshot_fencing: bool,
 }
 
 impl Default for ReliableDeliveryConfig {
@@ -247,6 +265,7 @@ impl Default for ReliableDeliveryConfig {
             on_gap_timeout: None,
             dispatch_mode: DispatchMode::default(),
             events_table: "epoch_events".to_string(),
+            snapshot_fencing: true,
         }
     }
 }
@@ -272,6 +291,7 @@ impl std::fmt::Debug for ReliableDeliveryConfig {
             )
             .field("dispatch_mode", &self.dispatch_mode)
             .field("events_table", &self.events_table)
+            .field("snapshot_fencing", &self.snapshot_fencing)
             .finish()
     }
 }
@@ -406,6 +426,7 @@ mod tests {
             on_gap_timeout: None,
             dispatch_mode: DispatchMode::default(),
             events_table: "custom_events".to_string(),
+            snapshot_fencing: false,
         };
 
         assert_eq!(config.max_retries, 5);
@@ -416,6 +437,7 @@ mod tests {
         assert_eq!(config.gap_timeout, Duration::from_secs(10));
         assert!(config.on_dlq_insertion.is_none());
         assert!(config.on_gap_timeout.is_none());
+        assert!(!config.snapshot_fencing);
     }
 
     #[test]
