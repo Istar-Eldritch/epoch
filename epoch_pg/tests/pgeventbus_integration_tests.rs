@@ -2878,12 +2878,20 @@ async fn create_sequence_gap(pool: &PgPool, stream_id: Uuid) -> (Uuid, u64, Uuid
 /// store for assertions.
 async fn start_gap_test_bus(
     pool: &PgPool,
-    config: epoch_pg::event_bus::ReliableDeliveryConfig,
+    mut config: epoch_pg::event_bus::ReliableDeliveryConfig,
 ) -> (
     PgEventBus<TestEventData>,
     String,
     InMemoryStateStore<TestState>,
 ) {
+    // These CLOUD-169 observability tests construct their gaps with *committed*
+    // rolled-back transactions, so under the CLOUD-180 default (`snapshot_fencing
+    // = true`) the resolver would prove the gap permanent and skip it as
+    // `FenceCleared` — without recording a gap-timeout row. To keep exercising
+    // the backstop recording machinery they intentionally target the legacy
+    // timeout-only path. The fence-aware behaviour is covered separately by the
+    // dedicated CLOUD-180 integration tests.
+    config.snapshot_fencing = false;
     let channel_name = format!("test_gap_obs_{}", Uuid::new_v4().simple());
     let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
     event_bus
@@ -3675,4 +3683,543 @@ async fn test_buffer_drain_deser_error_advances_checkpoint() {
         .expect("cleanup malformed event");
 
     event_bus.shutdown().await.expect("shutdown");
+}
+
+// ============================================================================
+// Snapshot-fencing integration tests (spec 0019 / CLOUD-180)
+//
+// These tests exercise the snapshot-fencing gap resolver end-to-end against a
+// live PostgreSQL (PG13+). They orchestrate real concurrent transactions — an
+// in-flight writer, a rolled-back writer, and an unrelated `xmin`-pinning
+// sentinel — so the `txid`/snapshot interaction is exercised for real rather
+// than simulated. All tests are `#[serial]`, use fresh `Uuid::new_v4()` streams,
+// and scope assertions to their own randomly-generated subscriber id.
+// ============================================================================
+
+/// Builds and starts a `PgEventBus` honouring the supplied `config` (in
+/// particular, **not** forcing `snapshot_fencing`), subscribes a fresh
+/// `TestProjection`, and returns the bus, its subscriber id, and state store.
+async fn start_fence_test_bus(
+    pool: &PgPool,
+    config: epoch_pg::event_bus::ReliableDeliveryConfig,
+) -> (
+    PgEventBus<TestEventData>,
+    String,
+    InMemoryStateStore<TestState>,
+) {
+    let channel_name = format!("test_fence_{}", Uuid::new_v4().simple());
+    let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup event bus trigger");
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start event bus listener");
+
+    let projection = TestProjection::new();
+    let subscriber_id = projection.subscriber_id().to_string();
+    let projection_events = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe projection");
+
+    // Let catch-up and buffer setup complete before producing the gap.
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    (event_bus, subscriber_id, projection_events)
+}
+
+/// FR-1 / FR-2: after migrations `epoch_events` has a `txid BIGINT` column that
+/// new inserts populate via the `pg_current_xact_id()` DEFAULT, while rows
+/// written with an explicit `NULL` (simulating pre-m011 history) are tolerated.
+#[tokio::test]
+#[serial]
+async fn test_txid_column_exists_and_populates() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // The column exists after m011 and is a BIGINT.
+    let col: Option<(String,)> = sqlx::query_as(
+        "SELECT data_type FROM information_schema.columns \
+         WHERE table_name = 'epoch_events' AND column_name = 'txid'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("query txid column");
+    let (data_type,) = col.expect("txid column must exist on epoch_events after m011");
+    assert_eq!(data_type, "bigint", "txid must be a BIGINT column");
+
+    // A new insert populates txid via the DEFAULT.
+    let stream_id = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    let data = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: "txid_populates".to_string(),
+    }))
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at)
+           VALUES ($1, $2, 1, 'MyEvent', $3, NOW())"#,
+    )
+    .bind(id)
+    .bind(stream_id)
+    .bind(&data)
+    .execute(&pool)
+    .await
+    .expect("insert event");
+    let txid: Option<i64> = sqlx::query_scalar("SELECT txid FROM epoch_events WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("query txid");
+    assert!(
+        txid.is_some(),
+        "a new insert must populate txid via the column DEFAULT"
+    );
+
+    // A row written with an explicit NULL txid (pre-m011 history) is tolerated.
+    let legacy_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO epoch_events
+               (id, stream_id, stream_version, event_type, data, created_at, txid)
+           VALUES ($1, $2, 2, 'MyEvent', $3, NOW(), NULL)"#,
+    )
+    .bind(legacy_id)
+    .bind(stream_id)
+    .bind(&data)
+    .execute(&pool)
+    .await
+    .expect("insert legacy NULL-txid row");
+    let legacy_txid: Option<i64> =
+        sqlx::query_scalar("SELECT txid FROM epoch_events WHERE id = $1")
+            .bind(legacy_id)
+            .fetch_one(&pool)
+            .await
+            .expect("query legacy txid");
+    assert!(
+        legacy_txid.is_none(),
+        "an explicit NULL txid must be tolerated (pre-migration rows keep NULL)"
+    );
+
+    // Clean up this test's rows.
+    sqlx::query("DELETE FROM epoch_events WHERE id = ANY($1)")
+        .bind(vec![id, legacy_id])
+        .execute(&pool)
+        .await
+        .expect("cleanup txid test rows");
+}
+
+/// Issue test (a) / FR-5: a gap whose writer is still in-flight must be HELD —
+/// the checkpoint does not advance and no gap-timeout row is recorded — until
+/// the writer commits, after which the previously-missing event is delivered and
+/// the checkpoint advances.
+#[tokio::test]
+#[serial]
+async fn test_in_flight_transaction_gap_is_held() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // Generous gap_timeout so the backstop cannot fire while we observe the hold.
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        ..Default::default()
+    };
+    let (event_bus, subscriber_id, projection_events) = start_fence_test_bus(&pool, config).await;
+
+    let stream_id = Uuid::new_v4();
+
+    // Open transaction A and claim the next global_sequence (N) WITHOUT committing.
+    let mut tx_a = pool.begin().await.expect("begin in-flight tx A");
+    let in_flight_id = Uuid::new_v4();
+    let data = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: "in_flight_N".to_string(),
+    }))
+    .unwrap();
+    let seq_n: i64 = sqlx::query_scalar(
+        r#"INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at)
+           VALUES ($1, $2, 1, 'MyEvent', $3, NOW())
+           RETURNING global_sequence"#,
+    )
+    .bind(in_flight_id)
+    .bind(stream_id)
+    .bind(&data)
+    .fetch_one(&mut *tx_a)
+    .await
+    .expect("claim sequence N in tx A");
+
+    // Commit the following event (N+1) in a separate transaction.
+    let (after_id, seq_after) = insert_committed_event(&pool, stream_id, 2, "after_gap").await;
+    assert!(
+        seq_after > seq_n,
+        "the committed event must own a later global_sequence than the in-flight one"
+    );
+
+    // Give the listener several periodic ticks to observe the gap and fence it.
+    tokio::time::sleep(GapDuration::from_secs(4)).await;
+
+    // The in-flight gap must NOT be recorded (the writer may still commit).
+    let entries = event_bus
+        .list_gap_timeouts(Some(&subscriber_id), false, 0, 50)
+        .await
+        .expect("list gap timeouts");
+    assert!(
+        !entries.iter().any(|e| e.skipped_sequence == seq_n as u64),
+        "an in-flight gap must not be recorded as a timeout while the writer is alive"
+    );
+
+    // The checkpoint must not have advanced past the held gap.
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("get checkpoint");
+    assert!(
+        checkpoint.is_none() || matches!(checkpoint, Some(s) if s < seq_n as u64),
+        "checkpoint ({checkpoint:?}) must not advance past the in-flight gap at {seq_n}"
+    );
+
+    // Commit the in-flight writer: the gap fills.
+    tx_a.commit().await.expect("commit in-flight tx A");
+
+    // Allow the listener to deliver the now-visible event and advance.
+    tokio::time::sleep(GapDuration::from_secs(2)).await;
+
+    let state = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("Should have received events once the writer committed");
+    let ids: Vec<Uuid> = state.0.iter().map(|e| e.id).collect();
+    assert!(
+        ids.contains(&in_flight_id),
+        "the previously in-flight event must be delivered after its commit"
+    );
+    assert!(
+        ids.contains(&after_id),
+        "the event after the gap must be delivered"
+    );
+
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("get checkpoint");
+    assert!(
+        matches!(checkpoint, Some(s) if s >= seq_after as u64),
+        "checkpoint ({checkpoint:?}) must advance past the filled gap to {seq_after}"
+    );
+
+    // Still no gap-timeout record: the gap filled, it was never skipped.
+    let entries = event_bus
+        .list_gap_timeouts(Some(&subscriber_id), false, 0, 50)
+        .await
+        .expect("list gap timeouts");
+    assert!(
+        !entries.iter().any(|e| e.skipped_sequence == seq_n as u64),
+        "a filled gap must never be recorded as a timeout"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+/// G-2 / FR-6: a genuinely rolled-back gap is resolved by the fence clearing
+/// (no in-flight transaction can fill it) — the surrounding events are delivered
+/// well within `gap_timeout` and NO gap-timeout row is recorded.
+#[tokio::test]
+#[serial]
+async fn test_rolled_back_gap_fence_clears_without_record() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // Generous gap_timeout: if a record appears it can only be the (wrong)
+    // backstop, never the fence-clear path we expect.
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        ..Default::default()
+    };
+    let (event_bus, subscriber_id, projection_events) = start_fence_test_bus(&pool, config).await;
+
+    let stream_id = Uuid::new_v4();
+    let (before_id, skipped_seq, after_id) = create_sequence_gap(&pool, stream_id).await;
+
+    // The fence should clear far faster than the 30s gap_timeout.
+    tokio::time::sleep(GapDuration::from_secs(6)).await;
+
+    let state = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("Should have received events around the rolled-back gap");
+    let ids: Vec<Uuid> = state.0.iter().map(|e| e.id).collect();
+    assert!(
+        ids.contains(&before_id),
+        "event before the gap must be delivered"
+    );
+    assert!(
+        ids.contains(&after_id),
+        "event after the gap must be delivered via fence-clear (not the backstop)"
+    );
+
+    // No gap-timeout record: the fence cleared the gap, it is not a backstop skip.
+    let entries = event_bus
+        .list_gap_timeouts(Some(&subscriber_id), false, 0, 50)
+        .await
+        .expect("list gap timeouts");
+    assert!(
+        !entries.iter().any(|e| e.skipped_sequence == skipped_seq),
+        "a fence-cleared (proven rolled-back) gap must NOT be recorded as a timeout"
+    );
+
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("get checkpoint");
+    assert!(
+        matches!(checkpoint, Some(s) if s >= skipped_seq),
+        "checkpoint ({checkpoint:?}) must advance past the fence-cleared gap {skipped_seq}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+/// Issue test (b) / G-3 / FR-7: when an unrelated long-running transaction pins
+/// `xmin`, the fence can never clear, so the `gap_timeout` backstop fires even
+/// with fencing enabled — recording a durable row and invoking `on_gap_timeout`
+/// exactly once.
+#[tokio::test]
+#[serial]
+async fn test_pinned_gap_resolves_via_backstop() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    #[derive(Default)]
+    struct RecordingGapCallback {
+        infos: std::sync::Mutex<Vec<GapTimeoutInfo>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GapTimeoutCallback for RecordingGapCallback {
+        async fn on_gap_timeout(&self, info: GapTimeoutInfo) {
+            self.infos.lock().unwrap().push(info);
+        }
+    }
+
+    let callback = Arc::new(RecordingGapCallback::default());
+
+    // Start the sentinel BEFORE the gap so its xid is older than the fence
+    // boundary captured at gap observation — it pins xmin indefinitely.
+    let mut sentinel = pool.begin().await.expect("begin sentinel tx");
+    let _sentinel_xid: i64 = sqlx::query_scalar("SELECT pg_current_xact_id()::text::bigint")
+        .fetch_one(&mut *sentinel)
+        .await
+        .expect("assign sentinel xid to pin xmin");
+
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_millis(800),
+        on_gap_timeout: Some(callback.clone()),
+        ..Default::default()
+    };
+    let (event_bus, subscriber_id, _projection_events) = start_fence_test_bus(&pool, config).await;
+
+    let stream_id = Uuid::new_v4();
+    let (_before_id, skipped_seq, _after_id) = create_sequence_gap(&pool, stream_id).await;
+
+    // The backstop must fire and record a row despite fencing being enabled,
+    // because the sentinel keeps the fence pinned.
+    let entry = poll_for_gap_record(&event_bus, &subscriber_id, skipped_seq)
+        .await
+        .expect("backstop must record a gap-timeout row when the fence is pinned");
+    assert_eq!(entry.skipped_sequence, skipped_seq);
+    assert_eq!(entry.subscriber_id, subscriber_id);
+
+    // The callback fires exactly once for the skipped sequence.
+    let mut matching: Vec<GapTimeoutInfo> = Vec::new();
+    for _ in 0..24 {
+        matching = callback
+            .infos
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| i.subscriber_id == subscriber_id && i.skipped_sequence == skipped_seq)
+            .cloned()
+            .collect();
+        if !matching.is_empty() {
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(250)).await;
+    }
+    assert_eq!(
+        matching.len(),
+        1,
+        "on_gap_timeout must fire exactly once for the backstop skip (got {})",
+        matching.len()
+    );
+
+    // Release the sentinel so it no longer pins xmin.
+    sentinel.rollback().await.expect("release sentinel tx");
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+/// FR-8: with `snapshot_fencing = false` the resolver reverts to the legacy
+/// timeout-only behaviour — a rolled-back gap is skipped after `gap_timeout` and
+/// recorded, with no fence involvement.
+#[tokio::test]
+#[serial]
+async fn test_fencing_disabled_uses_timeout() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_millis(500),
+        snapshot_fencing: false,
+        ..Default::default()
+    };
+    let (event_bus, subscriber_id, projection_events) = start_fence_test_bus(&pool, config).await;
+
+    let stream_id = Uuid::new_v4();
+    let (before_id, skipped_seq, after_id) = create_sequence_gap(&pool, stream_id).await;
+
+    let entry = poll_for_gap_record(&event_bus, &subscriber_id, skipped_seq)
+        .await
+        .expect("with fencing disabled, the timeout-only path must record the skipped gap");
+    assert_eq!(entry.skipped_sequence, skipped_seq);
+    assert!(
+        entry.gap_duration_ms >= 500,
+        "the recorded gap_duration_ms ({}) should be >= gap_timeout (500ms)",
+        entry.gap_duration_ms
+    );
+
+    let state = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("Should have received the surrounding events");
+    let ids: Vec<Uuid> = state.0.iter().map(|e| e.id).collect();
+    assert!(
+        ids.contains(&before_id),
+        "event before the gap must be delivered"
+    );
+    assert!(
+        ids.contains(&after_id),
+        "event after the gap must be delivered once the timeout fires"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+/// FR-10: `PgEventStore::with_table` auto-migrates a custom events table by
+/// ensuring the `txid` column (with the correct DEFAULT) exists, so inserts via
+/// the store populate it. Construction against a non-existent table degrades
+/// gracefully (logs a warning, no panic).
+#[tokio::test]
+#[serial]
+async fn test_ensure_txid_column_on_custom_table() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // Create a custom events table mirroring epoch_events, then drop the txid
+    // column so we genuinely exercise ensure_txid_column re-adding it.
+    let custom_table = format!("custom_events_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE TABLE {custom_table} (LIKE epoch_events INCLUDING ALL)"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create custom events table");
+    sqlx::query(&format!(
+        "ALTER TABLE {custom_table} DROP COLUMN IF EXISTS txid"
+    ))
+    .execute(&pool)
+    .await
+    .expect("drop txid from custom table");
+
+    // with_table runs ensure_txid_column during construction.
+    let bus = PgEventBus::<TestEventData>::new(
+        pool.clone(),
+        format!("custom_ch_{}", Uuid::new_v4().simple()),
+    );
+    let store = PgEventStore::with_table(pool.clone(), bus, custom_table.clone()).await;
+
+    // The column was (re)added with the correct DEFAULT.
+    let default_row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT column_default FROM information_schema.columns \
+         WHERE table_name = $1 AND column_name = 'txid'",
+    )
+    .bind(&custom_table)
+    .fetch_optional(&pool)
+    .await
+    .expect("query custom table txid default");
+    let (default_expr,) =
+        default_row.expect("ensure_txid_column must (re)add the txid column to the custom table");
+    let default_expr = default_expr.expect("the txid column must carry a DEFAULT");
+    assert!(
+        default_expr.contains("pg_current_xact_id"),
+        "the txid DEFAULT should call pg_current_xact_id, got: {default_expr}"
+    );
+
+    // Inserting through the store populates txid via the DEFAULT.
+    let stream_id = Uuid::new_v4();
+    store
+        .store_event(new_event(stream_id, 1, "custom_table_event"))
+        .await
+        .expect("store event into custom table");
+    let txid: Option<i64> = sqlx::query_scalar(&format!("SELECT txid FROM {custom_table} LIMIT 1"))
+        .fetch_one(&pool)
+        .await
+        .expect("query custom table txid");
+    assert!(
+        txid.is_some(),
+        "an insert into the custom table must populate txid"
+    );
+
+    // Graceful degradation: with_table on a non-existent table must not panic.
+    let bogus_table = format!("does_not_exist_{}", Uuid::new_v4().simple());
+    let bus2 = PgEventBus::<TestEventData>::new(
+        pool.clone(),
+        format!("bogus_ch_{}", Uuid::new_v4().simple()),
+    );
+    let _store2 = PgEventStore::with_table(pool.clone(), bus2, bogus_table).await;
+
+    // Clean up the custom table.
+    sqlx::query(&format!("DROP TABLE IF EXISTS {custom_table}"))
+        .execute(&pool)
+        .await
+        .expect("drop custom events table");
 }

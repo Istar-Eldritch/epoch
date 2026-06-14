@@ -31,9 +31,23 @@ impl<B: EventBus + Clone> PgEventStore<B> {
     }
 
     /// Creates a new `PgEventStore` writing to a custom events table.
-    pub fn with_table(postgres: PgPool, bus: B, events_table: impl Into<String>) -> Self {
+    ///
+    /// This is `async` because it ensures the CLOUD-180 `txid` column (used for
+    /// snapshot-fencing forensics) exists on the custom table, applying an
+    /// idempotent `ADD COLUMN IF NOT EXISTS` + `SET DEFAULT` + partial index.
+    /// The default `epoch_events` table (via [`new`](Self::new)) is covered by
+    /// migration m011 and does not need this. If ensuring the column fails the
+    /// error is logged and construction still succeeds — fencing simply degrades
+    /// to timeout-only for this table.
+    pub async fn with_table(postgres: PgPool, bus: B, events_table: impl Into<String>) -> Self {
         let events_table = events_table.into();
         log::debug!("Creating a new PgEventStore targeting table '{events_table}'");
+        if let Err(e) = crate::event_bus::ensure_txid_column(&postgres, &events_table).await {
+            log::warn!(
+                "Failed to ensure txid column on custom events table '{events_table}'; \
+                 snapshot fencing degrades to timeout-only for this table: {e}"
+            );
+        }
         Self {
             postgres,
             bus,
