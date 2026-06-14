@@ -350,10 +350,13 @@ async fn verify_store_events_atomicity_detects_non_atomic_backend() {
 }
 ```
 
-The `NonAtomicBackend` stores events in a `Mutex<Vec<Event<TestEvent>>>` and
-implements `store_events` by looping `store_event`, mirroring old default behavior.
-Because it has no optimistic-concurrency check beyond appending, the helper's
-bad batch leaks the first two events and the assertion panics.
+The `NonAtomicBackend` stores events in a `Mutex<Vec<Event<TestEvent>>>` with
+`store_event` enforcing per-event `stream_version` monotonicity (rejecting the
+duplicate `v3`), while `store_events` loops `store_event` without rolling back
+on failure — precisely the old default's footgun. The first two events (`v2`, `v3`)
+are therefore committed before the third is rejected, so `store_events` returns `Err`
+(satisfying the helper's first `assert!(result.is_err())`) yet the stream now holds
+3 events — tripping the `count == 1` assertion with the expected message.
 
 ### 5.7 `epoch_core/src/lib.rs` — exports
 
