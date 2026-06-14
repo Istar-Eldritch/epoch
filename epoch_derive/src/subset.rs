@@ -1,5 +1,5 @@
 use quote::quote;
-use syn::{Ident, ItemEnum, Token, punctuated::Punctuated};
+use syn::{punctuated::Punctuated, Ident, ItemEnum, Token};
 
 struct SubsetEnumAttr {
     subset_enum_name: Ident,

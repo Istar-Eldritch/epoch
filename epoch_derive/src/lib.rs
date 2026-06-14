@@ -1,6 +1,7 @@
 mod event_data;
 mod projection;
 mod subset;
+mod subset_of;
 
 #[proc_macro_attribute]
 pub fn subset_enum(
@@ -8,6 +9,11 @@ pub fn subset_enum(
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
     subset::subset_enum_impl(attr, item)
+}
+
+#[proc_macro_derive(SubsetOf, attributes(subset_of))]
+pub fn subset_of(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    subset_of::subset_of_impl(item)
 }
 
 #[proc_macro_derive(EventData)]
