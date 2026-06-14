@@ -15,24 +15,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91.1"
+          components: clippy
       - name: Clippy
         run: cargo clippy -- --deny warnings
   fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91.1"
+          components: rustfmt
       - name: rustfmt
         run: cargo fmt --all --check
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91.1"
       - name: Run 'cargo test' (excluding epoch_pg)
         run: cargo test --workspace --exclude epoch_pg
   test_epoch_pg:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91.1"
       - name: Start Postgres containers needed for epoch_pg
         run: docker compose -f epoch_pg/docker-compose.yml up -d
       - name: Wait for Postgres to be ready
