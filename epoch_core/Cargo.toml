@@ -24,6 +24,7 @@ uuid = { version = "1.17.0", features = ["serde", "v4"] }
 testing = []
 
 [dev-dependencies]
+epoch_core = { path = ".", features = ["testing"] }
 epoch_mem = { path = "../epoch_mem" }
 epoch_derive = { path = "../epoch_derive" }
 trybuild = "1.0"

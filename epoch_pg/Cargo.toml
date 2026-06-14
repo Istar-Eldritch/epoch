@@ -30,6 +30,7 @@ tokio = { version = "1", features = ["full"] }
 uuid = "1.17.0"
 
 [dev-dependencies]
+epoch_core = { path = "../epoch_core", features = ["testing"] }
 epoch_derive = { path = "../epoch_derive" }
 epoch_mem = { path = "../epoch_mem" }
 sqlx = { version = "0.8.6", features = [
