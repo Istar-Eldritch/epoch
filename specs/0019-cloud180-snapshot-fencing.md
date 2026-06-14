@@ -94,7 +94,7 @@ filled by an in-flight transaction, rather than guessing on a wall-clock timer.
 |------|----------|-------------|
 | Two event INSERT paths: `store_events_in_tx` and `store_event`, both with an explicit column list | `event_store.rs:91-99`, `event_store.rs:348-355` | Populate `txid` via a **column `DEFAULT`** so neither INSERT statement (nor custom `events_table` routing) needs editing |
 | `advance_contiguous_checkpoint(state, visible_seqs, gap_timeout) -> Vec<SkippedGap>` is pure, sync, DB-free; the timeout branch builds `SkippedGap`; `gap_first_seen: HashMap<u64, Instant>` records when each gap was first seen | `subscriber_state.rs:90-150` | The fence decision must stay pure. Pass the current snapshot bounds **in**; record the fence boundary in the gap tracker; keep all DB/log/callback side-effects in the caller |
-| Sole production caller is `process_subscriber_for_batch`; it already owns `config`, `checkpoint_pool`, `subscriber_id`, emits the batched `WARN`, and fire-and-forgets the `epoch_event_bus_gap_timeouts` insert + `on_gap_timeout` callback | `mod.rs:62-260` | All new side-effects (record only *backstop* skips) live here; no new plumbing to reach a pool |
+| Sole production caller is `process_subscriber_for_batch`; it already owns `config`, `checkpoint_pool`, `subscriber_id`, emits the batched `WARN`, and fire-and-forgets the `epoch_event_bus_gap_timeouts` insert + `on_gap_timeout` callback | `mod.rs:73-260` | All new side-effects (record only *backstop* skips) live here; no new plumbing to reach a pool |
 | Main listener loop builds `rows` then `visible_seqs: BTreeSet<u64>` from one batched catch-up query, wraps them in `Arc`, and passes a `BatchContext` to each concurrent subscriber task | `mod.rs:937-1045` | Query the current snapshot **once per batch that has active or newly-detected gaps** here and thread it through `BatchContext`; cheap (one round trip only when needed) |
 | `BatchContext { rows, visible_seqs, seq_to_id, config, dlq_pool, checkpoint_pool }` | `mod.rs:62-69` | Add `snapshot: Option<TxidSnapshot>` |
 | `PgEventBus::new` / `with_table`; listener clones `self.pool` into `listener_pool`/`checkpoint_pool`/`dlq_pool` | `mod.rs:478-524, 699-701` | Use the fixed PG13+ snapshot SQL; no server-version detection needed |
@@ -191,6 +191,13 @@ data loss) once a later snapshot satisfies `xmin ≥ fence_xmax`, because:
 Conversely, while `xmin < fence_xmax`, *some* transaction that was open at
 detection time is still running and **might** be `N`'s writer about to commit —
 so we **hold**. This is exactly G-1.
+
+If `fence_xmax` could not be captured at first observation (because no snapshot
+was available in that batch) and is later backfilled from a subsequent snapshot,
+the bound is **stricter, not looser**: a later `xmax` is always `≥` the value
+that would have been captured at first observation, so the backfilled fence can
+only delay clearing — it can never skip a gap that is still fillable. This makes
+the lazy-backfill path sound (§5.4, §7.3).
 
 This argument needs **no per-event `txid`** for the hold/skip *decision*. The
 `txid` column is still required for the reasons in §4.2.
@@ -417,6 +424,7 @@ if entry is None:
     break    // hold; re-evaluate next batch
 else:
     // LAZY BACKFILL: if we didn't have a snapshot at first observation, capture one now
+    // (in Rust this requires `get_mut` / re-insert since `fence_xmax` is mutated in-place)
     if entry.fence_xmax.is_none() {
         if let Some(snap) = snapshot {
             entry.fence_xmax = Some(snap.xmax);
