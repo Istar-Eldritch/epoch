@@ -1,0 +1,5 @@
+error: SubsetOf can only be derived for enums, found struct
+ --> tests/compile-fail/subset_of/non_enum_struct.rs:7:8
+  |
+7 | struct NotAnEnum {
+  |        ^^^^^^^^^

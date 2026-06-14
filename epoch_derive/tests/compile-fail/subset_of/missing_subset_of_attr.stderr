@@ -1,0 +1,5 @@
+error: missing `#[subset_of(PathToSupersetEnum)]` attribute — add `#[subset_of(YourSuperEnum)]` to specify the superset enum
+ --> tests/compile-fail/subset_of/missing_subset_of_attr.rs:7:6
+  |
+7 | enum NoAttrEnum {
+  |      ^^^^^^^^^^

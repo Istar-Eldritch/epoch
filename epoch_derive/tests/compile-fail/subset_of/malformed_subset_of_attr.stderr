@@ -1,0 +1,5 @@
+error: expected `#[subset_of(PathToSupersetEnum)]` — the argument must be a path to the superset enum (e.g. `AppEvent` or `crate::events::AppEvent`)
+ --> tests/compile-fail/subset_of/malformed_subset_of_attr.rs:7:1
+  |
+7 | #[subset_of("not a path")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -64,6 +64,24 @@ fn parse_subset_of_path(input: &DeriveInput) -> syn::Result<Path> {
 }
 
 /// Entry point called from `lib.rs` for the `SubsetOf` derive macro.
+///
+/// Generates the three conversion impls required by the `Saga::EventType` bound:
+///
+/// * `From<Sub> for Super` — moves ownership, total (every subset variant maps to a superset variant).
+/// * `TryFrom<Super> for Sub` — owned narrowing; excluded variants produce `Err(EnumConversionError)`.
+/// * `TryFrom<&Super> for Sub` — reference narrowing with per-field `.clone()`; this is the impl
+///   that satisfies `for<'a> TryFrom<&'a Super, Error = EnumConversionError>`.
+///
+/// Generic type parameters on the *subset* enum are threaded through the generated `impl` blocks
+/// via `split_for_impl()`. The superset path is emitted verbatim and may be a concrete path or a
+/// generic path such as `crate::events::Event<Domain>`.
+///
+/// # Errors
+///
+/// Returns a compile error if:
+/// - The item is not an enum.
+/// - The `#[subset_of(PathToSupersetEnum)]` attribute is missing or malformed.
+/// - The attribute appears more than once.
 pub fn subset_of_impl(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     subset_of_impl_internal(item.into()).into()
 }
@@ -102,6 +120,9 @@ fn subset_of_impl_internal(input: TokenStream) -> TokenStream {
     };
 
     let sub_name = &derive_input.ident;
+    // Thread the subset's own generic parameters into every generated `impl` block.
+    // The superset path is emitted verbatim; it may be concrete or generic.
+    let (impl_generics, type_generics, where_clause) = derive_input.generics.split_for_impl();
     let variants = &data_enum.variants;
 
     // Build match arms for `From<Sub> for Super`.
@@ -225,8 +246,10 @@ fn subset_of_impl_internal(input: TokenStream) -> TokenStream {
     let sub_name_str = sub_name.to_string();
 
     quote! {
-        impl ::core::convert::From<#sub_name> for #super_path {
-            fn from(value: #sub_name) -> Self {
+        impl #impl_generics ::core::convert::From<#sub_name #type_generics> for #super_path
+        #where_clause
+        {
+            fn from(value: #sub_name #type_generics) -> Self {
                 match value {
                     #(#from_arms)*
                 }
@@ -234,7 +257,9 @@ fn subset_of_impl_internal(input: TokenStream) -> TokenStream {
         }
 
         #[allow(unreachable_patterns)]
-        impl ::core::convert::TryFrom<#super_path> for #sub_name {
+        impl #impl_generics ::core::convert::TryFrom<#super_path> for #sub_name #type_generics
+        #where_clause
+        {
             type Error = ::epoch_core::event::EnumConversionError;
 
             fn try_from(value: #super_path) -> ::core::result::Result<Self, Self::Error> {
@@ -251,7 +276,9 @@ fn subset_of_impl_internal(input: TokenStream) -> TokenStream {
         }
 
         #[allow(unreachable_patterns)]
-        impl ::core::convert::TryFrom<&#super_path> for #sub_name {
+        impl #impl_generics ::core::convert::TryFrom<&#super_path> for #sub_name #type_generics
+        #where_clause
+        {
             type Error = ::epoch_core::event::EnumConversionError;
 
             fn try_from(value: &#super_path) -> ::core::result::Result<Self, Self::Error> {
