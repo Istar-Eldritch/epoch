@@ -106,6 +106,13 @@ impl EventStoreBackend for TestEventStore {
         Ok(())
     }
 
+    async fn store_events(
+        &self,
+        _events: Vec<Event<Self::EventType>>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     async fn read_events_by_correlation_id(
         &self,
         _correlation_id: Uuid,

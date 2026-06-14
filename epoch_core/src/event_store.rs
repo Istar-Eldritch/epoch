@@ -44,30 +44,32 @@ pub trait EventStoreBackend: Send + Sync {
     /// Appends events to a stream.
     async fn store_event(&self, event: Event<Self::EventType>) -> Result<(), Self::Error>;
 
-    /// Appends multiple events to a stream atomically.
+    /// Appends multiple events to one or more streams **atomically**.
     ///
-    /// All events are persisted in a single transaction. For backends that support
-    /// transactions (e.g., PostgreSQL), this results in a single fsync operation
-    /// regardless of the number of events.
+    /// # Atomicity Contract
     ///
-    /// Events are published to the event bus only after successful persistence.
+    /// Implementations **must** guarantee all-or-nothing persistence:
     ///
-    /// The default implementation falls back to individual `store_event` calls
-    /// for backward compatibility with custom implementations. Override this
-    /// method to provide true atomic batch writes.
+    /// - If every event is persisted successfully, the call returns `Ok(())`.
+    /// - If **any** event fails to persist (most commonly a `stream_version`
+    ///   optimistic-concurrency conflict mid-batch), the call returns `Err(..)` and
+    ///   **no event from the batch is persisted** — a subsequent [`read_events`]
+    ///   must observe the store exactly as it was before this call.
+    /// - Per-stream `stream_version` monotonicity must be preserved; a batch that
+    ///   would create a gap or conflict for any stream must be rejected in full.
+    /// - An empty batch is a no-op that returns `Ok(())`.
     ///
-    /// # Note
+    /// Events are published to the event bus **only after** successful, durable
+    /// persistence. Publishing is best-effort: a bus failure after the commit does
+    /// **not** roll back the persisted events (projections recover by replay).
     ///
-    /// The default implementation is **not atomic** - if a failure occurs partway
-    /// through, some events may have been persisted while others were not. Custom
-    /// implementations (e.g., `PgEventStore`) should override this to provide
-    /// transactional guarantees.
-    async fn store_events(&self, events: Vec<Event<Self::EventType>>) -> Result<(), Self::Error> {
-        for event in events {
-            self.store_event(event).await?;
-        }
-        Ok(())
-    }
+    /// # Verifying Your Implementation
+    ///
+    /// Use [`crate::testing::verify_store_events_atomicity`] in your backend's test
+    /// suite to assert this contract holds.
+    ///
+    /// [`read_events`]: Self::read_events
+    async fn store_events(&self, events: Vec<Event<Self::EventType>>) -> Result<(), Self::Error>;
 
     /// Returns the most recent event in the given stream, or `None` if the stream is empty.
     ///

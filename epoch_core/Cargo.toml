@@ -13,15 +13,17 @@ log = "0.4"
 async-trait = "0.1"
 chrono = { version = "0.4.41", features = ["serde"] }
 futures-core = "0.3.31"
-serde = { version = "1.0.219", features=["derive"] }
+serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "1.0"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1.17"
 uuid = { version = "1.17.0", features = ["serde", "v4"] }
 
+[features]
+# Test-only utilities (contract tests) for verifying backend implementations.
+testing = []
+
 [dev-dependencies]
 epoch_mem = { path = "../epoch_mem" }
 epoch_derive = { path = "../epoch_derive" }
 trybuild = "1.0"
-
-

@@ -29,6 +29,9 @@ pub mod saga;
 pub mod state_store;
 pub mod subscriber_id;
 
+#[cfg(feature = "testing")]
+pub mod testing;
+
 pub use subscriber_id::SubscriberId;
 
 /// Re-exports the most commonly used traits and types for convenience.
