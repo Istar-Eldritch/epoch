@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`EventStoreBackend::store_events()` atomicity contract test** (`epoch_core`, CLOUD-171) —
+  a reusable, backend-agnostic helper that verifies any backend's `store_events()` honours
+  the all-or-nothing persistence guarantee:
+  - `epoch_core::testing::verify_store_events_atomicity(backend, make_event)` seeds one
+    event, submits a mid-batch duplicate-version batch (which must be rejected), then
+    asserts that *no* event from the failed batch was persisted — catching partial writes.
+    It also exercises an empty-batch no-op and a fully-valid batch.
+  - Gated behind the new `testing` feature in `epoch_core`; never ships in production
+    builds. Enable it in `[dev-dependencies]` to run the helper from your own test suite.
+  - Both first-party backends (`epoch_mem`, `epoch_pg`) run this contract test as part
+    of their integration test suites and pass with no behavioral change.
 - **Snapshot fencing for gap resolution** (`epoch_pg`, CLOUD-180) — the event-bus
   gap resolver now *proves* whether a `global_sequence` gap can still be filled by
   an in-flight transaction instead of guessing on a wall-clock timer:
@@ -85,6 +96,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING**: `EventStoreBackend::store_events()` no longer has a default implementation
+  (`epoch_core`, CLOUD-171). It is now a required trait method. Third-party backends that
+  previously relied on the (non-atomic) default loop must provide an explicit implementation.
+  See the migration guide below.
 - **BREAKING**: `EventBus::publish` now takes `Arc<Event<T>>` instead of `Event<T>`
 - **BREAKING**: `EventObserver::on_event` now takes `Arc<Event<ED>>` instead of `Event<ED>`
 - **BREAKING**: `Projection::apply_and_store` now takes `&Event<ED>` instead of `Event<ED>`
@@ -119,6 +134,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Aggregate::handle` now uses `SliceRefEventStream` to avoid cloning events during internal re-hydration
 
 ### Migration Guide
+
+#### Implementing `EventStoreBackend::store_events()` (CLOUD-171)
+
+`store_events()` is now a **required** trait method. Any third-party backend that previously
+relied on the removed non-atomic default loop must add an explicit implementation.
+
+**If your backend supports transactions** (e.g. SQL), wrap all inserts in a single
+transaction and publish only after committing:
+
+```rust
+async fn store_events(
+    &self,
+    events: Vec<Event<Self::EventType>>,
+) -> Result<(), Self::Error> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    // Begin transaction, insert all events, commit, then publish.
+    // See `PgEventStore::store_events` for a complete example.
+    todo!()
+}
+```
+
+**If your backend is in-memory or lock-based**, validate all `stream_version`s first
+(under the lock), then commit all events, then publish after releasing the lock:
+
+```rust
+async fn store_events(
+    &self,
+    events: Vec<Event<Self::EventType>>,
+) -> Result<(), Self::Error> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    // Hold lock: validate all versions, then write all events.
+    // See `InMemoryEventStore::store_events` for a complete example.
+    todo!()
+}
+```
+
+**Verify your implementation** using the portable contract test (add the `testing`
+feature to your `[dev-dependencies]`):
+
+```toml
+[dev-dependencies]
+epoch_core = { version = "0.1", features = ["testing"] }
+```
+
+```rust
+#[tokio::test]
+async fn my_backend_satisfies_atomicity_contract() {
+    let backend = MyBackend::new();
+    epoch_core::testing::verify_store_events_atomicity(backend, |stream_id, version| {
+        Event::<MyEventType>::builder()
+            .stream_id(stream_id)
+            .stream_version(version)
+            // ... build event ...
+            .build()
+            .unwrap()
+    })
+    .await;
+}
+```
 
 #### Subscribing Projections
 
