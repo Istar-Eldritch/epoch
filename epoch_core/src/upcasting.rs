@@ -38,12 +38,9 @@ use uuid::Uuid;
 
 use crate::event::EventData;
 
-/// The schema version of an event payload.
-///
-/// `1` is the implicit version of any event written before versioning existed: legacy
-/// rows with a `NULL` stored version are interpreted as version `1`, and an event type
-/// that has never changed shape stays at version `1`.
-pub type SchemaVersion = u32;
+/// Re-export [`SchemaVersion`](crate::event::SchemaVersion) from the event module so
+/// that code importing from this module gets a consistent, unambiguous type.
+pub use crate::event::SchemaVersion;
 
 /// Context handed to an [`Upcaster`] step.
 ///

@@ -209,6 +209,9 @@ where
             global_sequence: Some(event_seq),
             causation_id: row.causation_id,
             correlation_id: row.correlation_id,
+            // schema_version column will be wired in Phase 5 (migration m012);
+            // for now all bus-read events default to 1.
+            schema_version: 1,
         });
 
         log::debug!(
@@ -707,6 +710,9 @@ where
                 global_sequence: row.global_sequence.map(|gs| gs as u64),
                 causation_id: row.causation_id,
                 correlation_id: row.correlation_id,
+                // schema_version column will be wired in Phase 5 (migration m012);
+                // for now all bus-read events default to 1.
+                schema_version: 1,
             });
         }
 
@@ -2202,6 +2208,9 @@ where
                         global_sequence: Some(event_global_seq),
                         causation_id: row.causation_id,
                         correlation_id: row.correlation_id,
+                        // schema_version column will be wired in Phase 5 (migration m012);
+                        // for now all bus-read events default to 1.
+                        schema_version: 1,
                     });
 
                     // Use the same retry/DLQ logic as real-time processing
@@ -2372,6 +2381,9 @@ where
                                 global_sequence: Some(event_global_seq),
                                 causation_id: row.causation_id,
                                 correlation_id: row.correlation_id,
+                                // schema_version column will be wired in Phase 5 (migration m012);
+                                // for now all bus-read events default to 1.
+                                schema_version: 1,
                             });
 
                             let result = process_event_with_retry(

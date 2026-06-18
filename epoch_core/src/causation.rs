@@ -188,6 +188,7 @@ mod tests {
             global_sequence,
             causation_id,
             correlation_id,
+            schema_version: 1,
         }
     }
 

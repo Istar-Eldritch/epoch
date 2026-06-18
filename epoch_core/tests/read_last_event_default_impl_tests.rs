@@ -113,6 +113,7 @@ fn make_event(stream_id: Uuid, version: u64) -> Event<TestEvent> {
         global_sequence: Some(version),
         causation_id: None,
         correlation_id: None,
+        schema_version: 1,
     }
 }
 

@@ -145,6 +145,7 @@ impl<B: EventBus + Clone> PgEventStore<B> {
                 global_sequence: Some(row.0 as u64),
                 causation_id: event.causation_id,
                 correlation_id: event.correlation_id,
+                schema_version: event.schema_version,
             });
         }
 
@@ -400,6 +401,7 @@ where
             global_sequence: Some(row.0 as u64),
             causation_id: event.causation_id,
             correlation_id: event.correlation_id,
+            schema_version: event.schema_version,
         };
 
         // Wrap in Arc for efficient sharing - no clone needed

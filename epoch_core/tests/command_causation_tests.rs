@@ -45,6 +45,7 @@ fn command_caused_by_sets_causation_and_correlation() {
         global_sequence: Some(10),
         correlation_id: Some(correlation_id),
         causation_id: None,
+        schema_version: 1,
     };
 
     let cmd = Command::<TestCommand, ()>::new(Uuid::new_v4(), TestCommand::DoSomething, None, None)
@@ -71,6 +72,7 @@ fn command_caused_by_handles_event_without_correlation() {
         global_sequence: Some(10),
         correlation_id: None,
         causation_id: None,
+        schema_version: 1,
     };
 
     let cmd = Command::<TestCommand, ()>::new(Uuid::new_v4(), TestCommand::DoSomething, None, None)
@@ -155,6 +157,7 @@ fn with_causation_id_overwrites_previous_value() {
         global_sequence: Some(1),
         correlation_id: Some(correlation_id),
         causation_id: None,
+        schema_version: 1,
     };
 
     let cmd2 =
