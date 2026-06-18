@@ -2,6 +2,7 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use epoch_core::event::{Event, EventData};
 use epoch_core::prelude::{EventBus, EventStoreBackend, EventStream};
+use epoch_core::upcasting::UpcasterRegistry;
 use futures_util::{Stream, StreamExt};
 use serde::Serialize;
 use serde::{Deserialize, de::DeserializeOwned};
@@ -12,11 +13,20 @@ use uuid::Uuid;
 
 /// A postgres based event store.
 ///
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PgEventStore<B: EventBus + Clone> {
     postgres: PgPool,
     bus: B,
     events_table: String,
+    upcasters: Arc<UpcasterRegistry>,
+}
+
+impl<B: EventBus + Clone> std::fmt::Debug for PgEventStore<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgEventStore")
+            .field("events_table", &self.events_table)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<B: EventBus + Clone> PgEventStore<B> {
@@ -27,6 +37,27 @@ impl<B: EventBus + Clone> PgEventStore<B> {
             postgres,
             bus,
             events_table: "epoch_events".to_string(),
+            upcasters: Arc::new(UpcasterRegistry::new()),
+        }
+    }
+
+    /// Creates a new `PgEventStore` writing to the default `epoch_events` table
+    /// with a configured [`UpcasterRegistry`].
+    ///
+    /// The registry is consulted on every read at the deserialization boundary
+    /// ([`pg_db_event_to_event`]): stored payloads are upcast forward to the
+    /// current schema version before being deserialized into the domain
+    /// [`EventData`] type, applying the registry's configured
+    /// [`FailurePolicy`](epoch_core::upcasting::FailurePolicy). The default
+    /// constructors install an empty registry, which is a no-op for any event
+    /// that still deserializes cleanly.
+    pub fn with_upcasters(postgres: PgPool, bus: B, upcasters: Arc<UpcasterRegistry>) -> Self {
+        log::debug!("Creating a new PgEventStore with an upcaster registry");
+        Self {
+            postgres,
+            bus,
+            events_table: "epoch_events".to_string(),
+            upcasters,
         }
     }
 
@@ -60,6 +91,7 @@ impl<B: EventBus + Clone> PgEventStore<B> {
             postgres,
             bus,
             events_table,
+            upcasters: Arc::new(UpcasterRegistry::new()),
         }
     }
 
@@ -112,8 +144,9 @@ impl<B: EventBus + Clone> PgEventStore<B> {
 
         let insert_sql = format!(
             "INSERT INTO {} (id, stream_id, stream_version, event_type, data, \
-             created_at, actor_id, purger_id, purged_at, causation_id, correlation_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             created_at, actor_id, purger_id, purged_at, causation_id, correlation_id, \
+             schema_version) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
              RETURNING global_sequence",
             self.events_table,
         );
@@ -137,6 +170,7 @@ impl<B: EventBus + Clone> PgEventStore<B> {
                 .bind(event.purged_at)
                 .bind(event.causation_id)
                 .bind(event.correlation_id)
+                .bind(event.schema_version as i32)
                 .fetch_one(&mut **tx)
                 .await?;
 
@@ -210,6 +244,10 @@ pub struct PgDBEvent {
     pub causation_id: Option<Uuid>,
     /// A shared identifier tying together all events in a causal tree.
     pub correlation_id: Option<Uuid>,
+    /// The schema version the payload was stored at. `NULL` on pre-migration rows
+    /// (interpreted as version `1` by the read path); stamped explicitly on new inserts.
+    #[sqlx(default)]
+    pub schema_version: Option<i32>,
 }
 
 /// Converts a [`PgDBEvent`] row into a domain [`Event`].
@@ -219,16 +257,36 @@ pub struct PgDBEvent {
 /// `trace_causation_chain`, and `read_last_event`. Optional metadata
 /// (`global_sequence`, `causation_id`, `correlation_id`) is only threaded onto
 /// the builder when present on the row.
-fn pg_db_event_to_event<D, BE>(entry: PgDBEvent) -> Result<Event<D>, PgEventStoreError<BE>>
+fn pg_db_event_to_event<D, BE>(
+    entry: PgDBEvent,
+    upcasters: &UpcasterRegistry,
+) -> Result<Option<Event<D>>, PgEventStoreError<BE>>
 where
     D: EventData + DeserializeOwned,
     BE: std::error::Error,
 {
-    let data: Option<D> = entry
-        .data
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(PgEventStoreError::DeserializeEventError::<BE>)?;
+    // The stored schema version. `NULL` (pre-migration rows) is interpreted as
+    // version `1` — the universal floor that lets us avoid a backfill.
+    let stored_version = entry.schema_version.unwrap_or(1).max(0) as u32;
+    let has_payload = entry.data.is_some();
+
+    // Route through the registry: upcast the stored payload forward to the current
+    // schema version, then deserialize into `D`, applying the configured
+    // `FailurePolicy`. `Ok(None)` is returned only when an event is explicitly
+    // dead-lettered (skip that row) or when the payload is `NULL` (purged event).
+    let data: Option<D> = upcasters.upcast_and_deserialize::<D>(
+        &entry.event_type,
+        stored_version,
+        entry.stream_id,
+        entry.id,
+        entry.data,
+    )?;
+
+    // If the row carried a payload but the registry returned `None`, the event was
+    // explicitly dead-lettered (counted, logged, captured): skip exactly this row.
+    if has_payload && data.is_none() {
+        return Ok(None);
+    }
 
     let mut builder = Event::<D>::builder()
         .id(entry.id)
@@ -239,6 +297,7 @@ where
         )
         .event_type(entry.event_type)
         .created_at(entry.created_at)
+        .schema_version(stored_version)
         .data(data);
 
     // Add global_sequence if present
@@ -256,6 +315,7 @@ where
 
     builder
         .build()
+        .map(Some)
         .map_err(PgEventStoreError::BuildEventError::<BE>)
 }
 
@@ -348,7 +408,8 @@ where
     {
         let read_sql = format!(
             "SELECT id, stream_id, stream_version, event_type, data, created_at, \
-             actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id \
+             actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id, \
+             schema_version \
              FROM {} WHERE stream_id = $1 AND stream_version >= $2 \
              ORDER BY stream_version ASC",
             self.events_table,
@@ -362,8 +423,13 @@ where
             while let Some(row) = inner_stream.next().await {
                 let entry: PgDBEvent = row.map_err(PgEventStoreError::DBError::<B::Error>)?;
 
-                let event = pg_db_event_to_event::<B::EventType, B::Error>(entry)?;
-                yield event;
+                // `None` means the row was explicitly dead-lettered (counted, logged,
+                // captured): skip it without aborting the stream.
+                if let Some(event) =
+                    pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters)?
+                {
+                    yield event;
+                }
             }
         };
 
@@ -379,8 +445,9 @@ where
         // Insert the event and get back the assigned global_sequence
         let store_sql = format!(
             "INSERT INTO {} (id, stream_id, stream_version, event_type, data, \
-             created_at, actor_id, purger_id, purged_at, causation_id, correlation_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             created_at, actor_id, purger_id, purged_at, causation_id, correlation_id, \
+             schema_version) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
              RETURNING global_sequence",
             self.events_table,
         );
@@ -401,6 +468,7 @@ where
             .bind(event.purged_at)
             .bind(event.causation_id)
             .bind(event.correlation_id)
+            .bind(event.schema_version as i32)
             .fetch_one(&self.postgres)
             .await?;
 
@@ -464,7 +532,8 @@ where
     ) -> Result<Option<Event<Self::EventType>>, Self::Error> {
         let last_sql = format!(
             "SELECT id, stream_id, stream_version, event_type, data, created_at, \
-             actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id \
+             actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id, \
+             schema_version \
              FROM {} WHERE stream_id = $1 ORDER BY stream_version DESC LIMIT 1",
             self.events_table,
         );
@@ -476,7 +545,7 @@ where
         let Some(entry) = row else {
             return Ok(None);
         };
-        Ok(Some(pg_db_event_to_event::<B::EventType, B::Error>(entry)?))
+        pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters)
     }
 
     async fn read_events_by_correlation_id(
@@ -485,7 +554,8 @@ where
     ) -> Result<Vec<Event<Self::EventType>>, Self::Error> {
         let correlation_sql = format!(
             "SELECT id, stream_id, stream_version, event_type, data, created_at, \
-             actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id \
+             actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id, \
+             schema_version \
              FROM {} WHERE correlation_id = $1 ORDER BY global_sequence ASC",
             self.events_table,
         );
@@ -496,7 +566,12 @@ where
 
         let mut events = Vec::with_capacity(rows.len());
         for entry in rows {
-            events.push(pg_db_event_to_event::<B::EventType, B::Error>(entry)?);
+            // Skip dead-lettered rows (`None`); fail loudly otherwise.
+            if let Some(event) =
+                pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters)?
+            {
+                events.push(event);
+            }
         }
 
         Ok(events)
@@ -509,7 +584,8 @@ where
         // Fetch the starting event
         let trace_sql = format!(
             "SELECT id, stream_id, stream_version, event_type, data, created_at, \
-             actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id \
+             actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id, \
+             schema_version \
              FROM {} WHERE id = $1",
             self.events_table,
         );
@@ -527,8 +603,11 @@ where
         let correlation_id = match entry.correlation_id {
             Some(cid) => cid,
             None => {
-                let event = pg_db_event_to_event::<B::EventType, B::Error>(entry)?;
-                return Ok(vec![event]);
+                let events =
+                    pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters)?
+                        .into_iter()
+                        .collect();
+                return Ok(events);
             }
         };
 
@@ -560,6 +639,7 @@ mod tests {
             global_sequence: Some(123),
             causation_id: None,
             correlation_id: None,
+            schema_version: None,
         };
 
         let json = serde_json::to_string(&db_event).unwrap();
@@ -587,6 +667,7 @@ mod tests {
             global_sequence: None,
             causation_id: None,
             correlation_id: None,
+            schema_version: None,
         };
 
         let json = serde_json::to_string(&db_event).unwrap();
@@ -620,9 +701,11 @@ mod tests {
             global_sequence: None,
             causation_id: None,
             correlation_id: None,
+            schema_version: None,
         };
 
-        let result = pg_db_event_to_event::<TestEvent, std::convert::Infallible>(entry);
+        let registry = UpcasterRegistry::new();
+        let result = pg_db_event_to_event::<TestEvent, std::convert::Infallible>(entry, &registry);
         assert!(
             matches!(result, Err(PgEventStoreError::InvalidStreamVersion(-1))),
             "expected InvalidStreamVersion(-1), got: {:?}",

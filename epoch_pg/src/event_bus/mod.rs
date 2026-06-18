@@ -236,9 +236,9 @@ where
             global_sequence: Some(event_seq),
             causation_id: row.causation_id,
             correlation_id: row.correlation_id,
-            // schema_version column will be wired in Phase 5 (migration m012);
-            // for now all bus-read events default to 1.
-            schema_version: 1,
+            // CLOUD-173: carry the stored schema version through the bus read path.
+            // NULL (pre-migration rows) is interpreted as version 1.
+            schema_version: row.schema_version.unwrap_or(1).max(0) as u32,
         });
 
         log::debug!(
@@ -700,7 +700,7 @@ where
     ) -> Result<Vec<Event<D>>, SqlxError> {
         let query = format!(
             "SELECT id, stream_id, stream_version, event_type, data, created_at, \
-             actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id \
+             actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id, schema_version \
              FROM {} WHERE global_sequence > $1 ORDER BY global_sequence ASC LIMIT $2",
             self.config.events_table,
         );
@@ -737,9 +737,9 @@ where
                 global_sequence: row.global_sequence.map(|gs| gs as u64),
                 causation_id: row.causation_id,
                 correlation_id: row.correlation_id,
-                // schema_version column will be wired in Phase 5 (migration m012);
-                // for now all bus-read events default to 1.
-                schema_version: 1,
+                // CLOUD-173: carry the stored schema version through the bus read path.
+                // NULL (pre-migration rows) is interpreted as version 1.
+                schema_version: row.schema_version.unwrap_or(1).max(0) as u32,
             });
         }
 
@@ -1125,7 +1125,7 @@ where
                     let catchup_query = format!(
                         "SELECT id, stream_id, stream_version, event_type, data, \
                          created_at, actor_id, purger_id, purged_at, \
-                         global_sequence, causation_id, correlation_id \
+                         global_sequence, causation_id, correlation_id, schema_version \
                          FROM {} WHERE global_sequence > $1 \
                          ORDER BY global_sequence ASC LIMIT $2",
                         config.events_table,
@@ -2162,7 +2162,7 @@ where
             let subscriber_catchup_query = format!(
                 "SELECT id, stream_id, stream_version, event_type, data, \
                  created_at, actor_id, purger_id, purged_at, \
-                 global_sequence, causation_id, correlation_id \
+                 global_sequence, causation_id, correlation_id, schema_version \
                  FROM {} WHERE global_sequence > $1 \
                  ORDER BY global_sequence ASC LIMIT $2",
                 config.events_table,
@@ -2250,9 +2250,9 @@ where
                         global_sequence: Some(event_global_seq),
                         causation_id: row.causation_id,
                         correlation_id: row.correlation_id,
-                        // schema_version column will be wired in Phase 5 (migration m012);
-                        // for now all bus-read events default to 1.
-                        schema_version: 1,
+                        // CLOUD-173: carry the stored schema version through the bus read path.
+                        // NULL (pre-migration rows) is interpreted as version 1.
+                        schema_version: row.schema_version.unwrap_or(1).max(0) as u32,
                     });
 
                     // Use the same retry/DLQ logic as real-time processing
@@ -2365,7 +2365,7 @@ where
                     let rows: Vec<PgDBEvent> = sqlx::query_as(&format!(
                         "SELECT id, stream_id, stream_version, event_type, data, \
                          created_at, actor_id, purger_id, purged_at, \
-                         global_sequence, causation_id, correlation_id \
+                         global_sequence, causation_id, correlation_id, schema_version \
                          FROM {} WHERE global_sequence > $1 AND global_sequence <= $2 \
                          ORDER BY global_sequence ASC LIMIT $3",
                         config.events_table,
@@ -2423,9 +2423,9 @@ where
                                 global_sequence: Some(event_global_seq),
                                 causation_id: row.causation_id,
                                 correlation_id: row.correlation_id,
-                                // schema_version column will be wired in Phase 5 (migration m012);
-                                // for now all bus-read events default to 1.
-                                schema_version: 1,
+                                // CLOUD-173: carry the stored schema version through the bus read path.
+                                // NULL (pre-migration rows) is interpreted as version 1.
+                                schema_version: row.schema_version.unwrap_or(1).max(0) as u32,
                             });
 
                             let result = process_event_with_retry(
