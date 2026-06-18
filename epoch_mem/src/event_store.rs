@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
@@ -413,21 +414,97 @@ where
     }
 }
 
-//
-// /// The error for the InMemoryEventBus event publication
-// #[derive(Debug, thiserror::Error)]
-// #[error("In memory eventbus publish error")]
-// pub struct InMemoryEventBusPublishError;
-//
-/// An implementation of an in-memory event bus
+/// Configuration for [`InMemoryEventBus`].
+///
+/// Controls retry behaviour when an observer returns an error, mirroring the
+/// at-least-once guarantees provided by `epoch_pg`'s `ReliableDeliveryConfig`.
+///
+/// The defaults are intentionally test-friendly: three retries with **zero**
+/// delay so test suites remain fast. Set `retry_delay` to a non-zero value
+/// only when you need to exercise time-dependent behaviour in a specific test.
+///
+/// # Example
+///
+/// ```rust
+/// use epoch_mem::InMemoryEventBusConfig;
+/// use std::time::Duration;
+///
+/// // Disable retries entirely (at-most-once) for a specific test scenario
+/// let config = InMemoryEventBusConfig { max_retries: 0, retry_delay: Duration::ZERO };
+/// ```
+#[derive(Debug, Clone)]
+pub struct InMemoryEventBusConfig {
+    /// Maximum number of retry attempts after the initial failure.
+    ///
+    /// Set to `0` to disable retries (at-most-once). Default: `3`.
+    pub max_retries: u32,
+
+    /// Fixed delay between retry attempts.
+    ///
+    /// The read-lock on the observer list is held during this sleep, so
+    /// concurrent [`InMemoryEventBus::subscribe`] calls will block for the
+    /// full duration of all retries. This is acceptable for a test bus;
+    /// keep the delay at [`Duration::ZERO`] (the default) unless you are
+    /// specifically testing timing behaviour.
+    pub retry_delay: Duration,
+}
+
+impl Default for InMemoryEventBusConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            retry_delay: Duration::ZERO,
+        }
+    }
+}
+
+/// An entry recorded in the in-memory Dead Letter Queue when all retries for
+/// a given observer are exhausted.
+///
+/// Accessible via [`InMemoryEventBus::dlq`] for assertions in tests.
+#[derive(Debug, Clone)]
+pub struct DlqEntry {
+    /// The [`SubscriberId`](epoch_core::SubscriberId) of the observer that failed.
+    pub subscriber_id: String,
+    /// ID of the event that could not be processed.
+    pub event_id: Uuid,
+    /// Error message from the final failed attempt.
+    pub error_message: String,
+    /// Total number of attempts made (1 initial + up to `max_retries` retries).
+    pub attempt_count: u32,
+}
+
+/// An implementation of an in-memory event bus.
 ///
 /// Uses a channel-based architecture similar to `PgEventBus`:
-/// - `publish()` sends events to a channel and returns immediately
-/// - A background task processes events and notifies observers
-/// - This matches production PostgreSQL NOTIFY/LISTEN behavior
+/// - `publish()` sends events to a channel and returns immediately.
+/// - A background task processes events and notifies observers.
+/// - This matches production PostgreSQL NOTIFY/LISTEN behavior.
 ///
 /// This design prevents synchronous call chains that can cause
 /// race conditions in sagas and projections.
+///
+/// ## At-least-once delivery
+///
+/// When an observer's `on_event` returns an error, the bus retries up to
+/// [`InMemoryEventBusConfig::max_retries`] additional times (default: 3).
+/// If all attempts fail, the event is appended to an in-memory Dead Letter
+/// Queue accessible via [`InMemoryEventBus::dlq`].
+///
+/// ## Intentional asymmetries vs `epoch_pg`
+///
+/// `InMemoryEventBus` deliberately omits several `PgEventBus` features that
+/// cannot be meaningfully simulated without a real database:
+///
+/// | Feature | `epoch_pg` | `epoch_mem` |
+/// |---|---|---|
+/// | At-least-once delivery + retries | ✅ | ✅ |
+/// | In-process DLQ for test assertions | — | ✅ |
+/// | Persistent checkpoints | ✅ (DB rows) | ❌ no persistence |
+/// | Global sequence numbers | ✅ | ❌ |
+/// | Multi-instance coordination | ✅ (advisory locks) | ❌ single in-process only |
+/// | Gap detection / snapshot fencing | ✅ | ❌ |
+/// | Batched checkpoint mode | ✅ | ❌ |
 #[derive(Clone)]
 pub struct InMemoryEventBus<D>
 where
@@ -436,6 +513,9 @@ where
     _phantom: PhantomData<D>,
     projections: Arc<RwLock<Vec<Box<dyn EventObserver<D>>>>>,
     event_tx: tokio::sync::mpsc::UnboundedSender<Arc<Event<D>>>,
+    /// In-memory Dead Letter Queue — events land here when all retries fail.
+    dlq: Arc<Mutex<Vec<DlqEntry>>>,
+    config: InMemoryEventBusConfig,
 }
 
 impl<D> Default for InMemoryEventBus<D>
@@ -451,29 +531,106 @@ impl<D> InMemoryEventBus<D>
 where
     D: EventData + Send + Sync,
 {
-    /// Creates a new in-memory bus
+    /// Creates a new in-memory bus with default configuration.
+    ///
+    /// Uses [`InMemoryEventBusConfig::default`]: 3 retries, zero delay.
     pub fn new() -> Self {
+        Self::with_config(InMemoryEventBusConfig::default())
+    }
+
+    /// Creates a new in-memory bus with custom configuration.
+    ///
+    /// ```rust,no_run
+    /// use epoch_mem::{InMemoryEventBus, InMemoryEventBusConfig};
+    /// use std::time::Duration;
+    ///
+    /// # #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    /// # struct MyEvent;
+    /// # impl epoch_core::event::EventData for MyEvent { fn event_type(&self) -> &'static str { "MyEvent" } }
+    /// // No retries — at-most-once for a specific test
+    /// let bus = InMemoryEventBus::<MyEvent>::with_config(InMemoryEventBusConfig {
+    ///     max_retries: 0,
+    ///     retry_delay: Duration::ZERO,
+    /// });
+    /// ```
+    pub fn with_config(config: InMemoryEventBusConfig) -> Self {
         log::debug!("Creating a new InMemoryEventBus");
         let projections: Arc<RwLock<Vec<Box<dyn EventObserver<D>>>>> =
             Arc::new(RwLock::new(vec![]));
+        let dlq: Arc<Mutex<Vec<DlqEntry>>> = Arc::new(Mutex::new(vec![]));
 
         // Create channel for event notifications (like PostgreSQL NOTIFY)
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Event<D>>>();
 
         // Spawn background task to process events (like PostgreSQL LISTEN)
         let projections_clone = projections.clone();
+        let dlq_clone = dlq.clone();
+        let config_clone = config.clone();
         tokio::spawn(async move {
             log::debug!("InMemoryEventBus: Starting background event processor");
 
             while let Some(event) = event_rx.recv().await {
                 log::debug!("InMemoryEventBus: Processing event {}", event.id);
 
-                // Process observers sequentially (maintaining order within this task)
+                // Process observers sequentially (maintaining causal order).
+                // The read lock is held for the full observer loop including any
+                // retry sleeps. Concurrent subscribe() calls will block for at
+                // most (max_retries * retry_delay) per event — acceptable for the
+                // default zero-delay configuration.
                 let observers = projections_clone.read().await;
                 for observer in observers.iter() {
-                    if let Err(e) = observer.on_event(Arc::clone(&event)).await {
-                        log::error!("Error applying event {}: {:?}", event.id, e);
-                        //TODO: Retry mechanism and dead letter queue
+                    let subscriber_id = observer.subscriber_id().to_string();
+                    let mut last_error: Option<String> = None;
+                    let mut succeeded = false;
+
+                    for attempt in 0..=config_clone.max_retries {
+                        if attempt > 0 && !config_clone.retry_delay.is_zero() {
+                            tokio::time::sleep(config_clone.retry_delay).await;
+                        }
+
+                        match observer.on_event(Arc::clone(&event)).await {
+                            Ok(_) => {
+                                if attempt > 0 {
+                                    log::debug!(
+                                        "Observer '{}' succeeded on event {} after {} retries",
+                                        subscriber_id, event.id, attempt
+                                    );
+                                }
+                                succeeded = true;
+                                break;
+                            }
+                            Err(e) => {
+                                let msg = format!("{:?}", e);
+                                if attempt < config_clone.max_retries {
+                                    log::warn!(
+                                        "Observer '{}' failed on event {} (attempt {}/{}): {}. Retrying.",
+                                        subscriber_id,
+                                        event.id,
+                                        attempt + 1,
+                                        config_clone.max_retries + 1,
+                                        msg
+                                    );
+                                } else {
+                                    log::error!(
+                                        "Observer '{}' failed on event {} after {} attempts: {}. Sending to DLQ.",
+                                        subscriber_id,
+                                        event.id,
+                                        config_clone.max_retries + 1,
+                                        msg
+                                    );
+                                }
+                                last_error = Some(msg);
+                            }
+                        }
+                    }
+
+                    if !succeeded {
+                        dlq_clone.lock().await.push(DlqEntry {
+                            subscriber_id,
+                            event_id: event.id,
+                            error_message: last_error.unwrap_or_default(),
+                            attempt_count: config_clone.max_retries + 1,
+                        });
                     }
                 }
             }
@@ -485,7 +642,24 @@ where
             _phantom: PhantomData,
             projections,
             event_tx,
+            dlq,
+            config,
         }
+    }
+
+    /// Returns a snapshot of the in-memory Dead Letter Queue.
+    ///
+    /// Events land here when all retry attempts for an observer are exhausted.
+    /// Use this in tests to assert that specific events were undeliverable:
+    ///
+    /// ```rust,ignore
+    /// let dlq = bus.dlq().await;
+    /// assert_eq!(dlq.len(), 1);
+    /// assert_eq!(dlq[0].subscriber_id, "projection:my-view");
+    /// assert_eq!(dlq[0].attempt_count, 4); // 1 initial + 3 retries
+    /// ```
+    pub async fn dlq(&self) -> Vec<DlqEntry> {
+        self.dlq.lock().await.clone()
     }
 }
 
@@ -494,7 +668,9 @@ where
     D: EventData + Send + Sync,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InMemoryEventBus").finish()
+        f.debug_struct("InMemoryEventBus")
+            .field("config", &self.config)
+            .finish()
     }
 }
 
@@ -1175,5 +1351,188 @@ mod tests {
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].id, event_a.id);
         assert_eq!(chain[1].id, event_b.id);
+    }
+
+    // -------------------------------------------------------------------------
+    // At-least-once delivery: retry and DLQ tests
+    // -------------------------------------------------------------------------
+
+    /// An observer that fails a configurable number of times before succeeding.
+    struct FlakyObserver {
+        /// How many times to fail before returning Ok.
+        fail_count: Arc<Mutex<u32>>,
+        /// Shared counter of total successful deliveries.
+        success_count: Arc<Mutex<u32>>,
+    }
+
+    impl FlakyObserver {
+        fn new(fail_count: u32) -> (Self, Arc<Mutex<u32>>) {
+            let success_count = Arc::new(Mutex::new(0u32));
+            (
+                Self {
+                    fail_count: Arc::new(Mutex::new(fail_count)),
+                    success_count: success_count.clone(),
+                },
+                success_count,
+            )
+        }
+    }
+
+    impl epoch_core::SubscriberId for FlakyObserver {
+        fn subscriber_id(&self) -> &str {
+            "projection:flaky"
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("intentional test failure")]
+    struct FlakyError;
+
+    #[async_trait]
+    impl epoch_core::event_store::EventObserver<MyEventData> for FlakyObserver {
+        async fn on_event(
+            &self,
+            _event: Arc<Event<MyEventData>>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let mut remaining = self.fail_count.lock().await;
+            if *remaining > 0 {
+                *remaining -= 1;
+                Err(Box::new(FlakyError))
+            } else {
+                *self.success_count.lock().await += 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// An observer that always fails.
+    struct AlwaysFailObserver;
+
+    impl epoch_core::SubscriberId for AlwaysFailObserver {
+        fn subscriber_id(&self) -> &str {
+            "projection:always-fail"
+        }
+    }
+
+    #[async_trait]
+    impl epoch_core::event_store::EventObserver<MyEventData> for AlwaysFailObserver {
+        async fn on_event(
+            &self,
+            _event: Arc<Event<MyEventData>>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err(Box::new(FlakyError))
+        }
+    }
+
+    /// A failing-then-succeeding observer receives the event again on retry.
+    #[tokio::test]
+    async fn retry_delivers_event_to_flaky_observer() {
+        // Observer fails twice, then succeeds on the third attempt.
+        // With max_retries = 3 the bus should eventually deliver successfully.
+        let (flaky, success_count) = FlakyObserver::new(2);
+        let bus = InMemoryEventBus::<MyEventData>::new(); // default: max_retries = 3
+        bus.subscribe(flaky).await.unwrap();
+
+        let stream_id = Uuid::new_v4();
+        let event = new_event(stream_id, 1, "retry-me");
+        bus.publish(Arc::new(event)).await.unwrap();
+
+        // Give the background task time to finish all retries.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            *success_count.lock().await,
+            1,
+            "observer should have succeeded after retries"
+        );
+        assert!(
+            bus.dlq().await.is_empty(),
+            "DLQ should be empty when observer eventually succeeds"
+        );
+    }
+
+    /// After exhausting all retries the event is appended to the DLQ.
+    #[tokio::test]
+    async fn always_failing_observer_lands_in_dlq() {
+        let bus = InMemoryEventBus::<MyEventData>::with_config(InMemoryEventBusConfig {
+            max_retries: 2, // 1 initial + 2 retries = 3 total attempts
+            retry_delay: Duration::ZERO,
+        });
+        bus.subscribe(AlwaysFailObserver).await.unwrap();
+
+        let stream_id = Uuid::new_v4();
+        let event = new_event(stream_id, 1, "doomed");
+        let event_id = event.id;
+        bus.publish(Arc::new(event)).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let dlq = bus.dlq().await;
+        assert_eq!(dlq.len(), 1, "exactly one DLQ entry expected");
+        assert_eq!(dlq[0].subscriber_id, "projection:always-fail");
+        assert_eq!(dlq[0].event_id, event_id);
+        assert_eq!(dlq[0].attempt_count, 3, "1 initial + 2 retries");
+        assert!(!dlq[0].error_message.is_empty());
+    }
+
+    /// With max_retries = 0 the bus is at-most-once: a single failure lands
+    /// the event in the DLQ with attempt_count = 1.
+    #[tokio::test]
+    async fn zero_retries_is_at_most_once() {
+        let bus = InMemoryEventBus::<MyEventData>::with_config(InMemoryEventBusConfig {
+            max_retries: 0,
+            retry_delay: Duration::ZERO,
+        });
+        bus.subscribe(AlwaysFailObserver).await.unwrap();
+
+        let stream_id = Uuid::new_v4();
+        let event = new_event(stream_id, 1, "once");
+        let event_id = event.id;
+        bus.publish(Arc::new(event)).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let dlq = bus.dlq().await;
+        assert_eq!(dlq.len(), 1);
+        assert_eq!(dlq[0].event_id, event_id);
+        assert_eq!(dlq[0].attempt_count, 1, "no retries: only 1 attempt");
+    }
+
+    /// A successful observer never adds anything to the DLQ.
+    #[tokio::test]
+    async fn successful_observer_does_not_populate_dlq() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let projection = TestProjection::new();
+        bus.subscribe(ProjectionHandler::new(projection))
+            .await
+            .unwrap();
+
+        let stream_id = Uuid::new_v4();
+        bus.publish(Arc::new(new_event(stream_id, 1, "fine")))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        assert!(bus.dlq().await.is_empty());
+    }
+
+    /// Multiple events all delivered successfully — DLQ stays empty.
+    #[tokio::test]
+    async fn dlq_is_empty_when_all_events_succeed() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        bus.subscribe(ProjectionHandler::new(TestProjection::new()))
+            .await
+            .unwrap();
+
+        let stream_id = Uuid::new_v4();
+        for version in 1..=5u64 {
+            bus.publish(Arc::new(new_event(stream_id, version, "ok")))
+                .await
+                .unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(bus.dlq().await.is_empty());
     }
 }
