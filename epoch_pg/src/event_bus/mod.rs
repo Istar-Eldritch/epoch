@@ -103,6 +103,33 @@ pub(crate) async fn ensure_txid_column(pool: &PgPool, table: &str) -> Result<(),
     Ok(())
 }
 
+/// Ensures the `schema_version` column (CLOUD-173 upcasting) exists on `table`
+/// with the correct `DEFAULT 1`.
+///
+/// Idempotent — safe to call on every startup. Both statements use
+/// `IF NOT EXISTS` / `SET DEFAULT`, so `ADD COLUMN` is a metadata-only
+/// operation (no table rewrite). Intended for **custom** events tables; the
+/// default `epoch_events` table is covered by migration m012.
+///
+/// On error the caller should `warn!` and continue: schema-version stamping
+/// simply degrades to the `NULL` → `1` fallback for that table.
+pub(crate) async fn ensure_schema_version_column(
+    pool: &PgPool,
+    table: &str,
+) -> Result<(), SqlxError> {
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS schema_version INT"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ALTER COLUMN schema_version SET DEFAULT 1"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Queries the reader session's current transaction-id snapshot bounds (PG13+).
 ///
 /// Returns `None` (with a single `warn!`) on query failure so the caller can
@@ -750,6 +777,21 @@ where
             warn!(
                 "Failed to ensure txid column on custom events table '{}'; \
                  snapshot fencing degrades to timeout-only for this bus: {}",
+                self.config.events_table, e
+            );
+        }
+
+        // CLOUD-173: ensure the `schema_version` column exists on a custom events
+        // table so upcasting version metadata is persisted correctly. The default
+        // `epoch_events` table is covered by migration m012, so it is skipped here.
+        // Failure is non-fatal: the read path falls back to NULL → 1.
+        if self.config.events_table != "epoch_events"
+            && let Err(e) =
+                ensure_schema_version_column(&self.pool, &self.config.events_table).await
+        {
+            warn!(
+                "Failed to ensure schema_version column on custom events table '{}'; \
+                 schema version will be read as NULL (treated as v1) for this bus: {}",
                 self.config.events_table, e
             );
         }

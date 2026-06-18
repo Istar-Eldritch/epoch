@@ -48,6 +48,14 @@ impl<B: EventBus + Clone> PgEventStore<B> {
                  snapshot fencing degrades to timeout-only for this table: {e}"
             );
         }
+        if let Err(e) =
+            crate::event_bus::ensure_schema_version_column(&postgres, &events_table).await
+        {
+            log::warn!(
+                "Failed to ensure schema_version column on custom events table '{events_table}'; \
+                 schema version will be read as NULL (treated as v1) for this table: {e}"
+            );
+        }
         Self {
             postgres,
             bus,
