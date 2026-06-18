@@ -303,6 +303,15 @@ where
     /// A stored `stream_version` is negative and cannot be converted to `u64` (data corruption)
     #[error("Invalid stream_version {0}: value is negative (data corruption)")]
     InvalidStreamVersion(i64),
+    /// An upcasting or deserialization failure reported by the [`UpcasterRegistry`].
+    ///
+    /// Only produced when [`epoch_core::upcasting::FailurePolicy::Fail`] is active (the
+    /// default). Under [`epoch_core::upcasting::FailurePolicy::DeadLetter`] the event is
+    /// captured by the configured sink and skipped (`Ok(None)`) without propagating an error.
+    ///
+    /// [`UpcasterRegistry`]: epoch_core::upcasting::UpcasterRegistry
+    #[error("Upcast error: {0}")]
+    Upcast(#[from] epoch_core::upcasting::UpcastError),
 }
 
 #[async_trait]

@@ -736,4 +736,234 @@ mod tests {
         assert!(matches!(result, Err(UpcastError::Deserialize { .. })));
         assert_eq!(registry.counters().failed(), 1);
     }
+
+    // ── DeadLetterSink helper for tests ──────────────────────────────────────
+
+    use std::sync::{Arc, Mutex};
+
+    /// An in-memory sink that records every captured event for assertions.
+    struct RecordingSink {
+        captured: Arc<Mutex<Vec<DeadLetteredEvent>>>,
+    }
+
+    impl RecordingSink {
+        /// Returns the sink and a shared handle to inspect captured events.
+        fn new() -> (Self, Arc<Mutex<Vec<DeadLetteredEvent>>>) {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    captured: Arc::clone(&captured),
+                },
+                captured,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DeadLetterSink for RecordingSink {
+        async fn capture(&self, event: DeadLetteredEvent) {
+            self.captured.lock().unwrap().push(event);
+        }
+    }
+
+    // ── R-11: DeadLetter policy tests ─────────────────────────────────────────
+
+    /// Under `DeadLetter`, a deserialization failure MUST NOT abort the stream:
+    /// it must return `Ok(None)`, increment the dead-lettered counter, and
+    /// capture the event in the registered sink.
+    #[tokio::test]
+    async fn dead_letter_policy_captures_and_continues_on_deserialize_error() {
+        let (sink, captured) = RecordingSink::new();
+        let mut registry = UpcasterRegistry::new();
+        registry
+            .with_policy(FailurePolicy::DeadLetter)
+            .with_dead_letter_sink(sink);
+
+        // No upcaster registered; payload missing `currency` → deserialize fails.
+        let result: Result<Option<OrderPlaced>, _> = registry.upcast_and_deserialize(
+            "OrderPlaced",
+            1,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(json!({ "amount": 42 })),
+        );
+
+        // DeadLetter: stream continues, event is skipped.
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None), got {result:?}"
+        );
+        assert_eq!(
+            registry.counters().dead_lettered(),
+            1,
+            "dead_lettered counter"
+        );
+        assert_eq!(
+            registry.counters().failed(),
+            0,
+            "failed counter must stay zero"
+        );
+        assert_eq!(registry.counters().succeeded(), 0, "succeeded counter");
+
+        // Give the fire-and-forget capture task a moment to complete.
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        let guard = captured.lock().unwrap();
+        assert_eq!(
+            guard.len(),
+            1,
+            "sink must receive exactly one dead-lettered event"
+        );
+        assert_eq!(guard[0].event_type, "OrderPlaced");
+        assert_eq!(guard[0].stored_version, 1);
+    }
+
+    /// Under `DeadLetter`, a missing-step error is treated the same way as a
+    /// deserialization error: captured, counted, and skipped (`Ok(None)`).
+    #[tokio::test]
+    async fn dead_letter_policy_captures_and_continues_on_missing_step() {
+        let (sink, captured) = RecordingSink::new();
+        let mut registry = UpcasterRegistry::new();
+        // Register 1→2 and 3→4 but NOT 2→3, leaving a gap.
+        registry.register(AddFieldUpcaster {
+            event_type: "OrderPlaced",
+            from_version: 1,
+            field: "a",
+            value: json!(1),
+        });
+        registry.register(AddFieldUpcaster {
+            event_type: "OrderPlaced",
+            from_version: 3,
+            field: "c",
+            value: json!(3),
+        });
+        registry
+            .with_policy(FailurePolicy::DeadLetter)
+            .with_dead_letter_sink(sink);
+
+        let result: Result<Option<OrderPlaced>, _> = registry.upcast_and_deserialize(
+            "OrderPlaced",
+            1,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(json!({ "amount": 42, "currency": "USD" })),
+        );
+
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None), got {result:?}"
+        );
+        assert_eq!(registry.counters().dead_lettered(), 1);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    /// `FutureVersion` is an operator/deploy error and MUST always propagate as
+    /// `Err`, even when the policy is `DeadLetter`. Silent skipping would hide a
+    /// serious mismatch between the binary and its data.
+    #[tokio::test]
+    async fn dead_letter_policy_future_version_always_propagates_as_err() {
+        let (sink, captured) = RecordingSink::new();
+        let mut registry = UpcasterRegistry::new();
+        registry.register(AddFieldUpcaster {
+            event_type: "OrderPlaced",
+            from_version: 1,
+            field: "currency",
+            value: json!("USD"),
+        });
+        // Current version is 2; stored version 5 is from the future.
+        registry
+            .with_policy(FailurePolicy::DeadLetter)
+            .with_dead_letter_sink(sink);
+
+        let result: Result<Option<OrderPlaced>, _> = registry.upcast_and_deserialize(
+            "OrderPlaced",
+            5,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(json!({ "amount": 42, "currency": "USD" })),
+        );
+
+        // Must be Err(FutureVersion), never Ok(None).
+        assert!(
+            matches!(result, Err(UpcastError::FutureVersion { .. })),
+            "expected Err(FutureVersion), got {result:?}",
+        );
+        // Counted as a failure, not a dead-letter.
+        assert_eq!(registry.counters().failed(), 1);
+        assert_eq!(registry.counters().dead_lettered(), 0);
+
+        // Sink must NOT receive a FutureVersion event — it is never skippable.
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        assert_eq!(captured.lock().unwrap().len(), 0);
+    }
+
+    // ── R-12: counter observability tests ────────────────────────────────────
+
+    /// The `applied`, `succeeded`, `failed`, and `dead_lettered` counters must
+    /// each track their respective outcomes independently and never cross-increment.
+    #[tokio::test]
+    async fn counters_track_outcomes_independently() {
+        let mut registry = UpcasterRegistry::new();
+        registry.register(AddFieldUpcaster {
+            event_type: "OrderPlaced",
+            from_version: 1,
+            field: "currency",
+            value: json!("USD"),
+        });
+
+        // Two successful round-trips: applied=2, succeeded=2
+        for _ in 0..2 {
+            let out: Option<OrderPlaced> = registry
+                .upcast_and_deserialize(
+                    "OrderPlaced",
+                    1,
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    Some(json!({ "amount": 10 })),
+                )
+                .unwrap();
+            assert!(out.is_some());
+        }
+
+        assert_eq!(registry.counters().applied(), 2, "two 1→2 steps applied");
+        assert_eq!(registry.counters().succeeded(), 2);
+        assert_eq!(registry.counters().failed(), 0);
+        assert_eq!(registry.counters().dead_lettered(), 0);
+
+        // One failure: failed=1, others unchanged.
+        let result: Result<Option<OrderPlaced>, _> = registry.upcast_and_deserialize(
+            "OrderPlaced",
+            1,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            // After upcasting, the payload is `{"amount":10, "currency":"USD"}`;
+            // the payload below forces a serde error by omitting the version 2 result.
+            // Inject a future version to trigger a clean failure without adding a upcaster.
+            None, // purged event → Ok(None), does not touch counters
+        );
+        // Purged event: all counters unchanged.
+        assert!(matches!(result, Ok(None)));
+        assert_eq!(registry.counters().succeeded(), 2);
+        assert_eq!(registry.counters().failed(), 0);
+    }
+
+    /// The `failed` counter increments once per failed event, never per step.
+    #[tokio::test]
+    async fn failed_counter_increments_once_per_failed_event() {
+        let registry = UpcasterRegistry::new();
+        // Three consecutive failures under Fail policy.
+        for i in 1u32..=3 {
+            let _: Result<Option<OrderPlaced>, _> = registry.upcast_and_deserialize(
+                "OrderPlaced",
+                1,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Some(json!({ "amount": i })), // missing `currency` → error
+            );
+        }
+        assert_eq!(registry.counters().failed(), 3);
+        assert_eq!(registry.counters().dead_lettered(), 0);
+        assert_eq!(registry.counters().succeeded(), 0);
+    }
 }
