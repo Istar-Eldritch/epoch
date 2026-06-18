@@ -21,4 +21,5 @@ uuid = { version = "1.17.0", features = ["serde", "v4"] }
 log = "0.4.27"
 
 [dev-dependencies]
-epoch_core = { path = "../epoch_core", features = ["testing"] }
+epoch_core = { path = "../epoch_core", features = ["testing", "upcasting"] }
+serde_json = "1.0"
