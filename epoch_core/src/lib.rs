@@ -29,6 +29,9 @@ pub mod saga;
 pub mod state_store;
 pub mod subscriber_id;
 
+#[cfg(feature = "upcasting")]
+pub mod upcasting;
+
 #[cfg(feature = "testing")]
 pub mod testing;
 
@@ -45,4 +48,6 @@ pub mod prelude {
     pub use super::saga::*;
     pub use super::state_store::*;
     pub use super::subscriber_id::*;
+    #[cfg(feature = "upcasting")]
+    pub use super::upcasting::*;
 }
