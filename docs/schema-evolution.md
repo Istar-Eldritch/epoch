@@ -527,11 +527,12 @@ async fn order_placed_upcasting_chain_is_correct() {
     registry.register(OrderPlacedV1ToV2);
     registry.register(OrderPlacedV2ToV3);
 
+    let expected = AppEvent::OrderPlaced { total_amount: 42, currency: "USD".into() };
     epoch_core::testing::verify_upcasting_chain::<AppEvent>(
-        registry,
+        &registry,
         "OrderPlaced",
         serde_json::json!({ "amount": 42 }),     // v1 raw payload
-        2,                                        // number of steps expected
+        expected,                                // expected deserialized value after full chain
     )
     .await;
 }
