@@ -593,7 +593,9 @@ where
                                 if attempt > 0 {
                                     log::debug!(
                                         "Observer '{}' succeeded on event {} after {} retries",
-                                        subscriber_id, event.id, attempt
+                                        subscriber_id,
+                                        event.id,
+                                        attempt,
                                     );
                                 }
                                 succeeded = true;
