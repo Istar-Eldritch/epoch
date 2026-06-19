@@ -16,7 +16,16 @@ pub fn event_data_enum_impl(item: proc_macro::TokenStream) -> proc_macro::TokenS
     };
 
     // Parse optional `#[event_data(schema_version = N)]` attribute on the enum.
-    let schema_version_override = parse_schema_version(&input);
+    let schema_version_override = match parse_schema_version(&input) {
+        Ok(v) => v,
+        Err(e) => return e.into_compile_error().into(),
+    };
+
+    let schema_version_method = Some(quote! {
+        fn schema_version(&self) -> ::epoch_core::event::SchemaVersion {
+            #schema_version_override
+        }
+    });
 
     let event_type_matches = variants.iter().map(|variant| {
         let variant_name = &variant.ident;
@@ -40,15 +49,6 @@ pub fn event_data_enum_impl(item: proc_macro::TokenStream) -> proc_macro::TokenS
         }
     });
 
-    // Only emit the schema_version override when the attribute was present.
-    let schema_version_method = schema_version_override.map(|v| {
-        quote! {
-            fn schema_version(&self) -> ::epoch_core::event::SchemaVersion {
-                #v
-            }
-        }
-    });
-
     let expanded = quote! {
         impl EventData for #enum_name {
             fn event_type(&self) -> &'static str {
@@ -64,35 +64,60 @@ pub fn event_data_enum_impl(item: proc_macro::TokenStream) -> proc_macro::TokenS
 }
 
 /// Parses the `#[event_data(schema_version = N)]` attribute from an enum's
-/// attributes and returns the version literal as a `u32` if present.
-///
-/// Returns `None` if the attribute is absent or does not have the expected form.
-fn parse_schema_version(input: &DeriveInput) -> Option<u32> {
+/// attributes and returns the version literal as a `u32`.
+/// Returns Err for malformed attributes, causing a compile-time error.
+fn parse_schema_version(input: &DeriveInput) -> Result<u32, syn::Error> {
     for attr in &input.attrs {
         if !attr.path().is_ident("event_data") {
             continue;
         }
-        // The attribute must be in "list" form: `#[event_data(key = value)]`.
         let meta_list = match &attr.meta {
             Meta::List(list) => list,
-            _ => continue,
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "expected #[event_data(schema_version = N)] (list form)",
+                ));
+            }
         };
-        // Parse the token stream inside the parens as `schema_version = <integer>`.
         let name_value: syn::MetaNameValue = match syn::parse2(meta_list.tokens.clone()) {
             Ok(nv) => nv,
-            Err(_) => continue,
+            Err(_) => {
+                return Err(syn::Error::new_spanned(attr, "couldn't parse event_data options"));
+            }
         };
         if !name_value.path.is_ident("schema_version") {
-            continue;
+            return Err(syn::Error::new_spanned(
+                &name_value.path,
+                "unknown key; expected schema_version",
+            ));
         }
-        if let Expr::Lit(ExprLit {
-            lit: Lit::Int(int_lit),
-            ..
-        }) = &name_value.value
-            && let Ok(v) = int_lit.base10_parse::<u32>()
-        {
-            return Some(v);
+        match &name_value.value {
+            Expr::Lit(ExprLit {
+                lit: Lit::Int(int_lit),
+                ..
+            }) => {
+                let parsed: Result<u32, _> = int_lit.base10_parse();
+                match parsed {
+                    Ok(v) => return Ok(v),
+                    Err(_) => {
+                        return Err(syn::Error::new_spanned(
+                            int_lit,
+                            "schema_version must be an integer literal",
+                        ));
+                    }
+                }
+            }
+            other => {
+                return Err(syn::Error::new_spanned(
+                    other,
+                    "schema_version must be an integer literal",
+                ));
+            }
         }
     }
-    None
+    Err(syn::Error::new_spanned(
+        input,
+        "no #[event_data(schema_version = N)] attribute found",
+    ))
 }

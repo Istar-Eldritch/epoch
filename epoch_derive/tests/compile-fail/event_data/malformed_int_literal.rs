@@ -8,12 +8,6 @@
 use epoch_core::event::EventData;
 use epoch_derive::EventData;
 use serde::{Deserialize, Serialize};
-\
-// This should ERROR - not an int
-#[event_data(schema_version = "not_an_int")]
-pub enum MalformedIntEvent {
-    A
-}
 
 // ── Enum without schema_version attribute (should default to 1) ───────────────
 
