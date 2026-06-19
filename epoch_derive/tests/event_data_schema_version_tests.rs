@@ -4,16 +4,13 @@
 //! - Absence of the attribute yields the default `schema_version()` of `1`.
 //! - Presence of `#[event_data(schema_version = N)]` overrides `schema_version()` to `N`.
 //! - The `event_type()` method is unaffected.
+//!
+//! Compile-fail cases (malformed attributes) live in
+//! `tests/compile-fail/event_data/` and are run by the trybuild harness.
 
 use epoch_core::event::EventData;
 use epoch_derive::EventData;
 use serde::{Deserialize, Serialize};
-\
-// This should ERROR - not an int
-#[event_data(schema_version = "not_an_int")]
-pub enum MalformedIntEvent {
-    A
-}
 
 // ── Enum without schema_version attribute (should default to 1) ───────────────
 

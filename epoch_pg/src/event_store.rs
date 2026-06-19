@@ -532,22 +532,33 @@ where
         &self,
         stream_id: Uuid,
     ) -> Result<Option<Event<Self::EventType>>, Self::Error> {
+        // Fetch rows in descending version order without a LIMIT so that, when the
+        // `DeadLetter` policy is active, we can skip dead-lettered rows at the tail
+        // and return the most-recent *live* event instead of falsely reporting an
+        // empty stream.  In the common (no-dead-letter) case the loop exits on the
+        // very first row.
         let last_sql = format!(
             "SELECT id, stream_id, stream_version, event_type, data, created_at, \
              actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id, \
              schema_version \
-             FROM {} WHERE stream_id = $1 ORDER BY stream_version DESC LIMIT 1",
+             FROM {} WHERE stream_id = $1 ORDER BY stream_version DESC",
             self.events_table,
         );
-        let row: Option<PgDBEvent> = sqlx::query_as(&last_sql)
+        let mut rows = sqlx::query_as::<_, PgDBEvent>(&last_sql)
             .bind(stream_id)
-            .fetch_optional(&self.postgres)
-            .await?;
+            .fetch(&self.postgres);
 
-        let Some(entry) = row else {
-            return Ok(None);
-        };
-        pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters).await
+        use futures_util::StreamExt;
+        while let Some(row) = rows.next().await {
+            let entry = row.map_err(PgEventStoreError::DBError::<B::Error>)?;
+            if let Some(event) =
+                pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters).await?
+            {
+                return Ok(Some(event));
+            }
+            // `Ok(None)` means the row was dead-lettered; advance to the prior row.
+        }
+        Ok(None)
     }
 
     async fn read_events_by_correlation_id(
