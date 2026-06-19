@@ -257,7 +257,7 @@ pub struct PgDBEvent {
 /// `trace_causation_chain`, and `read_last_event`. Optional metadata
 /// (`global_sequence`, `causation_id`, `correlation_id`) is only threaded onto
 /// the builder when present on the row.
-fn pg_db_event_to_event<D, BE>(
+async fn pg_db_event_to_event<D, BE>(
     entry: PgDBEvent,
     upcasters: &UpcasterRegistry,
 ) -> Result<Option<Event<D>>, PgEventStoreError<BE>>
@@ -274,13 +274,15 @@ where
     // schema version, then deserialize into `D`, applying the configured
     // `FailurePolicy`. `Ok(None)` is returned only when an event is explicitly
     // dead-lettered (skip that row) or when the payload is `NULL` (purged event).
-    let data: Option<D> = upcasters.upcast_and_deserialize::<D>(
-        &entry.event_type,
-        stored_version,
-        entry.stream_id,
-        entry.id,
-        entry.data,
-    )?;
+    let data: Option<D> = upcasters
+        .upcast_and_deserialize::<D>(
+            &entry.event_type,
+            stored_version,
+            entry.stream_id,
+            entry.id,
+            entry.data,
+        )
+        .await?;
 
     // If the row carried a payload but the registry returned `None`, the event was
     // explicitly dead-lettered (counted, logged, captured): skip exactly this row.
@@ -426,7 +428,7 @@ where
                 // `None` means the row was explicitly dead-lettered (counted, logged,
                 // captured): skip it without aborting the stream.
                 if let Some(event) =
-                    pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters)?
+                    pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters).await?
                 {
                     yield event;
                 }
@@ -545,7 +547,7 @@ where
         let Some(entry) = row else {
             return Ok(None);
         };
-        pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters)
+        pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters).await
     }
 
     async fn read_events_by_correlation_id(
@@ -568,7 +570,7 @@ where
         for entry in rows {
             // Skip dead-lettered rows (`None`); fail loudly otherwise.
             if let Some(event) =
-                pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters)?
+                pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters).await?
             {
                 events.push(event);
             }
@@ -603,10 +605,10 @@ where
         let correlation_id = match entry.correlation_id {
             Some(cid) => cid,
             None => {
-                let events =
-                    pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters)?
-                        .into_iter()
-                        .collect();
+                let events = pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters)
+                    .await?
+                    .into_iter()
+                    .collect();
                 return Ok(events);
             }
         };
@@ -676,8 +678,8 @@ mod tests {
         assert_eq!(parsed.global_sequence, None);
     }
 
-    #[test]
-    fn pg_db_event_to_event_rejects_negative_stream_version() {
+    #[tokio::test]
+    async fn pg_db_event_to_event_rejects_negative_stream_version() {
         // A corrupt row with a negative stream_version must produce a typed error,
         // not a panic. Regression test for CLOUD-170.
         #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -705,7 +707,8 @@ mod tests {
         };
 
         let registry = UpcasterRegistry::new();
-        let result = pg_db_event_to_event::<TestEvent, std::convert::Infallible>(entry, &registry);
+        let result =
+            pg_db_event_to_event::<TestEvent, std::convert::Infallible>(entry, &registry).await;
         assert!(
             matches!(result, Err(PgEventStoreError::InvalidStreamVersion(-1))),
             "expected InvalidStreamVersion(-1), got: {:?}",

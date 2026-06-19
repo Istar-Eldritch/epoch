@@ -155,13 +155,9 @@ pub async fn verify_upcasting_chain<D>(
     let stream_id = Uuid::new_v4();
     let event_id = Uuid::new_v4();
 
-    let result: Result<Option<D>, crate::upcasting::UpcastError> = registry.upcast_and_deserialize(
-        event_type,
-        1,
-        stream_id,
-        event_id,
-        Some(v1_payload.clone()),
-    );
+    let result: Result<Option<D>, crate::upcasting::UpcastError> = registry
+        .upcast_and_deserialize(event_type, 1, stream_id, event_id, Some(v1_payload.clone()))
+        .await;
 
     assert!(
         result.is_ok(),
@@ -203,8 +199,9 @@ pub async fn verify_upcasting_chain<D>(
     let succeeded_before = registry.counters().succeeded();
     let failed_before = registry.counters().failed();
 
-    let purged_result: Result<Option<D>, crate::upcasting::UpcastError> =
-        registry.upcast_and_deserialize(event_type, 1, Uuid::new_v4(), Uuid::new_v4(), None);
+    let purged_result: Result<Option<D>, crate::upcasting::UpcastError> = registry
+        .upcast_and_deserialize(event_type, 1, Uuid::new_v4(), Uuid::new_v4(), None)
+        .await;
 
     assert!(
         matches!(purged_result, Ok(None)),

@@ -393,7 +393,7 @@ impl UpcasterRegistry {
     /// backend skips exactly that row) or when `payload` is `None` (a purged event).
     /// A [`UpcastError::FutureVersion`] always propagates as `Err`, even under
     /// [`FailurePolicy::DeadLetter`].
-    pub fn upcast_and_deserialize<D: EventData>(
+    pub async fn upcast_and_deserialize<D: EventData>(
         &self,
         event_type: &str,
         stored_version: SchemaVersion,
@@ -417,14 +417,16 @@ impl UpcasterRegistry {
                 return Err(err);
             }
             Err(err) => {
-                return self.handle_failure(
-                    event_type,
-                    stored_version,
-                    stream_id,
-                    event_id,
-                    payload,
-                    err,
-                );
+                return self
+                    .handle_failure(
+                        event_type,
+                        stored_version,
+                        stream_id,
+                        event_id,
+                        payload,
+                        err,
+                    )
+                    .await;
             }
         };
 
@@ -447,12 +449,13 @@ impl UpcasterRegistry {
                     payload,
                     err,
                 )
+                .await
             }
         }
     }
 
     /// Applies the configured [`FailurePolicy`] to a non-future-version failure.
-    fn handle_failure<D>(
+    async fn handle_failure<D>(
         &self,
         event_type: &str,
         stored_version: SchemaVersion,
@@ -489,10 +492,8 @@ impl UpcasterRegistry {
                         raw_payload,
                         reason,
                     );
-                    // Capture is fire-and-forget: it must not block or fail the read.
-                    tokio::spawn(async move {
-                        sink.capture(dle).await;
-                    });
+                    // Capture is awaited to guarantee delivery before continuing (R-11).
+                    sink.capture(dle).await;
                 }
                 Ok(None)
             }
@@ -711,6 +712,7 @@ mod tests {
                 Uuid::new_v4(),
                 Some(json!({ "amount": 42 })),
             )
+            .await
             .unwrap();
         assert_eq!(
             out,
@@ -726,13 +728,15 @@ mod tests {
     async fn fail_policy_aborts_on_deserialize_error() {
         let registry = UpcasterRegistry::new();
         // No upcaster, payload missing `currency` → deserialize fails under Fail.
-        let result: Result<Option<OrderPlaced>, _> = registry.upcast_and_deserialize(
-            "OrderPlaced",
-            1,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Some(json!({ "amount": 42 })),
-        );
+        let result: Result<Option<OrderPlaced>, _> = registry
+            .upcast_and_deserialize(
+                "OrderPlaced",
+                1,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Some(json!({ "amount": 42 })),
+            )
+            .await;
         assert!(matches!(result, Err(UpcastError::Deserialize { .. })));
         assert_eq!(registry.counters().failed(), 1);
     }
@@ -780,13 +784,15 @@ mod tests {
             .with_dead_letter_sink(sink);
 
         // No upcaster registered; payload missing `currency` → deserialize fails.
-        let result: Result<Option<OrderPlaced>, _> = registry.upcast_and_deserialize(
-            "OrderPlaced",
-            1,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Some(json!({ "amount": 42 })),
-        );
+        let result: Result<Option<OrderPlaced>, _> = registry
+            .upcast_and_deserialize(
+                "OrderPlaced",
+                1,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Some(json!({ "amount": 42 })),
+            )
+            .await;
 
         // DeadLetter: stream continues, event is skipped.
         assert!(
@@ -805,8 +811,6 @@ mod tests {
         );
         assert_eq!(registry.counters().succeeded(), 0, "succeeded counter");
 
-        // Give the fire-and-forget capture task a moment to complete.
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         let guard = captured.lock().unwrap();
         assert_eq!(
             guard.len(),
@@ -840,13 +844,15 @@ mod tests {
             .with_policy(FailurePolicy::DeadLetter)
             .with_dead_letter_sink(sink);
 
-        let result: Result<Option<OrderPlaced>, _> = registry.upcast_and_deserialize(
-            "OrderPlaced",
-            1,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Some(json!({ "amount": 42, "currency": "USD" })),
-        );
+        let result: Result<Option<OrderPlaced>, _> = registry
+            .upcast_and_deserialize(
+                "OrderPlaced",
+                1,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Some(json!({ "amount": 42, "currency": "USD" })),
+            )
+            .await;
 
         assert!(
             matches!(result, Ok(None)),
@@ -854,7 +860,6 @@ mod tests {
         );
         assert_eq!(registry.counters().dead_lettered(), 1);
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         assert_eq!(captured.lock().unwrap().len(), 1);
     }
 
@@ -876,13 +881,15 @@ mod tests {
             .with_policy(FailurePolicy::DeadLetter)
             .with_dead_letter_sink(sink);
 
-        let result: Result<Option<OrderPlaced>, _> = registry.upcast_and_deserialize(
-            "OrderPlaced",
-            5,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Some(json!({ "amount": 42, "currency": "USD" })),
-        );
+        let result: Result<Option<OrderPlaced>, _> = registry
+            .upcast_and_deserialize(
+                "OrderPlaced",
+                5,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Some(json!({ "amount": 42, "currency": "USD" })),
+            )
+            .await;
 
         // Must be Err(FutureVersion), never Ok(None).
         assert!(
@@ -894,7 +901,6 @@ mod tests {
         assert_eq!(registry.counters().dead_lettered(), 0);
 
         // Sink must NOT receive a FutureVersion event — it is never skippable.
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         assert_eq!(captured.lock().unwrap().len(), 0);
     }
 
@@ -922,6 +928,7 @@ mod tests {
                     Uuid::new_v4(),
                     Some(json!({ "amount": 10 })),
                 )
+                .await
                 .unwrap();
             assert!(out.is_some());
         }
@@ -932,16 +939,18 @@ mod tests {
         assert_eq!(registry.counters().dead_lettered(), 0);
 
         // One failure: failed=1, others unchanged.
-        let result: Result<Option<OrderPlaced>, _> = registry.upcast_and_deserialize(
-            "OrderPlaced",
-            1,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            // After upcasting, the payload is `{"amount":10, "currency":"USD"}`;
-            // the payload below forces a serde error by omitting the version 2 result.
-            // Inject a future version to trigger a clean failure without adding a upcaster.
-            None, // purged event → Ok(None), does not touch counters
-        );
+        let result: Result<Option<OrderPlaced>, _> = registry
+            .upcast_and_deserialize(
+                "OrderPlaced",
+                1,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                // After upcasting, the payload is `{"amount":10, "currency":"USD"}`;
+                // the payload below forces a serde error by omitting the version 2 result.
+                // Inject a future version to trigger a clean failure without adding a upcaster.
+                None, // purged event → Ok(None), does not touch counters
+            )
+            .await;
         // Purged event: all counters unchanged.
         assert!(matches!(result, Ok(None)));
         assert_eq!(registry.counters().succeeded(), 2);
@@ -954,13 +963,15 @@ mod tests {
         let registry = UpcasterRegistry::new();
         // Three consecutive failures under Fail policy.
         for i in 1u32..=3 {
-            let _: Result<Option<OrderPlaced>, _> = registry.upcast_and_deserialize(
-                "OrderPlaced",
-                1,
-                Uuid::new_v4(),
-                Uuid::new_v4(),
-                Some(json!({ "amount": i })), // missing `currency` → error
-            );
+            let _: Result<Option<OrderPlaced>, _> = registry
+                .upcast_and_deserialize(
+                    "OrderPlaced",
+                    1,
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    Some(json!({ "amount": i })), // missing `currency` → error
+                )
+                .await;
         }
         assert_eq!(registry.counters().failed(), 3);
         assert_eq!(registry.counters().dead_lettered(), 0);

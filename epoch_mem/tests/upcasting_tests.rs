@@ -198,13 +198,15 @@ async fn empty_registry_passes_through_current_version_payload() {
     let registry = UpcasterRegistry::new();
 
     // No upcasters → current version is 1 → the payload must already be the v1 shape.
-    let result: Result<Option<TicketClosed>, UpcastError> = registry.upcast_and_deserialize(
-        "TicketClosed",
-        1,
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-        Some(json!({ "id": "abc" })),
-    );
+    let result: Result<Option<TicketClosed>, UpcastError> = registry
+        .upcast_and_deserialize(
+            "TicketClosed",
+            1,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(json!({ "id": "abc" })),
+        )
+        .await;
     assert_eq!(
         result.unwrap(),
         Some(TicketClosed {
@@ -237,13 +239,15 @@ async fn missing_step_returns_missing_step_error() {
     });
     assert_eq!(registry.current_version("ItemAdded"), 4);
 
-    let result: Result<Option<ItemAdded>, UpcastError> = registry.upcast_and_deserialize(
-        "ItemAdded",
-        1,
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-        Some(json!({ "sku": "X", "quantity": 1, "warehouse": "main" })),
-    );
+    let result: Result<Option<ItemAdded>, UpcastError> = registry
+        .upcast_and_deserialize(
+            "ItemAdded",
+            1,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(json!({ "sku": "X", "quantity": 1, "warehouse": "main" })),
+        )
+        .await;
     assert!(
         matches!(
             result,
@@ -273,13 +277,15 @@ async fn future_version_always_propagates_as_error() {
     // current = 2; stored version 5 is from the "future".
     registry.with_policy(FailurePolicy::DeadLetter);
 
-    let result: Result<Option<ItemAdded>, UpcastError> = registry.upcast_and_deserialize(
-        "ItemAdded",
-        5,
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-        Some(json!({ "sku": "X", "quantity": 1, "warehouse": "main" })),
-    );
+    let result: Result<Option<ItemAdded>, UpcastError> = registry
+        .upcast_and_deserialize(
+            "ItemAdded",
+            5,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(json!({ "sku": "X", "quantity": 1, "warehouse": "main" })),
+        )
+        .await;
     assert!(
         matches!(
             result,
@@ -306,13 +312,15 @@ async fn future_version_always_propagates_as_error() {
 async fn fail_policy_aborts_loudly_on_deserialization_error() {
     let registry = UpcasterRegistry::new();
     // No upcaster; payload missing `quantity` and `warehouse` → serde error.
-    let result: Result<Option<ItemAdded>, UpcastError> = registry.upcast_and_deserialize(
-        "ItemAdded",
-        1,
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-        Some(json!({ "sku": "X" })),
-    );
+    let result: Result<Option<ItemAdded>, UpcastError> = registry
+        .upcast_and_deserialize(
+            "ItemAdded",
+            1,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(json!({ "sku": "X" })),
+        )
+        .await;
     assert!(
         matches!(result, Err(UpcastError::Deserialize { .. })),
         "Fail policy must surface a deserialization error as Err, got: {:?}",
@@ -334,13 +342,15 @@ async fn dead_letter_policy_captures_counts_and_continues() {
         .with_dead_letter_sink(sink);
 
     // Payload missing `quantity` and `warehouse` → fails after upcasting (no steps).
-    let result: Result<Option<ItemAdded>, UpcastError> = registry.upcast_and_deserialize(
-        "ItemAdded",
-        1,
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-        Some(json!({ "sku": "X" })),
-    );
+    let result: Result<Option<ItemAdded>, UpcastError> = registry
+        .upcast_and_deserialize(
+            "ItemAdded",
+            1,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(json!({ "sku": "X" })),
+        )
+        .await;
 
     // Stream continues: Ok(None).
     assert!(
@@ -389,13 +399,15 @@ async fn dead_letter_policy_never_silently_loses_events() {
 
     // Three consecutive failures (missing fields).
     for _ in 0..3 {
-        let _: Result<Option<ItemAdded>, _> = registry.upcast_and_deserialize(
-            "ItemAdded",
-            1,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Some(json!({ "sku": "X" })),
-        );
+        let _: Result<Option<ItemAdded>, _> = registry
+            .upcast_and_deserialize(
+                "ItemAdded",
+                1,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Some(json!({ "sku": "X" })),
+            )
+            .await;
     }
 
     assert_eq!(
