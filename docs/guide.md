@@ -102,7 +102,6 @@ let cmd = Command::new(order_id, PlaceOrder { .. }, None, None)
 
 Use `extract_causation_subtree` to navigate the causal tree — given a target event and all correlated events, it returns ancestors + the target + all descendants, ordered by `global_sequence`.
 
-
 ## Aggregates (Write Model)
 
 Aggregates encapsulate business logic, validate commands, enforce invariants, and emit events. They implement both `EventApplicator` (for state reconstruction) and `Aggregate` (for command handling).
@@ -147,6 +146,7 @@ tx.commit().await?;   // single fsync, then events published
 ```
 
 Key points:
+
 - **Atomic** — all events and state changes commit or rollback together
 - **Version continuity** — multiple `handle()` calls on the same aggregate within a transaction track versions correctly via an internal cache
 - **Events buffered** — published only after successful commit
@@ -201,6 +201,7 @@ event_bus.subscribe(ProjectionHandler::new(projection)).await?;
 ```
 
 Key points:
+
 - **`EventApplicator`** defines `apply` — shared base trait between projections and aggregates
 - **`Projection`** adds `apply_and_store` for event bus integration (has a default implementation)
 - **`ProjectionHandler`** wraps a projection to subscribe it to the event bus
@@ -247,6 +248,7 @@ event_bus.subscribe(SagaHandler::new(saga)).await?;
 ```
 
 Key points:
+
 - **State is an enum** acting as a state machine — each variant represents a step in the process
 - **`get_id_from_event`** maps events to saga instances (e.g., by `order_id`)
 - **State is persisted** automatically after each transition via the state store
@@ -293,3 +295,7 @@ The Pg event bus provides reliable delivery with:
 **Why no AggregateRepository?** With immediate state persistence, there's no complex loading logic to encapsulate. The `Aggregate` trait handles the full command lifecycle.
 
 **Why PostgreSQL NOTIFY for the event bus?** Transactional consistency (only committed events propagate), simpler ops (no separate message queue). Trade-off: at-most-once delivery — projections can rebuild from the event store if needed.
+
+## Further Reading
+
+- [Schema Evolution Guide](schema-evolution.md) — how to handle breaking event-type changes: field renames, type changes, required field additions, failure policies, and the split/merge pattern.

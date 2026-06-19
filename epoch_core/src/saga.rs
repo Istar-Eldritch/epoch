@@ -428,6 +428,7 @@ where
             global_sequence: event.global_sequence,
             causation_id: event.causation_id,
             correlation_id: event.correlation_id,
+            schema_version: event.schema_version,
         };
         self.saga.as_ref().process_event(&target_event).await?;
         Ok(())

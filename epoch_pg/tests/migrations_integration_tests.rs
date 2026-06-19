@@ -322,6 +322,9 @@ async fn test_migrator_applied_returns_applied_migrations() {
     assert_eq!(applied_after[10].version, 11);
     assert_eq!(applied_after[10].name, "add_txid_to_events");
 
+    assert_eq!(applied_after[11].version, 12);
+    assert_eq!(applied_after[11].name, "add_schema_version_to_events");
+
     teardown(&pool).await;
 }
 
@@ -446,6 +449,131 @@ async fn test_m011_adds_txid_column_when_table_present() {
     .expect("Index existence check");
     assert!(idx_exists, "idx_epoch_events_txid should exist after m011");
 
+    teardown(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_m012_adds_schema_version_column_when_table_present() {
+    // On a normal (non-cutover) database, m012 must add the schema_version
+    // column with DEFAULT 1 to epoch_events.
+    let Some(pool) = common::try_get_pg_pool_for_db("epoch_pg_test_migrations").await else {
+        return;
+    };
+    teardown(&pool).await;
+
+    let migrator = Migrator::new(pool.clone());
+    migrator.run().await.expect("Migration run should succeed");
+
+    // Assert the schema_version column exists on epoch_events.
+    let col_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (\
+            SELECT 1 FROM information_schema.columns \
+            WHERE table_name = 'epoch_events' AND column_name = 'schema_version'\
+        )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("Column existence check");
+    assert!(
+        col_exists,
+        "schema_version column should exist on epoch_events after m012"
+    );
+
+    // Assert that the column DEFAULT is 1 by inserting a row and reading back
+    // the default. We use a partial check via information_schema.
+    let col_default: Option<String> = sqlx::query_scalar(
+        "SELECT column_default \
+         FROM information_schema.columns \
+         WHERE table_name = 'epoch_events' AND column_name = 'schema_version'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("Column default check");
+    assert_eq!(
+        col_default.as_deref(),
+        Some("1"),
+        "schema_version DEFAULT should be 1"
+    );
+
+    teardown(&pool).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_m012_skips_when_epoch_events_renamed() {
+    // After the R28 table rename, m012 must succeed as a no-op rather than
+    // aborting with `relation \"epoch_events\" does not exist`.
+    let Some(pool) = common::try_get_pg_pool_for_db("epoch_pg_test_migrations").await else {
+        return;
+    };
+    teardown(&pool).await;
+
+    let migrator = Migrator::new(pool.clone());
+
+    // Apply all migrations on a clean DB (m012 runs normally).
+    migrator
+        .run()
+        .await
+        .expect("Initial migration run should succeed");
+
+    // Simulate the R28 cutover by removing m012's effects, deleting its
+    // tracking record, and renaming the table.
+    sqlx::query("ALTER TABLE epoch_events DROP COLUMN IF EXISTS schema_version")
+        .execute(&pool)
+        .await
+        .expect("Drop schema_version column");
+    sqlx::query("ALTER TABLE epoch_events RENAME TO epoch_events_legacy")
+        .execute(&pool)
+        .await
+        .expect("Rename epoch_events → epoch_events_legacy");
+    sqlx::query("DELETE FROM _epoch_migrations WHERE version = 12")
+        .execute(&pool)
+        .await
+        .expect("Remove m012 tracking record");
+
+    // m012 must succeed as a no-op when epoch_events does not exist.
+    migrator
+        .run()
+        .await
+        .expect("m012 must succeed as a no-op when epoch_events does not exist");
+
+    // m012 should be re-recorded as applied.
+    let applied_after = migrator.applied().await.expect("Should get applied");
+    let m012_applied = applied_after.iter().any(|m| m.version == 12);
+    assert!(
+        m012_applied,
+        "m012 should be recorded as applied after the no-op run"
+    );
+
+    // epoch_events must not have been recreated.
+    let epoch_events_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('epoch_events') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("to_regclass query");
+    assert!(
+        !epoch_events_exists,
+        "epoch_events must not be recreated by the no-op m012 migration"
+    );
+
+    // The renamed table must still be intact.
+    let legacy_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'epoch_events_legacy')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("legacy table check");
+    assert!(
+        legacy_exists,
+        "epoch_events_legacy should still exist after the no-op run"
+    );
+
+    // Cleanup.
+    sqlx::query("DROP TABLE IF EXISTS epoch_events_legacy CASCADE")
+        .execute(&pool)
+        .await
+        .expect("Drop epoch_events_legacy");
     teardown(&pool).await;
 }
 

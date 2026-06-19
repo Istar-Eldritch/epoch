@@ -101,7 +101,7 @@ pub fn subset_of(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     subset_of::subset_of_impl(item)
 }
 
-#[proc_macro_derive(EventData)]
+#[proc_macro_derive(EventData, attributes(event_data))]
 pub fn event_data(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     event_data::event_data_enum_impl(item)
 }

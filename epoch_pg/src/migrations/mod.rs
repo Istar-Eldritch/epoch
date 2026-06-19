@@ -38,6 +38,7 @@ mod m008_add_bus_name_to_checkpoints;
 mod m009_create_gap_timeout_log;
 mod m010_strip_data_from_notify_payload;
 mod m011_add_txid_to_events;
+mod m012_add_schema_version_to_events;
 
 use m001_create_events_table::CreateEventsTable;
 use m002_add_global_sequence::AddGlobalSequence;
@@ -50,6 +51,7 @@ use m008_add_bus_name_to_checkpoints::AddBusNameToCheckpoints;
 use m009_create_gap_timeout_log::CreateGapTimeoutLog;
 use m010_strip_data_from_notify_payload::StripDataFromNotifyPayload;
 use m011_add_txid_to_events::AddTxidToEvents;
+use m012_add_schema_version_to_events::AddSchemaVersionToEvents;
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -82,6 +84,7 @@ const MIGRATIONS: &[&dyn Migration] = &[
     &CreateGapTimeoutLog,
     &StripDataFromNotifyPayload,
     &AddTxidToEvents,
+    &AddSchemaVersionToEvents,
 ];
 
 /// The number of registered migrations in the `MIGRATIONS` registry.
