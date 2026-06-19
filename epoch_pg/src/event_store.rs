@@ -299,8 +299,8 @@ where
         )
         .event_type(entry.event_type)
         .created_at(entry.created_at)
-        .schema_version(stored_version)
-        .data(data);
+        .data(data)
+        .schema_version(stored_version);
 
     // Add global_sequence if present
     if let Some(gs) = entry.global_sequence {
