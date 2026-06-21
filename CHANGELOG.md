@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Versioned snapshot store with configurable capture & retention** (`epoch_core`,
+  `epoch_pg`, `epoch_mem`, CLOUD-184) — an opt-in, version-keyed historical snapshot
+  capability distinct from the single-snapshot `StateStoreBackend`. Aggregates with no
+  snapshot config are byte-for-byte identical to before (no extra I/O, no behaviour change):
+  - **`epoch_core::snapshot`** (new module, re-exported from the prelude) — `SnapshotStore<S>`
+    trait (`load_snapshot` nearest `≤ target_version`, idempotent `save_snapshot`,
+    `apply_retention`), plus `Snapshot<S>`, `SnapshotConfig`, `SnapshotTrigger`
+    (`Manual` | `Automatic { interval }`) and `SnapshotRetention` (`Unlimited` |
+    `KeepLast(n)`). The trigger/retention enums are `#[non_exhaustive]` for future variants.
+  - **`Aggregate::after_persist`** — new defaulted **no-op** lifecycle hook invoked once by
+    `handle()` in the state-present branch after `persist_state`; external `Aggregate`
+    implementors compile unchanged. The `delete_state` branch is untouched.
+  - **`SnapshottingAggregate<ED>`** extension trait — `capture_snapshot_if_due` (captures iff
+    an `interval` boundary is crossed by the command, then prunes per retention; store
+    failures are logged, never fatal — a snapshot is a rebuildable cache) and a manual
+    `save_snapshot(id)` path. `interval == 0` never captures. `SaveSnapshotError`.
+  - **`epoch_core::snapshot::state_at(...)`** — free function reconstructing the state of a
+    stream as of a given version, equivalent to a full replay from zero but using the
+    nearest snapshot `≤ version` as a fast start; `StateAtError`. The target implementation
+    uses CLOUD-183's `EventStoreBackend::read_events_range`; until that lands it uses an
+    interim `read_events_since` + user-space truncation (correct, just not I/O-optimal;
+    `TODO(CLOUD-183)`).
+  - **`InMemorySnapshotStore<S>`** (`epoch_mem`) and **`PgSnapshotStore<S>`** (`epoch_pg`,
+    `S: Serialize + DeserializeOwned`) implement `SnapshotStore<S>`; both re-exported.
+  - **Migration `m013_create_snapshots_table`** (version 13) — creates the `epoch_snapshots`
+    table (`stream_id`, `version`, `data jsonb`, `created_at`) with
+    `PRIMARY KEY (stream_id, version)` and an `(stream_id, version DESC)` index; additive,
+    forward-only, no backfill.
+
 - **Event schema evolution / upcasting mechanism** (`epoch_core`, `epoch_pg`, `epoch_derive`, CLOUD-173) —
   a first-class, versioned, fail-loud-by-default upcasting system so that historic
   persisted events can be transformed forward to the current schema before
