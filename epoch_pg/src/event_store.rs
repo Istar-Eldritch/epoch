@@ -394,39 +394,45 @@ where
     type EventType = B::EventType;
     type Error = PgEventStoreError<B::Error>;
 
-    async fn read_events(
+    async fn read_events_range(
         &self,
         stream_id: Uuid,
+        from: Option<u64>,
+        to: Option<u64>,
     ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
     {
-        self.read_events_since(stream_id, 0).await
-    }
+        let mut where_clause = String::from("stream_id = $1");
+        let mut next_param: u32 = 2;
+        if from.is_some() {
+            where_clause.push_str(&format!(" AND stream_version >= ${next_param}"));
+            next_param += 1;
+        }
+        if to.is_some() {
+            where_clause.push_str(&format!(" AND stream_version <= ${next_param}"));
+        }
 
-    async fn read_events_since(
-        &self,
-        stream_id: Uuid,
-        version: u64,
-    ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
-    {
         let read_sql = format!(
             "SELECT id, stream_id, stream_version, event_type, data, created_at, \
              actor_id, purger_id, purged_at, global_sequence, causation_id, correlation_id, \
              schema_version \
-             FROM {} WHERE stream_id = $1 AND stream_version >= $2 \
+             FROM {} WHERE {} \
              ORDER BY stream_version ASC",
-            self.events_table,
+            self.events_table, where_clause,
         );
+
         let stream = try_stream! {
-            let mut inner_stream = sqlx::query_as::<_, PgDBEvent>(&read_sql)
-            .bind(stream_id)
-            .bind(version as i64)
-            .fetch(&self.postgres);
+            let mut query = sqlx::query_as::<_, PgDBEvent>(&read_sql).bind(stream_id);
+            if let Some(v) = from {
+                query = query.bind(v as i64);
+            }
+            if let Some(v) = to {
+                query = query.bind(v as i64);
+            }
+            let mut inner_stream = query.fetch(&self.postgres);
 
             while let Some(row) = inner_stream.next().await {
                 let entry: PgDBEvent = row.map_err(PgEventStoreError::DBError::<B::Error>)?;
 
-                // `None` means the row was explicitly dead-lettered (counted, logged,
-                // captured): skip it without aborting the stream.
                 if let Some(event) =
                     pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters).await?
                 {
