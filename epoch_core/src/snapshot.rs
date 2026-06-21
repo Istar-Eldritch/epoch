@@ -1,10 +1,13 @@
-//! Versioned snapshot store — config value types, `SnapshotStore` trait.
+//! Versioned snapshot store — config value types, `SnapshotStore` trait, and `state_at`.
 
 use crate::aggregate::{Aggregate, AggregateState};
-use crate::event::EventData;
-use crate::event_applicator::EventApplicator;
+use crate::event::{EnumConversionError, Event, EventData};
+use crate::event_applicator::{EventApplicator, ReHydrateError};
+use crate::event_store::{EventStoreBackend, EventStream, SliceEventStream};
 use crate::state_store::StateStoreBackend;
 use async_trait::async_trait;
+use std::pin::Pin;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 /// Configures snapshot capture and retention for an aggregate.
@@ -92,6 +95,90 @@ pub trait SnapshotStore<S>: Send + Sync {
         stream_id: Uuid,
         policy: &SnapshotRetention,
     ) -> Result<(), Self::Error>;
+}
+
+/// Errors returned by [`state_at`].
+#[derive(Debug, thiserror::Error)]
+pub enum StateAtError<SnapErr, EsErr, ApplyErr>
+where
+    SnapErr: std::error::Error,
+    EsErr: std::error::Error,
+    ApplyErr: std::error::Error,
+{
+    /// The snapshot store returned an error.
+    #[error("Snapshot store error: {0}")]
+    Snapshot(SnapErr),
+    /// The event store returned an error.
+    #[error("Event store error: {0}")]
+    EventStore(EsErr),
+    /// State reconstruction (re-hydration) failed.
+    #[error("Hydration error: {0}")]
+    Hydrate(#[from] ReHydrateError<ApplyErr, EnumConversionError, EsErr>),
+}
+
+/// Reconstructs the state of `stream_id` as of `version`, equivalent to a full replay
+/// from zero but using the nearest snapshot `<= version` as a fast start.
+///
+/// The equivalence contract: for every `v`, `state_at(.., v)` returns the same result
+/// as replaying all events from version 1 to `v` with no snapshot in play.
+///
+/// # Dependency
+///
+/// The target implementation calls `read_events_range(stream_id, Some(from), Some(version))`
+/// (CLOUD-183). Until that lands, this interim implementation calls
+/// `read_events_since(stream_id, from)` and truncates the stream at `version` in user space.
+/// See `TODO(CLOUD-183)` below.
+pub async fn state_at<ED, A, ES, SS>(
+    applicator: &A,
+    event_store: &ES,
+    snapshot_store: &SS,
+    stream_id: Uuid,
+    version: u64,
+) -> Result<Option<A::State>, StateAtError<SS::Error, ES::Error, A::ApplyError>>
+where
+    ED: EventData + Send + Sync + 'static,
+    A: EventApplicator<ED> + Sync,
+    ES: EventStoreBackend<EventType = ED> + Sync,
+    SS: SnapshotStore<A::State> + Sync,
+{
+    // 1. Nearest snapshot <= version.
+    let snap = snapshot_store
+        .load_snapshot(stream_id, version)
+        .await
+        .map_err(StateAtError::Snapshot)?;
+
+    let (start_state, from) = match snap {
+        Some(s) => (Some(s.state), s.version + 1),
+        None => (None, 1),
+    };
+
+    // 2. Bounded replay (from, version] via the event store.
+    // TODO(CLOUD-183): replace with
+    //   `event_store.read_events_range(stream_id, Some(from), Some(version)).await`
+    // once read_events_range is available. The current interim over-reads events with
+    // stream_version > version and discards them in user space — correct, not I/O-optimal.
+    let mut raw_stream = event_store
+        .read_events_since(stream_id, from)
+        .await
+        .map_err(StateAtError::EventStore)?;
+
+    let mut events: Vec<Event<ED>> = Vec::new();
+    while let Some(result) = raw_stream.next().await {
+        let event = result.map_err(StateAtError::EventStore)?;
+        if event.stream_version > version {
+            break;
+        }
+        events.push(event);
+    }
+
+    // 3. Fold the collected events onto the start state.
+    let stream: Pin<Box<dyn EventStream<ED, ES::Error> + Send + '_>> =
+        Box::pin(SliceEventStream::<ED, ES::Error>::from(events.as_slice()));
+
+    applicator
+        .re_hydrate(start_state, stream)
+        .await
+        .map_err(StateAtError::Hydrate)
 }
 
 /// Errors raised by the manual [`SnapshottingAggregate::save_snapshot`] path.
