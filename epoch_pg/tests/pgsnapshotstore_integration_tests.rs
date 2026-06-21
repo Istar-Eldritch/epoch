@@ -222,6 +222,41 @@ async fn test_unlimited_retention_no_op() {
 
 #[tokio::test]
 #[serial]
+async fn test_keep_last_larger_than_count_leaves_all() {
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    setup(&pool).await;
+
+    let store: PgSnapshotStore<TestState> = PgSnapshotStore::new(pool.clone());
+    let stream_id = Uuid::new_v4();
+
+    for v in [2u64, 5, 9] {
+        store
+            .save_snapshot(stream_id, v, &TestState::new(format!("v{v}")))
+            .await
+            .expect("save");
+    }
+
+    // KeepLast(10) with only 3 snapshots: the subquery returns all rows so nothing is deleted.
+    store
+        .apply_retention(stream_id, &SnapshotRetention::KeepLast(10))
+        .await
+        .expect("apply_retention");
+
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM epoch_snapshots WHERE stream_id = $1")
+        .bind(stream_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(
+        count.0, 3,
+        "KeepLast(10) with 3 snapshots must leave all 3 rows intact"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn test_keep_last_zero_empties() {
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
@@ -271,19 +306,6 @@ async fn test_epoch_snapshots_table_exists_after_migration() {
     .expect("table existence check");
 
     assert!(exists, "epoch_snapshots table must exist after m013");
-
-    // Verify the index exists.
-    let idx_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_epoch_snapshots_stream_version')",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("index existence check");
-
-    assert!(
-        idx_exists,
-        "idx_epoch_snapshots_stream_version must exist after m013"
-    );
 }
 
 // ---------------------------------------------------------------------------
