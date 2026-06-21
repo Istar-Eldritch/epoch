@@ -71,29 +71,23 @@ where
     type Error = InMemoryEventStoreBackendError;
     type EventType = B::EventType;
 
-    async fn read_events(
+    async fn read_events_range(
         &self,
         stream_id: Uuid,
-    ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
-    {
-        self.read_events_since(stream_id, 1).await
-    }
-
-    /// Fetches a stream from the storage backend.
-    async fn read_events_since(
-        &self,
-        stream_id: Uuid,
-        version: u64,
+        from: Option<u64>,
+        to: Option<u64>,
     ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
     {
         log::debug!(
-            "Reading events for stream_id: {} since version: {}",
+            "Reading events for stream_id: {} in range [{:?}, {:?}]",
             stream_id,
-            version
+            from,
+            to
         );
+        let start_version = from.map(|v| v.saturating_sub(1)).unwrap_or(0);
         let data = self.data.clone();
         let stream: Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send>> = Box::pin(
-            InMemoryEventStoreStream::<B, Self::Error>::new(data, stream_id, version - 1),
+            InMemoryEventStoreStream::<B, Self::Error>::new(data, stream_id, start_version, to),
         );
         Ok(stream)
     }
@@ -324,6 +318,7 @@ where
     id: Uuid,
     data: Arc<Mutex<EventStoreData<B::EventType>>>,
     current_index: usize,
+    to_version: Option<u64>,
     _phantom: PhantomData<(B, E)>,
 }
 
@@ -332,11 +327,17 @@ where
     B: EventBus + Clone,
     E: std::error::Error + Send + Sync,
 {
-    fn new(data: Arc<Mutex<EventStoreData<B::EventType>>>, id: Uuid, start_version: u64) -> Self {
+    fn new(
+        data: Arc<Mutex<EventStoreData<B::EventType>>>,
+        id: Uuid,
+        start_version: u64,
+        to_version: Option<u64>,
+    ) -> Self {
         Self {
             data,
             id,
             current_index: start_version as usize,
+            to_version,
             _phantom: PhantomData,
         }
     }
@@ -391,6 +392,11 @@ where
 
                 // Find the actual event in the store's main events vector
                 if let Some(event) = data.events.get(&event_id) {
+                    if let Some(to) = this.to_version
+                        && event.stream_version > to
+                    {
+                        return Poll::Ready(None);
+                    }
                     log::debug!(
                         "InMemoryEventStoreStream: poll_next - Returning event_id: {}",
                         event_id
