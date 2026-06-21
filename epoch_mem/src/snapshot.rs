@@ -56,10 +56,7 @@ where
             .get(&stream_id)
             .and_then(|snaps| {
                 // Vec is kept sorted ascending; find the last entry with version <= target
-                snaps
-                    .iter()
-                    .rev()
-                    .find(|s| s.version <= target_version)
+                snaps.iter().rev().find(|s| s.version <= target_version)
             })
             .cloned();
         Ok(result)
@@ -82,7 +79,7 @@ where
                     version,
                     state: state.clone(),
                 });
-                // Keep sorted by version ascending so load_snapshot can binary-scan.
+                // Keep sorted by version ascending.
                 snaps.sort_unstable_by_key(|s| s.version);
             }
         }
