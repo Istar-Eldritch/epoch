@@ -199,6 +199,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Migration Guide
 
+#### Implementing `EventStoreBackend::read_events_range()` (CLOUD-183)
+
+`read_events_range()` is now a **required** trait method on `EventStoreBackend`. Any
+third-party backend must add an implementation. The `read_events` and `read_events_since`
+methods no longer need to be overridden — they are now default methods that delegate to
+`read_events_range`.
+
+```rust
+async fn read_events_range(
+    &self,
+    stream_id: Uuid,
+    from: Option<u64>,
+    to: Option<u64>,
+) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error> {
+    // Implement bounded replay:
+    // - from = None means no lower bound (start from the first event)
+    // - to = None means no upper bound (read to the end of the stream)
+    // - Both inclusive: stream_version in [from, to]
+    // - from > to should return an empty stream (no error)
+    todo!()
+}
+```
+
 #### Implementing `EventStoreBackend::store_events()` (CLOUD-171)
 
 `store_events()` is now a **required** trait method. Any third-party backend that previously
