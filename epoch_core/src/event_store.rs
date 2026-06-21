@@ -28,18 +28,46 @@ pub trait EventStoreBackend: Send + Sync {
     /// The error when an event store operation fails
     type Error: std::error::Error + Send + Sync;
 
-    /// Fetches a stream from the storage backend.
+    /// Fetches an inclusive `[from, to]` `stream_version` range from the backend.
+    ///
+    /// `from` and `to` are inclusive `stream_version` bounds; `None` means unbounded on
+    /// that side. Events are yielded in ascending `stream_version` order. An empty range
+    /// (`from > to`) yields zero events and is not an error.
+    ///
+    /// This is the bounded-replay primitive: [`read_events`](Self::read_events) and
+    /// [`read_events_since`](Self::read_events_since) are default methods that delegate here.
+    /// Backends should push the bounds down to storage rather than over-reading and filtering.
+    async fn read_events_range(
+        &self,
+        stream_id: Uuid,
+        from: Option<u64>,
+        to: Option<u64>,
+    ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>;
+
+    /// Fetches the full stream from the storage backend.
+    ///
+    /// Default implementation delegates to
+    /// [`read_events_range`](Self::read_events_range) with both bounds unset.
     async fn read_events(
         &self,
         stream_id: Uuid,
-    ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>;
+    ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
+    {
+        self.read_events_range(stream_id, None, None).await
+    }
 
-    /// Fetches a stream from the storage backend.
+    /// Fetches the stream from `version` (inclusive) onward.
+    ///
+    /// Default implementation delegates to
+    /// [`read_events_range`](Self::read_events_range) with `from = Some(version)` and no upper bound.
     async fn read_events_since(
         &self,
         stream_id: Uuid,
         version: u64,
-    ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>;
+    ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
+    {
+        self.read_events_range(stream_id, Some(version), None).await
+    }
 
     /// Appends events to a stream.
     async fn store_event(&self, event: Event<Self::EventType>) -> Result<(), Self::Error>;
