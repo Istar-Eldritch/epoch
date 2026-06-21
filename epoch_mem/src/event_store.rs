@@ -343,7 +343,7 @@ where
     }
 }
 
-// All fields (Uuid, Arc, usize, PhantomData) are Unpin, so InMemoryEventStoreStream is Unpin.
+// All fields (Uuid, Arc, usize, Option<u64>, PhantomData) are Unpin, so InMemoryEventStoreStream is Unpin.
 impl<B, E> Unpin for InMemoryEventStoreStream<B, E> where B: EventBus + Clone {}
 
 impl<B, E> EventStream<B::EventType, E> for InMemoryEventStoreStream<B, E>
