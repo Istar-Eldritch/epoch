@@ -541,7 +541,7 @@ where
     /// cache), so implementors log and swallow errors.
     ///
     /// Because the default body is empty, aggregates that do not override it perform
-    /// zero extra work — no I/O, no allocation, no observable behaviour change.
+    /// no I/O and no observable behaviour change (the empty async-trait future still incurs one boxed-future allocation per command).
     ///
     /// # Arguments
     ///

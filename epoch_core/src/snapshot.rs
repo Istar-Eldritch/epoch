@@ -59,7 +59,7 @@ pub struct Snapshot<S> {
 /// A versioned snapshot store: load, save, and prune version-keyed snapshots.
 ///
 /// Implementors add snapshot capabilities on top of the existing
-/// [`StateStoreBackend`](crate::state_store::StateStoreBackend), which remains a
+/// [`StateStoreBackend`], which remains a
 /// single-snapshot live-state store unchanged by this trait.
 ///
 /// Serialization requirements are imposed by concrete implementations:
@@ -121,6 +121,12 @@ where
 ///
 /// The equivalence contract: for every `v`, `state_at(.., v)` returns the same result
 /// as replaying all events from version 1 to `v` with no snapshot in play.
+///
+/// # Version field of returned state
+///
+/// The returned state's `version` field is set by the applicator's `apply()`, which
+/// stamps `event.stream_version`. So `state_at(v).get_version() == v` holds only when
+/// `apply` stamps `event.stream_version` — as the reference implementations do.
 ///
 /// # Dependency
 ///
@@ -219,7 +225,7 @@ pub enum SaveSnapshotError<StateErr, SnapErr> {
 /// ```
 ///
 /// Aggregates that do not implement this trait keep the default no-op
-/// `after_persist` and are byte-for-byte identical to a non-snapshotting aggregate.
+/// `after_persist` and have no observable behaviour change versus a non-snapshotting aggregate.
 #[async_trait]
 pub trait SnapshottingAggregate<ED>: Aggregate<ED>
 where

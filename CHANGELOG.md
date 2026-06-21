@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Versioned snapshot store with configurable capture & retention** (`epoch_core`,
   `epoch_pg`, `epoch_mem`, CLOUD-184) — an opt-in, version-keyed historical snapshot
   capability distinct from the single-snapshot `StateStoreBackend`. Aggregates with no
-  snapshot config are byte-for-byte identical to before (no extra I/O, no behaviour change):
+  snapshot config have no observable behaviour change versus before (no extra I/O; the defaulted async hook adds one boxed-future allocation per command):
   - **`epoch_core::snapshot`** (new module, re-exported from the prelude) — `SnapshotStore<S>`
     trait (`load_snapshot` nearest `≤ target_version`, idempotent `save_snapshot`,
     `apply_retention`), plus `Snapshot<S>`, `SnapshotConfig`, `SnapshotTrigger`
@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `S: Serialize + DeserializeOwned`) implement `SnapshotStore<S>`; both re-exported.
   - **Migration `m013_create_snapshots_table`** (version 13) — creates the `epoch_snapshots`
     table (`stream_id`, `version`, `data jsonb`, `created_at`) with
-    `PRIMARY KEY (stream_id, version)` and an `(stream_id, version DESC)` index; additive,
+    `PRIMARY KEY (stream_id, version)`; additive,
     forward-only, no backfill.
 
 - **Event schema evolution / upcasting mechanism** (`epoch_core`, `epoch_pg`, `epoch_derive`, CLOUD-173) —
