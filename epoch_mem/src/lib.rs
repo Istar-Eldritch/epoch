@@ -35,6 +35,8 @@
 
 mod aggregate;
 mod event_store;
+mod snapshot;
 
 pub use aggregate::{InMemoryTransaction, InMemoryTransactionError};
 pub use event_store::*;
+pub use snapshot::{InMemorySnapshotStore, InMemorySnapshotStoreError};
