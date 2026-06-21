@@ -1,5 +1,9 @@
 //! Versioned snapshot store — config value types, `SnapshotStore` trait.
 
+use crate::aggregate::{Aggregate, AggregateState};
+use crate::event::EventData;
+use crate::event_applicator::EventApplicator;
+use crate::state_store::StateStoreBackend;
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -88,6 +92,128 @@ pub trait SnapshotStore<S>: Send + Sync {
         stream_id: Uuid,
         policy: &SnapshotRetention,
     ) -> Result<(), Self::Error>;
+}
+
+/// Errors raised by the manual [`SnapshottingAggregate::save_snapshot`] path.
+#[derive(Debug, thiserror::Error)]
+pub enum SaveSnapshotError<StateErr, SnapErr> {
+    /// The live state could not be read from the state store.
+    #[error("Error reading state: {0}")]
+    State(StateErr),
+
+    /// No live state exists for the requested aggregate, so nothing can be snapshotted.
+    #[error("No state found for aggregate")]
+    NoState,
+
+    /// The snapshot store rejected the write.
+    #[error("Error saving snapshot: {0}")]
+    Snapshot(SnapErr),
+}
+
+/// Extension trait adding opt-in snapshot capture and retention to an [`Aggregate`].
+///
+/// An aggregate implements this trait to wire a [`SnapshotStore`] and a
+/// [`SnapshotConfig`] into its command-handling lifecycle. The reusable
+/// capture/prune logic lives here as [`capture_snapshot_if_due`](Self::capture_snapshot_if_due);
+/// a concrete aggregate bridges it into [`Aggregate::after_persist`] with a one-line
+/// override:
+///
+/// ```ignore
+/// async fn after_persist(
+///     &self,
+///     stream_id: Uuid,
+///     new_version: u64,
+///     events_applied: usize,
+///     state: &MyState,
+/// ) {
+///     self.capture_snapshot_if_due(stream_id, new_version, events_applied, state)
+///         .await;
+/// }
+/// ```
+///
+/// Aggregates that do not implement this trait keep the default no-op
+/// `after_persist` and are byte-for-byte identical to a non-snapshotting aggregate.
+#[async_trait]
+pub trait SnapshottingAggregate<ED>: Aggregate<ED>
+where
+    ED: EventData + Send + Sync + 'static,
+    <Self as EventApplicator<ED>>::State: AggregateState,
+    Self::CommandData: Send + Sync,
+    <Self::Command as TryFrom<Self::CommandData>>::Error: Send + Sync,
+{
+    /// The snapshot store backing this aggregate.
+    type SnapshotStore: SnapshotStore<<Self as EventApplicator<ED>>::State> + Send + Sync;
+
+    /// Returns the snapshot store.
+    fn snapshot_store(&self) -> Self::SnapshotStore;
+
+    /// Returns the snapshot capture/retention config.
+    fn snapshot_config(&self) -> &SnapshotConfig;
+
+    /// Captures a snapshot and prunes per config, if a capture is due.
+    ///
+    /// Call this from [`Aggregate::after_persist`]. A snapshot is captured iff the
+    /// trigger is [`SnapshotTrigger::Automatic`] with a non-zero `interval` and an
+    /// interval boundary falls in `(prev_version, new_version]`, where
+    /// `prev_version = new_version - events_applied`. After a successful capture the
+    /// configured [`SnapshotRetention`] policy is applied.
+    ///
+    /// Store failures are logged and swallowed: a snapshot is a rebuildable cache and
+    /// must never fail an already-committed command. `interval == 0` never captures
+    /// (and never divides).
+    async fn capture_snapshot_if_due(
+        &self,
+        stream_id: Uuid,
+        new_version: u64,
+        events_applied: usize,
+        state: &<Self as EventApplicator<ED>>::State,
+    ) {
+        let config = self.snapshot_config();
+        let interval = match config.trigger {
+            SnapshotTrigger::Automatic { interval } if interval > 0 => interval,
+            _ => return, // Manual or interval == 0: no automatic capture
+        };
+        // Capture iff an `interval` boundary lies in (prev_version, new_version].
+        let prev = new_version.saturating_sub(events_applied as u64);
+        if new_version / interval == prev / interval {
+            return; // no boundary crossed this command
+        }
+        let store = self.snapshot_store();
+        if let Err(e) = store.save_snapshot(stream_id, new_version, state).await {
+            log::warn!("snapshot capture failed for {stream_id}@{new_version}: {e}");
+            return;
+        }
+        if let Err(e) = store.apply_retention(stream_id, &config.retention).await {
+            log::warn!("snapshot retention failed for {stream_id}: {e}");
+        }
+    }
+
+    /// Manual snapshot path: loads the current live state and persists it as a
+    /// versioned snapshot at the state's current version.
+    ///
+    /// Returns [`SaveSnapshotError::NoState`] if no live state exists for `id`.
+    async fn save_snapshot(
+        &self,
+        id: Uuid,
+    ) -> Result<
+        (),
+        SaveSnapshotError<
+            <Self::StateStore as StateStoreBackend<<Self as EventApplicator<ED>>::State>>::Error,
+            <Self::SnapshotStore as SnapshotStore<<Self as EventApplicator<ED>>::State>>::Error,
+        >,
+    > {
+        let state = self
+            .get_state_store()
+            .get_state(id)
+            .await
+            .map_err(SaveSnapshotError::State)?
+            .ok_or(SaveSnapshotError::NoState)?;
+        let version = state.get_version();
+        self.snapshot_store()
+            .save_snapshot(id, version, &state)
+            .await
+            .map_err(SaveSnapshotError::Snapshot)
+    }
 }
 
 #[cfg(test)]
