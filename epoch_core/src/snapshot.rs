@@ -126,11 +126,11 @@ mod tests {
     #[test]
     fn snapshot_retention_variants() {
         assert_eq!(SnapshotRetention::Unlimited, SnapshotRetention::Unlimited);
-        assert_eq!(SnapshotRetention::KeepLast(2), SnapshotRetention::KeepLast(2));
-        assert_ne!(
-            SnapshotRetention::Unlimited,
-            SnapshotRetention::KeepLast(0)
+        assert_eq!(
+            SnapshotRetention::KeepLast(2),
+            SnapshotRetention::KeepLast(2)
         );
+        assert_ne!(SnapshotRetention::Unlimited, SnapshotRetention::KeepLast(0));
     }
 
     #[test]
@@ -159,21 +159,61 @@ mod tests {
 
         let cases = [
             // exact boundary crossing
-            Case { interval: 5, prev: 4, new: 5, should_capture: true },
+            Case {
+                interval: 5,
+                prev: 4,
+                new: 5,
+                should_capture: true,
+            },
             // lands on boundary (multi-event command)
-            Case { interval: 5, prev: 3, new: 5, should_capture: true },
+            Case {
+                interval: 5,
+                prev: 3,
+                new: 5,
+                should_capture: true,
+            },
             // skips over a boundary (command applied many events at once)
-            Case { interval: 5, prev: 3, new: 8, should_capture: true },
+            Case {
+                interval: 5,
+                prev: 3,
+                new: 8,
+                should_capture: true,
+            },
             // no boundary within range
-            Case { interval: 5, prev: 5, new: 9, should_capture: false },
+            Case {
+                interval: 5,
+                prev: 5,
+                new: 9,
+                should_capture: false,
+            },
             // adjacent, no boundary
-            Case { interval: 5, prev: 1, new: 2, should_capture: false },
+            Case {
+                interval: 5,
+                prev: 1,
+                new: 2,
+                should_capture: false,
+            },
             // interval == 0 must never fire (guard prevents divide-by-zero)
-            Case { interval: 0, prev: 0, new: 100, should_capture: false },
+            Case {
+                interval: 0,
+                prev: 0,
+                new: 100,
+                should_capture: false,
+            },
             // single event on boundary
-            Case { interval: 10, prev: 9, new: 10, should_capture: true },
+            Case {
+                interval: 10,
+                prev: 9,
+                new: 10,
+                should_capture: true,
+            },
             // prev == new (zero events applied; degenerate; no boundary)
-            Case { interval: 5, prev: 5, new: 5, should_capture: false },
+            Case {
+                interval: 5,
+                prev: 5,
+                new: 5,
+                should_capture: false,
+            },
         ];
 
         for c in &cases {
