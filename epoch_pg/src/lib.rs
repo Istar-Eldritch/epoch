@@ -67,5 +67,5 @@ pub use event_bus::{
 };
 pub use event_store::*;
 pub use migrations::{AppliedMigration, Migration, MigrationError, Migrator};
-pub use state_store::*;
 pub use snapshot_store::PgSnapshotStore;
+pub use state_store::*;

@@ -66,9 +66,8 @@ where
         match row {
             None => Ok(None),
             Some((version, data)) => {
-                let state: S = serde_json::from_value(data).map_err(|e| {
-                    sqlx::Error::Decode(Box::new(e))
-                })?;
+                let state: S =
+                    serde_json::from_value(data).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
                 Ok(Some(Snapshot {
                     version: version as u64,
                     state,

@@ -88,10 +88,7 @@ async fn test_save_and_load_nearest() {
     assert_eq!(snap.version, 9);
 
     // load(1) → None (nothing at or before 1)
-    let snap = store
-        .load_snapshot(stream_id, 1)
-        .await
-        .expect("load");
+    let snap = store.load_snapshot(stream_id, 1).await.expect("load");
     assert!(snap.is_none(), "expected None for version 1");
 }
 
@@ -130,13 +127,11 @@ async fn test_save_snapshot_idempotent() {
     assert_eq!(snap.state, TestState::new("second"));
 
     // Confirm there is exactly one row for this stream.
-    let count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM epoch_snapshots WHERE stream_id = $1",
-    )
-    .bind(stream_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count query");
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM epoch_snapshots WHERE stream_id = $1")
+        .bind(stream_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count query");
     assert_eq!(count.0, 1, "must be exactly one row at v5");
 }
 
@@ -168,13 +163,11 @@ async fn test_keep_last_prunes() {
         .await
         .expect("apply_retention");
 
-    let count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM epoch_snapshots WHERE stream_id = $1",
-    )
-    .bind(stream_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count");
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM epoch_snapshots WHERE stream_id = $1")
+        .bind(stream_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
     assert_eq!(count.0, 2, "KeepLast(2) must leave exactly 2 rows");
 
     // v2 must be gone; v9 must remain.
@@ -212,13 +205,11 @@ async fn test_unlimited_retention_no_op() {
         .await
         .expect("apply_retention");
 
-    let count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM epoch_snapshots WHERE stream_id = $1",
-    )
-    .bind(stream_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count");
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM epoch_snapshots WHERE stream_id = $1")
+        .bind(stream_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
     assert_eq!(count.0, 3, "Unlimited must leave all rows intact");
 }
 
@@ -245,13 +236,11 @@ async fn test_keep_last_zero_empties() {
         .await
         .expect("apply_retention");
 
-    let count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM epoch_snapshots WHERE stream_id = $1",
-    )
-    .bind(stream_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count");
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM epoch_snapshots WHERE stream_id = $1")
+        .bind(stream_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
     assert_eq!(count.0, 0, "KeepLast(0) must remove all rows");
 }
 
