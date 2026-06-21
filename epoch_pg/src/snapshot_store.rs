@@ -14,8 +14,8 @@ use uuid::Uuid;
 /// [`DeserializeOwned`].
 ///
 /// The table's `PRIMARY KEY (stream_id, version)` makes [`save_snapshot`] idempotent
-/// via `ON CONFLICT DO UPDATE`. The `(stream_id, version DESC)` index makes
-/// [`load_snapshot`] a single index seek.
+/// via `ON CONFLICT DO UPDATE`. The same PK serves [`load_snapshot`] via a backward
+/// index scan (`ORDER BY version DESC LIMIT 1`).
 ///
 /// [`save_snapshot`]: SnapshotStore::save_snapshot
 /// [`load_snapshot`]: SnapshotStore::load_snapshot
@@ -59,7 +59,7 @@ where
             "#,
         )
         .bind(stream_id)
-        .bind(target_version as i64)
+        .bind(target_version.min(i64::MAX as u64) as i64)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -82,7 +82,7 @@ where
         version: u64,
         state: &S,
     ) -> Result<(), Self::Error> {
-        let data = serde_json::to_value(state).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        let data = serde_json::to_value(state).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
         sqlx::query(
             r#"
             INSERT INTO epoch_snapshots (stream_id, version, data)
@@ -126,7 +126,10 @@ where
                 .await?;
                 Ok(())
             }
-            _ => Ok(()),
+            other => {
+                log::warn!("unhandled SnapshotRetention variant {other:?}; no pruning applied");
+                Ok(())
+            }
         }
     }
 }

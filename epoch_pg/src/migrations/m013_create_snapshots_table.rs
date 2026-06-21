@@ -2,9 +2,10 @@
 //!
 //! Creates the versioned snapshot store table used by `PgSnapshotStore`.
 //! Each row is a `(stream_id, version)` keyed copy of aggregate state serialised
-//! as JSONB. The composite primary key makes `save_snapshot` idempotent via
-//! `ON CONFLICT DO UPDATE`; the `version DESC` index makes the nearest-`≤` lookup
-//! a single index seek.
+//! as JSONB. The composite `PRIMARY KEY (stream_id, version)` serves two purposes:
+//! it makes `save_snapshot` idempotent via `ON CONFLICT DO UPDATE`, and it serves
+//! the nearest-`≤` `load_snapshot` lookup — Postgres scans the PK btree backward
+//! for `ORDER BY version DESC LIMIT 1`.
 //!
 //! Forward-only — no `down()` (see `migrations::Migration` design note).
 
@@ -36,16 +37,6 @@ impl Migration for CreateSnapshotsTable {
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (stream_id, version)
             )
-            "#,
-        )
-        .execute(&mut **tx)
-        .await?;
-
-        // Supports `WHERE stream_id = $1 AND version <= $2 ORDER BY version DESC LIMIT 1`.
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_epoch_snapshots_stream_version
-                ON epoch_snapshots (stream_id, version DESC)
             "#,
         )
         .execute(&mut **tx)

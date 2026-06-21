@@ -104,7 +104,9 @@ where
                     }
                 }
             }
-            _ => {}
+            other => {
+                log::warn!("unhandled SnapshotRetention variant {other:?}; no pruning applied");
+            }
         }
         Ok(())
     }
