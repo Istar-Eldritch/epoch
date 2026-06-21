@@ -147,8 +147,8 @@ impl EventStoreBackend for NonAtomicBackend {
             .get(&stream_id)
             .map(|v| {
                 v.iter()
-                    .filter(|e| from.map_or(true, |f| e.stream_version >= f))
-                    .filter(|e| to.map_or(true, |t| e.stream_version <= t))
+                    .filter(|e| from.is_none_or(|f| e.stream_version >= f))
+                    .filter(|e| to.is_none_or(|t| e.stream_version <= t))
                     .cloned()
                     .collect()
             })

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`read_events_range` bounded-replay primitive** (`epoch_core`, `epoch_pg`, `epoch_mem`, CLOUD-183) —
+  a new `EventStoreBackend::read_events_range(stream_id, from: Option<u64>, to: Option<u64>)`
+  primitive that pushes inclusive `[from, to]` `stream_version` bounds down to storage,
+  eliminating the full-stream over-read previously required for upper-bounded replay:
+  - **`epoch_core`** — `read_events_range` added as the new required method;
+    `read_events` and `read_events_since` converted to default methods delegating to it
+    (`None, None` and `Some(version), None` respectively). ⚠ **Breaking change** for external
+    `EventStoreBackend` implementors: the new required method must be added.
+  - **`epoch_pg`** — `PgEventStore::read_events_range` builds optional `>= from` / `<= to`
+    predicates with dynamic `$N` binding, staying sargable on the existing
+    `UNIQUE (stream_id, stream_version)` index; the `read_events`/`read_events_since`
+    overrides are removed.
+  - **`epoch_mem`** — `InMemoryEventStore::read_events_range` with early-termination on
+    the upper bound; `InMemoryEventStoreStream` gains `to_version: Option<u64>`; the
+    `read_events`/`read_events_since` overrides are removed.
+  - No schema migration, no new dependency, no event-format change.
+
 - **Event schema evolution / upcasting mechanism** (`epoch_core`, `epoch_pg`, `epoch_derive`, CLOUD-173) —
   a first-class, versioned, fail-loud-by-default upcasting system so that historic
   persisted events can be transformed forward to the current schema before

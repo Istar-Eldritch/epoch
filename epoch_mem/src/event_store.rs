@@ -980,6 +980,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_event_store_read_events_range() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let store = InMemoryEventStore::new(bus);
+        let stream_id = Uuid::new_v4();
+
+        let event1 = new_event(stream_id, 1, "test1");
+        let event2 = new_event(stream_id, 2, "test2");
+        let event3 = new_event(stream_id, 3, "test3");
+
+        store.store_event(event1.clone()).await.unwrap();
+        store.store_event(event2.clone()).await.unwrap();
+        store.store_event(event3.clone()).await.unwrap();
+
+        // Half-open upper bound: (None, Some(2)) -> [event1, event2]
+        let mut stream = store
+            .read_events_range(stream_id, None, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), event1);
+        assert_eq!(stream.next().await.unwrap().unwrap(), event2);
+        assert!(stream.next().await.is_none());
+
+        // Closed range: (Some(2), Some(3)) -> [event2, event3]
+        let mut stream = store
+            .read_events_range(stream_id, Some(2), Some(3))
+            .await
+            .unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), event2);
+        assert_eq!(stream.next().await.unwrap().unwrap(), event3);
+        assert!(stream.next().await.is_none());
+
+        // Single-version: (Some(2), Some(2)) -> [event2]
+        let mut stream = store
+            .read_events_range(stream_id, Some(2), Some(2))
+            .await
+            .unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), event2);
+        assert!(stream.next().await.is_none());
+
+        // Empty range: from > to -> no events
+        let mut stream = store
+            .read_events_range(stream_id, Some(3), Some(2))
+            .await
+            .unwrap();
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn in_memory_event_bus_new() {
         let bus = InMemoryEventBus::<MyEventData>::new();
         assert!(bus.projections.read().await.is_empty());

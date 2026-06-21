@@ -190,6 +190,96 @@ async fn test_read_events_since() {
 
 #[tokio::test]
 #[serial]
+async fn test_read_events_range() {
+    let Some((_pool, event_store)) = setup().await else {
+        return;
+    };
+
+    let stream_id = Uuid::new_v4();
+
+    let event1 = Event::<TestEventData>::builder()
+        .id(Uuid::new_v4())
+        .stream_id(stream_id)
+        .stream_version(1)
+        .event_type("TestEvent1".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "test1".to_string(),
+        }))
+        .build()
+        .unwrap();
+
+    let event2 = Event::<TestEventData>::builder()
+        .id(Uuid::new_v4())
+        .stream_id(stream_id)
+        .stream_version(2)
+        .event_type("TestEvent2".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "test2".to_string(),
+        }))
+        .build()
+        .unwrap();
+
+    let event3 = Event::<TestEventData>::builder()
+        .id(Uuid::new_v4())
+        .stream_id(stream_id)
+        .stream_version(3)
+        .event_type("TestEvent3".to_string())
+        .data(Some(TestEventData::TestEvent {
+            value: "test3".to_string(),
+        }))
+        .build()
+        .unwrap();
+
+    event_store.store_event(event1.clone()).await.unwrap();
+    event_store.store_event(event2.clone()).await.unwrap();
+    event_store.store_event(event3.clone()).await.unwrap();
+
+    // Half-open upper bound: (None, Some(2)) -> [event1, event2]
+    let mut events = event_store
+        .read_events_range(stream_id, None, Some(2))
+        .await
+        .unwrap();
+    let read_event1 = events.next().await.unwrap().unwrap();
+    assert_eq!(read_event1.id, event1.id);
+    assert_eq!(read_event1.stream_version, event1.stream_version);
+    let read_event2 = events.next().await.unwrap().unwrap();
+    assert_eq!(read_event2.id, event2.id);
+    assert_eq!(read_event2.stream_version, event2.stream_version);
+    assert!(events.next().await.is_none());
+
+    // Closed range: (Some(2), Some(3)) -> [event2, event3]
+    let mut events = event_store
+        .read_events_range(stream_id, Some(2), Some(3))
+        .await
+        .unwrap();
+    let read_event2 = events.next().await.unwrap().unwrap();
+    assert_eq!(read_event2.id, event2.id);
+    assert_eq!(read_event2.stream_version, event2.stream_version);
+    let read_event3 = events.next().await.unwrap().unwrap();
+    assert_eq!(read_event3.id, event3.id);
+    assert_eq!(read_event3.stream_version, event3.stream_version);
+    assert!(events.next().await.is_none());
+
+    // Single-version: (Some(2), Some(2)) -> [event2]
+    let mut events = event_store
+        .read_events_range(stream_id, Some(2), Some(2))
+        .await
+        .unwrap();
+    let read_event2 = events.next().await.unwrap().unwrap();
+    assert_eq!(read_event2.id, event2.id);
+    assert_eq!(read_event2.stream_version, event2.stream_version);
+    assert!(events.next().await.is_none());
+
+    // Empty range: from > to -> no events
+    let mut events = event_store
+        .read_events_range(stream_id, Some(3), Some(2))
+        .await
+        .unwrap();
+    assert!(events.next().await.is_none());
+}
+
+#[tokio::test]
+#[serial]
 async fn test_migrations_create_global_sequence_column() {
     let Some((pool, _event_store)) = setup().await else {
         return;
