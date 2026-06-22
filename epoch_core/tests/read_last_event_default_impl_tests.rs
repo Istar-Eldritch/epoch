@@ -53,18 +53,11 @@ impl EventStoreBackend for MinimalBackend {
     type EventType = TestEvent;
     type Error = TestError;
 
-    async fn read_events(
-        &self,
-        stream_id: Uuid,
-    ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
-    {
-        self.read_events_since(stream_id, 1).await
-    }
-
-    async fn read_events_since(
+    async fn read_events_range(
         &self,
         _stream_id: Uuid,
-        _version: u64,
+        _from: Option<u64>,
+        _to: Option<u64>,
     ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
     {
         let stream: SliceEventStream<'_, Self::EventType, Self::Error> =

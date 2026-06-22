@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`read_events_range` bounded-replay primitive** (`epoch_core`, `epoch_pg`, `epoch_mem`, CLOUD-183) —
+  a new `EventStoreBackend::read_events_range(stream_id, from: Option<u64>, to: Option<u64>)`
+  primitive that pushes inclusive `[from, to]` `stream_version` bounds down to storage,
+  eliminating the full-stream over-read previously required for upper-bounded replay:
+  - **`epoch_core`** — `read_events_range` added as the new required method;
+    `read_events` and `read_events_since` converted to default methods delegating to it
+    (`None, None` and `Some(version), None` respectively). ⚠ **Breaking change** for external
+    `EventStoreBackend` implementors: the new required method must be added.
+  - **`epoch_pg`** — `PgEventStore::read_events_range` builds optional `>= from` / `<= to`
+    predicates with dynamic `$N` binding, staying sargable on the existing
+    `UNIQUE (stream_id, stream_version)` index; the `read_events`/`read_events_since`
+    overrides are removed.
+  - **`epoch_mem`** — `InMemoryEventStore::read_events_range` with early-termination on
+    the upper bound; `InMemoryEventStoreStream` gains `to_version: Option<u64>`; the
+    `read_events`/`read_events_since` overrides are removed.
+  - No schema migration, no new dependency, no event-format change.
+
 - **Event schema evolution / upcasting mechanism** (`epoch_core`, `epoch_pg`, `epoch_derive`, CLOUD-173) —
   a first-class, versioned, fail-loud-by-default upcasting system so that historic
   persisted events can be transformed forward to the current schema before
@@ -181,6 +198,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Aggregate::handle` now uses `SliceRefEventStream` to avoid cloning events during internal re-hydration
 
 ### Migration Guide
+
+#### Implementing `EventStoreBackend::read_events_range()` (CLOUD-183)
+
+`read_events_range()` is now a **required** trait method on `EventStoreBackend`. Any
+third-party backend must add an implementation. The `read_events` and `read_events_since`
+methods no longer need to be overridden — they are now default methods that delegate to
+`read_events_range`.
+
+```rust
+async fn read_events_range(
+    &self,
+    stream_id: Uuid,
+    from: Option<u64>,
+    to: Option<u64>,
+) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error> {
+    // Implement bounded replay:
+    // - from = None means no lower bound (start from the first event)
+    // - to = None means no upper bound (read to the end of the stream)
+    // - Both inclusive: stream_version in [from, to]
+    // - from > to should return an empty stream (no error)
+    todo!()
+}
+```
 
 #### Implementing `EventStoreBackend::store_events()` (CLOUD-171)
 
