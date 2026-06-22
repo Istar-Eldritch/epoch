@@ -433,6 +433,8 @@ where
             while let Some(row) = inner_stream.next().await {
                 let entry: PgDBEvent = row.map_err(PgEventStoreError::DBError::<B::Error>)?;
 
+                // `None` means the row was explicitly dead-lettered (counted, logged,
+                // captured): skip it without aborting the stream.
                 if let Some(event) =
                     pg_db_event_to_event::<B::EventType, B::Error>(entry, &self.upcasters).await?
                 {
