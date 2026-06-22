@@ -26,6 +26,7 @@ pub mod event_applicator;
 pub mod event_store;
 pub mod projection;
 pub mod saga;
+pub mod snapshot;
 pub mod state_store;
 pub mod subscriber_id;
 
@@ -46,6 +47,7 @@ pub mod prelude {
     pub use super::event_store::*;
     pub use super::projection::*;
     pub use super::saga::*;
+    pub use super::snapshot::*;
     pub use super::state_store::*;
     pub use super::subscriber_id::*;
     #[cfg(feature = "upcasting")]

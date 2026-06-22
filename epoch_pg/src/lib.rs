@@ -56,6 +56,9 @@ pub mod migrations;
 /// The state store implementation for postgres
 pub mod state_store;
 
+/// PostgreSQL-backed versioned snapshot store
+pub mod snapshot_store;
+
 pub use aggregate::*;
 pub use event_bus::{
     CheckpointMode, DispatchMode, DlqCallback, DlqEntry, DlqInsertionInfo, GapTimeoutCallback,
@@ -64,4 +67,5 @@ pub use event_bus::{
 };
 pub use event_store::*;
 pub use migrations::{AppliedMigration, Migration, MigrationError, Migrator};
+pub use snapshot_store::PgSnapshotStore;
 pub use state_store::*;

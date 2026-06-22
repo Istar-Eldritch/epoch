@@ -494,9 +494,10 @@ where
                     s
                 });
 
+            let events_applied = events.len();
             debug!(
                 "Storing {} events of type {:?}",
-                events.len(),
+                events_applied,
                 std::any::type_name::<ED>()
             );
             self.get_event_store()
@@ -513,6 +514,8 @@ where
                     .persist_state(*state.get_id(), state.clone())
                     .await
                     .map_err(HandleCommandError::State)?;
+                self.after_persist(state_id, new_state_version, events_applied, &state)
+                    .await;
                 Ok(Some(state))
             } else {
                 debug!("Deleting state for command. State ID: {:?}", state_id);
@@ -526,6 +529,34 @@ where
             debug!("Command handling complete.");
             Ok(None)
         }
+    }
+
+    /// Hook invoked by [`handle()`](Self::handle) immediately after the canonical
+    /// event writes and the live-state `persist_state` succeed (the state-present
+    /// branch only). The default implementation is a **no-op**.
+    ///
+    /// Snapshotting aggregates override this to delegate to their snapshot
+    /// capture/prune logic. It returns `()` deliberately: a snapshot failure must never fail an
+    /// already-committed command (events are durable; a snapshot is a rebuildable
+    /// cache), so implementors log and swallow errors.
+    ///
+    /// Because the default body is empty, aggregates that do not override it perform
+    /// no I/O and no observable behaviour change (the empty async-trait future still incurs one boxed-future allocation per command).
+    ///
+    /// # Arguments
+    ///
+    /// * `stream_id` - The aggregate/stream ID whose state was just persisted.
+    /// * `new_version` - The `stream_version` of the last event applied this command.
+    /// * `events_applied` - The number of events applied by this command.
+    /// * `state` - The freshly persisted state.
+    async fn after_persist(
+        &self,
+        _stream_id: Uuid,
+        _new_version: u64,
+        _events_applied: usize,
+        _state: &<Self as EventApplicator<ED>>::State,
+    ) {
+        // no-op
     }
 
     /// Extracts the aggregate ID from a command.

@@ -24,6 +24,10 @@ async fn teardown(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("Failed to drop gap_timeouts table");
+    sqlx::query("DROP TABLE IF EXISTS epoch_snapshots CASCADE")
+        .execute(pool)
+        .await
+        .expect("Failed to drop snapshots table");
     sqlx::query("DROP TABLE IF EXISTS epoch_event_bus_dlq CASCADE")
         .execute(pool)
         .await
@@ -324,6 +328,9 @@ async fn test_migrator_applied_returns_applied_migrations() {
 
     assert_eq!(applied_after[11].version, 12);
     assert_eq!(applied_after[11].name, "add_schema_version_to_events");
+
+    assert_eq!(applied_after[12].version, 13);
+    assert_eq!(applied_after[12].name, "create_snapshots_table");
 
     teardown(&pool).await;
 }
