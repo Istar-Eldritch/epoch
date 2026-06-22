@@ -443,8 +443,8 @@ where
                 None
             };
 
-            // Calculate the next version based on the re-hydrated state
-            let mut new_state_version = state.as_ref().map(|s| s.get_version()).unwrap_or(0) + 1;
+            let base_version = state.as_ref().map(|s| s.get_version()).unwrap_or(0);
+            let next_version = base_version + 1;
 
             // Extract causation fields before consuming command in the iterator
             let causation_id = command.causation_id;
@@ -458,11 +458,12 @@ where
                 .into_iter()
                 .enumerate()
                 .map(|(i, mut e)| {
-                    e.stream_version = new_state_version + i as u64;
-                    new_state_version = e.stream_version;
+                    e.stream_version = next_version + i as u64;
                     e
                 })
                 .collect();
+
+            let new_state_version = events.last().map_or(base_version, |e| e.stream_version);
 
             // Stamp causation fields on all events
             if let Some(first_event) = events.first_mut() {

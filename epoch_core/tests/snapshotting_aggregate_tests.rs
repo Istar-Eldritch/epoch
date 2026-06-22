@@ -10,6 +10,7 @@ use epoch_core::prelude::*;
 use epoch_mem::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -329,7 +330,6 @@ async fn multi_event_command_spanning_boundary() {
         .handle(Command::new(id, CounterCommand::Increment, None, None))
         .await
         .unwrap();
-    // n=2 is deliberate: n>=3 skips a version in handle()'s stamping loop (CLOUD-185).
     aggregate
         .handle(Command::new(id, CounterCommand::IncrementN(2), None, None))
         .await
@@ -362,7 +362,6 @@ async fn multi_event_command_skipping_boundary() {
             .await
             .unwrap();
     }
-    // n=2 is deliberate: n>=3 skips a version in handle()'s stamping loop (CLOUD-185).
     aggregate
         .handle(Command::new(id, CounterCommand::IncrementN(2), None, None))
         .await
@@ -374,6 +373,35 @@ async fn multi_event_command_skipping_boundary() {
     assert_eq!(snap.state.value, 5); // Created=0 + 5 Incremented
     // No snapshot at v5 even though the boundary was crossed there
     assert!(snapshots.load_snapshot(id, 5).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn multi_event_command_versions_are_consecutive() {
+    // Regression test for CLOUD-185: a command that emits N events must stamp
+    // consecutive stream_versions. The bug produced triangular gaps for N>=3
+    // (e.g. v1, v2, v4, v7, v11 instead of v1, v2, v3, v4, v5).
+    let (aggregate, _) = build_aggregate(SnapshotConfig {
+        trigger: SnapshotTrigger::Manual,
+        retention: SnapshotRetention::Unlimited,
+    });
+    let id = Uuid::new_v4();
+
+    aggregate
+        .handle(Command::new(id, CounterCommand::Create, None, None))
+        .await
+        .unwrap();
+    // IncrementN(4) emits 4 events; with the bug they landed at v2, v3, v5, v8.
+    aggregate
+        .handle(Command::new(id, CounterCommand::IncrementN(4), None, None))
+        .await
+        .unwrap();
+
+    let mut stream = aggregate.event_store.read_events(id).await.unwrap();
+    let mut versions = Vec::new();
+    while let Some(ev) = stream.next().await {
+        versions.push(ev.unwrap().stream_version);
+    }
+    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
 }
 
 // ── FIX 6: snapshot store failure swallowing tests ───────────────────────────
