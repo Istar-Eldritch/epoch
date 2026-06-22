@@ -71,29 +71,23 @@ where
     type Error = InMemoryEventStoreBackendError;
     type EventType = B::EventType;
 
-    async fn read_events(
+    async fn read_events_range(
         &self,
         stream_id: Uuid,
-    ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
-    {
-        self.read_events_since(stream_id, 1).await
-    }
-
-    /// Fetches a stream from the storage backend.
-    async fn read_events_since(
-        &self,
-        stream_id: Uuid,
-        version: u64,
+        from: Option<u64>,
+        to: Option<u64>,
     ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
     {
         log::debug!(
-            "Reading events for stream_id: {} since version: {}",
+            "Reading events for stream_id: {} in range [{:?}, {:?}]",
             stream_id,
-            version
+            from,
+            to
         );
+        let start_version = from.map(|v| v.saturating_sub(1)).unwrap_or(0);
         let data = self.data.clone();
         let stream: Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send>> = Box::pin(
-            InMemoryEventStoreStream::<B, Self::Error>::new(data, stream_id, version - 1),
+            InMemoryEventStoreStream::<B, Self::Error>::new(data, stream_id, start_version, to),
         );
         Ok(stream)
     }
@@ -324,6 +318,7 @@ where
     id: Uuid,
     data: Arc<Mutex<EventStoreData<B::EventType>>>,
     current_index: usize,
+    to_version: Option<u64>,
     _phantom: PhantomData<(B, E)>,
 }
 
@@ -332,17 +327,23 @@ where
     B: EventBus + Clone,
     E: std::error::Error + Send + Sync,
 {
-    fn new(data: Arc<Mutex<EventStoreData<B::EventType>>>, id: Uuid, start_version: u64) -> Self {
+    fn new(
+        data: Arc<Mutex<EventStoreData<B::EventType>>>,
+        id: Uuid,
+        start_version: u64,
+        to_version: Option<u64>,
+    ) -> Self {
         Self {
             data,
             id,
             current_index: start_version as usize,
+            to_version,
             _phantom: PhantomData,
         }
     }
 }
 
-// All fields (Uuid, Arc, usize, PhantomData) are Unpin, so InMemoryEventStoreStream is Unpin.
+// All fields (Uuid, Arc, usize, Option<u64>, PhantomData) are Unpin, so InMemoryEventStoreStream is Unpin.
 impl<B, E> Unpin for InMemoryEventStoreStream<B, E> where B: EventBus + Clone {}
 
 impl<B, E> EventStream<B::EventType, E> for InMemoryEventStoreStream<B, E>
@@ -391,6 +392,11 @@ where
 
                 // Find the actual event in the store's main events vector
                 if let Some(event) = data.events.get(&event_id) {
+                    if let Some(to) = this.to_version
+                        && event.stream_version > to
+                    {
+                        return Poll::Ready(None);
+                    }
                     log::debug!(
                         "InMemoryEventStoreStream: poll_next - Returning event_id: {}",
                         event_id
@@ -971,6 +977,73 @@ mod tests {
 
         let mut stream_from_version_4 = store.read_events_since(stream_id, 4).await.unwrap(); // Starts from index 3 (non-existent)
         assert!(stream_from_version_4.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_store_read_events_range() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let store = InMemoryEventStore::new(bus);
+        let stream_id = Uuid::new_v4();
+
+        let event1 = new_event(stream_id, 1, "test1");
+        let event2 = new_event(stream_id, 2, "test2");
+        let event3 = new_event(stream_id, 3, "test3");
+
+        store.store_event(event1.clone()).await.unwrap();
+        store.store_event(event2.clone()).await.unwrap();
+        store.store_event(event3.clone()).await.unwrap();
+
+        // Half-open upper bound: (None, Some(2)) -> [event1, event2]
+        let mut stream = store
+            .read_events_range(stream_id, None, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), event1);
+        assert_eq!(stream.next().await.unwrap().unwrap(), event2);
+        assert!(stream.next().await.is_none());
+
+        // Closed range: (Some(2), Some(3)) -> [event2, event3]
+        let mut stream = store
+            .read_events_range(stream_id, Some(2), Some(3))
+            .await
+            .unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), event2);
+        assert_eq!(stream.next().await.unwrap().unwrap(), event3);
+        assert!(stream.next().await.is_none());
+
+        // Single-version: (Some(2), Some(2)) -> [event2]
+        let mut stream = store
+            .read_events_range(stream_id, Some(2), Some(2))
+            .await
+            .unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), event2);
+        assert!(stream.next().await.is_none());
+
+        // Full stream: (None, None) -> [event1, event2, event3]
+        let mut stream = store
+            .read_events_range(stream_id, None, None)
+            .await
+            .unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), event1);
+        assert_eq!(stream.next().await.unwrap().unwrap(), event2);
+        assert_eq!(stream.next().await.unwrap().unwrap(), event3);
+        assert!(stream.next().await.is_none());
+
+        // Lower-bound only: (Some(2), None) -> [event2, event3]
+        let mut stream = store
+            .read_events_range(stream_id, Some(2), None)
+            .await
+            .unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), event2);
+        assert_eq!(stream.next().await.unwrap().unwrap(), event3);
+        assert!(stream.next().await.is_none());
+
+        // Empty range: from > to -> no events
+        let mut stream = store
+            .read_events_range(stream_id, Some(3), Some(2))
+            .await
+            .unwrap();
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

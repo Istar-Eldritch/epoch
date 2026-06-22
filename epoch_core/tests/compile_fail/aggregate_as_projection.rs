@@ -85,18 +85,11 @@ impl EventStoreBackend for TestEventStore {
     type Error = TestEventStoreError;
     type EventType = TestEvent;
 
-    async fn read_events(
+    async fn read_events_range(
         &self,
         _stream_id: Uuid,
-    ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
-    {
-        unimplemented!()
-    }
-
-    async fn read_events_since(
-        &self,
-        _stream_id: Uuid,
-        _version: u64,
+        _from: Option<u64>,
+        _to: Option<u64>,
     ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
     {
         unimplemented!()

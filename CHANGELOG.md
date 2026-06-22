@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`read_events_range` bounded-replay primitive** (`epoch_core`, `epoch_pg`, `epoch_mem`, CLOUD-183) —
+  a new `EventStoreBackend::read_events_range(stream_id, from: Option<u64>, to: Option<u64>)`
+  primitive that pushes inclusive `[from, to]` `stream_version` bounds down to storage,
+  eliminating the full-stream over-read previously required for upper-bounded replay:
+  - **`epoch_core`** — `read_events_range` added as the new required method;
+    `read_events` and `read_events_since` converted to default methods delegating to it
+    (`None, None` and `Some(version), None` respectively). ⚠ **Breaking change** for external
+    `EventStoreBackend` implementors: the new required method must be added.
+  - **`epoch_pg`** — `PgEventStore::read_events_range` builds optional `>= from` / `<= to`
+    predicates with dynamic `$N` binding, staying sargable on the existing
+    `UNIQUE (stream_id, stream_version)` index; the `read_events`/`read_events_since`
+    overrides are removed.
+  - **`epoch_mem`** — `InMemoryEventStore::read_events_range` with early-termination on
+    the upper bound; `InMemoryEventStoreStream` gains `to_version: Option<u64>`; the
+    `read_events`/`read_events_since` overrides are removed.
+  - No schema migration, no new dependency, no event-format change.
+
 - **Versioned snapshot store with configurable capture & retention** (`epoch_core`,
   `epoch_pg`, `epoch_mem`, CLOUD-184) — an opt-in, version-keyed historical snapshot
   capability distinct from the single-snapshot `StateStoreBackend`. Aggregates with no
@@ -27,10 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `save_snapshot(id)` path. `interval == 0` never captures. `SaveSnapshotError`.
   - **`epoch_core::snapshot::state_at(...)`** — free function reconstructing the state of a
     stream as of a given version, equivalent to a full replay from zero but using the
-    nearest snapshot `≤ version` as a fast start; `StateAtError`. The target implementation
-    uses CLOUD-183's `EventStoreBackend::read_events_range`; until that lands it uses an
-    interim `read_events_since` + user-space truncation (correct, just not I/O-optimal;
-    `TODO(CLOUD-183)`).
+    nearest snapshot `≤ version` as a fast start; `StateAtError`. Uses
+    `EventStoreBackend::read_events_range(stream_id, Some(from), Some(version))` for
+    I/O-optimal bounded replay.
   - **`InMemorySnapshotStore<S>`** (`epoch_mem`) and **`PgSnapshotStore<S>`** (`epoch_pg`,
     `S: Serialize + DeserializeOwned`) implement `SnapshotStore<S>`; both re-exported.
   - **Migration `m013_create_snapshots_table`** (version 13) — creates the `epoch_snapshots`
@@ -210,6 +226,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Aggregate::handle` now uses `SliceRefEventStream` to avoid cloning events during internal re-hydration
 
 ### Migration Guide
+
+#### Implementing `EventStoreBackend::read_events_range()` (CLOUD-183)
+
+`read_events_range()` is now a **required** trait method on `EventStoreBackend`. Any
+third-party backend must add an implementation. The `read_events` and `read_events_since`
+methods no longer need to be overridden — they are now default methods that delegate to
+`read_events_range`.
+
+```rust
+async fn read_events_range(
+    &self,
+    stream_id: Uuid,
+    from: Option<u64>,
+    to: Option<u64>,
+) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error> {
+    // Implement bounded replay:
+    // - from = None means no lower bound (start from the first event)
+    // - to = None means no upper bound (read to the end of the stream)
+    // - Both inclusive: stream_version in [from, to]
+    // - from > to should return an empty stream (no error)
+    todo!()
+}
+```
 
 #### Implementing `EventStoreBackend::store_events()` (CLOUD-171)
 

@@ -134,18 +134,11 @@ impl EventStoreBackend for NonAtomicBackend {
     type Error = NonAtomicBackendError;
     type EventType = TestEvent;
 
-    async fn read_events(
+    async fn read_events_range(
         &self,
         stream_id: Uuid,
-    ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
-    {
-        self.read_events_since(stream_id, 1).await
-    }
-
-    async fn read_events_since(
-        &self,
-        stream_id: Uuid,
-        version: u64,
+        from: Option<u64>,
+        to: Option<u64>,
     ) -> Result<Pin<Box<dyn EventStream<Self::EventType, Self::Error> + Send + 'life0>>, Self::Error>
     {
         let state = self.state.lock().await;
@@ -154,7 +147,8 @@ impl EventStoreBackend for NonAtomicBackend {
             .get(&stream_id)
             .map(|v| {
                 v.iter()
-                    .filter(|e| e.stream_version >= version)
+                    .filter(|e| from.is_none_or(|f| e.stream_version >= f))
+                    .filter(|e| to.is_none_or(|t| e.stream_version <= t))
                     .cloned()
                     .collect()
             })

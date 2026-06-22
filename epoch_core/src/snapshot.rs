@@ -1,13 +1,12 @@
 //! Versioned snapshot store — config value types, `SnapshotStore` trait, and `state_at`.
 
 use crate::aggregate::{Aggregate, AggregateState};
-use crate::event::{EnumConversionError, Event, EventData};
+use crate::event::{EnumConversionError, EventData};
 use crate::event_applicator::{EventApplicator, ReHydrateError};
-use crate::event_store::{EventStoreBackend, EventStream, SliceEventStream};
+use crate::event_store::EventStoreBackend;
 use crate::state_store::StateStoreBackend;
 use async_trait::async_trait;
-use std::pin::Pin;
-use tokio_stream::StreamExt;
+
 use uuid::Uuid;
 
 /// Configures snapshot capture and retention for an aggregate.
@@ -128,12 +127,6 @@ where
 /// stamps `event.stream_version`. So `state_at(v).get_version() == v` holds only when
 /// `apply` stamps `event.stream_version` — as the reference implementations do.
 ///
-/// # Dependency
-///
-/// The target implementation calls `read_events_range(stream_id, Some(from), Some(version))`
-/// (CLOUD-183). Until that lands, this interim implementation calls
-/// `read_events_since(stream_id, from)` and truncates the stream at `version` in user space.
-/// See `TODO(CLOUD-183)` below.
 pub async fn state_at<ED, A, ES, SS>(
     applicator: &A,
     event_store: &ES,
@@ -158,29 +151,13 @@ where
         None => (None, 1),
     };
 
-    // 2. Bounded replay (from, version] via the event store.
-    // TODO(CLOUD-183): replace with
-    //   `event_store.read_events_range(stream_id, Some(from), Some(version)).await`
-    // once read_events_range is available. The current interim over-reads events with
-    // stream_version > version and discards them in user space — correct, not I/O-optimal.
-    let mut raw_stream = event_store
-        .read_events_since(stream_id, from)
+    // 2. Bounded replay [from, version] via the event store.
+    let stream = event_store
+        .read_events_range(stream_id, Some(from), Some(version))
         .await
         .map_err(StateAtError::EventStore)?;
 
-    let mut events: Vec<Event<ED>> = Vec::new();
-    while let Some(result) = raw_stream.next().await {
-        let event = result.map_err(StateAtError::EventStore)?;
-        if event.stream_version > version {
-            break;
-        }
-        events.push(event);
-    }
-
-    // 3. Fold the collected events onto the start state.
-    let stream: Pin<Box<dyn EventStream<ED, ES::Error> + Send + '_>> =
-        Box::pin(SliceEventStream::<ED, ES::Error>::from(events.as_slice()));
-
+    // 3. Apply the bounded event stream onto the start state.
     applicator
         .re_hydrate(start_state, stream)
         .await
