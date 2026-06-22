@@ -1019,6 +1019,25 @@ mod tests {
         assert_eq!(stream.next().await.unwrap().unwrap(), event2);
         assert!(stream.next().await.is_none());
 
+        // Full stream: (None, None) -> [event1, event2, event3]
+        let mut stream = store
+            .read_events_range(stream_id, None, None)
+            .await
+            .unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), event1);
+        assert_eq!(stream.next().await.unwrap().unwrap(), event2);
+        assert_eq!(stream.next().await.unwrap().unwrap(), event3);
+        assert!(stream.next().await.is_none());
+
+        // Lower-bound only: (Some(2), None) -> [event2, event3]
+        let mut stream = store
+            .read_events_range(stream_id, Some(2), None)
+            .await
+            .unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), event2);
+        assert_eq!(stream.next().await.unwrap().unwrap(), event3);
+        assert!(stream.next().await.is_none());
+
         // Empty range: from > to -> no events
         let mut stream = store
             .read_events_range(stream_id, Some(3), Some(2))

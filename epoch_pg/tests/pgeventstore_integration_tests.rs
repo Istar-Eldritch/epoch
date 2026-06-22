@@ -270,6 +270,35 @@ async fn test_read_events_range() {
     assert_eq!(read_event2.stream_version, event2.stream_version);
     assert!(events.next().await.is_none());
 
+    // Full stream: (None, None) -> [event1, event2, event3]
+    let mut events = event_store
+        .read_events_range(stream_id, None, None)
+        .await
+        .unwrap();
+    let read_event1 = events.next().await.unwrap().unwrap();
+    assert_eq!(read_event1.id, event1.id);
+    assert_eq!(read_event1.stream_version, event1.stream_version);
+    let read_event2 = events.next().await.unwrap().unwrap();
+    assert_eq!(read_event2.id, event2.id);
+    assert_eq!(read_event2.stream_version, event2.stream_version);
+    let read_event3 = events.next().await.unwrap().unwrap();
+    assert_eq!(read_event3.id, event3.id);
+    assert_eq!(read_event3.stream_version, event3.stream_version);
+    assert!(events.next().await.is_none());
+
+    // Lower-bound only: (Some(2), None) -> [event2, event3]
+    let mut events = event_store
+        .read_events_range(stream_id, Some(2), None)
+        .await
+        .unwrap();
+    let read_event2 = events.next().await.unwrap().unwrap();
+    assert_eq!(read_event2.id, event2.id);
+    assert_eq!(read_event2.stream_version, event2.stream_version);
+    let read_event3 = events.next().await.unwrap().unwrap();
+    assert_eq!(read_event3.id, event3.id);
+    assert_eq!(read_event3.stream_version, event3.stream_version);
+    assert!(events.next().await.is_none());
+
     // Empty range: from > to -> no events
     let mut events = event_store
         .read_events_range(stream_id, Some(3), Some(2))
