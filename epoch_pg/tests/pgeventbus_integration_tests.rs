@@ -116,18 +116,7 @@ async fn setup() -> Option<(
         .run()
         .await
         .expect("Failed to run migrations");
-
-    // Clean up any malformed events from previous test runs that would break deserialization
-    // These events have invalid JSON data that can't be deserialized to TestEventData
-    let _ = sqlx::query(
-        r#"
-        DELETE FROM epoch_events 
-        WHERE data IS NOT NULL 
-        AND data->>'invalid_field' IS NOT NULL
-        "#,
-    )
-    .execute(&pool)
-    .await;
+    common::truncate_epoch_tables(&pool).await;
 
     let channel_name = format!("test_channel_{}", Uuid::new_v4().simple());
     let event_bus = PgEventBus::new(pool.clone(), channel_name);
@@ -1187,6 +1176,7 @@ async fn test_coordinated_mode_acquires_lock_on_subscribe() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     // Create event bus with coordinated mode
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
@@ -1259,6 +1249,7 @@ async fn test_coordinated_mode_skips_subscribe_if_lock_held() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     // Use a fixed subscriber ID for this test
     let subscriber_id = format!("projection:coord-test:{}", Uuid::new_v4());
@@ -1364,6 +1355,7 @@ async fn test_coordinated_mode_allows_different_subscribers_on_same_instance() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     // Create event bus with coordinated mode
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
@@ -1446,6 +1438,7 @@ async fn test_batched_checkpoint_flushes_at_batch_size() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     // Configure batched mode with batch_size=5 and long max_delay (won't trigger)
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
@@ -1534,6 +1527,7 @@ async fn test_batched_checkpoint_flushes_at_max_delay() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     // Configure batched mode with large batch_size (won't trigger) and short max_delay
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
@@ -1612,6 +1606,7 @@ async fn test_batched_checkpoint_during_catchup() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     // First, store some events before subscribing (these will be caught up)
     let channel_name = format!("test_batched_catchup_{}", Uuid::new_v4().simple());
@@ -1701,6 +1696,7 @@ async fn test_synchronous_checkpoint_still_works() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     // Explicitly use Synchronous mode
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
@@ -1769,6 +1765,7 @@ async fn setup_without_listener() -> Option<(PgPool, PgEventBus<TestEventData>)>
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     let channel_name = format!("test_channel_{}", Uuid::new_v4().simple());
     let event_bus = PgEventBus::new(pool.clone(), channel_name);
@@ -1906,6 +1903,7 @@ async fn test_shutdown_flushes_batched_checkpoints() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     // Create event bus with batched checkpointing (large batch size so it won't auto-flush)
     let config = ReliableDeliveryConfig {
@@ -2532,6 +2530,7 @@ async fn test_batched_checkpoint_with_gap_tracking() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
         checkpoint_mode: epoch_pg::event_bus::CheckpointMode::Batched {
@@ -2730,6 +2729,7 @@ async fn test_graceful_shutdown_flushes_subscriber_states() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
         checkpoint_mode: epoch_pg::event_bus::CheckpointMode::Batched {
@@ -2951,6 +2951,7 @@ async fn test_gap_timeout_inserts_record() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
         gap_timeout: GapDuration::from_millis(500),
@@ -3020,6 +3021,7 @@ async fn test_event_committed_after_gap_timeout_is_reported_as_skipped() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
         gap_timeout: GapDuration::from_millis(500),
@@ -3101,6 +3103,7 @@ async fn test_gap_timeout_callback_is_invoked() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     #[derive(Default)]
     struct RecordingGapCallback {
@@ -3177,6 +3180,7 @@ async fn test_list_gap_timeouts_returns_entries() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
         gap_timeout: GapDuration::from_millis(500),
@@ -3225,6 +3229,7 @@ async fn test_resolve_gap_timeout_marks_resolved() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
         gap_timeout: GapDuration::from_millis(500),
@@ -3299,6 +3304,7 @@ async fn test_no_gap_timeout_record_on_in_order_events() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
         gap_timeout: GapDuration::from_millis(500),
@@ -3348,6 +3354,7 @@ async fn test_gap_timeout_record_insert_is_idempotent() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     // Re-recording the same (bus_name, subscriber_id, skipped_sequence) is a
     // no-op thanks to the UNIQUE constraint + ON CONFLICT DO NOTHING (NFR-6).
@@ -3746,6 +3753,7 @@ async fn test_txid_column_exists_and_populates() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     // The column exists after m011 and is a BIGINT.
     let col: Option<(String,)> = sqlx::query_as(
@@ -3832,6 +3840,7 @@ async fn test_in_flight_transaction_gap_is_held() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     // Generous gap_timeout so the backstop cannot fire while we observe the hold.
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
@@ -3948,6 +3957,7 @@ async fn test_rolled_back_gap_fence_clears_without_record() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     // Generous gap_timeout: if a record appears it can only be the (wrong)
     // backstop, never the fence-clear path we expect.
@@ -4015,6 +4025,7 @@ async fn test_pinned_gap_resolves_via_backstop() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     #[derive(Default)]
     struct RecordingGapCallback {
@@ -4099,6 +4110,7 @@ async fn test_fencing_disabled_uses_timeout() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     let config = epoch_pg::event_bus::ReliableDeliveryConfig {
         gap_timeout: GapDuration::from_millis(500),
@@ -4153,6 +4165,7 @@ async fn test_ensure_txid_column_on_custom_table() {
         .run()
         .await
         .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
     // Create a custom events table mirroring epoch_events, then drop the txid
     // column so we genuinely exercise ensure_txid_column re-adding it.

@@ -165,3 +165,21 @@ pub async fn get_pg_pool() -> PgPool {
         .await
         .expect("Failed to create Postgres pool")
 }
+
+/// Truncates all epoch tables and resets the global-sequence counter.
+///
+/// Call this at the start of every integration test that uses the shared
+/// test database, after running migrations. This guarantees each test begins
+/// from empty state, preventing accumulated events and sequence gaps from
+/// prior runs inflating catch-up time or triggering spurious gap-timeout waits.
+#[allow(dead_code)]
+pub async fn truncate_epoch_tables(pool: &PgPool) {
+    sqlx::query(
+        "TRUNCATE epoch_events, epoch_event_bus_checkpoints, \
+         epoch_event_bus_dlq, epoch_event_bus_gap_timeouts, \
+         epoch_snapshots RESTART IDENTITY",
+    )
+    .execute(pool)
+    .await
+    .expect("Failed to truncate epoch tables");
+}
