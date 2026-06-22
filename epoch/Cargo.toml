@@ -12,13 +12,14 @@ categories.workspace = true
 epoch_core = { path = "../epoch_core/", version = "0.1.0" }
 epoch_derive = { path = "../epoch_derive", optional = true, version = "0.1.0" }
 epoch_mem = { path = "../epoch_mem", optional = true, version = "0.1.0" }
-epoch_pg = { path = "../epoch_pg", optional =true, version = "0.1.0" }
+epoch_pg = { path = "../epoch_pg", optional = true, version = "0.1.0" }
 
 [dev-dependencies]
 async-trait = "0.1"
 chrono = { version = "0.4.41", features = ["serde"] }
 futures-core = "0.3.31"
-serde = { version = "1.0.219", features=["derive"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "1.0"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1.17"
@@ -32,6 +33,7 @@ default = ["derive"]
 derive = ["epoch_derive"]
 in-memory = ["epoch_mem"]
 postgres = ["epoch_pg"]
+upcasting = ["epoch_core/upcasting"]
 
 [[example]]
 name = "hello-world"
@@ -44,3 +46,12 @@ path = "examples/saga-order-fulfillment.rs"
 [[example]]
 name = "event-correlation-causation"
 path = "examples/event-correlation-causation.rs"
+
+[[example]]
+name = "versioned-snapshots"
+path = "examples/versioned-snapshots.rs"
+
+[[example]]
+name = "schema-evolution"
+path = "examples/schema-evolution.rs"
+required-features = ["upcasting"]

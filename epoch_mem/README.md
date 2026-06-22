@@ -1,17 +1,49 @@
-# Epoch Memory Store
+# epoch_mem
 
-`epoch_mem` is an in-memory implementation of an event store and event bus, designed primarily for testing and development purposes within the `epoch` project. It provides a non-persistent way to store and retrieve events, and to publish events to subscribed projections.
+`epoch_mem` provides in-memory implementations of the Epoch storage backends, intended for testing and development. All state lives in `Arc<Mutex<...>>` so instances can be cheaply cloned and shared across test fixtures.
 
-## Features
+> **Not for production.** All data is lost when the process exits.
 
-- **InMemoryEventStore**: Stores events and manages event streams in memory. Ideal for unit and integration testing where persistence is not required.
-- **InMemoryEventBus**: Facilitates in-memory event publishing and subscription, allowing projections to react to events.
+## Provided types
+
+| Type | Implements | Use |
+|------|-----------|-----|
+| `InMemoryEventStore<Bus>` | `EventStoreBackend` | Stores events; drives `InMemoryEventBus` on write |
+| `InMemoryEventBus<ED>` | `EventBus` | Delivers events to in-process subscribers |
+| `InMemoryStateStore<S>` | `StateStoreBackend` | Persists live aggregate and projection state |
+| `InMemorySnapshotStore<S>` | `SnapshotStore<S>` | Stores version-keyed historical snapshots for `state_at` and `SnapshottingAggregate` |
 
 ## Usage
 
-This crate is part of the larger `epoch` project and is intended for internal use, particularly for testing event-driven architectures without the overhead of a durable storage backend.
+```rust
+use epoch_mem::{InMemoryEventBus, InMemoryEventStore, InMemoryStateStore, InMemorySnapshotStore};
 
-## Warning
+let bus = InMemoryEventBus::<AppEvent>::new();
+let event_store = InMemoryEventStore::new(bus);
+let state_store = InMemoryStateStore::<UserState>::new();
 
-This crate is **not recommended for production use** as it does not provide any form of durable storage for events. All data will be lost when the application stops.
+// Optional: versioned snapshot store for state_at / SnapshottingAggregate
+let snapshot_store = InMemorySnapshotStore::<UserState>::new();
+```
 
+All types implement `Clone` via inner `Arc`, so multiple handles share the same underlying store — useful for asserting state in tests without extra ceremony.
+
+## `InMemorySnapshotStore<S>`
+
+Implements `SnapshotStore<S>` (where `S: Clone + Send + Sync`). Snapshots are kept sorted by version; `load_snapshot` returns the nearest entry `≤ target_version`:
+
+```rust
+use epoch_core::prelude::*;
+use epoch_mem::InMemorySnapshotStore;
+
+let store = InMemorySnapshotStore::<MyState>::new();
+
+// Save and load
+store.save_snapshot(stream_id, 5, &state_at_v5).await?;
+let snap = store.load_snapshot(stream_id, 7).await?; // returns the v5 snapshot
+
+// Prune to keep only the 2 most recent
+store.apply_retention(stream_id, &SnapshotRetention::KeepLast(2)).await?;
+```
+
+`save_snapshot` is idempotent per `(stream_id, version)`: re-saving the same version overwrites the stored state without error.

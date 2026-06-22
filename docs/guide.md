@@ -4,7 +4,9 @@ Epoch is a Rust framework for event-sourced systems using CQRS patterns.
 
 ## Core Idea
 
-**Aggregates are living snapshots.** State is persisted immediately after every command — no event replay on reads, no snapshot management. Events are still stored for audit, projections, and history.
+**Aggregates are living snapshots.** State is persisted immediately after every command — no event replay on reads. Events are still stored for audit, projections, and history.
+
+This is the default path. An opt-in **versioned snapshot store** layers on top for use cases that need historical state at a specific past version — audits, time-travel queries, debugging — without changing the write path or normal read performance.
 
 ```
                    ┌──────────┐
@@ -163,6 +165,103 @@ assert!(event.purger_id.is_some());
 assert!(event.purged_at.is_some());
 ```
 
+## Versioned Snapshot Store
+
+While Epoch's default model persists live state after every command (O(1) reads, no replay), some use cases need access to **historical state** at a specific past version — for audits, time-travel queries, or debugging. The versioned snapshot store provides this without changing normal write-path performance.
+
+Snapshots are distinct from the live `StateStore`: they are version-keyed historical copies, stored in a separate backend, and never affect aggregate command handling.
+
+### Core types
+
+```rust
+// Configure capture frequency and retention per aggregate.
+let config = SnapshotConfig {
+    trigger: SnapshotTrigger::Automatic { interval: 10 }, // capture every 10 events
+    retention: SnapshotRetention::KeepLast(5),           // keep the 5 newest snapshots
+};
+
+// SnapshotTrigger::Manual disables automatic capture; use save_snapshot() explicitly.
+// SnapshotRetention::Unlimited keeps every snapshot ever taken.
+```
+
+### `SnapshotStore<S>` trait
+
+```rust
+#[async_trait]
+pub trait SnapshotStore<S>: Send + Sync {
+    // Load the nearest snapshot at or before target_version.
+    async fn load_snapshot(&self, stream_id: Uuid, target_version: u64) -> Result<Option<Snapshot<S>>, _>;
+    // Save a snapshot (idempotent per (stream_id, version)).
+    async fn save_snapshot(&self, stream_id: Uuid, version: u64, state: &S) -> Result<(), _>;
+    // Prune snapshots beyond what the retention policy allows.
+    async fn apply_retention(&self, stream_id: Uuid, policy: &SnapshotRetention) -> Result<(), _>;
+}
+```
+
+Available implementations: `InMemorySnapshotStore` (`epoch_mem`, testing) and `PgSnapshotStore` (`epoch_pg`, production).
+
+### Automatic capture with `SnapshottingAggregate`
+
+`SnapshottingAggregate<ED>` is an opt-in extension trait. Implement it on your aggregate, then wire `after_persist` to trigger automatic capture:
+
+```rust
+impl SnapshottingAggregate<AppEvent> for UserAggregate {
+    type SnapshotStore = InMemorySnapshotStore<UserState>;
+
+    fn snapshot_store(&self) -> Self::SnapshotStore {
+        self.snapshot_store.clone()
+    }
+
+    fn snapshot_config(&self) -> &SnapshotConfig {
+        &self.config  // SnapshotConfig { trigger, retention }
+    }
+}
+
+// Override the lifecycle hook in your Aggregate impl:
+#[async_trait]
+impl Aggregate<AppEvent> for UserAggregate {
+    // ... other methods ...
+
+    async fn after_persist(
+        &self,
+        stream_id: Uuid,
+        new_version: u64,
+        events_applied: usize,
+        state: &UserState,
+    ) {
+        // Captures iff an interval boundary was crossed; logs and swallows store failures.
+        self.capture_snapshot_if_due(stream_id, new_version, events_applied, state)
+            .await;
+    }
+}
+```
+
+Aggregates that do not implement `SnapshottingAggregate` keep the default no-op `after_persist` — no behaviour change and no overhead.
+
+### Historical state reconstruction with `state_at`
+
+`state_at` reconstructs the state of a stream at an arbitrary past version. It finds the nearest snapshot `≤ version` and replays only the bounded event range `(snapshot_version, version]` — much cheaper than a full replay from version 1:
+
+```rust
+use epoch::prelude::state_at;
+
+// Reconstruct state at version 42 — uses snapshot@40 + replay events 41..=42.
+let state = state_at(&applicator, &event_store, &snapshot_store, stream_id, 42)
+    .await?
+    .expect("stream has events up to version 42");
+```
+
+If no snapshot exists before `version`, it falls back to a full replay from event 1.
+
+### Manual snapshots
+
+```rust
+// Reads the current live state and persists it as a versioned snapshot.
+aggregate.save_snapshot(aggregate_id).await?;
+```
+
+See [`examples/versioned-snapshots.rs`](../epoch/examples/versioned-snapshots.rs) for a complete runnable example.
+
 ## Projections (Read Model)
 
 Projections build denormalized, query-optimized views from events. They are passive — no commands, no business rules, no new events.
@@ -254,6 +353,77 @@ Key points:
 - **State is persisted** automatically after each transition via the state store
 - **Returning `None`** deletes the saga state (cleanup after completion or failure)
 
+## Schema Evolution
+
+Event sourcing stores facts forever — once an event is persisted, its serialised JSON shape is frozen. When the Rust type it deserializes into changes (renamed field, new required field, type change), stored old-format records can no longer deserialize cleanly. **Upcasting** solves this by transforming stored JSON one version at a time before deserialization.
+
+Enable the feature (adds `serde_json` as a dependency):
+
+```toml
+epoch = { version = "0.1", features = ["upcasting"] }
+```
+
+### Writing an upcaster
+
+Each `Upcaster` handles one version step for one event type: v`N` → v`N+1`.
+
+```rust
+struct OrderPlacedV1ToV2;
+
+impl Upcaster for OrderPlacedV1ToV2 {
+    fn event_type(&self) -> &str { "OrderPlaced" }
+    fn from_version(&self) -> SchemaVersion { 1 }
+
+    fn upcast(&self, _ctx: &UpcastContext<'_>, mut payload: Value) -> Result<Value, UpcastError> {
+        // Add the new required field with a default.
+        if let Value::Object(map) = &mut payload {
+            map.entry("currency").or_insert_with(|| json!("USD"));
+        }
+        Ok(payload)
+    }
+}
+```
+
+Mark the current version on the event type:
+
+```rust
+impl EventData for OrderPlaced {
+    fn event_type(&self) -> &'static str { "OrderPlaced" }
+    fn schema_version(&self) -> SchemaVersion { 2 }  // was 1 before the change
+}
+// — or via derive:
+#[event_data(schema_version = 2)]
+#[derive(Debug, Clone, Serialize, Deserialize, EventData)]
+pub enum AppEvent { OrderPlaced { product: String, currency: String }, /* ... */ }
+```
+
+### Registering with the event store
+
+```rust
+// In-memory or unit tests — call upcast_and_deserialize directly.
+let mut registry = UpcasterRegistry::new();
+registry.register(OrderPlacedV1ToV2);
+
+// PostgreSQL — wire the registry into the read path.
+let event_store = PgEventStore::with_upcasters(pool, bus, Arc::new(registry));
+```
+
+### Failure policy
+
+```rust
+// Default: Fail — abort the stream on any upcasting/deserialization error (safe default).
+registry.with_policy(FailurePolicy::Fail);
+
+// Alternative: DeadLetter — route the broken event to a sink and continue the stream.
+registry
+    .with_policy(FailurePolicy::DeadLetter)
+    .with_dead_letter_sink(my_sink);  // impl DeadLetterSink
+```
+
+`UpcastError::FutureVersion` (the running binary is older than the data it's reading) always propagates as `Err`, even under `DeadLetter` — silent skipping would hide a serious deploy mismatch.
+
+See [`examples/schema-evolution.rs`](../epoch/examples/schema-evolution.rs) for a runnable example covering single-step, chained, and dead-letter scenarios. The full design guide is at [`docs/schema-evolution.md`](schema-evolution.md).
+
 ## Event Store & Event Bus
 
 - **EventStoreBackend** — append-only persistence for events
@@ -261,6 +431,19 @@ Key points:
 - **EventBus** — publishes events to subscribers (projections, sagas)
 
 The PostgreSQL implementation uses database `NOTIFY` for the event bus, triggered after event persistence. This guarantees only committed events are propagated.
+
+### Bounded event reads with `read_events_range`
+
+The `EventStoreBackend` trait exposes a bounded-replay primitive that pushes version bounds down to storage:
+
+```rust
+// Fetch events [from, to] inclusive (both bounds optional).
+let stream = event_store.read_events_range(stream_id, Some(5), Some(10)).await?;
+
+// read_events and read_events_since are default methods built on top of this.
+```
+
+Backends implement `read_events_range`; `read_events` and `read_events_since` become default implementations that delegate to it. This eliminates the full-stream over-read previously required for upper-bounded replay (e.g., in `state_at`).
 
 ### Reliable Delivery (PostgreSQL)
 
@@ -286,7 +469,7 @@ The Pg event bus provides reliable delivery with:
 
 ## Design Decisions
 
-**Why persist state on every write?** Trades slightly more write overhead for O(1) reads, no snapshot complexity, and always-consistent state.
+**Why persist state on every write?** Trades slightly more write overhead for O(1) reads and always-consistent live state. Historical queries that need state at a past version can use the opt-in versioned snapshot store without affecting the normal read/write path.
 
 **Why do Aggregates and Projections share `EventApplicator`?** Both need to apply events to state. `EventApplicator` captures this shared behavior while keeping the two separate — aggregates can't accidentally be subscribed to the event bus as projections.
 
@@ -298,4 +481,4 @@ The Pg event bus provides reliable delivery with:
 
 ## Further Reading
 
-- [Schema Evolution Guide](schema-evolution.md) — how to handle breaking event-type changes: field renames, type changes, required field additions, failure policies, and the split/merge pattern.
+- [Schema Evolution Guide](schema-evolution.md) — full reference for breaking event-type changes: field renames, type changes, required field additions, failure policies, and the split/merge pattern.

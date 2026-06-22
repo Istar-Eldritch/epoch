@@ -6,7 +6,7 @@ A Rust framework for building event-sourced systems with CQRS patterns.
 
 Epoch is an **opinionated event sourcing framework** that prioritizes simplicity and performance. The core idea:
 
-> **Aggregates are living snapshots.** State is persisted immediately after every command — no event replay on reads, no snapshot management. Events are still stored for audit, projections, and history.
+> **Aggregates are living snapshots.** State is persisted immediately after every command — no event replay on reads. Events are still stored for audit, projections, and history. An opt-in versioned snapshot store enables historical state reconstruction when you need it.
 
 ## Quick Start
 
@@ -18,8 +18,9 @@ epoch = { version = "0.1", features = ["derive", "postgres"] }
 ## Features
 
 - **`derive`** (default) — Proc macros for event data and enum subsetting
-- **`in-memory`** — In-memory event store and bus for testing
-- **`postgres`** — PostgreSQL-backed event store and bus
+- **`in-memory`** — In-memory event store, bus, and snapshot store for testing
+- **`postgres`** — PostgreSQL-backed event store, bus, and snapshot store
+- **`upcasting`** — Forward-compatible event schema evolution via versioned JSON transformations
 
 ## Crate Structure
 
@@ -36,10 +37,13 @@ epoch = { version = "0.1", features = ["derive", "postgres"] }
 - [`hello-world.rs`](epoch/examples/hello-world.rs) — Basic aggregate and projection usage
 - [`saga-order-fulfillment.rs`](epoch/examples/saga-order-fulfillment.rs) — Multi-aggregate saga coordination
 - [`event-correlation-causation.rs`](epoch/examples/event-correlation-causation.rs) — Event correlation and causation tracking
+- [`versioned-snapshots.rs`](epoch/examples/versioned-snapshots.rs) — Automatic snapshot capture, retention, and historical `state_at` reconstruction
+- [`schema-evolution.rs`](epoch/examples/schema-evolution.rs) — Forward-compatible event upcasting with chained steps and dead-letter policy (requires `--features upcasting`)
 
 ## Documentation
 
 - [Guide](docs/guide.md) — Architecture, patterns, and design decisions
+- [Schema Evolution Guide](docs/schema-evolution.md) — How to evolve persisted event schemas without breaking existing data
 
 ## License
 

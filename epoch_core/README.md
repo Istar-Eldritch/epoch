@@ -1,180 +1,186 @@
 # epoch_core
 
-`epoch_core` is the foundational crate for building event-driven applications within the Epoch ecosystem. It provides core traits and types for defining events, managing event streams in an event store, and creating projections and sagas to derive read models and coordinate processes from event data.
+`epoch_core` is the foundational crate for the Epoch ecosystem. It defines the core traits and types for building event-sourced systems using CQRS patterns: events, aggregates, projections, sagas, the event store and bus interfaces, versioned snapshots, and event schema evolution via upcasting.
 
 ## Features
 
-- **Event Definition**: Provides traits and types for defining domain events.
-- **Event Store Interface**: Defines the fundamental interface for interacting with an event store, allowing for appending, reading, and subscribing to events.
-- **Projections**: Offers mechanisms for creating and managing projections, enabling the transformation of event streams into queryable read models.
-- **Sagas**: Provides traits for implementing sagas that coordinate long-running processes across aggregates.
-- **Asynchronous Operations**: All APIs are designed for asynchronous event processing.
+- **Events** — `EventData` trait, `Event<D>` envelope, correlation/causation tracing, event purging
+- **Aggregates** — `Aggregate<ED>` trait, command handling lifecycle, optimistic concurrency, `TransactionalAggregate`
+- **Projections** — `Projection<ED>` trait, `ProjectionHandler` for event bus subscription
+- **Sagas** — `Saga<ED>` trait, `SagaHandler` for coordinating long-running processes
+- **Event Store** — `EventStoreBackend` trait with `read_events_range` bounded-replay primitive; `read_events` and `read_events_since` are default methods built on top
+- **State Store** — `StateStoreBackend` trait for persisting live aggregate and projection state
+- **Versioned Snapshot Store** — `SnapshotStore<S>` trait, `SnapshottingAggregate<ED>` extension trait, `state_at` for historical state reconstruction; enabled for all builds (no feature flag)
+- **Schema Evolution** — `Upcaster` trait, `UpcasterRegistry`, `FailurePolicy`, `DeadLetterSink` for forward-only JSON schema migration at the deserialization boundary; gated behind the `upcasting` feature flag
+- **Contract testing** — `verify_store_events_atomicity` and `verify_upcasting_chain` helpers for testing backend implementations; gated behind the `testing` feature flag
 
-## Usage
-
-Add `epoch_core` as a dependency in your `Cargo.toml`:
+## Cargo features
 
 ```toml
-[dependencies]
-epoch_core = { workspace = true }
+# Schema evolution / upcasting (adds serde_json dependency)
+epoch_core = { version = "0.1", features = ["upcasting"] }
+
+# Contract test helpers (for testing your own EventStoreBackend impl)
+epoch_core = { version = "0.1", features = ["testing"] }
 ```
 
-## Core Traits
+## Core traits
 
-### Events
+### `EventData`
 
-Events are immutable facts representing something that happened in the system:
+All domain events implement `EventData`. Use `#[derive(EventData)]` from `epoch_derive` for enums:
 
 ```rust
-use epoch_core::prelude::*;
-
-// Define your event data (typically using #[derive(EventData)] from epoch_derive)
-pub enum MyEvent {
-    Created { name: String },
-    Updated { name: String },
-    Deleted,
+#[derive(Debug, Clone, Serialize, Deserialize, EventData)]
+pub enum AppEvent {
+    UserCreated { name: String },
+    OrderPlaced { product: String },
 }
 ```
 
-### Projections
-
-Projections build read-optimized views from events:
+For schema evolution, mark the current version:
 
 ```rust
-use epoch_core::prelude::*;
-
-impl Projection<AppEvent> for MyProjection {
-    type State = MyProjectionState;
-    type StateStore = MyStateStore;
-    type EventType = MyEvent;
-    type ProjectionError = MyError;
-
-    fn apply(
-        &self,
-        state: Option<Self::State>,
-        event: &Event<Self::EventType>,
-    ) -> Result<Option<Self::State>, Self::ProjectionError> {
-        // Build read model from events
-    }
-
-    fn get_state_store(&self) -> Self::StateStore {
-        // Return the state store
-    }
-}
+#[event_data(schema_version = 2)]
+#[derive(Debug, Clone, Serialize, Deserialize, EventData)]
+pub enum AppEvent { /* ... */ }
 ```
 
-### Sagas
+### `Aggregate<ED>`
 
-Sagas coordinate long-running business processes:
+Aggregates validate commands, enforce invariants, and emit events:
 
 ```rust
-use epoch_core::prelude::*;
-
 #[async_trait]
-impl Saga<AppEvent> for MySaga {
-    type State = MySagaState;
-    type StateStore = MyStateStore;
-    type SagaError = MyError;
-    type EventType = MySagaEvent;
+impl Aggregate<AppEvent> for UserAggregate {
+    type CommandData = AppCommand;
+    type Command = UserCommand;
+    type AggregateError = UserError;
+    type EventStore = /* ... */;
+    // ...
 
-    fn get_state_store(&self) -> Self::StateStore {
-        // Return the state store
-    }
+    async fn handle_command(
+        &self,
+        state: &Option<Self::State>,
+        command: Command<Self::Command, Self::CommandCredentials>,
+    ) -> Result<Vec<Event<AppEvent>>, Self::AggregateError> { /* ... */ }
+}
+```
+
+`handle()` orchestrates the full lifecycle: load state → validate → store events → update state → publish to bus.
+
+### `SnapshotStore<S>` and `SnapshottingAggregate<ED>`
+
+The versioned snapshot store is an opt-in layer for historical state reconstruction, distinct from the live `StateStoreBackend`:
+
+```rust
+// Configure capture and retention
+let config = SnapshotConfig {
+    trigger: SnapshotTrigger::Automatic { interval: 10 },
+    retention: SnapshotRetention::KeepLast(5),
+};
+
+// Implement the extension trait on your aggregate
+impl SnapshottingAggregate<AppEvent> for UserAggregate {
+    type SnapshotStore = /* InMemorySnapshotStore or PgSnapshotStore */;
+
+    fn snapshot_store(&self) -> Self::SnapshotStore { /* ... */ }
+    fn snapshot_config(&self) -> &SnapshotConfig { &self.config }
+}
+
+// Wire into the lifecycle hook
+async fn after_persist(&self, stream_id: Uuid, new_version: u64, events_applied: usize, state: &UserState) {
+    self.capture_snapshot_if_due(stream_id, new_version, events_applied, state).await;
+}
+
+// Reconstruct state at any past version
+let state = state_at(&applicator, &event_store, &snapshot_store, stream_id, 42).await?;
+```
+
+### `Projection<ED>`
+
+Projections subscribe to the event bus and build denormalized read models:
+
+```rust
+impl EventApplicator<AppEvent> for MyProjection {
+    type EventType = MyEvent; // subset — only receives relevant events
+
+    fn apply(&self, state: Option<Self::State>, event: &Event<Self::EventType>)
+        -> Result<Option<Self::State>, Self::ApplyError> { /* ... */ }
+}
+
+impl Projection<AppEvent> for MyProjection {}
+
+event_bus.subscribe(ProjectionHandler::new(projection)).await?;
+```
+
+### `Saga<ED>`
+
+Sagas coordinate long-running processes by reacting to events and dispatching commands:
+
+```rust
+#[async_trait]
+impl Saga<AppEvent> for OrderFulfillmentSaga {
+    type State = FulfillmentState;
+    type EventType = OrderFulfillmentEvent;
 
     async fn handle_event(
         &self,
         state: Self::State,
-        event: &Event<Self::EventType>,  // Takes reference for efficiency
-    ) -> Result<Option<Self::State>, Self::SagaError> {
-        // React to events and coordinate processes
-    }
+        event: &Event<Self::EventType>,
+    ) -> Result<Option<Self::State>, Self::SagaError> { /* ... */ }
 }
-```
 
-## Subscribing to the Event Bus
-
-To subscribe projections and sagas to an event bus, use the provided handler wrappers:
-
-```rust
-use epoch_core::prelude::*;
-
-// For projections
-let projection = MyProjection::new();
-event_bus.subscribe(ProjectionHandler::new(projection)).await?;
-
-// For sagas
-let saga = MySaga::new();
 event_bus.subscribe(SagaHandler::new(saga)).await?;
 ```
 
-The wrapper types (`ProjectionHandler` and `SagaHandler`) provide efficient `EventObserver` implementations that:
-- Receive events as `Arc<Event<ED>>` for zero-cost sharing
-- Pass events by reference to avoid unnecessary cloning
-- Handle event type conversion automatically
+### Event schema evolution (`upcasting` feature)
 
-## Subset Event Types
-
-Use the `#[subset_enum]` macro (from `epoch_derive`) to define focused event types for projections and sagas:
+Register forward-only transformations that run at the deserialization boundary:
 
 ```rust
-use epoch_derive::subset_enum;
+struct OrderPlacedV1ToV2;
 
-// Define subset enums for different bounded contexts
-#[subset_enum(UserEvent, UserCreated, UserUpdated)]
-#[subset_enum(OrderEvent, OrderCreated, OrderShipped)]
-#[derive(Debug, Clone, Serialize, Deserialize, EventData)]
-pub enum ApplicationEvent {
-    UserCreated { name: String },
-    UserUpdated { name: String },
-    UserDeleted,
-    OrderCreated { product: String },
-    OrderShipped { tracking: String },
+impl Upcaster for OrderPlacedV1ToV2 {
+    fn event_type(&self) -> &str { "OrderPlaced" }
+    fn from_version(&self) -> SchemaVersion { 1 }
+
+    fn upcast(&self, _ctx: &UpcastContext<'_>, mut payload: Value) -> Result<Value, UpcastError> {
+        if let Value::Object(map) = &mut payload {
+            map.entry("currency").or_insert_with(|| json!("USD"));
+        }
+        Ok(payload)
+    }
 }
 
-// UserEvent only contains: UserCreated, UserUpdated
-// OrderEvent only contains: OrderCreated, OrderShipped
+let mut registry = UpcasterRegistry::new();
+registry.register(OrderPlacedV1ToV2);
 ```
 
-The macro generates:
-- The subset enum type
-- `From<SubsetEnum>` for converting to the parent enum
-- `TryFrom<ParentEnum>` for converting from the parent (may fail)
-- `TryFrom<&ParentEnum>` for efficient reference-based conversion
+See [Schema Evolution Guide](../docs/schema-evolution.md) for the full reference.
 
-## Event Type Conversion
+## Subset event types
 
-Projections and sagas use subset event types. The framework automatically converts events:
+Use `#[subset_enum]` (from `epoch_derive`) to scope projections and sagas to only the variants they care about:
 
 ```rust
-impl Projection<ApplicationEvent> for UserProjection {
-    type EventType = UserEvent;  // Only receives user-related events
+#[subset_enum(UserEvent, UserCreated, UserUpdated)]
+#[subset_enum(OrderEvent, OrderPlaced, OrderShipped)]
+#[derive(Debug, Clone, Serialize, Deserialize, EventData)]
+pub enum AppEvent { /* all variants */ }
+
+// UserProjection only receives UserCreated and UserUpdated
+impl EventApplicator<AppEvent> for UserProjection {
+    type EventType = UserEvent;
     // ...
 }
 ```
 
-For **identity conversions** (where `EventType == ED`), add this impl:
+For aggregates or applicators where `EventType == ED` (no subset), implement the identity conversion manually:
 
 ```rust
 impl TryFrom<&MyEvent> for MyEvent {
     type Error = EnumConversionError;
-    
-    fn try_from(value: &MyEvent) -> Result<Self, Self::Error> {
-        Ok(value.clone())
-    }
+    fn try_from(v: &MyEvent) -> Result<Self, Self::Error> { Ok(v.clone()) }
 }
 ```
-
-## Event Ownership Model
-
-Epoch uses a hybrid ownership model optimized for performance:
-
-| Component | Receives | Rationale |
-|-----------|----------|-----------|
-| `EventStoreBackend::store_event` | `Event<T>` (owned) | Store consumes and persists the event |
-| `EventBus::publish` | `Arc<Event<T>>` | Shared across multiple subscribers |
-| `EventObserver::on_event` | `Arc<Event<T>>` | Can hold reference or dereference |
-| `Projection::apply` | `&Event<T>` | Read-only access |
-| `Saga::handle_event` | `&Event<T>` | Read-only access |
-| `Saga::process_event` | `&Event<T>` | Read-only access |
-
-This design minimizes cloning while maintaining a clean API.
