@@ -567,23 +567,55 @@ pub enum PgEventBusError {
 /// happen at startup, the current design is sufficient.
 type Projections<D> = Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>>;
 
-tokio::task_local! {
-    /// Identities of the buses whose inline dispatch queues are currently
-    /// being drained on this task (a stack: one entry per nested drain).
-    /// A bus is identified by the pointer of its shared `inline_state` `Arc`,
-    /// which is stable across `Clone`s of the same logical bus and distinct
+/// A publish deferred by [`PgEventBus::dispatch_inline`] because it targeted a
+/// bus other than the one currently draining on this task. Boxed/type-erased
+/// so buses over different `EventData` types can share one queue.
+type PendingPublish =
+    Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>>;
+
+/// Per-task context for `DispatchMode::Inline` re-entrance and cross-bus
+/// deferral.
+#[derive(Clone)]
+struct InlineDispatchCtx {
+    /// Identities (by `inline_state` `Arc` pointer) of buses currently
+    /// draining somewhere up this task's call stack — a stack, one entry per
+    /// nested drain. Stable across `Clone`s of the same logical bus, distinct
     /// between different buses.
+    draining: Vec<usize>,
+    /// Cross-bus publishes deferred until the currently-innermost draining
+    /// bus's own queue is empty, then run in FIFO order before control
+    /// returns to the originating command's caller. One shared queue per
+    /// true top-level dispatch, reused across every nested bus in the
+    /// cascade tree so the whole tree drains to quiescence together.
+    pending_cross_bus: Arc<std::sync::Mutex<VecDeque<PendingPublish>>>,
+}
+
+tokio::task_local! {
+    /// `None` (unset) when the task isn't inside any inline dispatch.
     ///
     /// A `publish()` call originating from inside a subscriber handler is
-    /// re-entrant only for a bus that is already draining on this task: the
-    /// event is appended to that bus's queue without waiting, and the outer
-    /// drain picks it up after the current handler returns. A publish to a
-    /// *different* bus starts a nested drain of that bus instead, so
-    /// cross-bus cascades (saga on bus A dispatching commands whose events
-    /// land on bus B) are dispatched synchronously rather than parked on the
-    /// other bus's queue until some unrelated future publish. Used only in
-    /// `DispatchMode::Inline`.
-    static INLINE_DRAINING: Vec<usize>;
+    /// same-bus re-entrant only when that bus is already draining on this
+    /// task (present in `draining`): the event is appended to that bus's own
+    /// queue without waiting, and the active drain picks it up after the
+    /// current handler returns — this is what lets a saga publish an event
+    /// its own aggregate handles without deadlocking on the subscriber mutex.
+    ///
+    /// A publish to a bus *not* in `draining` (a cross-bus cascade, e.g. a
+    /// saga on bus A dispatching a command whose event lands on bus B) is
+    /// deferred onto `pending_cross_bus` rather than dispatched immediately.
+    /// This matters for correctness, not just ordering: in the plain
+    /// (non-transactional) `Aggregate::handle()` path, `publish()` (and thus
+    /// every synchronous Inline subscriber) runs *before* the originating
+    /// command's own `persist_state()`. Same-bus re-entrance is already safe
+    /// because the queued event is only drained after the *whole* current
+    /// `handle()` call (state persist included) returns. Dispatching a
+    /// cross-bus cascade immediately, by contrast, would run its subscribers
+    /// *during* that window — so a saga reacting to the cascade that calls
+    /// `.handle()` again on the *same* aggregate stream would read a stale or
+    /// missing state. Deferral preserves the same "only after persist_state"
+    /// guarantee for cross-bus cascades that same-bus re-entrance already had.
+    /// Used only in `DispatchMode::Inline`.
+    static INLINE_CTX: InlineDispatchCtx;
 }
 
 /// One entry in the inline dispatch queue: the event to process plus a
@@ -1859,50 +1891,71 @@ where
         Ok(result.0)
     }
 
-    /// Synchronously dispatch `event` to every registered subscriber, in priority
-    /// order. Used only by `DispatchMode::Inline`.
-    ///
-    /// Re-entrance: if the current task is already draining *this bus's*
-    /// inline queue (i.e. we were called from inside a subscriber handler on
-    /// this bus, possibly through a nested cross-bus cascade), the event is
-    /// appended to the queue and the call returns immediately. The outer
-    /// drainer picks it up after the current handler returns, preserving
-    /// causal order without recursing into the subscriber mutex.
-    ///
-    /// A publish to a bus *not* currently draining on this task (a cross-bus
-    /// cascade, e.g. a saga on bus A dispatching a command whose event lands
-    /// on bus B) starts a nested drain of that bus, so the cascade's
-    /// subscribers run before the originating handler returns.
-    ///
-    /// Concurrent callers from other tasks serialize: the first one drains the
-    /// queue (its own event plus any cascade), later callers wait for their
-    /// individual event to be processed and then return.
+    /// Bus identity for `INLINE_CTX` bookkeeping: the shared `inline_state`
+    /// `Arc` is common to all clones of this bus and unique per logical bus.
+    fn inline_bus_id(&self) -> usize {
+        Arc::as_ptr(&self.inline_state) as usize
+    }
+
+    /// Synchronously dispatch `event` to every registered subscriber, in
+    /// priority order. Used only by `DispatchMode::Inline`. See
+    /// [`INLINE_CTX`] for why same-bus re-entrance queues in place while a
+    /// cross-bus cascade is deferred rather than run immediately.
     pub(crate) async fn dispatch_inline(
         &self,
         event: Arc<Event<D>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Bus identity: the shared inline_state Arc is common to all clones
-        // of this bus and unique per logical bus.
-        let bus_id = Arc::as_ptr(&self.inline_state) as usize;
+        let bus_id = self.inline_bus_id();
+        let ctx = INLINE_CTX.try_with(Clone::clone).ok();
 
-        // Same-task, same-bus re-entrance: we're already inside a drain of
-        // this bus on this task. Append and return; the outer drain will
-        // process this event.
-        let draining_this_bus = INLINE_DRAINING
-            .try_with(|stack| stack.contains(&bus_id))
-            .unwrap_or(false);
-        if draining_this_bus {
-            let mut state = self.inline_state.lock().await;
-            state.queue.push_back(InlineQueueEntry {
-                event,
-                done: Arc::new(Notify::new()),
-            });
-            return Ok(());
+        match ctx {
+            Some(ctx) if ctx.draining.contains(&bus_id) => {
+                // Same-task, same-bus re-entrance: append and return. The
+                // active drain of this bus (further up this task's stack)
+                // will process it after the current handler returns.
+                let mut state = self.inline_state.lock().await;
+                state.queue.push_back(InlineQueueEntry {
+                    event,
+                    done: Arc::new(Notify::new()),
+                });
+                Ok(())
+            }
+            Some(ctx) => {
+                // Cross-bus cascade: defer. The innermost currently-draining
+                // bus's drain_owning loop picks this up once its own queue
+                // empties (see INLINE_CTX for why this must not run
+                // immediately).
+                let bus = self.clone();
+                ctx.pending_cross_bus
+                    .lock()
+                    .expect("pending_cross_bus mutex poisoned")
+                    .push_back(Box::pin(async move { bus.drain_owning(event).await }));
+                Ok(())
+            }
+            None => {
+                // True top level for this task: become the drainer with a
+                // fresh shared cross-bus queue.
+                self.drain_owning(event).await
+            }
         }
+    }
 
-        // Top-level call, or a nested cross-bus cascade. Either become the
-        // drainer of this bus or wait for the existing drainer (on another
-        // task) to process our event.
+    /// Becomes (or joins, via the existing `should_drive`/`Notify` wait) the
+    /// drainer for this bus, pushes `event` onto its queue, then drains this
+    /// bus's own queue and the shared cross-bus queue to quiescence —
+    /// alternating between the two, since draining one can enqueue more work
+    /// on the other, until a full pass finds both empty.
+    ///
+    /// Called both for the true top-level entry (fresh `pending_cross_bus`)
+    /// and when a deferred cross-bus publish is popped and run (reusing the
+    /// ambient `pending_cross_bus`, so the whole cascade tree rooted at one
+    /// top-level dispatch shares a single queue).
+    async fn drain_owning(
+        &self,
+        event: Arc<Event<D>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let bus_id = self.inline_bus_id();
+
         let done = Arc::new(Notify::new());
         let should_drive = {
             let mut state = self.inline_state.lock().await;
@@ -1919,27 +1972,34 @@ where
         };
 
         if !should_drive {
-            // Another task is draining. Wait for our entry to be processed.
+            // Another task is already draining this bus. Wait for our entry
+            // to be processed.
             done.notified().await;
             return Ok(());
         }
 
-        // We own the drain. Process the queue inside an INLINE_DRAINING scope
-        // extended with this bus's identity, so publish() calls from within
-        // subscriber handlers are recognized as re-entrant for this bus while
-        // publishes to other buses start their own nested drain.
-        let drain_stack = {
-            let mut stack = INLINE_DRAINING
-                .try_with(|stack| stack.clone())
-                .unwrap_or_default();
-            stack.push(bus_id);
-            stack
+        // We own the drain. Extend (or start) the ambient INLINE_CTX with
+        // this bus's identity, reusing the ambient pending_cross_bus if
+        // we're nested under an outer drain so the whole cascade tree
+        // shares one deferred-publish queue.
+        let ambient = INLINE_CTX.try_with(Clone::clone).ok();
+        let pending_cross_bus = ambient
+            .as_ref()
+            .map(|c| c.pending_cross_bus.clone())
+            .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(VecDeque::new())));
+        let mut draining = ambient.map(|c| c.draining).unwrap_or_default();
+        draining.push(bus_id);
+        let ctx = InlineDispatchCtx {
+            draining,
+            pending_cross_bus: pending_cross_bus.clone(),
         };
+
         let projections = self.projections.clone();
         let inline_state = self.inline_state.clone();
-        INLINE_DRAINING
-            .scope(drain_stack, async move {
-                let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+        INLINE_CTX
+            .scope(ctx, async move {
+                loop {
+                    // Drain this bus's own queue fully.
                     loop {
                         let entry = {
                             let mut state = inline_state.lock().await;
@@ -1947,7 +2007,7 @@ where
                                 Some(e) => e,
                                 None => {
                                     state.in_progress = false;
-                                    return Ok(());
+                                    break;
                                 }
                             }
                         };
@@ -1982,13 +2042,23 @@ where
 
                         entry.done.notify_one();
                     }
-                }
-                .await;
-                result
-            })
-            .await?;
 
-        Ok(())
+                    // Own queue is empty. Pop one deferred cross-bus publish
+                    // (if any) and run it — it may itself enqueue more work
+                    // on our own queue (same-bus reentrance from within its
+                    // processing) or on pending_cross_bus again, so loop back
+                    // around rather than assuming a single pass suffices.
+                    let next = pending_cross_bus
+                        .lock()
+                        .expect("pending_cross_bus mutex poisoned")
+                        .pop_front();
+                    match next {
+                        Some(fut) => fut.await?,
+                        None => return Ok(()),
+                    }
+                }
+            })
+            .await
     }
 }
 
