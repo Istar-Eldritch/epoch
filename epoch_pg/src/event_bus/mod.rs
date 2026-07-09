@@ -568,12 +568,22 @@ pub enum PgEventBusError {
 type Projections<D> = Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>>;
 
 tokio::task_local! {
-    /// Marks a task as currently draining the inline dispatch queue. When set,
-    /// any `publish()` call originating from inside a subscriber handler is
-    /// treated as re-entrant: the event is appended to the queue without
-    /// waiting, and the top-level `publish` drains it after the current handler
-    /// returns. Used only in `DispatchMode::Inline`.
-    static INLINE_DRAINING: ();
+    /// Identities of the buses whose inline dispatch queues are currently
+    /// being drained on this task (a stack: one entry per nested drain).
+    /// A bus is identified by the pointer of its shared `inline_state` `Arc`,
+    /// which is stable across `Clone`s of the same logical bus and distinct
+    /// between different buses.
+    ///
+    /// A `publish()` call originating from inside a subscriber handler is
+    /// re-entrant only for a bus that is already draining on this task: the
+    /// event is appended to that bus's queue without waiting, and the outer
+    /// drain picks it up after the current handler returns. A publish to a
+    /// *different* bus starts a nested drain of that bus instead, so
+    /// cross-bus cascades (saga on bus A dispatching commands whose events
+    /// land on bus B) are dispatched synchronously rather than parked on the
+    /// other bus's queue until some unrelated future publish. Used only in
+    /// `DispatchMode::Inline`.
+    static INLINE_DRAINING: Vec<usize>;
 }
 
 /// One entry in the inline dispatch queue: the event to process plus a
@@ -1852,11 +1862,17 @@ where
     /// Synchronously dispatch `event` to every registered subscriber, in priority
     /// order. Used only by `DispatchMode::Inline`.
     ///
-    /// Re-entrance: if the current task is already draining this bus's inline
-    /// queue (i.e. we were called from inside a subscriber handler), the event
-    /// is appended to the queue and the call returns immediately. The top-level
-    /// drainer picks it up after the current handler returns, preserving causal
-    /// order without recursing into the subscriber mutex.
+    /// Re-entrance: if the current task is already draining *this bus's*
+    /// inline queue (i.e. we were called from inside a subscriber handler on
+    /// this bus, possibly through a nested cross-bus cascade), the event is
+    /// appended to the queue and the call returns immediately. The outer
+    /// drainer picks it up after the current handler returns, preserving
+    /// causal order without recursing into the subscriber mutex.
+    ///
+    /// A publish to a bus *not* currently draining on this task (a cross-bus
+    /// cascade, e.g. a saga on bus A dispatching a command whose event lands
+    /// on bus B) starts a nested drain of that bus, so the cascade's
+    /// subscribers run before the originating handler returns.
     ///
     /// Concurrent callers from other tasks serialize: the first one drains the
     /// queue (its own event plus any cascade), later callers wait for their
@@ -1865,9 +1881,17 @@ where
         &self,
         event: Arc<Event<D>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Same-task re-entrance: we're already inside a drain on this task.
-        // Append and return; the outer drain will process this event.
-        if INLINE_DRAINING.try_with(|_| ()).is_ok() {
+        // Bus identity: the shared inline_state Arc is common to all clones
+        // of this bus and unique per logical bus.
+        let bus_id = Arc::as_ptr(&self.inline_state) as usize;
+
+        // Same-task, same-bus re-entrance: we're already inside a drain of
+        // this bus on this task. Append and return; the outer drain will
+        // process this event.
+        let draining_this_bus = INLINE_DRAINING
+            .try_with(|stack| stack.contains(&bus_id))
+            .unwrap_or(false);
+        if draining_this_bus {
             let mut state = self.inline_state.lock().await;
             state.queue.push_back(InlineQueueEntry {
                 event,
@@ -1876,8 +1900,9 @@ where
             return Ok(());
         }
 
-        // Top-level (or cross-task) call. Either become the drainer or wait
-        // for the existing drainer to process our event.
+        // Top-level call, or a nested cross-bus cascade. Either become the
+        // drainer of this bus or wait for the existing drainer (on another
+        // task) to process our event.
         let done = Arc::new(Notify::new());
         let should_drive = {
             let mut state = self.inline_state.lock().await;
@@ -1899,13 +1924,21 @@ where
             return Ok(());
         }
 
-        // We own the drain. Process the queue inside the INLINE_DRAINING scope
-        // so that any publish() calls from within subscriber handlers are
-        // recognized as re-entrant.
+        // We own the drain. Process the queue inside an INLINE_DRAINING scope
+        // extended with this bus's identity, so publish() calls from within
+        // subscriber handlers are recognized as re-entrant for this bus while
+        // publishes to other buses start their own nested drain.
+        let drain_stack = {
+            let mut stack = INLINE_DRAINING
+                .try_with(|stack| stack.clone())
+                .unwrap_or_default();
+            stack.push(bus_id);
+            stack
+        };
         let projections = self.projections.clone();
         let inline_state = self.inline_state.clone();
         INLINE_DRAINING
-            .scope((), async move {
+            .scope(drain_stack, async move {
                 let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
                     loop {
                         let entry = {

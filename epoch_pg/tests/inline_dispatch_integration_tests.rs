@@ -7,6 +7,10 @@
 //!    recursively dispatched — so a saga that emits an event of its own
 //!    subscribed type does not deadlock on its observer mutex.
 //! 3. Priority ordering is honored.
+//! 4. Cross-bus cascades dispatch synchronously: a handler on bus A that
+//!    publishes to bus B triggers a nested drain of B (not a parked queue
+//!    entry), and a B handler publishing back to A defers to A's outer drain
+//!    without deadlocking.
 
 mod common;
 
@@ -264,4 +268,163 @@ async fn inline_mode_queues_reentrant_publishes_instead_of_recursing() {
 
     let order = order.lock().await.clone();
     assert_eq!(order, vec!["A:start", "A:end", "B"]);
+}
+
+/// A subscriber on one bus that stores (and thus publishes) to another bus's
+/// event store from inside its handler.
+struct CrossBusForwarder {
+    id: String,
+    order: Arc<Mutex<Vec<&'static str>>>,
+    other_store: Arc<PgEventStore<PgEventBus<TestEvent>>>,
+    stream_id: Uuid,
+    /// Event data that triggers the forward (any other event is only logged).
+    forward_on: TestEvent,
+    /// What to store on the other bus when triggered.
+    forward_as: TestEvent,
+    tag: &'static str,
+}
+impl epoch_core::SubscriberId for CrossBusForwarder {
+    fn subscriber_id(&self) -> &str {
+        &self.id
+    }
+}
+#[async_trait]
+impl EventObserver<TestEvent> for CrossBusForwarder {
+    async fn on_event(
+        &self,
+        event: Arc<Event<TestEvent>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.order.lock().await.push(self.tag);
+        if event.data.as_ref() == Some(&self.forward_on) {
+            self.other_store
+                .store_event(ev(self.stream_id, 1, self.forward_as.clone()))
+                .await
+                .expect("cross-bus store");
+            self.order.lock().await.push("forwarded");
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn inline_mode_dispatches_cross_bus_cascades_synchronously() {
+    // Models the multi-bus monolith wiring: a saga subscribed to bus A
+    // handles an event by dispatching a command whose events are stored and
+    // published on bus B. Bus B's subscribers must run as part of the
+    // cascade — before the top-level publish on A returns — not sit parked
+    // on B's queue until some unrelated future publish on B.
+    let Some((pool, bus_a, store_a)) = setup_inline().await else {
+        return;
+    };
+
+    // Second, independent bus sharing the same events table.
+    let channel_b = format!("inline_test_{}", Uuid::new_v4().simple());
+    let cfg_b = ReliableDeliveryConfig {
+        dispatch_mode: DispatchMode::Inline,
+        ..Default::default()
+    };
+    let bus_b = PgEventBus::with_config(pool.clone(), channel_b, cfg_b);
+    let store_b = Arc::new(PgEventStore::new(pool.clone(), bus_b.clone()));
+
+    let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let stream_b = Uuid::new_v4();
+
+    // Bus A: saga that forwards A-events to bus B.
+    bus_a
+        .subscribe(CrossBusForwarder {
+            id: "inline:cross:a_saga".into(),
+            order: order.clone(),
+            other_store: store_b.clone(),
+            stream_id: stream_b,
+            forward_on: TestEvent::A,
+            forward_as: TestEvent::B,
+            tag: "a_saga",
+        })
+        .await
+        .expect("subscribe a saga");
+
+    // Bus B: plain recorder.
+    let (recorder_b, seen_b) = Recorder::new("inline:cross:b_recorder", 0);
+    bus_b.subscribe(recorder_b).await.expect("subscribe b");
+
+    store_a
+        .store_event(ev(Uuid::new_v4(), 1, TestEvent::A))
+        .await
+        .expect("store A");
+
+    // By the time the top-level store on bus A returns, bus B's subscriber
+    // must have run (nested inline drain), and the forwarding handler must
+    // have completed.
+    let seen_b = seen_b.lock().await.clone();
+    assert_eq!(seen_b, vec![TestEvent::B]);
+    let order = order.lock().await.clone();
+    assert_eq!(order, vec!["a_saga", "forwarded"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn inline_mode_cross_bus_cycle_defers_to_outer_drain_without_deadlock() {
+    // A -> B -> A cycle: bus A's saga forwards to bus B, whose saga forwards
+    // back to bus A. The publish back to A must be recognized as re-entrant
+    // for A (A is still draining further up the same task) and queued for
+    // A's outer drain — not nested (mutex deadlock) and not lost.
+    let Some((pool, bus_a, store_a)) = setup_inline().await else {
+        return;
+    };
+    let store_a = Arc::new(store_a);
+
+    let channel_b = format!("inline_test_{}", Uuid::new_v4().simple());
+    let cfg_b = ReliableDeliveryConfig {
+        dispatch_mode: DispatchMode::Inline,
+        ..Default::default()
+    };
+    let bus_b = PgEventBus::with_config(pool.clone(), channel_b, cfg_b);
+    let store_b = Arc::new(PgEventStore::new(pool.clone(), bus_b.clone()));
+
+    let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+    // Bus A: on A, forward B to bus B. (On the queued follow-up B event it
+    // only logs — forward_on doesn't match.)
+    bus_a
+        .subscribe(CrossBusForwarder {
+            id: "inline:cycle:a_saga".into(),
+            order: order.clone(),
+            other_store: store_b.clone(),
+            stream_id: Uuid::new_v4(),
+            forward_on: TestEvent::A,
+            forward_as: TestEvent::B,
+            tag: "a_saga",
+        })
+        .await
+        .expect("subscribe a saga");
+
+    // Bus B: on B, forward back to bus A as B (so A's saga logs it without
+    // re-forwarding, terminating the cascade).
+    bus_b
+        .subscribe(CrossBusForwarder {
+            id: "inline:cycle:b_saga".into(),
+            order: order.clone(),
+            other_store: store_a.clone(),
+            stream_id: Uuid::new_v4(),
+            forward_on: TestEvent::B,
+            forward_as: TestEvent::B,
+            tag: "b_saga",
+        })
+        .await
+        .expect("subscribe b saga");
+
+    store_a
+        .store_event(ev(Uuid::new_v4(), 1, TestEvent::A))
+        .await
+        .expect("store A");
+
+    // Cascade: a_saga(A) -> nested drain of B: b_saga(B) -> publish back to
+    // A is queued (A still draining) -> b_saga finishes -> a_saga finishes
+    // -> A's outer drain processes the queued B -> a_saga(B) logs it.
+    let order = order.lock().await.clone();
+    assert_eq!(
+        order,
+        vec!["a_saga", "b_saga", "forwarded", "forwarded", "a_saga"]
+    );
 }
