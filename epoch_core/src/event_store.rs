@@ -187,16 +187,6 @@ pub trait EventBus {
         T: EventObserver<Self::EventType> + Send + Sync + 'static;
 }
 
-/// Traits to define observers to the event bus.
-///
-/// Observers receive events wrapped in `Arc` for efficient sharing. Observers can:
-/// - Dereference for read-only access (zero cost)
-/// - Clone the `Arc` if they need to retain the event (cheap O(1) operation)
-/// - Pass `&*event` to functions expecting `&Event<ED>` (zero cost)
-///
-/// # Subscriber ID
-///
-/// Implementors must also implement [`SubscriberId`](crate::SubscriberId) to provide
 /// How a subscriber relates to persisted checkpoints.
 ///
 /// Controls whether the event bus reads and writes a checkpoint row for this
@@ -214,6 +204,16 @@ pub enum SubscriptionMode {
     ReplayAlways,
 }
 
+/// Traits to define observers to the event bus.
+///
+/// Observers receive events wrapped in `Arc` for efficient sharing. Observers can:
+/// - Dereference for read-only access (zero cost)
+/// - Clone the `Arc` if they need to retain the event (cheap O(1) operation)
+/// - Pass `&*event` to functions expecting `&Event<ED>` (zero cost)
+///
+/// # Subscriber ID
+///
+/// Implementors must also implement [`SubscriberId`](crate::SubscriberId) to provide
 /// a unique identifier for checkpoint tracking, multi-instance coordination, and
 /// dead letter queue association. Use the `#[derive(SubscriberId)]` macro from
 /// `epoch_derive` for automatic implementation.
