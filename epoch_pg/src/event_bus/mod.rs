@@ -84,6 +84,27 @@ struct BatchContext {
 ///
 /// On error the caller should `warn!` and continue: fencing simply degrades to
 /// timeout-only for that table.
+/// Reports whether the `epoch_event_bus_notify_trigger` AFTER INSERT trigger
+/// exists on `table`. Used by Async `subscribe` to warn when delivery would
+/// silently depend on the timer tick because the trigger is absent (R4).
+pub(crate) async fn trigger_exists(pool: &PgPool, table: &str) -> Result<bool, SqlxError> {
+    let (exists,): (bool,) = sqlx::query_as(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_trigger t
+            JOIN pg_class c ON c.oid = t.tgrelid
+            WHERE t.tgname = 'epoch_event_bus_notify_trigger'
+              AND c.relname = $1
+        )
+        "#,
+    )
+    .bind(table)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
 pub(crate) async fn ensure_txid_column(pool: &PgPool, table: &str) -> Result<(), SqlxError> {
     sqlx::query(&format!(
         "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS txid BIGINT"
@@ -838,6 +859,15 @@ where
             );
         }
 
+        self.ensure_trigger().await
+    }
+
+    /// Idempotently drops and recreates the NOTIFY trigger for this bus's events
+    /// table. This is the drop-then-create body shared by [`setup_trigger`](Self::setup_trigger)
+    /// and the implicit trigger creation folded into [`start_listener`](Self::start_listener)
+    /// (R4), so an Async bus started without an explicit `setup_trigger` still has
+    /// a working trigger.
+    async fn ensure_trigger(&self) -> Result<(), SqlxError> {
         // Drop existing trigger if present
         sqlx::query(&format!(
             "DROP TRIGGER IF EXISTS epoch_event_bus_notify_trigger ON {};",
@@ -915,6 +945,11 @@ where
             }
         }
 
+        // R4: fold trigger creation into start_listener so an Async bus is never
+        // left relying on the timer tick because setup_trigger was never called.
+        // Idempotent, so an explicit setup_trigger call remains harmless.
+        self.ensure_trigger().await?;
+
         let listener_pool = self.pool.clone();
         let checkpoint_pool = self.pool.clone();
         let dlq_pool = self.pool.clone();
@@ -954,6 +989,36 @@ where
                     sorted_info.push(format!("{}(p={})", obs.subscriber_id(), obs.priority()));
                 }
                 log::debug!("Event bus: processing order after sort: {:?}", sorted_info);
+            }
+
+            // R2: run one checkpoint-driven catch-up pass over every registered
+            // subscriber before entering the select loop, so a readiness gate
+            // resolves without waiting for the first NOTIFY or the flush_interval
+            // tick. Transient DB errors are logged and retried on the next loop
+            // iteration; the listener still starts (at-least-once discipline,
+            // matching subscribe()).
+            {
+                let guard = projections.lock().await;
+                for projection in guard.iter() {
+                    let subscriber_id = {
+                        let obs = projection.lock().await;
+                        obs.subscriber_id().to_string()
+                    };
+                    if let Err(e) = catch_up_from_checkpoint(
+                        projection,
+                        &subscriber_id,
+                        &config,
+                        &checkpoint_pool,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "start_listener: initial catch-up for '{}' failed: {}; \
+                             the listener will retry on its next loop iteration",
+                            subscriber_id, e
+                        );
+                    }
+                }
             }
 
             let mut listener_option: Option<PgListener> = None;
@@ -2062,6 +2127,220 @@ where
     }
 }
 
+/// Runs one checkpoint-driven catch-up pass for a single subscriber.
+///
+/// Reads the subscriber's persisted checkpoint, then paginates
+/// `global_sequence > checkpoint` in `catch_up_batch_size` chunks, dispatching
+/// each event through [`process_event_with_retry`] and advancing the checkpoint.
+/// Returns the highest `global_sequence` reached (the persisted checkpoint after
+/// the pass). Shared by `subscribe` and the pre-loop pass in `start_listener` so
+/// the two catch-up paths cannot drift apart.
+pub(crate) async fn catch_up_from_checkpoint<ED>(
+    observer: &Arc<Mutex<dyn EventObserver<ED>>>,
+    subscriber_id: &str,
+    config: &ReliableDeliveryConfig,
+    pool: &PgPool,
+) -> Result<u64, SqlxError>
+where
+    ED: EventData + Send + Sync + DeserializeOwned + 'static,
+{
+    // Get the last checkpoint for this subscriber
+    let last_sequence = {
+        let result: Option<(i64,)> = sqlx::query_as(
+            r#"
+            SELECT last_global_sequence
+            FROM epoch_event_bus_checkpoints
+            WHERE bus_name = $1 AND subscriber_id = $2
+            "#,
+        )
+        .bind(&config.events_table)
+        .bind(subscriber_id)
+        .fetch_optional(pool)
+        .await?;
+
+        result.map(|(seq,)| seq as u64).unwrap_or(0)
+    };
+
+    let mut current_sequence = last_sequence;
+    let mut total_caught_up = 0u64;
+
+    // Pending checkpoint for batched mode during catch-up
+    let mut pending_checkpoint: Option<PendingCheckpoint> = None;
+    // Local checkpoint cache for flush_checkpoint
+    let mut checkpoint_cache: HashMap<String, u64> = HashMap::new();
+
+    // Process catch-up events from the database
+    let subscriber_catchup_query = format!(
+        "SELECT id, stream_id, stream_version, event_type, data, \
+         created_at, actor_id, purger_id, purged_at, \
+         global_sequence, causation_id, correlation_id, schema_version \
+         FROM {} WHERE global_sequence > $1 \
+         ORDER BY global_sequence ASC LIMIT $2",
+        config.events_table,
+    );
+    loop {
+        let rows: Vec<PgDBEvent> = sqlx::query_as(&subscriber_catchup_query)
+            .bind(current_sequence as i64)
+            .bind(config.catch_up_batch_size as i64)
+            .fetch_all(pool)
+            .await?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        let batch_size = rows.len();
+        if total_caught_up == 0 && !rows.is_empty() {
+            info!(
+                "Catch-up for '{}': starting from sequence {}, found events to process",
+                subscriber_id, current_sequence
+            );
+        }
+
+        for row in rows {
+            let event_global_seq = row.global_sequence.unwrap_or(0) as u64;
+            let event_id = row.id;
+
+            let data: Option<ED> = match row.data.map(|d| serde_json::from_value(d)).transpose() {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        "Catch-up: skipping event {} (type: '{}', global_seq: {}) for '{}': \
+                             failed to deserialize: {}. This is expected when event variants have \
+                             been removed from the application enum. Advancing checkpoint past this event.",
+                        event_id, row.event_type, event_global_seq, subscriber_id, e
+                    );
+                    // Advance current_sequence and checkpoint past the
+                    // undeserializable event to avoid an infinite retry loop.
+                    current_sequence = event_global_seq;
+                    total_caught_up += 1;
+                    match &mut pending_checkpoint {
+                        Some(pending) => {
+                            pending.update(event_global_seq, event_id);
+                        }
+                        None => {
+                            pending_checkpoint =
+                                Some(PendingCheckpoint::new(event_global_seq, event_id));
+                        }
+                    }
+                    if let Some(pending) = pending_checkpoint
+                        .take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
+                        && let Err(flush_err) = flush_checkpoint(
+                            pool,
+                            &config.events_table,
+                            subscriber_id,
+                            &pending,
+                            &mut checkpoint_cache,
+                        )
+                        .await
+                    {
+                        error!(
+                            "Catch-up: failed to flush checkpoint for '{}': {}",
+                            subscriber_id, flush_err
+                        );
+                        pending_checkpoint = Some(pending);
+                    }
+                    continue;
+                }
+            };
+
+            let event = Arc::new(Event {
+                id: row.id,
+                stream_id: row.stream_id,
+                stream_version: row.stream_version as u64,
+                event_type: row.event_type,
+                actor_id: row.actor_id,
+                purger_id: row.purger_id,
+                data,
+                created_at: row.created_at,
+                purged_at: row.purged_at,
+                global_sequence: Some(event_global_seq),
+                causation_id: row.causation_id,
+                correlation_id: row.correlation_id,
+                // CLOUD-173: carry the stored schema version through the bus read path.
+                // NULL (pre-migration rows) is interpreted as version 1.
+                schema_version: row.schema_version.unwrap_or(1).max(0) as u32,
+            });
+
+            // Use the same retry/DLQ logic as real-time processing
+            let result =
+                process_event_with_retry(observer, &event, subscriber_id, config, pool).await;
+
+            // Track pending checkpoint for batched mode
+            match &mut pending_checkpoint {
+                Some(pending) => {
+                    pending.update(event_global_seq, event_id);
+                }
+                None => {
+                    pending_checkpoint = Some(PendingCheckpoint::new(event_global_seq, event_id));
+                }
+            }
+
+            // Check if we should flush the checkpoint
+            if let Some(pending) =
+                pending_checkpoint.take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
+                && let Err(e) = flush_checkpoint(
+                    pool,
+                    &config.events_table,
+                    subscriber_id,
+                    &pending,
+                    &mut checkpoint_cache,
+                )
+                .await
+            {
+                error!(
+                    "Catch-up: failed to flush checkpoint for '{}': {}",
+                    subscriber_id, e
+                );
+                // Re-insert pending checkpoint for retry
+                pending_checkpoint = Some(pending);
+            }
+
+            current_sequence = event_global_seq;
+            total_caught_up += 1;
+
+            if let ProcessResult::Success = result {
+                log::debug!(
+                    "Catch-up: processed event {} for '{}'",
+                    event_id,
+                    subscriber_id
+                );
+            }
+        }
+
+        // If we got fewer events than the batch size, we've caught up
+        if batch_size < config.catch_up_batch_size as usize {
+            break;
+        }
+    }
+
+    // Flush any remaining pending checkpoint after catch-up
+    if let Some(pending) = pending_checkpoint.take()
+        && let Err(e) = flush_checkpoint(
+            pool,
+            &config.events_table,
+            subscriber_id,
+            &pending,
+            &mut checkpoint_cache,
+        )
+        .await
+    {
+        error!(
+            "Catch-up: failed to flush final checkpoint for '{}': {}",
+            subscriber_id, e
+        );
+    }
+
+    if total_caught_up > 0 {
+        info!(
+            "Catch-up complete for '{}': processed {} events, checkpoint now at {}",
+            subscriber_id, total_caught_up, current_sequence
+        );
+    }
+
+    Ok(current_sequence)
+}
+
 impl<D> EventBus for PgEventBus<D>
 where
     D: EventData + Send + Sync + DeserializeOwned + 'static,
@@ -2121,6 +2400,27 @@ where
                 let guard = observer.lock().await;
                 guard.subscriber_id().to_string()
             };
+
+            // R4 (defence-in-depth): in Async mode, delivery of newly committed
+            // events depends on the AFTER INSERT NOTIFY trigger. If it is absent
+            // (e.g. subscribe() called before start_listener/setup_trigger created
+            // it), warn loudly so a misconfiguration is visible in logs rather than
+            // silently relying on the 1s timer tick. We do not hard-error: the R2
+            // catch-up pass and the timer fallback still deliver correctly.
+            match trigger_exists(&pool, &config.events_table).await {
+                Ok(false) => warn!(
+                    "Async subscribe for '{}' on bus '{}' (channel '{}'): no NOTIFY trigger \
+                     on table '{}'. New events will be delivered only on the periodic timer \
+                     tick until start_listener()/setup_trigger() creates it.",
+                    subscriber_id, config.events_table, channel_name, config.events_table
+                ),
+                Ok(true) => {}
+                Err(e) => log::debug!(
+                    "Could not probe for NOTIFY trigger on '{}': {}",
+                    config.events_table,
+                    e
+                ),
+            }
 
             // === Multi-instance coordination ===
             // If in Coordinated mode, try to acquire an advisory lock.
@@ -2236,205 +2536,15 @@ where
                 }
             });
 
-            // Get the last checkpoint for this subscriber
-            let last_sequence = {
-                let result: Option<(i64,)> = sqlx::query_as(
-                    r#"
-                    SELECT last_global_sequence
-                    FROM epoch_event_bus_checkpoints
-                    WHERE bus_name = $1 AND subscriber_id = $2
-                    "#,
-                )
-                .bind(&config.events_table)
-                .bind(&subscriber_id)
-                .fetch_optional(&pool)
-                .await?;
+            // Catch up from the persisted checkpoint. Reuses the same paginated,
+            // retry/DLQ-backed pass that start_listener runs before entering its
+            // loop (R2), so the two paths cannot drift.
+            let mut current_sequence =
+                catch_up_from_checkpoint(&observer, &subscriber_id, &config, &pool).await?;
 
-                result.map(|(seq,)| seq as u64).unwrap_or(0)
-            };
-
-            let mut current_sequence = last_sequence;
-            let mut total_caught_up = 0u64;
-
-            // Pending checkpoint for batched mode during catch-up
+            // Pending checkpoint / local cache for the buffer-drain phase below.
             let mut pending_checkpoint: Option<PendingCheckpoint> = None;
-            // Local checkpoint cache for flush_checkpoint
             let mut checkpoint_cache: HashMap<String, u64> = HashMap::new();
-
-            // Process catch-up events from the database
-            let subscriber_catchup_query = format!(
-                "SELECT id, stream_id, stream_version, event_type, data, \
-                 created_at, actor_id, purger_id, purged_at, \
-                 global_sequence, causation_id, correlation_id, schema_version \
-                 FROM {} WHERE global_sequence > $1 \
-                 ORDER BY global_sequence ASC LIMIT $2",
-                config.events_table,
-            );
-            loop {
-                let rows: Vec<PgDBEvent> = sqlx::query_as(&subscriber_catchup_query)
-                    .bind(current_sequence as i64)
-                    .bind(config.catch_up_batch_size as i64)
-                    .fetch_all(&pool)
-                    .await?;
-
-                if rows.is_empty() {
-                    break;
-                }
-
-                let batch_size = rows.len();
-                if total_caught_up == 0 && !rows.is_empty() {
-                    info!(
-                        "Catch-up for '{}': starting from sequence {}, found events to process",
-                        subscriber_id, current_sequence
-                    );
-                }
-
-                for row in rows {
-                    let event_global_seq = row.global_sequence.unwrap_or(0) as u64;
-                    let event_id = row.id;
-
-                    let data: Option<Self::EventType> = match row
-                        .data
-                        .map(|d| serde_json::from_value(d))
-                        .transpose()
-                    {
-                        Ok(d) => d,
-                        Err(e) => {
-                            warn!(
-                                "Catch-up: skipping event {} (type: '{}', global_seq: {}) for '{}': \
-                                     failed to deserialize: {}. This is expected when event variants have \
-                                     been removed from the application enum. Advancing checkpoint past this event.",
-                                event_id, row.event_type, event_global_seq, subscriber_id, e
-                            );
-                            // Advance current_sequence and checkpoint past the
-                            // undeserializable event to avoid an infinite retry loop.
-                            current_sequence = event_global_seq;
-                            total_caught_up += 1;
-                            match &mut pending_checkpoint {
-                                Some(pending) => {
-                                    pending.update(event_global_seq, event_id);
-                                }
-                                None => {
-                                    pending_checkpoint =
-                                        Some(PendingCheckpoint::new(event_global_seq, event_id));
-                                }
-                            }
-                            if let Some(pending) = pending_checkpoint
-                                .take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
-                                && let Err(flush_err) = flush_checkpoint(
-                                    &pool,
-                                    &config.events_table,
-                                    &subscriber_id,
-                                    &pending,
-                                    &mut checkpoint_cache,
-                                )
-                                .await
-                            {
-                                error!(
-                                    "Catch-up: failed to flush checkpoint for '{}': {}",
-                                    subscriber_id, flush_err
-                                );
-                                pending_checkpoint = Some(pending);
-                            }
-                            continue;
-                        }
-                    };
-
-                    let event = Arc::new(Event {
-                        id: row.id,
-                        stream_id: row.stream_id,
-                        stream_version: row.stream_version as u64,
-                        event_type: row.event_type,
-                        actor_id: row.actor_id,
-                        purger_id: row.purger_id,
-                        data,
-                        created_at: row.created_at,
-                        purged_at: row.purged_at,
-                        global_sequence: Some(event_global_seq),
-                        causation_id: row.causation_id,
-                        correlation_id: row.correlation_id,
-                        // CLOUD-173: carry the stored schema version through the bus read path.
-                        // NULL (pre-migration rows) is interpreted as version 1.
-                        schema_version: row.schema_version.unwrap_or(1).max(0) as u32,
-                    });
-
-                    // Use the same retry/DLQ logic as real-time processing
-                    let result =
-                        process_event_with_retry(&observer, &event, &subscriber_id, &config, &pool)
-                            .await;
-
-                    // Track pending checkpoint for batched mode
-                    match &mut pending_checkpoint {
-                        Some(pending) => {
-                            pending.update(event_global_seq, event_id);
-                        }
-                        None => {
-                            pending_checkpoint =
-                                Some(PendingCheckpoint::new(event_global_seq, event_id));
-                        }
-                    }
-
-                    // Check if we should flush the checkpoint
-                    if let Some(pending) = pending_checkpoint
-                        .take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
-                        && let Err(e) = flush_checkpoint(
-                            &pool,
-                            &config.events_table,
-                            &subscriber_id,
-                            &pending,
-                            &mut checkpoint_cache,
-                        )
-                        .await
-                    {
-                        error!(
-                            "Catch-up: failed to flush checkpoint for '{}': {}",
-                            subscriber_id, e
-                        );
-                        // Re-insert pending checkpoint for retry
-                        pending_checkpoint = Some(pending);
-                    }
-
-                    current_sequence = event_global_seq;
-                    total_caught_up += 1;
-
-                    if let ProcessResult::Success = result {
-                        log::debug!(
-                            "Catch-up: processed event {} for '{}'",
-                            event_id,
-                            subscriber_id
-                        );
-                    }
-                }
-
-                // If we got fewer events than the batch size, we've caught up
-                if batch_size < config.catch_up_batch_size as usize {
-                    break;
-                }
-            }
-
-            // Flush any remaining pending checkpoint after catch-up
-            if let Some(pending) = pending_checkpoint.take()
-                && let Err(e) = flush_checkpoint(
-                    &pool,
-                    &config.events_table,
-                    &subscriber_id,
-                    &pending,
-                    &mut checkpoint_cache,
-                )
-                .await
-            {
-                error!(
-                    "Catch-up: failed to flush final checkpoint for '{}': {}",
-                    subscriber_id, e
-                );
-            }
-
-            if total_caught_up > 0 {
-                info!(
-                    "Catch-up complete for '{}': processed {} events, checkpoint now at {}",
-                    subscriber_id, total_caught_up, current_sequence
-                );
-            }
 
             // Stop the buffer listener
             buffer_handle.abort();

@@ -1,5 +1,66 @@
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use std::sync::{Mutex, Once, OnceLock};
 use std::time::Duration;
+
+static CAPTURED_LOGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static LOGGER_INIT: Once = Once::new();
+static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
+
+fn captured_logs() -> &'static Mutex<Vec<String>> {
+    CAPTURED_LOGS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+struct CaptureLogger;
+
+impl log::Log for CaptureLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        // Only retain WARN/ERROR so the buffer stays small and matches the
+        // default (silent) env_logger behaviour for lower levels.
+        if record.level() <= log::Level::Warn {
+            captured_logs()
+                .lock()
+                .unwrap()
+                .push(format!("[{}] {}", record.level(), record.args()));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// Installs a process-global logger that captures WARN/ERROR records so tests
+/// can assert on emitted warnings. Idempotent and safe to call from every test;
+/// replaces the previous `env_logger` init in this test binary.
+#[allow(dead_code)]
+pub fn init_test_logger() {
+    LOGGER_INIT.call_once(|| {
+        // If another logger was already installed for this binary, capture
+        // assertions will see an empty buffer; that is acceptable because all
+        // inits in this binary funnel through here.
+        let _ = log::set_logger(&CAPTURE_LOGGER);
+        log::set_max_level(log::LevelFilter::Trace);
+    });
+}
+
+/// Returns true if any captured WARN/ERROR record contains `needle`.
+#[allow(dead_code)]
+pub fn captured_logs_contain(needle: &str) -> bool {
+    captured_logs()
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.contains(needle))
+}
+
+/// Clears the captured-log buffer. Call before the action under test so the
+/// assertion only sees records emitted by that action.
+#[allow(dead_code)]
+pub fn clear_captured_logs() {
+    captured_logs().lock().unwrap().clear();
+}
 
 /// Loads `epoch_pg/.env` if it exists.
 ///

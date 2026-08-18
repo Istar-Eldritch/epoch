@@ -108,7 +108,7 @@ async fn setup() -> Option<(
     PgEventBus<TestEventData>,
     PgEventStore<PgEventBus<TestEventData>>,
 )> {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let pool = common::try_get_pg_pool().await?;
 
     // Run migrations to set up the schema
@@ -1167,7 +1167,7 @@ async fn test_multiple_subscribers_have_independent_checkpoints() {
 #[tokio::test]
 #[serial]
 async fn test_coordinated_mode_acquires_lock_on_subscribe() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -1240,7 +1240,7 @@ async fn test_coordinated_mode_acquires_lock_on_subscribe() {
 #[tokio::test]
 #[serial]
 async fn test_coordinated_mode_skips_subscribe_if_lock_held() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -1346,7 +1346,7 @@ async fn test_coordinated_mode_skips_subscribe_if_lock_held() {
 #[tokio::test]
 #[serial]
 async fn test_coordinated_mode_allows_different_subscribers_on_same_instance() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -1429,7 +1429,7 @@ async fn test_coordinated_mode_allows_different_subscribers_on_same_instance() {
 #[tokio::test]
 #[serial]
 async fn test_batched_checkpoint_flushes_at_batch_size() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -1518,7 +1518,7 @@ async fn test_batched_checkpoint_flushes_at_batch_size() {
 #[tokio::test]
 #[serial]
 async fn test_batched_checkpoint_flushes_at_max_delay() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -1597,7 +1597,7 @@ async fn test_batched_checkpoint_flushes_at_max_delay() {
 #[tokio::test]
 #[serial]
 async fn test_batched_checkpoint_during_catchup() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -1687,7 +1687,7 @@ async fn test_batched_checkpoint_during_catchup() {
 #[serial]
 async fn test_synchronous_checkpoint_still_works() {
     // Verify that synchronous mode (default) still works correctly
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -1758,7 +1758,7 @@ async fn test_synchronous_checkpoint_still_works() {
 
 /// Helper to create an event bus without starting the listener
 async fn setup_without_listener() -> Option<(PgPool, PgEventBus<TestEventData>)> {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let pool = common::try_get_pg_pool().await?;
 
     Migrator::new(pool.clone())
@@ -1894,7 +1894,7 @@ async fn test_shutdown_flushes_batched_checkpoints() {
     use epoch_pg::event_bus::{CheckpointMode, ReliableDeliveryConfig};
     use std::time::Duration;
 
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -2521,7 +2521,7 @@ async fn test_catchup_plus_realtime_handoff_no_loss() {
 #[tokio::test]
 #[serial]
 async fn test_batched_checkpoint_with_gap_tracking() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -2720,7 +2720,7 @@ async fn test_undeserializable_event_advances_past() {
 #[tokio::test]
 #[serial]
 async fn test_graceful_shutdown_flushes_subscriber_states() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -2943,7 +2943,7 @@ async fn poll_for_gap_record(
 #[tokio::test]
 #[serial]
 async fn test_gap_timeout_inserts_record() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -3013,7 +3013,7 @@ async fn test_gap_timeout_inserts_record() {
 #[tokio::test]
 #[serial]
 async fn test_event_committed_after_gap_timeout_is_reported_as_skipped() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -3095,7 +3095,7 @@ async fn test_event_committed_after_gap_timeout_is_reported_as_skipped() {
 #[tokio::test]
 #[serial]
 async fn test_gap_timeout_callback_is_invoked() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -3172,7 +3172,7 @@ async fn test_gap_timeout_callback_is_invoked() {
 #[tokio::test]
 #[serial]
 async fn test_list_gap_timeouts_returns_entries() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -3221,7 +3221,7 @@ async fn test_list_gap_timeouts_returns_entries() {
 #[tokio::test]
 #[serial]
 async fn test_resolve_gap_timeout_marks_resolved() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -3296,7 +3296,7 @@ async fn test_resolve_gap_timeout_marks_resolved() {
 #[tokio::test]
 #[serial]
 async fn test_no_gap_timeout_record_on_in_order_events() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -3346,7 +3346,7 @@ async fn test_no_gap_timeout_record_on_in_order_events() {
 #[tokio::test]
 #[serial]
 async fn test_gap_timeout_record_insert_is_idempotent() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -3745,7 +3745,7 @@ async fn start_fence_test_bus(
 #[tokio::test]
 #[serial]
 async fn test_txid_column_exists_and_populates() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -3832,7 +3832,7 @@ async fn test_txid_column_exists_and_populates() {
 #[tokio::test]
 #[serial]
 async fn test_in_flight_transaction_gap_is_held() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -3949,7 +3949,7 @@ async fn test_in_flight_transaction_gap_is_held() {
 #[tokio::test]
 #[serial]
 async fn test_rolled_back_gap_fence_clears_without_record() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -4017,7 +4017,7 @@ async fn test_rolled_back_gap_fence_clears_without_record() {
 #[tokio::test]
 #[serial]
 async fn test_pinned_gap_resolves_via_backstop() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -4102,7 +4102,7 @@ async fn test_pinned_gap_resolves_via_backstop() {
 #[tokio::test]
 #[serial]
 async fn test_fencing_disabled_uses_timeout() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -4157,7 +4157,7 @@ async fn test_fencing_disabled_uses_timeout() {
 #[tokio::test]
 #[serial]
 async fn test_ensure_txid_column_on_custom_table() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -4235,4 +4235,155 @@ async fn test_ensure_txid_column_on_custom_table() {
         .execute(&pool)
         .await
         .expect("drop custom events table");
+}
+
+// ==================== Phase 2: R2 pre-loop catch-up + R4 implicit trigger ====================
+
+/// R-2: `start_listener` runs one checkpoint-driven catch-up pass over every
+/// registered subscriber *before* entering its select loop. Events committed
+/// while no listener is running must be reflected in the checkpoint well under
+/// the 1s `flush_interval`, without waiting for a NOTIFY or timer tick.
+#[tokio::test]
+#[serial]
+async fn test_start_listener_catches_up_before_loop() {
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    // Register a subscriber before any events exist, so subscribe()'s own
+    // catch-up processes nothing and writes no checkpoint.
+    let subscriber_id = format!("projection:before-loop:{}", Uuid::new_v4());
+    let projection = TestProjection::with_subscriber_id(subscriber_id.clone());
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe projection");
+
+    // Commit events with no listener running. The NOTIFY fires but nothing
+    // consumes it; without the R2 pass the checkpoint would only advance on the
+    // 1s timer tick.
+    let stream_id = Uuid::new_v4();
+    let n = 5u64;
+    for v in 1..=n {
+        event_store
+            .store_event(new_event(stream_id, v, &format!("e{v}")))
+            .await
+            .expect("Failed to store event");
+    }
+    // The global_sequence counter is a standalone sequence not reset by
+    // TRUNCATE, so read the actual head rather than assuming it equals `n`.
+    let head: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(global_sequence), 0) FROM epoch_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    // Well under the 1s flush_interval: the pre-loop catch-up must already have
+    // advanced the checkpoint.
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("Failed to read checkpoint");
+    assert_eq!(
+        checkpoint,
+        Some(head as u64),
+        "start_listener should catch up to head before entering its loop, without waiting for the timer tick"
+    );
+
+    event_bus.shutdown().await.expect("Failed to shutdown");
+}
+
+/// R-4: `start_listener` folds in an idempotent `ensure_trigger`, so an Async
+/// bus started without an explicit `setup_trigger` still delivers newly
+/// published events promptly (via NOTIFY, not the timer tick). Calling
+/// `setup_trigger` afterwards remains harmless (idempotent).
+#[tokio::test]
+#[serial]
+async fn test_ensure_trigger_implicit_in_start_listener() {
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    // Deliberately no setup_trigger() call.
+    let subscriber_id = format!("projection:implicit-trigger:{}", Uuid::new_v4());
+    let projection = TestProjection::with_subscriber_id(subscriber_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe projection");
+
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    // Publish after the listener is up. This must be delivered via NOTIFY, which
+    // requires the trigger start_listener created implicitly.
+    let stream_id = Uuid::new_v4();
+    let event = new_event(stream_id, 1, "implicit");
+    event_store
+        .store_event(event.clone())
+        .await
+        .expect("Failed to store event");
+
+    // Well under the 1s timer tick: prompt delivery proves the trigger exists.
+    tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+
+    let state =
+        store.get_state(stream_id).await.unwrap().expect(
+            "event should be delivered promptly because start_listener created the trigger",
+        );
+    assert_eq!(state.0.len(), 1);
+    assert_eq!(state.0[0].id, event.id);
+
+    // Idempotent alongside an explicit setup_trigger call.
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("explicit setup_trigger should be idempotent");
+
+    event_bus.shutdown().await.expect("Failed to shutdown");
+}
+
+/// R-4: subscribing in Async mode before any trigger exists logs a WARN and
+/// still succeeds (no hard error).
+#[tokio::test]
+#[serial]
+async fn test_subscribe_warns_when_trigger_absent() {
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+
+    // The NOTIFY trigger is a schema object on the shared events table and is not
+    // removed by truncation, so a prior test may have created it. Drop it to make
+    // "trigger absent" genuinely true for this bus's table.
+    sqlx::query("DROP TRIGGER IF EXISTS epoch_event_bus_notify_trigger ON epoch_events")
+        .execute(&pool)
+        .await
+        .expect("Failed to drop trigger");
+
+    common::clear_captured_logs();
+
+    // No setup_trigger(): the Async subscribe must warn but still succeed.
+    let subscriber_id = format!("projection:no-trigger:{}", Uuid::new_v4());
+    let projection = TestProjection::with_subscriber_id(subscriber_id);
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe should succeed even without a trigger");
+
+    assert!(
+        common::captured_logs_contain("no NOTIFY trigger"),
+        "Async subscribe without a trigger should emit a WARN naming the missing trigger"
+    );
 }
