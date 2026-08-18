@@ -171,6 +171,15 @@ where
         }
         Ok(())
     }
+
+    /// How this projection relates to persisted checkpoints.
+    ///
+    /// Defaults to [`SubscriptionMode::Checkpointed`]. Override and return
+    /// [`SubscriptionMode::ReplayAlways`] for in-memory projections that must
+    /// replay from sequence 0 on every process start.
+    fn subscription_mode(&self) -> crate::event_store::SubscriptionMode {
+        crate::event_store::SubscriptionMode::Checkpointed
+    }
 }
 
 /// Wraps a [`Projection`] to implement [`EventObserver`](crate::event_store::EventObserver)
@@ -246,6 +255,10 @@ where
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.0.apply_and_store(&event).await?;
         Ok(())
+    }
+
+    fn subscription_mode(&self) -> crate::event_store::SubscriptionMode {
+        self.0.subscription_mode()
     }
 }
 
@@ -345,7 +358,62 @@ mod tests {
         }
     }
 
+    struct ReplayAlwaysProjection;
+
+    impl crate::SubscriberId for ReplayAlwaysProjection {
+        fn subscriber_id(&self) -> &str {
+            "projection:replay-always"
+        }
+    }
+
+    impl EventApplicator<TestEventData> for ReplayAlwaysProjection {
+        type State = TestState;
+        type StateStore = TestStateStore;
+        type EventType = TestEventData;
+        type ApplyError = TestProjectionError;
+
+        fn get_state_store(&self) -> Self::StateStore {
+            TestStateStore
+        }
+
+        fn apply(
+            &self,
+            _state: Option<Self::State>,
+            event: &Event<Self::EventType>,
+        ) -> Result<Option<Self::State>, Self::ApplyError> {
+            Ok(Some(TestState {
+                id: event.stream_id,
+            }))
+        }
+    }
+
+    impl Projection<TestEventData> for ReplayAlwaysProjection {
+        fn subscription_mode(&self) -> crate::event_store::SubscriptionMode {
+            crate::event_store::SubscriptionMode::ReplayAlways
+        }
+    }
+
     impl Projection<TestEventData> for TestProjection {}
+
+    #[test]
+    fn subscription_mode_defaults_to_checkpointed() {
+        use crate::event_store::{EventObserver, SubscriptionMode};
+
+        assert_eq!(SubscriptionMode::default(), SubscriptionMode::Checkpointed);
+
+        let handler = ProjectionHandler::new(TestProjection);
+        let observer: &dyn EventObserver<TestEventData> = &handler;
+        assert_eq!(observer.subscription_mode(), SubscriptionMode::Checkpointed);
+    }
+
+    #[test]
+    fn subscription_mode_forwarded_through_projection_handler() {
+        use crate::event_store::{EventObserver, SubscriptionMode};
+
+        let handler = ProjectionHandler::new(ReplayAlwaysProjection);
+        let observer: &dyn EventObserver<TestEventData> = &handler;
+        assert_eq!(observer.subscription_mode(), SubscriptionMode::ReplayAlways);
+    }
 
     #[test]
     fn projection_subscriber_id_is_available_via_event_observer() {

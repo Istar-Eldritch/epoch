@@ -127,6 +127,15 @@ where
         100
     }
 
+    /// How this saga relates to persisted checkpoints.
+    ///
+    /// Defaults to [`SubscriptionMode::Checkpointed`]. Override and return
+    /// [`SubscriptionMode::ReplayAlways`] for in-memory sagas that must
+    /// replay from sequence 0 on every process start.
+    fn subscription_mode(&self) -> crate::event_store::SubscriptionMode {
+        crate::event_store::SubscriptionMode::Checkpointed
+    }
+
     /// Processes an incoming event, applies it to the saga, and persists the resulting state.
     ///
     /// This method is called by the blanket [`EventObserver`] implementation. It handles:
@@ -217,6 +226,10 @@ where
     fn priority(&self) -> u8 {
         (**self).priority()
     }
+
+    fn subscription_mode(&self) -> crate::event_store::SubscriptionMode {
+        (**self).subscription_mode()
+    }
 }
 
 /// A wrapper type that provides an [`EventObserver`] implementation for [`Saga`] types.
@@ -279,6 +292,10 @@ where
     /// Delegates to the inner saga's [`Saga::priority`] method.
     fn priority(&self) -> u8 {
         self.0.priority()
+    }
+
+    fn subscription_mode(&self) -> crate::event_store::SubscriptionMode {
+        self.0.subscription_mode()
     }
 }
 
@@ -436,5 +453,163 @@ where
 
     fn priority(&self) -> u8 {
         self.saga.priority()
+    }
+
+    fn subscription_mode(&self) -> crate::event_store::SubscriptionMode {
+        self.saga.subscription_mode()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::EnumConversionError;
+    use crate::event_store::{EventObserver, SubscriptionMode};
+    use crate::state_store::StateStoreBackend;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum TestEvent {
+        Something,
+    }
+
+    impl EventData for TestEvent {
+        fn event_type(&self) -> &'static str {
+            "Something"
+        }
+    }
+
+    impl TryFrom<&TestEvent> for TestEvent {
+        type Error = EnumConversionError;
+        fn try_from(v: &TestEvent) -> Result<Self, Self::Error> {
+            Ok(v.clone())
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("state error")]
+    struct NoError;
+
+    struct NoState {
+        id: Uuid,
+    }
+
+    impl Default for NoState {
+        fn default() -> Self {
+            Self { id: Uuid::nil() }
+        }
+    }
+
+    impl crate::event_applicator::EventApplicatorState for NoState {
+        fn get_id(&self) -> &Uuid {
+            &self.id
+        }
+    }
+
+    struct NoStore;
+
+    #[async_trait]
+    impl StateStoreBackend<NoState> for NoStore {
+        type Error = NoError;
+        async fn get_state(&self, _: Uuid) -> Result<Option<NoState>, Self::Error> {
+            Ok(None)
+        }
+        async fn persist_state(&mut self, _: Uuid, _: NoState) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        async fn delete_state(&mut self, _: Uuid) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    struct CheckpointedSaga;
+
+    impl crate::SubscriberId for CheckpointedSaga {
+        fn subscriber_id(&self) -> &str {
+            "saga:checkpointed"
+        }
+    }
+
+    #[async_trait]
+    impl Saga<TestEvent> for CheckpointedSaga {
+        type State = NoState;
+        type StateStore = NoStore;
+        type SagaError = NoError;
+        type EventType = TestEvent;
+
+        fn get_state_store(&self) -> Self::StateStore {
+            NoStore
+        }
+
+        async fn handle_event(
+            &self,
+            state: Self::State,
+            _event: &Event<Self::EventType>,
+        ) -> Result<Option<Self::State>, Self::SagaError> {
+            Ok(Some(state))
+        }
+    }
+
+    struct ReplayAlwaysSaga;
+
+    impl crate::SubscriberId for ReplayAlwaysSaga {
+        fn subscriber_id(&self) -> &str {
+            "saga:replay-always"
+        }
+    }
+
+    #[async_trait]
+    impl Saga<TestEvent> for ReplayAlwaysSaga {
+        type State = NoState;
+        type StateStore = NoStore;
+        type SagaError = NoError;
+        type EventType = TestEvent;
+
+        fn get_state_store(&self) -> Self::StateStore {
+            NoStore
+        }
+
+        async fn handle_event(
+            &self,
+            state: Self::State,
+            _event: &Event<Self::EventType>,
+        ) -> Result<Option<Self::State>, Self::SagaError> {
+            Ok(Some(state))
+        }
+
+        fn subscription_mode(&self) -> SubscriptionMode {
+            SubscriptionMode::ReplayAlways
+        }
+    }
+
+    #[test]
+    fn subscription_mode_defaults_to_checkpointed_on_saga_handler() {
+        let handler = SagaHandler::new(CheckpointedSaga);
+        let observer: &dyn EventObserver<TestEvent> = &handler;
+        assert_eq!(observer.subscription_mode(), SubscriptionMode::Checkpointed);
+    }
+
+    #[test]
+    fn subscription_mode_forwarded_through_saga_handler() {
+        let handler = SagaHandler::new(ReplayAlwaysSaga);
+        let observer: &dyn EventObserver<TestEvent> = &handler;
+        assert_eq!(observer.subscription_mode(), SubscriptionMode::ReplayAlways);
+    }
+
+    #[test]
+    fn subscription_mode_forwarded_through_arc_blanket() {
+        let saga = Arc::new(ReplayAlwaysSaga);
+        let handler = SagaHandler::new(saga);
+        let observer: &dyn EventObserver<TestEvent> = &handler;
+        assert_eq!(observer.subscription_mode(), SubscriptionMode::ReplayAlways);
+    }
+
+    #[test]
+    fn subscription_mode_forwarded_through_saga_adapter() {
+        let saga = Arc::new(ReplayAlwaysSaga);
+        let adapter = SagaAdapter::new(saga, "saga:adapter:test", |e: &TestEvent| Some(e.clone()));
+        let observer: &dyn EventObserver<TestEvent> = &adapter;
+        assert_eq!(observer.subscription_mode(), SubscriptionMode::ReplayAlways);
     }
 }

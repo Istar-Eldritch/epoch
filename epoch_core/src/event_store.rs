@@ -197,6 +197,23 @@ pub trait EventBus {
 /// # Subscriber ID
 ///
 /// Implementors must also implement [`SubscriberId`](crate::SubscriberId) to provide
+/// How a subscriber relates to persisted checkpoints.
+///
+/// Controls whether the event bus reads and writes a checkpoint row for this
+/// subscriber, or tracks progress via a per-process in-memory high-water mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SubscriptionMode {
+    /// Default. Honour and advance a persisted checkpoint; resume from it across
+    /// process restarts.
+    #[default]
+    Checkpointed,
+    /// Replay from sequence 0 on every process start; never read or write a
+    /// persisted checkpoint. Readiness is tracked via a per-process in-memory
+    /// high-water mark. For in-memory read models with no durable store.
+    ReplayAlways,
+}
+
 /// a unique identifier for checkpoint tracking, multi-instance coordination, and
 /// dead letter queue association. Use the `#[derive(SubscriberId)]` macro from
 /// `epoch_derive` for automatic implementation.
@@ -220,6 +237,16 @@ where
     /// read models are up-to-date before sagas query them.
     fn priority(&self) -> u8 {
         0
+    }
+
+    /// How this subscriber relates to persisted checkpoints.
+    ///
+    /// Defaults to [`SubscriptionMode::Checkpointed`]: honour and advance a
+    /// persisted checkpoint row across process restarts. Override and return
+    /// [`SubscriptionMode::ReplayAlways`] for in-memory read models that must
+    /// replay from sequence 0 on every process start.
+    fn subscription_mode(&self) -> SubscriptionMode {
+        SubscriptionMode::Checkpointed
     }
 }
 
