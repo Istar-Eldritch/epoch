@@ -72,7 +72,12 @@ pub struct InMemoryDeadLetterSink {
 impl InMemoryDeadLetterSink {
     fn new() -> (Self, Arc<Mutex<Vec<DeadLetteredEvent>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
-        (Self { events: Arc::clone(&events) }, events)
+        (
+            Self {
+                events: Arc::clone(&events),
+            },
+            events,
+        )
     }
 }
 
@@ -111,7 +116,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     println!("  Upcast result: {order:?}");
     assert_eq!(order.product, "Widget");
-    assert_eq!(order.currency, "USD", "upcaster should supply default currency");
+    assert_eq!(
+        order.currency, "USD",
+        "upcaster should supply default currency"
+    );
 
     // ── Part 2: v2 payload passes through unchanged ───────────────────────────
 
@@ -189,7 +197,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("  Chain result: {order:?}");
     assert_eq!(order.currency, "USD");
     assert_eq!(order.quantity, 1);
-    assert_eq!(chain_registry.counters().applied(), 2, "two upcaster steps applied");
+    assert_eq!(
+        chain_registry.counters().applied(),
+        2,
+        "two upcaster steps applied"
+    );
 
     // ── Part 4: FailurePolicy::DeadLetter ────────────────────────────────────
     //

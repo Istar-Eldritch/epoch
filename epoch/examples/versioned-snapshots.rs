@@ -273,10 +273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "Balance at v7: ${} (snapshot@v5 + 2 events replayed)",
         state_v7.balance
     );
-    assert_eq!(
-        state_v7.balance, 700,
-        "7 deposits × $100 = $700"
-    );
+    assert_eq!(state_v7.balance, 700, "7 deposits × $100 = $700");
 
     // ── Manual snapshot ───────────────────────────────────────────────────────
     //
