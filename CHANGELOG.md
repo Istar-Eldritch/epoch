@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Subscriber readiness + startup safety** (`epoch_core`, `epoch_pg`, CLOUD-221) —
+  first-class lag/readiness API on `PgEventBus`, a `ReplayAlways` subscription mode for
+  in-memory projections that replay from zero every boot, and startup catch-up so a
+  healthy boot no longer pays the `flush_interval` (~1 s) tax:
+  - **`epoch_core`** — `SubscriptionMode { Checkpointed (default), ReplayAlways }` enum
+    (`#[non_exhaustive]`) added to `event_store.rs`; `EventObserver::subscription_mode()`
+    defaulted to `Checkpointed`; `Projection::subscription_mode()` and
+    `Saga::subscription_mode()` likewise defaulted and forwarded by
+    `ProjectionHandler`, `SagaHandler`, `SagaAdapter`, and the `impl Saga for Arc<S>`
+    blanket. Existing observers that override nothing are byte-for-byte unchanged.
+  - **`epoch_pg`** — `PgEventBus` gains `head_sequence() -> Option<u64>`,
+    `subscriber_lag(id) -> Result<Option<u64>>`, `wait_until_caught_up(id, timeout) -> bool`,
+    and `wait_until_all_caught_up(timeout) -> bool`; readiness position dispatches on
+    `subscription_mode` (checkpoint for `Checkpointed`, in-memory HWM for `ReplayAlways`).
+    `start_listener` runs a full catch-up pass before entering the select loop (closing
+    the subscribe → first-batch window) and calls idempotent `ensure_trigger` so Async
+    buses always have the NOTIFY trigger. `subscribe` WARNs when subscribing in Async
+    without a trigger already present. `fast_forward_all_subscribers` skips `ReplayAlways`
+    subscribers (no checkpoint row to update). No schema migration; no new dependency.
+
 - **`read_events_range` bounded-replay primitive** (`epoch_core`, `epoch_pg`, `epoch_mem`, CLOUD-183) —
   a new `EventStoreBackend::read_events_range(stream_id, from: Option<u64>, to: Option<u64>)`
   primitive that pushes inclusive `[from, to]` `stream_version` bounds down to storage,
