@@ -462,30 +462,24 @@ where
                 }
             }
 
-            // Flush checkpoint to DB if threshold reached.
-            if let Some(pending) =
-                pending_checkpoint.take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
-            {
-                let mut local_cache = HashMap::new();
-                match flush_checkpoint(
-                    &checkpoint_pool,
-                    &config.events_table,
-                    &subscriber_id,
-                    &pending,
-                    &mut local_cache,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        if let Some(val) = local_cache.get(&subscriber_id) {
-                            cached_checkpoint = Some(*val);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to flush checkpoint for '{}': {}", subscriber_id, e);
-                        pending_checkpoint = Some(pending);
-                    }
-                }
+            // Flush checkpoint to DB if threshold reached. Uses a fresh local
+            // cache (rather than a cache shared across concurrent subscriber
+            // tasks) purely to read back the flushed value for
+            // `cached_checkpoint`; the caller merges it into the listener-level
+            // cache once this task's `SubscriberBatchOutcome` is collected.
+            let mut local_cache = HashMap::new();
+            try_flush_pending_checkpoint(
+                &mut pending_checkpoint,
+                "process_subscriber_for_batch",
+                &config.events_table,
+                &subscriber_id,
+                &config.checkpoint_mode,
+                &checkpoint_pool,
+                &mut local_cache,
+            )
+            .await;
+            if let Some(val) = local_cache.get(&subscriber_id) {
+                cached_checkpoint = Some(*val);
             }
         }
     }
@@ -2485,6 +2479,42 @@ where
     }
 }
 
+/// Flushes `pending_checkpoint` if [`should_flush_checkpoint`] says the
+/// configured threshold is met; a no-op otherwise. On flush failure the
+/// pending checkpoint is put back so the next call retries, and the error is
+/// logged with `context` (a short label identifying the caller for the log
+/// line). Shared by [`record_catchup_progress`] and
+/// `process_subscriber_for_batch` so the flush-and-retry-on-error dance can't
+/// drift between the catch-up and live-batch paths.
+async fn try_flush_pending_checkpoint(
+    pending_checkpoint: &mut Option<PendingCheckpoint>,
+    context: &str,
+    events_table: &str,
+    subscriber_id: &str,
+    mode: &CheckpointMode,
+    pool: &PgPool,
+    checkpoint_cache: &mut HashMap<String, u64>,
+) {
+    let Some(pending) = pending_checkpoint.take_if(|p| should_flush_checkpoint(p, mode)) else {
+        return;
+    };
+    if let Err(e) = flush_checkpoint(
+        pool,
+        events_table,
+        subscriber_id,
+        &pending,
+        checkpoint_cache,
+    )
+    .await
+    {
+        error!(
+            "{context}: failed to flush checkpoint for '{}': {}",
+            subscriber_id, e
+        );
+        *pending_checkpoint = Some(pending);
+    }
+}
+
 /// Records catch-up progress for one event.
 ///
 /// For a `Checkpointed` subscriber this advances the batched pending checkpoint
@@ -2515,23 +2545,16 @@ async fn record_catchup_progress(
         None => *pending_checkpoint = Some(PendingCheckpoint::new(event_global_seq, event_id)),
     }
 
-    if let Some(pending) =
-        pending_checkpoint.take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
-        && let Err(e) = flush_checkpoint(
-            pool,
-            &config.events_table,
-            subscriber_id,
-            &pending,
-            checkpoint_cache,
-        )
-        .await
-    {
-        error!(
-            "Catch-up: failed to flush checkpoint for '{}': {}",
-            subscriber_id, e
-        );
-        *pending_checkpoint = Some(pending);
-    }
+    try_flush_pending_checkpoint(
+        pending_checkpoint,
+        "Catch-up",
+        &config.events_table,
+        subscriber_id,
+        &config.checkpoint_mode,
+        pool,
+        checkpoint_cache,
+    )
+    .await;
 }
 
 /// Runs one catch-up pass for a single subscriber.
