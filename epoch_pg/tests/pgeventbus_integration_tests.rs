@@ -5400,3 +5400,90 @@ async fn test_readiness_not_blocked_by_in_progress_drain() {
 
     event_bus.shutdown().await.expect("shutdown failed");
 }
+
+#[tokio::test]
+#[serial]
+async fn test_second_bus_on_same_table_gets_its_own_trigger() {
+    // The NOTIFY channel is an argument to the trigger, so a single shared
+    // trigger name per table means a second bus either steals the first bus's
+    // trigger or, if creation is skipped because some trigger already exists, is
+    // left deaf and silently degraded to the periodic timer tick. Trigger names
+    // are per-channel so both buses coexist, each notifying its own channel.
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
+
+    // Two independent buses on the same events table, each with its own channel.
+    let first_channel = format!("test_channel_{}", Uuid::new_v4().simple());
+    let first_bus: PgEventBus<TestEventData> = PgEventBus::new(pool.clone(), first_channel.clone());
+    first_bus
+        .start_listener()
+        .await
+        .expect("first start_listener failed");
+
+    let second_channel = format!("test_channel_{}", Uuid::new_v4().simple());
+    let second_bus: PgEventBus<TestEventData> =
+        PgEventBus::new(pool.clone(), second_channel.clone());
+
+    let subscriber_id = format!("projection:rebind:{}", Uuid::new_v4());
+    let projection = TestProjection::with_subscriber_id(subscriber_id.clone());
+    second_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe on second bus");
+    second_bus
+        .start_listener()
+        .await
+        .expect("second start_listener failed");
+
+    // Both buses' triggers must be present simultaneously, each bound to its own
+    // channel: the second bus must not have displaced the first.
+    let bound: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT split_part(encode(t.tgargs, 'escape'), E'\\000', 1) AS channel
+        FROM pg_trigger t
+        JOIN pg_class c ON c.oid = t.tgrelid
+        WHERE t.tgname LIKE 'epoch_event_bus_notify_trigger%'
+          AND c.relname = 'epoch_events'
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("failed to read trigger definitions");
+    let channels: Vec<String> = bound.into_iter().map(|(c,)| c).collect();
+    assert!(
+        channels.contains(&second_channel),
+        "the second bus must have its own trigger; bound channels: {channels:?}"
+    );
+    assert!(
+        channels.contains(&first_channel),
+        "the first bus's trigger must survive the second bus starting; bound channels: {channels:?}"
+    );
+
+    // And delivery must actually work on the second bus, promptly (i.e. via
+    // NOTIFY, not by waiting out the 1s timer tick).
+    let event_store = PgEventStore::new(pool.clone(), second_bus.clone());
+    let stream_id = Uuid::new_v4();
+    event_store
+        .store_event(new_event(stream_id, 1, "delivered-via-notify"))
+        .await
+        .expect("store_event failed");
+
+    let caught_up = second_bus
+        .wait_until_caught_up(&subscriber_id, std::time::Duration::from_millis(900))
+        .await
+        .expect("wait_until_caught_up failed");
+    assert!(
+        caught_up,
+        "second bus must receive its own NOTIFYs rather than depending on the timer tick"
+    );
+
+    second_bus.shutdown().await.expect("second shutdown failed");
+    first_bus.shutdown().await.expect("first shutdown failed");
+}

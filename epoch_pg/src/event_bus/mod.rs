@@ -78,23 +78,57 @@ struct BatchContext {
     snapshot: Option<TxidSnapshot>,
 }
 
-/// Reports whether the `epoch_event_bus_notify_trigger` AFTER INSERT trigger
-/// exists on `table`. Used by Async `subscribe` to warn when delivery would
-/// silently depend on the timer tick because the trigger is absent (R4), and
-/// by `ensure_trigger` to avoid redundant DDL on every listener start.
-pub(crate) async fn trigger_exists(pool: &PgPool, table: &str) -> Result<bool, SqlxError> {
+/// The pre-per-channel trigger name, kept only so [`PgEventBus::setup_trigger`]
+/// can clean it up on deployments that ran an earlier version.
+pub(crate) const LEGACY_NOTIFY_TRIGGER: &str = "epoch_event_bus_notify_trigger";
+
+/// Returns this bus's NOTIFY trigger name: the fixed prefix plus a digest of the
+/// channel.
+///
+/// The name has to encode the channel because the channel is otherwise only an
+/// *argument* to the trigger function (`EXECUTE FUNCTION
+/// epoch_notify_event('<channel>')`). With one shared name per table, a second
+/// bus on the same events table either steals the first bus's trigger or, if
+/// creation is skipped because a trigger already exists, is left deaf and
+/// silently downgraded to the periodic timer tick. A per-channel name lets every
+/// bus own its own trigger and coexist: all of them fire, each notifying its own
+/// channel.
+///
+/// The digest is computed by Postgres' built-in `md5()` rather than a Rust hasher
+/// so the name is stable across processes and library versions (`DefaultHasher`
+/// guarantees neither), without taking on a hash dependency. Truncated to 16 hex
+/// characters to stay inside the 63-character identifier limit, and hex-only by
+/// construction, so the result never needs quoting or escaping.
+pub(crate) async fn notify_trigger_name(pool: &PgPool, channel: &str) -> Result<String, SqlxError> {
+    let (name,): (String,) =
+        sqlx::query_as("SELECT 'epoch_event_bus_notify_trigger_' || substr(md5($1), 1, 16)")
+            .bind(channel)
+            .fetch_one(pool)
+            .await?;
+    Ok(name)
+}
+
+/// Reports whether `trigger_name` exists on `table`. Used by Async `subscribe` to
+/// warn when delivery would silently depend on the timer tick (R4), and by
+/// `ensure_trigger` to avoid redundant DDL on every listener start.
+pub(crate) async fn trigger_exists(
+    pool: &PgPool,
+    table: &str,
+    trigger_name: &str,
+) -> Result<bool, SqlxError> {
     let (exists,): (bool,) = sqlx::query_as(
         r#"
         SELECT EXISTS (
             SELECT 1
             FROM pg_trigger t
             JOIN pg_class c ON c.oid = t.tgrelid
-            WHERE t.tgname = 'epoch_event_bus_notify_trigger'
+            WHERE t.tgname = $2
               AND c.relname = $1
         )
         "#,
     )
     .bind(table)
+    .bind(trigger_name)
     .fetch_one(pool)
     .await?;
     Ok(exists)
@@ -910,37 +944,62 @@ where
             );
         }
 
-        self.ensure_trigger().await
-    }
-
-    /// Idempotently drops and recreates the NOTIFY trigger for this bus's events
-    /// table. This is the drop-then-create body shared by [`setup_trigger`](Self::setup_trigger)
-    /// and the implicit trigger creation folded into [`start_listener`](Self::start_listener)
-    /// (R4), so an Async bus started without an explicit `setup_trigger` still has
-    /// a working trigger.
-    async fn ensure_trigger(&self) -> Result<(), SqlxError> {
-        // Drop existing trigger if present
-        sqlx::query(&format!(
-            "DROP TRIGGER IF EXISTS epoch_event_bus_notify_trigger ON {};",
+        // Explicit, caller-invoked path: also clean up the pre-per-channel trigger
+        // if an earlier version left one behind. Only done here, never in
+        // start_listener: this call already hard-fails on DDL errors and is under
+        // the caller's control, whereas dropping a trigger implicitly on every boot
+        // would take an ACCESS EXCLUSIVE lock on the events table and could cut
+        // delivery for a still-running older instance mid-deploy.
+        if let Err(e) = sqlx::query(&format!(
+            "DROP TRIGGER IF EXISTS {LEGACY_NOTIFY_TRIGGER} ON {};",
             self.config.events_table,
         ))
         .execute(&self.pool)
-        .await?;
+        .await
+        {
+            warn!(
+                "setup_trigger: failed to drop the legacy '{}' trigger on '{}' \
+                 (harmless: it only produces a duplicate NOTIFY, which the \
+                 per-event checkpoint check discards): {}",
+                LEGACY_NOTIFY_TRIGGER, self.config.events_table, e
+            );
+        }
 
-        // Create the trigger that calls the function after an INSERT.
-        // We escape single quotes in the channel name to prevent SQL injection.
-        let create_trigger_query = format!(
-            "CREATE TRIGGER epoch_event_bus_notify_trigger \
+        self.ensure_trigger().await
+    }
+
+    /// Creates this bus's per-channel NOTIFY trigger on its events table if it is
+    /// not already present.
+    ///
+    /// Shared by [`setup_trigger`](Self::setup_trigger) and the implicit trigger
+    /// creation folded into [`start_listener`](Self::start_listener) (R4), so an
+    /// Async bus started without an explicit `setup_trigger` still has a working
+    /// trigger.
+    ///
+    /// Purely additive: it never drops anything. The trigger name encodes the
+    /// channel (see [`notify_trigger_name`]), so this bus cannot disturb another
+    /// bus's trigger on the same table, and re-running it is a no-op rather than a
+    /// drop-and-recreate that would take an ACCESS EXCLUSIVE lock on every boot.
+    async fn ensure_trigger(&self) -> Result<(), SqlxError> {
+        let trigger_name = notify_trigger_name(&self.pool, &self.channel_name).await?;
+
+        if trigger_exists(&self.pool, &self.config.events_table, &trigger_name).await? {
+            return Ok(());
+        }
+
+        // The trigger name is prefix + hex from md5, so it needs no quoting. The
+        // channel is a function argument, with single quotes escaped.
+        sqlx::query(&format!(
+            "CREATE TRIGGER {} \
              AFTER INSERT ON {} \
              FOR EACH ROW \
              EXECUTE FUNCTION epoch_notify_event('{}');",
+            trigger_name,
             self.config.events_table,
             self.channel_name.replace('\'', "''")
-        );
-
-        sqlx::query(&create_trigger_query)
-            .execute(&self.pool)
-            .await?;
+        ))
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -998,37 +1057,21 @@ where
 
         // R4: fold trigger creation into start_listener so an Async bus is never
         // left relying on the timer tick because setup_trigger was never called.
-        // Only create when absent (probed via trigger_exists) rather than
-        // unconditionally dropping and recreating: DROP TRIGGER takes an ACCESS
-        // EXCLUSIVE lock on the events table on every boot, and a fixed trigger
-        // name means a second bus on the same table would otherwise silently
-        // steal/rebind the first bus's trigger on every start_listener call.
-        // Never hard-fail here either: an app role without DDL rights (trigger
-        // created out-of-band by a migration/DBA) must still be able to start a
-        // listener — the periodic timer tick plus the R2 catch-up pass below keep
-        // delivery correct without it. The explicit setup_trigger() path below
-        // keeps the old unconditional drop+create, hard-failing on error, for a
-        // caller that deliberately wants to force a rebind.
-        match trigger_exists(&self.pool, &self.config.events_table).await {
-            Ok(true) => {}
-            Ok(false) => {
-                if let Err(e) = self.ensure_trigger().await {
-                    warn!(
-                        "start_listener: failed to create NOTIFY trigger on '{}' \
-                         (continuing without it; delivery falls back to the periodic \
-                         timer tick and the startup catch-up pass): {}",
-                        self.config.events_table, e
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "start_listener: failed to check for an existing NOTIFY trigger on '{}' \
-                     (continuing; delivery falls back to the periodic timer tick and the \
-                     startup catch-up pass): {}",
-                    self.config.events_table, e
-                );
-            }
+        // `ensure_trigger` is additive and creates only when this bus's own
+        // per-channel trigger is missing, so this neither disturbs another bus on
+        // the same table nor takes an ACCESS EXCLUSIVE lock on an ordinary boot.
+        //
+        // Never hard-fail: an app role without DDL rights (trigger created
+        // out-of-band by a migration/DBA) must still be able to start a listener —
+        // the periodic timer tick plus the R2 catch-up pass below keep delivery
+        // correct without it.
+        if let Err(e) = self.ensure_trigger().await {
+            warn!(
+                "start_listener: failed to ensure the NOTIFY trigger on '{}' \
+                 (continuing without it; delivery falls back to the periodic \
+                 timer tick and the startup catch-up pass): {}",
+                self.config.events_table, e
+            );
         }
 
         let listener_pool = self.pool.clone();
@@ -2851,19 +2894,31 @@ where
             // it), warn loudly so a misconfiguration is visible in logs rather than
             // silently relying on the 1s timer tick. We do not hard-error: the R2
             // catch-up pass and the timer fallback still deliver correctly.
-            match trigger_exists(&pool, &config.events_table).await {
-                Ok(false) => warn!(
-                    "Async subscribe for '{}' on bus '{}' (channel '{}'): no NOTIFY trigger \
-                     on table '{}'. New events will be delivered only on the periodic timer \
-                     tick until start_listener()/setup_trigger() creates it.",
-                    subscriber_id, config.events_table, channel_name, config.events_table
-                ),
-                Ok(true) => {}
-                Err(e) => log::debug!(
-                    "Could not probe for NOTIFY trigger on '{}': {}",
-                    config.events_table,
-                    e
-                ),
+            // The probe is for THIS bus's per-channel trigger: another bus's
+            // trigger on the same table would not deliver to this channel.
+            match notify_trigger_name(&pool, &channel_name).await {
+                Ok(trigger_name) => {
+                    match trigger_exists(&pool, &config.events_table, &trigger_name).await {
+                        Ok(false) => warn!(
+                            "Async subscribe for '{}' on bus '{}' (channel '{}'): no NOTIFY \
+                             trigger '{}' on table '{}'. New events will be delivered only on \
+                             the periodic timer tick until start_listener()/setup_trigger() \
+                             creates it.",
+                            subscriber_id,
+                            config.events_table,
+                            channel_name,
+                            trigger_name,
+                            config.events_table
+                        ),
+                        Ok(true) => {}
+                        Err(e) => log::debug!(
+                            "Could not probe for NOTIFY trigger on '{}': {}",
+                            config.events_table,
+                            e
+                        ),
+                    }
+                }
+                Err(e) => log::debug!("Could not derive NOTIFY trigger name: {}", e),
             }
 
             // === Multi-instance coordination ===
