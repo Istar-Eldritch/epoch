@@ -774,6 +774,15 @@ where
     /// replays from 0, which is the intended contract. Shared across `Clone`s so
     /// `subscribe`, the listener task, and readiness queries observe the same value.
     hwm: Arc<Mutex<HashMap<String, u64>>>,
+    /// `subscriber_id` -> [`SubscriptionMode`] for every registered subscriber.
+    ///
+    /// Readiness queries need only this static metadata, and reading it from the
+    /// observers themselves would deadlock: `process_event_with_retry` holds an
+    /// observer's mutex across its `on_event` await, so a subscriber that is slow
+    /// or blocked makes any caller that locks it wait for the whole handler,
+    /// indefinitely, ignoring the timeout it was given. This registry is only ever
+    /// locked for the length of a map operation.
+    subscriber_modes: Arc<Mutex<HashMap<String, SubscriptionMode>>>,
 }
 
 /// Poll cadence for `wait_until_caught_up` / `wait_until_all_caught_up`.
@@ -804,6 +813,7 @@ where
             listener_state: Arc::new(Mutex::new(None)),
             inline_state: Arc::new(Mutex::new(InlineDispatchState::default())),
             hwm: Arc::new(Mutex::new(HashMap::new())),
+            subscriber_modes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1702,23 +1712,15 @@ where
         &self,
         subscriber_id: &str,
     ) -> Result<SubscriptionMode, PgEventBusError> {
-        // Snapshot the observer list and release the projections lock before
-        // locking each observer's own mutex, so a slow or re-entrant observer
-        // doesn't hold up other callers of subscribe()/unsubscribe() for the
-        // whole scan.
-        let snapshot: Vec<_> = {
-            let guard = self.projections.lock().await;
-            guard.iter().cloned().collect()
-        };
-        for obs in &snapshot {
-            let o = obs.lock().await;
-            if o.subscriber_id() == subscriber_id {
-                return Ok(o.subscription_mode());
-            }
-        }
-        Err(PgEventBusError::SubscriberNotFound(
-            subscriber_id.to_string(),
-        ))
+        // Read the registry rather than the observers: locking an observer here
+        // would block for the duration of its current `on_event`, which is
+        // unbounded (see `subscriber_modes`).
+        self.subscriber_modes
+            .lock()
+            .await
+            .get(subscriber_id)
+            .copied()
+            .ok_or_else(|| PgEventBusError::SubscriberNotFound(subscriber_id.to_string()))
     }
 
     /// Reads the current position for `subscriber_id` given its already-resolved
@@ -1881,16 +1883,16 @@ where
         };
 
         // Snapshot ids and modes once; mode can't change during the wait and
-        // this avoids a full registry scan on every 25 ms poll iteration.
-        let subscribers: Vec<(String, SubscriptionMode)> = {
-            let guard = self.projections.lock().await;
-            let mut items = Vec::with_capacity(guard.len());
-            for obs in guard.iter() {
-                let o = obs.lock().await;
-                items.push((o.subscriber_id().to_string(), o.subscription_mode()));
-            }
-            items
-        };
+        // this avoids a full registry scan on every 25 ms poll iteration. Taken
+        // from the registry, never from the observers, which may each be locked
+        // for the length of an in-flight `on_event` (see `subscriber_modes`).
+        let subscribers: Vec<(String, SubscriptionMode)> = self
+            .subscriber_modes
+            .lock()
+            .await
+            .iter()
+            .map(|(id, mode)| (id.clone(), *mode))
+            .collect();
 
         if subscribers.is_empty() {
             return Ok(true);
@@ -2850,12 +2852,23 @@ where
         let config = self.config.clone();
         let channel_name = self.channel_name.clone();
         let hwm = self.hwm.clone();
+        let subscriber_modes = self.subscriber_modes.clone();
 
         let inline_state = self.inline_state.clone();
         Box::pin(async move {
             // Wrap the projector in Arc<Mutex<>> for sharing
             let observer: Arc<Mutex<dyn EventObserver<Self::EventType>>> =
                 Arc::new(Mutex::new(projector));
+
+            // Record id -> mode up front, while nothing can be holding the
+            // observer's lock, so readiness never has to lock it later.
+            {
+                let o = observer.lock().await;
+                subscriber_modes
+                    .lock()
+                    .await
+                    .insert(o.subscriber_id().to_string(), o.subscription_mode());
+            }
 
             // Inline dispatch: no LISTEN task, no NOTIFY channel, no catch-up.
             // Just register the subscriber and return. Any events published
