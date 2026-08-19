@@ -593,6 +593,17 @@ pub enum PgEventBusError {
     /// fast-forwarded to head (Correction 4).
     #[error("subscriber '{0}' is not registered on this bus")]
     SubscriberNotFound(String),
+    /// Readiness gating (`subscriber_lag` / `wait_until_caught_up` /
+    /// `wait_until_all_caught_up`) was called on a [`DispatchMode::Inline`] bus.
+    /// Inline dispatch delivers events synchronously from `publish()` and
+    /// advances neither a checkpoint nor an in-memory HWM, so these methods
+    /// would otherwise poll until the caller's timeout and report a subscriber
+    /// as perpetually not-ready.
+    #[error(
+        "readiness gating is not supported on a DispatchMode::Inline bus: events are \
+         dispatched synchronously from publish() and no checkpoint or HWM position is tracked"
+    )]
+    InlineDispatchNotSupported,
 }
 
 /// Type alias for the projections collection to reduce type complexity.
@@ -1610,7 +1621,7 @@ where
     /// Note: with non-transactional `nextval` (spec 0019) the head may be a
     /// burned/in-flight value that never becomes visible; readiness treats such
     /// a tail via the gap backstop (§7.2).
-    pub async fn head_sequence(&self) -> Result<Option<u64>, SqlxError> {
+    pub async fn head_sequence(&self) -> Result<Option<u64>, PgEventBusError> {
         // `SELECT MAX(...)` always returns exactly one row (NULL when the
         // table is empty), so use fetch_one with Option<i64>.
         let row: (Option<i64>,) = sqlx::query_as(&format!(
@@ -1620,6 +1631,18 @@ where
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0.map(|v| v as u64))
+    }
+
+    /// Returns `Err(InlineDispatchNotSupported)` if this bus is
+    /// `DispatchMode::Inline`. Shared entry check for every readiness method:
+    /// Inline dispatch advances neither a checkpoint nor the in-memory HWM, so
+    /// polling position would silently burn the caller's whole timeout and
+    /// always report "not ready" rather than surfacing a clear error.
+    fn require_non_inline_dispatch(&self) -> Result<(), PgEventBusError> {
+        if self.config.dispatch_mode == config::DispatchMode::Inline {
+            return Err(PgEventBusError::InlineDispatchNotSupported);
+        }
+        Ok(())
     }
 
     /// Returns the `SubscriptionMode` for `subscriber_id`, or
@@ -1665,7 +1688,19 @@ where
                 .get(subscriber_id)
                 .copied()
                 .unwrap_or(0)),
-            _ => Ok(self.get_checkpoint(subscriber_id).await?.unwrap_or(0)),
+            // `SubscriptionMode` is `#[non_exhaustive]`, so a future variant added
+            // by epoch_core lands here. Silently falling back to the Checkpointed
+            // read would risk the exact false-ready this dispatch exists to avoid
+            // (Correction 4) for a mode whose position isn't tracked by a
+            // checkpoint at all. Report unconditionally not-ready instead.
+            other => {
+                warn!(
+                    "position_for_mode: unrecognized SubscriptionMode {other:?} for '{}'; \
+                     treating as position 0 (never ready) rather than guessing",
+                    subscriber_id
+                );
+                Ok(0)
+            }
         }
     }
 
@@ -1687,13 +1722,45 @@ where
     /// Point-in-time; the head may move under a cascade.
     ///
     /// Returns [`PgEventBusError::SubscriberNotFound`] if `subscriber_id` is
-    /// not registered on this bus.
+    /// not registered on this bus, or [`PgEventBusError::InlineDispatchNotSupported`]
+    /// if this bus is [`DispatchMode::Inline`](crate::DispatchMode::Inline) (Inline
+    /// dispatch tracks no checkpoint or HWM position to measure lag against).
     pub async fn subscriber_lag(&self, subscriber_id: &str) -> Result<u64, PgEventBusError> {
+        self.require_non_inline_dispatch()?;
         // Validate subscriber first so unknown ids get SubscriberNotFound
         // even when the bus has no events (Correction 4).
         let pos = self.subscriber_position(subscriber_id).await?;
         let head = self.head_sequence().await?.unwrap_or(0);
         Ok(head.saturating_sub(pos))
+    }
+
+    /// Shared polling loop for [`wait_until_caught_up`](Self::wait_until_caught_up)
+    /// and [`wait_until_all_caught_up`](Self::wait_until_all_caught_up): polls every
+    /// entry's position against `target` at [`READINESS_POLL_INTERVAL`] until all
+    /// are `>= target` or `deadline` elapses.
+    async fn poll_until_all_at_or_past(
+        &self,
+        subscribers: &[(String, SubscriptionMode)],
+        target: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, PgEventBusError> {
+        loop {
+            let mut all_caught_up = true;
+            for (id, mode) in subscribers {
+                let pos = self.position_for_mode(id, *mode).await?;
+                if pos < target {
+                    all_caught_up = false;
+                    break;
+                }
+            }
+            if all_caught_up {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            sleep(READINESS_POLL_INTERVAL).await;
+        }
     }
 
     /// Awaits until `subscriber_id` has processed every event up to the head
@@ -1721,12 +1788,14 @@ where
     /// Cross-bus readiness needs the fixed-point gate in **spec 0025**.
     ///
     /// Returns [`PgEventBusError::SubscriberNotFound`] if `subscriber_id` is
-    /// not registered on this bus.
+    /// not registered on this bus, or [`PgEventBusError::InlineDispatchNotSupported`]
+    /// if this bus is [`DispatchMode::Inline`](crate::DispatchMode::Inline).
     pub async fn wait_until_caught_up(
         &self,
         subscriber_id: &str,
         timeout: Duration,
     ) -> Result<bool, PgEventBusError> {
+        self.require_non_inline_dispatch()?;
         // Validate subscriber and resolve mode once (Correction 4: fail with
         // SubscriberNotFound even when the bus is empty, before reading
         // head_sequence). Mode can't change during the wait, so resolve once.
@@ -1738,16 +1807,8 @@ where
         };
 
         let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let pos = self.position_for_mode(subscriber_id, mode).await?;
-            if pos >= target {
-                return Ok(true);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Ok(false);
-            }
-            sleep(READINESS_POLL_INTERVAL).await;
-        }
+        self.poll_until_all_at_or_past(&[(subscriber_id.to_string(), mode)], target, deadline)
+            .await
     }
 
     /// Bus-wide variant: [`wait_until_caught_up`][Self::wait_until_caught_up]
@@ -1755,11 +1816,14 @@ where
     /// call time, under one shared timeout.
     ///
     /// Returns `Ok(true)` only if **all** registered subscribers are caught up
-    /// before the timeout, `Ok(false)` otherwise.
+    /// before the timeout, `Ok(false)` otherwise. Returns
+    /// [`PgEventBusError::InlineDispatchNotSupported`] if this bus is
+    /// [`DispatchMode::Inline`](crate::DispatchMode::Inline).
     pub async fn wait_until_all_caught_up(
         &self,
         timeout: Duration,
     ) -> Result<bool, PgEventBusError> {
+        self.require_non_inline_dispatch()?;
         let target = match self.head_sequence().await? {
             Some(h) => h,
             None => return Ok(true), // empty bus — trivially caught up
@@ -1782,23 +1846,8 @@ where
         }
 
         let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let mut all_caught_up = true;
-            for (id, mode) in &subscribers {
-                let pos = self.position_for_mode(id, *mode).await?;
-                if pos < target {
-                    all_caught_up = false;
-                    break;
-                }
-            }
-            if all_caught_up {
-                return Ok(true);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Ok(false);
-            }
-            sleep(READINESS_POLL_INTERVAL).await;
-        }
+        self.poll_until_all_at_or_past(&subscribers, target, deadline)
+            .await
     }
 
     /// Fast-forwards every currently-registered subscriber's checkpoint to the
