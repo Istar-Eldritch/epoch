@@ -201,6 +201,16 @@ pub enum SubscriptionMode {
     /// Replay from sequence 0 on every process start; never read or write a
     /// persisted checkpoint. Readiness is tracked via a per-process in-memory
     /// high-water mark. For in-memory read models with no durable store.
+    ///
+    /// # Caveat: re-subscribing does not rebuild your model for you
+    /// A backend that implements this mode resets its own high-water mark to 0
+    /// on every `subscribe()` call (including a re-subscribe of the same
+    /// `subscriber_id` after `unsubscribe()`), so catch-up replays the full
+    /// history again. If you pass in an observer that wraps a model instance
+    /// which **survived** from a previous subscription (rather than a fresh
+    /// one), that model will have the same history applied to it twice. Build
+    /// a fresh model before every `subscribe()` call for a `ReplayAlways`
+    /// subscriber, or ensure `apply` is idempotent under re-application.
     ReplayAlways,
 }
 
