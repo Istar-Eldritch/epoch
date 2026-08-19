@@ -78,19 +78,10 @@ struct BatchContext {
     snapshot: Option<TxidSnapshot>,
 }
 
-/// Ensures the `txid` column (CLOUD-180 snapshot fencing) exists on `table` with
-/// the correct `pg_current_xact_id()` default and a partial index.
-///
-/// Idempotent — safe to call on every startup. The three statements all use
-/// `IF NOT EXISTS` / `SET DEFAULT`, so `ADD COLUMN` is a metadata-only operation
-/// (no table rewrite) on PG13+. Intended for **custom** events tables; the
-/// default `epoch_events` table is covered by migration m011.
-///
-/// On error the caller should `warn!` and continue: fencing simply degrades to
-/// timeout-only for that table.
 /// Reports whether the `epoch_event_bus_notify_trigger` AFTER INSERT trigger
 /// exists on `table`. Used by Async `subscribe` to warn when delivery would
-/// silently depend on the timer tick because the trigger is absent (R4).
+/// silently depend on the timer tick because the trigger is absent (R4), and
+/// by `ensure_trigger` to avoid redundant DDL on every listener start.
 pub(crate) async fn trigger_exists(pool: &PgPool, table: &str) -> Result<bool, SqlxError> {
     let (exists,): (bool,) = sqlx::query_as(
         r#"
@@ -109,6 +100,16 @@ pub(crate) async fn trigger_exists(pool: &PgPool, table: &str) -> Result<bool, S
     Ok(exists)
 }
 
+/// Ensures the `txid` column (CLOUD-180 snapshot fencing) exists on `table` with
+/// the correct `pg_current_xact_id()` default and a partial index.
+///
+/// Idempotent — safe to call on every startup. The three statements all use
+/// `IF NOT EXISTS` / `SET DEFAULT`, so `ADD COLUMN` is a metadata-only operation
+/// (no table rewrite) on PG13+. Intended for **custom** events tables; the
+/// default `epoch_events` table is covered by migration m011.
+///
+/// On error the caller should `warn!` and continue: fencing simply degrades to
+/// timeout-only for that table.
 pub(crate) async fn ensure_txid_column(pool: &PgPool, table: &str) -> Result<(), SqlxError> {
     sqlx::query(&format!(
         "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS txid BIGINT"
