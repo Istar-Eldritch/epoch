@@ -5303,3 +5303,100 @@ async fn test_no_config_subscriber_identical_baseline() {
 
     event_bus.shutdown().await.expect("shutdown failed");
 }
+
+#[tokio::test]
+#[serial]
+async fn test_readiness_not_blocked_by_in_progress_drain() {
+    // CLOUD-225: the listener must not hold the `projections` lock across its
+    // batch drain. Every readiness API locks `projections` too, so a long-held
+    // guard makes them block for the whole drain and silently ignore their own
+    // timeout.
+    //
+    // A gated subscriber parks the listener inside its batch loop indefinitely.
+    // While it is parked, readiness calls for a DIFFERENT subscriber must still
+    // answer. Before the fix they blocked until the gated observer was released,
+    // so the `timeout(..)` wrappers below expired and this test failed.
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    let sub_free = format!("projection:drain-free:{}", Uuid::new_v4());
+    let sub_gated = format!("projection:drain-gated:{}", Uuid::new_v4());
+    event_bus
+        .subscribe(ProjectionHandler::new(TestProjection::with_subscriber_id(
+            sub_free.clone(),
+        )))
+        .await
+        .expect("Failed to subscribe free subscriber");
+    let (gated, released, notify) = GatedObserver::new(sub_gated.clone());
+    event_bus
+        .subscribe(gated)
+        .await
+        .expect("Failed to subscribe gated subscriber");
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("setup_trigger failed");
+    event_bus
+        .start_listener()
+        .await
+        .expect("start_listener failed");
+
+    let stream_id = Uuid::new_v4();
+    event_store
+        .store_event(new_event(stream_id, 1, "parks-the-listener"))
+        .await
+        .expect("store_event failed");
+
+    // Wait until the listener is genuinely parked in the gated observer's
+    // on_event, rather than sleeping a fixed amount and hoping. Both
+    // subscribers share one priority group, so they run in the same concurrent
+    // batch: once the free subscriber's checkpoint lands (Synchronous mode
+    // writes it inside the batch task), the batch is provably in flight and the
+    // gated task provably has not returned.
+    let mut parked = false;
+    for _ in 0..40 {
+        if event_bus
+            .get_checkpoint(&sub_free)
+            .await
+            .expect("get_checkpoint failed")
+            .is_some_and(|c| c >= 1)
+        {
+            parked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert!(
+        parked,
+        "the free subscriber should have processed the event while the gated one blocks"
+    );
+
+    // The listener is now inside its batch loop with the gated subscriber
+    // blocked. These must still answer.
+    let lag = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        event_bus.subscriber_lag(&sub_free),
+    )
+    .await
+    .expect("subscriber_lag blocked behind the listener's in-progress drain")
+    .expect("subscriber_lag returned an error");
+    assert_eq!(lag, 0, "the free subscriber processed the only event");
+
+    let caught_up = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        event_bus.wait_until_caught_up(&sub_free, std::time::Duration::from_millis(200)),
+    )
+    .await
+    .expect("wait_until_caught_up blocked behind the listener's in-progress drain")
+    .expect("wait_until_caught_up returned an error");
+    assert!(caught_up, "the free subscriber is at head");
+
+    // Release the gated subscriber so the listener can finish and shut down.
+    released.store(true, std::sync::atomic::Ordering::Release);
+    notify.notify_waiters();
+
+    event_bus.shutdown().await.expect("shutdown failed");
+}

@@ -1277,12 +1277,26 @@ where
                 // see the same snapshot of events, preventing race conditions where
                 // a projection misses events that a later saga sees.
 
-                // NOTE: The projections lock is held while iterating and processing events.
-                // This means new subscribers cannot be added during event processing.
-                let projections_guard = projections.lock().await;
+                // Snapshot the subscriber list and release the lock before doing any
+                // work: every readiness API (`subscriber_lag`,
+                // `wait_until_caught_up`, `wait_until_all_caught_up`) also locks
+                // `projections`, so holding the guard across the drain below made them
+                // block for its full duration and silently overrun their own timeout
+                // (CLOUD-225). Mirrors the R2 catch-up pass above.
+                //
+                // Releasing it lets a `subscribe()` land mid-drain. That is safe and
+                // does not double-deliver: `subscribe()` registers its observer last,
+                // only after its own synchronous catch-up and checkpoint flush, and the
+                // per-event checkpoint check skips anything at or below the checkpoint.
+                // A subscriber that arrives mid-drain is simply picked up on the next
+                // wake.
+                let projections_snapshot: Vec<_> = {
+                    let guard = projections.lock().await;
+                    guard.iter().cloned().collect()
+                };
 
                 // Initialize per-subscriber state for any new subscribers.
-                for projection in projections_guard.iter() {
+                for projection in projections_snapshot.iter() {
                     let (subscriber_id, replay_always) = {
                         let guard = projection.lock().await;
                         (
@@ -1402,11 +1416,10 @@ where
                         None
                     };
 
-                    // Collect (priority, subscriber_id, projection) tuples sequentially.
-                    // We hold projections_guard here, so inner per-subscriber locks are
-                    // acquired one at a time to read metadata.
+                    // Collect (priority, subscriber_id, projection) tuples sequentially,
+                    // acquiring each per-subscriber lock one at a time to read metadata.
                     let mut tagged = Vec::new();
-                    for projection in projections_guard.iter() {
+                    for projection in projections_snapshot.iter() {
                         let guard = projection.lock().await;
                         let priority = guard.priority();
                         let sid = guard.subscriber_id().to_string();
