@@ -34,10 +34,10 @@ Relevant existing behaviour: `subscribe()` already does synchronous catch-up bef
 ### 4.1 R1 — lag + readiness (inherent on `PgEventBus`)
 
 ```rust
-pub async fn head_sequence(&self) -> Result<Option<u64>, SqlxError>;
-pub async fn subscriber_lag(&self, subscriber_id: &str) -> Result<u64, SqlxError>;
-pub async fn wait_until_caught_up(&self, subscriber_id: &str, timeout: Duration) -> Result<bool, SqlxError>;
-pub async fn wait_until_all_caught_up(&self, timeout: Duration) -> Result<bool, SqlxError>;
+pub async fn head_sequence(&self) -> Result<Option<u64>, PgEventBusError>;
+pub async fn subscriber_lag(&self, subscriber_id: &str) -> Result<u64, PgEventBusError>;
+pub async fn wait_until_caught_up(&self, subscriber_id: &str, timeout: Duration) -> Result<bool, PgEventBusError>;
+pub async fn wait_until_all_caught_up(&self, timeout: Duration) -> Result<bool, PgEventBusError>;
 ```
 
 - `subscriber_lag` = `head − position`, saturating; `position` dispatches on mode (§4.6).
@@ -56,7 +56,7 @@ Unimplementable on the current listener: the gap fence is per-subscriber, histor
 
 ### 4.4 R4 — Async trigger-absence hazard
 
-1. **Implicit trigger (primary):** `start_listener()` (Async) calls idempotent `ensure_trigger()` before the R2 pass; events written pre-trigger are recovered by the R2 pass regardless of NOTIFY. Explicit `setup_trigger()` callers unaffected.
+1. **Implicit trigger (primary):** `start_listener()` (Async) probes `trigger_exists()` and calls `ensure_trigger()` only when absent, before the R2 pass; events written pre-trigger are recovered by the R2 pass regardless of NOTIFY. A failure here (missing DDL rights, or the existence probe itself failing) is logged via `warn!` and does not fail `start_listener()` — the timer tick + R2 pass keep delivery correct without it. Explicit `setup_trigger()` callers are unaffected and keep the unconditional drop+create, hard-failing on error, for a caller that deliberately wants to force a rebind.
 2. **Loud report (defence-in-depth):** `subscribe()` in Async probes `pg_trigger` and emits a `WARN` naming bus + channel if absent.
 
 No hard error — the timer fallback + R2 pass keep delivery correct.
@@ -131,7 +131,7 @@ Cross-bus quiescence tests move to spec 0025. Regression: `cargo test --workspac
 - **Moving head:** `wait_until_caught_up` snapshots target, won't hang; convergence is 0025's job.
 - **Burned/in-flight tail** (spec 0019 non-transactional `nextval`): raw head may need `timeout > gap_timeout` to resolve via the gap backstop.
 - **Timeout:** returns `bool`, not `Err`; caller decides fatality.
-- **`DispatchMode::Inline`:** no listener; `wait_until_caught_up` returns `true` immediately; R2/R4 no-op.
+- **`DispatchMode::Inline`:** no listener; readiness methods return `Err(PgEventBusError::InlineDispatchNotSupported)` rather than silently reporting not-ready forever (Inline dispatch tracks no checkpoint or HWM position); R2/R4 no-op.
 - **`InstanceMode::Coordinated`:** subscriber owned by another instance not gated locally (NG-4).
 - **HWM process-local by design:** crash → next boot replays from 0 (intended); in-process restart catches up from surviving HWM (no reset).
 
