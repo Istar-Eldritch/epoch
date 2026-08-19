@@ -21,45 +21,56 @@ impl log::Log for CaptureLogger {
         // Only retain WARN/ERROR so the buffer stays small and matches the
         // default (silent) env_logger behaviour for lower levels.
         if record.level() <= log::Level::Warn {
-            captured_logs()
-                .lock()
-                .unwrap()
-                .push(format!("[{}] {}", record.level(), record.args()));
+            let line = format!("[{}] {}", record.level(), record.args());
+            // Also print, so a failing test still surfaces the WARN/ERROR in
+            // `cargo test`'s captured-output-on-failure, matching what the
+            // previous env_logger-based setup gave for free.
+            eprintln!("{line}");
+            captured_logs().lock().unwrap().push(line);
         }
     }
 
     fn flush(&self) {}
 }
 
-/// Installs a process-global logger that captures WARN/ERROR records so tests
-/// can assert on emitted warnings. Idempotent and safe to call from every test;
+/// Installs a process-global logger that captures WARN/ERROR records (and
+/// still prints them, so a failing test surfaces them) so tests can assert a
+/// specific warning was emitted. Idempotent and safe to call from every test;
 /// replaces the previous `env_logger` init in this test binary.
 #[allow(dead_code)]
 pub fn init_test_logger() {
     LOGGER_INIT.call_once(|| {
-        // If another logger was already installed for this binary, capture
-        // assertions will see an empty buffer; that is acceptable because all
-        // inits in this binary funnel through here.
+        // If another logger is already installed process-wide for this binary
+        // (unusual, but possible), leave it in place: every
+        // `captured_logs_contain_since` call below then sees an always-empty
+        // buffer, so a test relying on it fails loudly instead of silently
+        // passing against no captured output.
         let _ = log::set_logger(&CAPTURE_LOGGER);
         log::set_max_level(log::LevelFilter::Trace);
     });
 }
 
-/// Returns true if any captured WARN/ERROR record contains `needle`.
+/// Current length of the captured-log buffer. Snapshot this **before** the
+/// action under test, then pass it to [`captured_logs_contain_since`].
+///
+/// The buffer is process-global and shared across every test in this binary
+/// running concurrently (only `#[serial]` tests are mutually exclusive with
+/// each other, not with non-serial ones), so a destructive "clear before,
+/// assert after" API would race: one test's clear can drop another
+/// concurrently-running test's own log line before it gets to assert on it.
+/// Snapshotting a start index and only scanning the suffix avoids that.
 #[allow(dead_code)]
-pub fn captured_logs_contain(needle: &str) -> bool {
-    captured_logs()
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|line| line.contains(needle))
+pub fn captured_logs_len() -> usize {
+    captured_logs().lock().unwrap().len()
 }
 
-/// Clears the captured-log buffer. Call before the action under test so the
-/// assertion only sees records emitted by that action.
+/// Returns true if any captured WARN/ERROR record appended at or after
+/// `start` (see [`captured_logs_len`]) contains `needle`.
 #[allow(dead_code)]
-pub fn clear_captured_logs() {
-    captured_logs().lock().unwrap().clear();
+pub fn captured_logs_contain_since(start: usize, needle: &str) -> bool {
+    let logs = captured_logs().lock().unwrap();
+    let start = start.min(logs.len());
+    logs[start..].iter().any(|line| line.contains(needle))
 }
 
 /// Loads `epoch_pg/.env` if it exists.

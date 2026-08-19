@@ -1,5 +1,6 @@
 mod common;
 
+use async_trait::async_trait;
 use epoch_core::prelude::*;
 use epoch_core::projection::ProjectionHandler;
 use epoch_derive::EventData;
@@ -4300,18 +4301,27 @@ async fn test_start_listener_catches_up_before_loop() {
         .await
         .expect("Failed to start listener");
 
-    // Well under the 1s flush_interval: the pre-loop catch-up must already have
-    // advanced the checkpoint.
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-    let checkpoint = event_bus
-        .get_checkpoint(&subscriber_id)
-        .await
-        .expect("Failed to read checkpoint");
-    assert_eq!(
-        checkpoint,
-        Some(head as u64),
-        "start_listener should catch up to head before entering its loop, without waiting for the timer tick"
+    // Poll (rather than a single fixed sleep) so a loaded CI box gets extra
+    // margin without slowing down the common case. `>=` rather than `==`
+    // against our own `head` snapshot: the events table is shared with sibling
+    // test binaries running in parallel, so the checkpoint may legitimately
+    // advance past our own N events if another process inserted concurrently;
+    // it must never be lower.
+    let mut checkpoint = None;
+    for _ in 0..20 {
+        checkpoint = event_bus
+            .get_checkpoint(&subscriber_id)
+            .await
+            .expect("Failed to read checkpoint");
+        if checkpoint.unwrap_or(0) >= head as u64 {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        checkpoint.unwrap_or(0) >= head as u64,
+        "start_listener should catch up to at least our own head ({head}) before entering \
+         its loop, without waiting for the timer tick; got {checkpoint:?}"
     );
 
     event_bus.shutdown().await.expect("Failed to shutdown");
@@ -4352,13 +4362,19 @@ async fn test_ensure_trigger_implicit_in_start_listener() {
         .await
         .expect("Failed to store event");
 
-    // Well under the 1s timer tick: prompt delivery proves the trigger exists.
-    tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
-
-    let state =
-        store.get_state(stream_id).await.unwrap().expect(
-            "event should be delivered promptly because start_listener created the trigger",
-        );
+    // Poll well under the 1s timer tick: prompt delivery proves the trigger
+    // exists. Polling (rather than one fixed sleep) avoids flaking on a loaded
+    // CI box while still failing fast in the common case.
+    let mut state = None;
+    for _ in 0..20 {
+        state = store.get_state(stream_id).await.unwrap();
+        if state.is_some() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    let state = state
+        .expect("event should be delivered promptly because start_listener created the trigger");
     assert_eq!(state.0.len(), 1);
     assert_eq!(state.0[0].id, event.id);
 
@@ -4373,22 +4389,34 @@ async fn test_ensure_trigger_implicit_in_start_listener() {
 
 /// R-4: subscribing in Async mode before any trigger exists logs a WARN and
 /// still succeeds (no hard error).
+///
+/// Runs against a dedicated database rather than the shared test database:
+/// making "trigger absent" genuinely true requires dropping
+/// `epoch_event_bus_notify_trigger`, a schema object other test binaries
+/// running in parallel against the shared database depend on for NOTIFY
+/// delivery (`#[serial]` only serializes within this binary, not across the
+/// separate processes `cargo test --workspace` runs per integration-test file).
 #[tokio::test]
 #[serial]
 async fn test_subscribe_warns_when_trigger_absent() {
-    let Some((pool, event_bus)) = setup_without_listener().await else {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool_for_db("epoch_pg_test_no_trigger").await else {
         return;
     };
-
-    // The NOTIFY trigger is a schema object on the shared events table and is not
-    // removed by truncation, so a prior test may have created it. Drop it to make
-    // "trigger absent" genuinely true for this bus's table.
-    sqlx::query("DROP TRIGGER IF EXISTS epoch_event_bus_notify_trigger ON epoch_events")
-        .execute(&pool)
+    Migrator::new(pool.clone())
+        .run()
         .await
-        .expect("Failed to drop trigger");
+        .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
 
-    common::clear_captured_logs();
+    let channel_name = format!("test_channel_{}", Uuid::new_v4().simple());
+    let event_bus = PgEventBus::new(pool.clone(), channel_name);
+
+    // A freshly migrated database never had the trigger created on it (no
+    // migration creates `epoch_event_bus_notify_trigger`; only
+    // setup_trigger()/start_listener() do, at runtime), so "absent" is genuine
+    // without dropping any schema object another test depends on.
+    let log_start = common::captured_logs_len();
 
     // No setup_trigger(): the Async subscribe must warn but still succeed.
     let subscriber_id = format!("projection:no-trigger:{}", Uuid::new_v4());
@@ -4399,7 +4427,7 @@ async fn test_subscribe_warns_when_trigger_absent() {
         .expect("subscribe should succeed even without a trigger");
 
     assert!(
-        common::captured_logs_contain("no NOTIFY trigger"),
+        common::captured_logs_contain_since(log_start, "no NOTIFY trigger"),
         "Async subscribe without a trigger should emit a WARN naming the missing trigger"
     );
 }
@@ -4581,9 +4609,16 @@ async fn test_replay_always_listener_does_not_redeliver_history() {
         .await
         .expect("Failed to store event");
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
-
-    let len = store.get_state(stream_id).await.unwrap().unwrap().0.len();
+    // Poll rather than a fixed sleep, for CI headroom without slowing the
+    // common case; the final assert_eq still checks the exact count.
+    let mut len = 0;
+    for _ in 0..20 {
+        len = store.get_state(stream_id).await.unwrap().unwrap().0.len();
+        if len >= (n + 1) as usize {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
     assert_eq!(
         len,
         (n + 1) as usize,
@@ -4693,9 +4728,16 @@ async fn test_replay_always_listener_restart_from_hwm() {
         .await
         .expect("Failed to restart listener");
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
-
-    let len = store.get_state(stream_id).await.unwrap().unwrap().0.len();
+    // Poll rather than a fixed sleep, for CI headroom without slowing the
+    // common case; the final assert_eq still checks the exact count.
+    let mut len = 0;
+    for _ in 0..20 {
+        len = store.get_state(stream_id).await.unwrap().unwrap().0.len();
+        if len >= (n + 1) as usize {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
     assert_eq!(
         len,
         (n + 1) as usize,
@@ -4806,19 +4848,16 @@ async fn test_wait_until_caught_up_gates_on_head() {
             .expect("store_event failed");
     }
 
-    let start = std::time::Instant::now();
+    // No wall-clock assertion here: a CI-loaded-box timing bound is inherently
+    // flaky and belongs in a benchmark, not a correctness test. R2 removing
+    // the flush_interval cost is exercised functionally instead, by the
+    // `timeout` below being far shorter than the 1s tick it replaces.
     let caught_up = event_bus
-        .wait_until_caught_up(&subscriber_id, tokio::time::Duration::from_secs(3))
+        .wait_until_caught_up(&subscriber_id, tokio::time::Duration::from_millis(500))
         .await
         .expect("wait_until_caught_up failed");
-    let elapsed = start.elapsed();
 
     assert!(caught_up, "subscriber should be caught up");
-    assert!(
-        elapsed.as_millis() < 1000,
-        "wait_until_caught_up took {}ms, expected < 1000ms (R2 should have removed flush_interval cost)",
-        elapsed.as_millis()
-    );
 
     event_bus.shutdown().await.expect("shutdown failed");
 }
@@ -4949,11 +4988,68 @@ async fn test_readiness_unknown_subscriber_errors() {
     );
 }
 
+/// An `EventObserver` whose `on_event` blocks until externally released, used
+/// to hold one subscriber's checkpoint back so a gating test can observe a
+/// genuine not-yet-ready state rather than trivially passing because every
+/// subscriber happened to catch up immediately.
+struct GatedObserver {
+    subscriber_id: String,
+    is_released: Arc<std::sync::atomic::AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl GatedObserver {
+    /// Returns the observer plus the flag/notify pair the test uses to release
+    /// it later. Set the flag and call `notify_waiters()` to release: events
+    /// already blocked in `on_event` wake immediately, and any event that
+    /// arrives after release sees the flag set and never blocks.
+    fn new(
+        subscriber_id: String,
+    ) -> (
+        Self,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let is_released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        (
+            Self {
+                subscriber_id,
+                is_released: is_released.clone(),
+                notify: notify.clone(),
+            },
+            is_released,
+            notify,
+        )
+    }
+}
+
+impl epoch_core::SubscriberId for GatedObserver {
+    fn subscriber_id(&self) -> &str {
+        &self.subscriber_id
+    }
+}
+
+#[async_trait]
+impl EventObserver<TestEventData> for GatedObserver {
+    async fn on_event(
+        &self,
+        _event: Arc<Event<TestEventData>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !self.is_released.load(std::sync::atomic::Ordering::Acquire) {
+            self.notify.notified().await;
+        }
+        Ok(())
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn test_wait_until_all_caught_up_gates_every_subscriber() {
-    // Two subscribers, one shared head snapshot: wait_until_all_caught_up
-    // returns true only once both have processed up to head.
+    // Two subscribers, one shared head snapshot: wait_until_all_caught_up must
+    // check EVERY subscriber, not short-circuit on the first. Subscriber B is
+    // gated so it provably cannot have caught up yet, proving the negative
+    // case; releasing it then proves the positive one.
     let Some((pool, event_bus)) = setup_without_listener().await else {
         return;
     };
@@ -4967,10 +5063,9 @@ async fn test_wait_until_all_caught_up_gates_every_subscriber() {
         )))
         .await
         .expect("Failed to subscribe A");
+    let (gated_b, released, notify) = GatedObserver::new(sub_b.clone());
     event_bus
-        .subscribe(ProjectionHandler::new(TestProjection::with_subscriber_id(
-            sub_b.clone(),
-        )))
+        .subscribe(gated_b)
         .await
         .expect("Failed to subscribe B");
 
@@ -4991,11 +5086,35 @@ async fn test_wait_until_all_caught_up_gates_every_subscriber() {
             .expect("store_event failed");
     }
 
+    // B is blocked in on_event and cannot advance its checkpoint: this must be
+    // false, proving the gate actually checks B rather than short-circuiting
+    // on A alone.
+    let all_caught_up = event_bus
+        .wait_until_all_caught_up(tokio::time::Duration::from_millis(300))
+        .await
+        .expect("wait_until_all_caught_up failed");
+    assert!(
+        !all_caught_up,
+        "must be false while subscriber B is still blocked on the gate"
+    );
+    assert_eq!(
+        event_bus.subscriber_lag(&sub_a).await.expect("lag A"),
+        0,
+        "subscriber A should already be caught up even while B is gated"
+    );
+
+    // Release B; both must now be reported caught up.
+    released.store(true, std::sync::atomic::Ordering::Release);
+    notify.notify_waiters();
+
     let all_caught_up = event_bus
         .wait_until_all_caught_up(tokio::time::Duration::from_secs(3))
         .await
         .expect("wait_until_all_caught_up failed");
-    assert!(all_caught_up, "both subscribers should be caught up");
+    assert!(
+        all_caught_up,
+        "both subscribers should be caught up after releasing B"
+    );
 
     assert_eq!(
         event_bus.subscriber_lag(&sub_a).await.expect("lag A"),
@@ -5006,6 +5125,120 @@ async fn test_wait_until_all_caught_up_gates_every_subscriber() {
         event_bus.subscriber_lag(&sub_b).await.expect("lag B"),
         0,
         "subscriber B lag should be 0"
+    );
+
+    event_bus.shutdown().await.expect("shutdown failed");
+}
+
+/// A projection that relies entirely on `Projection`'s **defaulted**
+/// `subscription_mode()` (never overridden) — the "opt-out" observer shape
+/// that predates `SubscriptionMode` entirely. Proves R-7: such an observer
+/// resolves to `Checkpointed` and behaves byte-for-byte identically to one
+/// that explicitly sets `SubscriptionMode::Checkpointed`.
+struct DefaultModeProjection {
+    state_store: InMemoryStateStore<TestState>,
+    subscriber_id: String,
+}
+
+impl DefaultModeProjection {
+    fn new(subscriber_id: String) -> Self {
+        Self {
+            state_store: InMemoryStateStore::new(),
+            subscriber_id,
+        }
+    }
+}
+
+impl epoch_core::SubscriberId for DefaultModeProjection {
+    fn subscriber_id(&self) -> &str {
+        &self.subscriber_id
+    }
+}
+
+impl EventApplicator<TestEventData> for DefaultModeProjection {
+    type State = TestState;
+    type StateStore = InMemoryStateStore<Self::State>;
+    type EventType = TestEventData;
+    type ApplyError = TestProjectionError;
+
+    fn get_state_store(&self) -> Self::StateStore {
+        self.state_store.clone()
+    }
+    fn apply(
+        &self,
+        state: Option<Self::State>,
+        event: &Event<Self::EventType>,
+    ) -> Result<Option<Self::State>, Self::ApplyError> {
+        if let Some(mut state) = state {
+            state.0.push(event.clone());
+            Ok(Some(state))
+        } else {
+            Ok(Some(TestState(vec![event.clone()])))
+        }
+    }
+}
+
+// Deliberately no `subscription_mode()` override: this is the point of R-7.
+impl Projection<TestEventData> for DefaultModeProjection {}
+
+#[tokio::test]
+#[serial]
+async fn test_no_config_subscriber_identical_baseline() {
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    let subscriber_id = format!("projection:default-mode:{}", Uuid::new_v4());
+    let projection = DefaultModeProjection::new(subscriber_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("setup_trigger failed");
+    event_bus
+        .start_listener()
+        .await
+        .expect("start_listener failed");
+
+    let stream_id = Uuid::new_v4();
+    let n = 3u64;
+    for v in 1..=n {
+        event_store
+            .store_event(new_event(stream_id, v, &format!("e{v}")))
+            .await
+            .expect("store_event failed");
+    }
+
+    // Same readiness contract as an explicit Checkpointed subscriber: gates on
+    // the persisted checkpoint, resolves once caught up.
+    let caught_up = event_bus
+        .wait_until_caught_up(&subscriber_id, tokio::time::Duration::from_secs(3))
+        .await
+        .expect("wait_until_caught_up failed");
+    assert!(
+        caught_up,
+        "defaulted-mode subscriber should be gateable exactly like Checkpointed"
+    );
+
+    assert_eq!(
+        store.get_state(stream_id).await.unwrap().unwrap().0.len(),
+        n as usize,
+        "defaulted-mode subscriber should receive every event, same as Checkpointed"
+    );
+
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("get_checkpoint failed");
+    assert!(
+        checkpoint.is_some(),
+        "defaulted-mode subscriber must write a checkpoint row like Checkpointed, unlike ReplayAlways"
     );
 
     event_bus.shutdown().await.expect("shutdown failed");
