@@ -4988,6 +4988,66 @@ async fn test_readiness_unknown_subscriber_errors() {
     );
 }
 
+#[tokio::test]
+#[serial]
+async fn test_readiness_inline_dispatch_errors() {
+    use epoch_pg::PgEventBusError;
+    use epoch_pg::event_bus::{DispatchMode, ReliableDeliveryConfig};
+
+    // Inline dispatch advances neither a checkpoint nor an in-memory HWM, so
+    // all three readiness methods must fail fast with InlineDispatchNotSupported
+    // instead of polling until timeout and reporting perpetually-not-ready.
+    // The check runs before subscriber lookup, so no subscriber needs to be
+    // registered to observe it.
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
+
+    let channel_name = format!("test_channel_{}", Uuid::new_v4().simple());
+    let config = ReliableDeliveryConfig {
+        dispatch_mode: DispatchMode::Inline,
+        ..Default::default()
+    };
+    let event_bus: PgEventBus<TestEventData> =
+        PgEventBus::with_config(pool.clone(), channel_name, config);
+
+    let subscriber_id = format!("projection:inline-readiness:{}", Uuid::new_v4());
+
+    let lag_result = event_bus.subscriber_lag(&subscriber_id).await;
+    assert!(
+        matches!(lag_result, Err(PgEventBusError::InlineDispatchNotSupported)),
+        "subscriber_lag on an Inline bus must return InlineDispatchNotSupported, got: {lag_result:?}"
+    );
+
+    let wait_result = event_bus
+        .wait_until_caught_up(&subscriber_id, tokio::time::Duration::from_millis(100))
+        .await;
+    assert!(
+        matches!(
+            wait_result,
+            Err(PgEventBusError::InlineDispatchNotSupported)
+        ),
+        "wait_until_caught_up on an Inline bus must return InlineDispatchNotSupported, got: {wait_result:?}"
+    );
+
+    let wait_all_result = event_bus
+        .wait_until_all_caught_up(tokio::time::Duration::from_millis(100))
+        .await;
+    assert!(
+        matches!(
+            wait_all_result,
+            Err(PgEventBusError::InlineDispatchNotSupported)
+        ),
+        "wait_until_all_caught_up on an Inline bus must return InlineDispatchNotSupported, got: {wait_all_result:?}"
+    );
+}
+
 /// An `EventObserver` whose `on_event` blocks until externally released, used
 /// to hold one subscriber's checkpoint back so a gating test can observe a
 /// genuine not-yet-ready state rather than trivially passing because every
