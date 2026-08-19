@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `Saga::subscription_mode()` likewise defaulted and forwarded by
     `ProjectionHandler`, `SagaHandler`, `SagaAdapter`, and the `impl Saga for Arc<S>`
     blanket. Existing observers that override nothing are byte-for-byte unchanged.
-  - **`epoch_pg`** — `PgEventBus` gains `head_sequence() -> Result<Option<u64>>`,
+  - **`epoch_pg`** — `PgEventBus` gains `head_sequence() -> Result<Option<u64>, SqlxError>`,
     `subscriber_lag(id) -> Result<u64>` (returns `Err(SubscriberNotFound)` for unregistered ids),
     `wait_until_caught_up(id, timeout) -> Result<bool>`, and
     `wait_until_all_caught_up(timeout) -> Result<bool>`; readiness position dispatches on
