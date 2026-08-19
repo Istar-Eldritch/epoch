@@ -4,6 +4,10 @@
 **Title:** epoch: cross-bus fixed-point quiescence gate for saga-driven cascades
 **Status:** Design problem — **not** ready for a delivery plan (see §7 Open Decision)
 **Created:** 2026-08-18
+**Last probed:** 2026-08-19 — three independent read-only investigations re-verified this
+spec against current `main` (post-0024) and against catacloud. Their findings are in §9,
+and they **materially change the conclusion**: read §9 before acting on §4–§7, some of
+which is now known to be stale or overstated.
 **Crates:** `epoch_pg` (a cross-bus readiness gate; the listener concurrency model it
 would depend on lives in `epoch_pg/src/event_bus/`)
 **Commit scope:** `feat(pg)` / concept scope `event-bus` (when eventually delivered)
@@ -14,7 +18,10 @@ safety); this spec is the cross-bus gate that must sit on top of it before catac
 delete its raw-SQL `PolicyGraph` warm-up.
 **Forcing consumer:** catacloud `integration/src/lib.rs::initialize_aggregates` (nine
 `PgEventBus` instances + the raw-SQL `PolicyGraph` warm-up block, `~1785-1822`). The
-warm-up deletion is **blocked on this spec**, not on 0024 alone (§1, §2).
+warm-up deletion is **blocked on this spec**, not on 0024 alone (§1, §2). **Superseded by
+§9.4:** the policy warm-up appears to be deletable *today* by ordering two existing
+`wait_until_caught_up` calls, with no new epoch code. The general gate is no longer on this
+consumer's critical path.
 **Migrations:** none anticipated.
 
 ---
@@ -307,3 +314,192 @@ is deliberate.
   `ReplayAlways` projection on `policy_bus` gated by the cross-bus gate while an upstream
   saga-surrogate extends `policy_events`, asserting the model is complete exactly when the
   gate settles), and a phased-delivery plan with a machine-readable block. Not before.
+
+---
+
+## 9. Probe findings (2026-08-19) — what changed
+
+Three independent read-only probes re-verified this spec against `epoch` @ `main` (with 0024
+merged) and against catacloud. Everything below was checked against source; line numbers are
+current as of 2026-08-19. Where a probe contradicted the spec, the contradiction wins and is
+marked. **§4–§7 above are preserved as the original argument, but §9 supersedes them where
+they conflict.**
+
+### 9.1 §3's anchors are stale; one entry is now false
+
+0024 rewrote ~1090 lines of `event_bus/mod.rs`, so every `mod.rs` line number in §3 has
+shifted. The **claims** mostly survive; the **citations** did not. Corrected:
+
+| §3 fact | Current anchor | Verdict |
+|---|---|---|
+| `GapObservation { first_seen, fence_xmax }` | `subscriber_state.rs:67-73`; `SubscriberState` `:89-104` (`gap_first_seen` `:103`) | stale line, claim true |
+| Fence proof `snap.xmin >= fence_xmax` | `subscriber_state.rs:199-200` (block `:196-211`) | stale line, claim true |
+| `PgEventBus` has no fence state | struct `mod.rs:726-743` | **NOW FALSE as written.** 0024 added a **7th** field, `hwm: Arc<Mutex<HashMap<String,u64>>>` (`:742`), alongside `pool`(730) `channel_name`(731) `projections`(732) `config`(733) `listener_state`(735) `inline_state`(737). The *conclusion* holds (`hwm` is not fence state) but the "fields are exactly …" phrasing is wrong, and `hwm` is precisely the class of bus-reachable per-subscriber state §4.1 asserts cannot exist. |
+| `subscriber_states` is a listener stack local | `mod.rs:1135`, inside the `tokio::spawn` at `:1045` | stale line, claim true |
+| Backstop advances subscriber checkpoint only | `subscriber_state.rs:220-236` | stale line, claim true |
+| Move-out / move-back | `.remove(sid)` `:1435`, `join_all` `:1459`, merge-back `.insert` `:1482` | stale line, claim true — **the core blocker is real and current** |
+| `seen_sids` dedupe | `mod.rs:1429` | stale line, claim true |
+
+### 9.2 The blocker is narrower than §4.5 claims — position is already exposed
+
+§4.5 treats "expose per-subscriber readiness" as one monolithic problem requiring a
+concurrency-model change. It is **two** problems, and one is already solved:
+
+- **Position needs no new plumbing.** It is already readable from `&self` while the listener
+  runs: `get_checkpoint()` (`mod.rs:1563`) for `Checkpointed`, the `hwm` map for
+  `ReplayAlways`, and `head_sequence()` (`:1619`) for the target. All three have the **safe**
+  error direction (under-report ⇒ bias toward refusing).
+- **Only one bit is genuinely missing:** the per-subscriber gap flag
+  (`!gap_first_seen.is_empty()`) — a single boolean, not the whole `SubscriberState`. Option A
+  therefore does not require a shadow of the full state, and Option B is unnecessary.
+- **The two halves have opposite safe directions.** For position, safe = under-report. For the
+  gap flag, safe = **over-report** ("assume gap present until proven absent"). A single "busy"
+  boolean cannot express both, which the §5 framing misses.
+
+Refinements to §4.5's mechanics: the move-out is **per-priority-group**, not
+all-subscribers-at-once (groups are processed in ascending priority, each fully merged back
+before the next removes anything), and it repeats per page while `batch_was_full`. Also,
+`subscriber_states` is a **bare local `HashMap` behind no lock at all** today, so §4.5's "a
+probe that locked and read the map" describes a hypothetical wrapper, not existing code.
+
+**Incidental defect found, independent of this spec:** `projections.lock()` is held at
+`mod.rs:1282` across the *entire* backlog-drain batch loop, so anything wired through that
+lock blocks for the whole drain. This is the same defect class 0024 just fixed for the R2
+catch-up pass (snapshot-then-release, `:1076-1100`). Any future probe must not wire through
+`projections`.
+
+### 9.3 Option D specified, Option E measured
+
+- **D-1 (recommended): listener-published quiescence channel.** Add one field to
+  `PgEventBus`: a `tokio::sync::watch::Sender<BusQuiescence>` where `BusQuiescence
+  { generation: u64, settled: bool, per_subscriber: HashMap<String,(u64,bool)> }`. The
+  listener publishes at exactly two points: `settled=false` immediately on waking from
+  `select!` (`~:1211`), before touching any state; and a fresh snapshot at the bottom of the
+  outer loop once the inner batch loop exhausts (`rows.is_empty()`, `:1361`), where
+  `subscriber_states` is fully merged back. **Direction contract:** a reader can only observe
+  state that was true while the listener is asleep, or `settled=false`. Any observed
+  `settled=false` — however fleeting — resets a prober's consecutive-settled counter, which is
+  what kills the stale-low race in Option A. **Blast radius: one field, two publish points, no
+  change to move-out/move-back and no new hot-path lock.** This also inverts the design
+  usefully: the listener already owns the state, so nothing needs to read it out.
+- **D-2: durable checkpoint + activity heartbeat.** Works cross-process, but (a) under
+  `CheckpointMode::Batched` the persisted row lags in-memory position — the *unsafe*
+  direction — and (b) `ReplayAlways` subscribers have **no persisted checkpoint by design**,
+  so it cannot observe the one subscriber that matters, without new persisted state
+  (contradicting NG-2). Ranked below D-1.
+- **D-3: shrink `gap_timeout` during the gate.** Dead. It only makes `TimeoutBackstop` (which
+  the code itself documents as potential data loss) fire sooner: trades correctness for
+  latency, the wrong way relative to the safety invariant.
+- **E (xmin fence): viable, narrow, and not new.** Measured against the project's own
+  Postgres 14 container. `pg_current_snapshot()`'s `xmax` is `latestCompletedXid + 1`, so
+  while a write transaction is live, `xmin == xmax == that xid` and stays frozen for its whole
+  duration; rollback releases exactly as fast as commit; read-only
+  `idle-in-transaction` sessions do **not** pin `xmin` (only a real assigned xid does). This
+  is why the existing inclusive `xmin >= fence_xmax` test is correct, which means **Option E
+  is the existing per-gap fence relocated to gate scope, not new engineering** (`query_txid_snapshot`,
+  `mod.rs:161-183`). **New hazard, empirically confirmed and not anticipated anywhere above:
+  `xmin` is cluster-wide.** Any open write transaction anywhere in the Postgres instance — an
+  unrelated batch job, a forgotten uncommitted `INSERT` in a debug session — pins global
+  `xmin` and stalls the gate indefinitely even when every probed bus is quiescent. That is
+  strictly broader than P1, and it forces the same timeout-backstop escape hatch, which
+  reintroduces §7.3's hard-refuse-vs-warn tension. **Scope limit:** E closes only §4.2's
+  "transaction already in flight at gate start" horn. It does not address position tracking
+  and does not replace D-1.
+
+### 9.4 The forcing consumer may not need this spec at all
+
+Two probes independently concluded the premise is weaker than stated.
+
+**A pre-existing mechanism this spec never mentions:** `subscribe()` performs its **own
+fully synchronous, gap-free catch-up** before its future resolves — it awaits
+`catch_up_from_checkpoint(...)` and then drains a buffered `PgListener` channel
+(`mod.rs:~2973-2995`), entirely distinct from 0024's R2 pre-loop pass. Verified directly.
+
+**Consequence:** because every catacloud saga dispatches synchronously (see 9.5), a saga's
+checkpoint advances only *after* every downstream command it triggered has been dispatched
+and committed. So the ordering below is sufficient for the policy cascade, using only shipped
+0024 API and **zero new epoch code**:
+
+1. `iam_bus.wait_until_caught_up("policy_lifecycle_saga", timeout)` → `true`
+2. *then* `policy_bus.wait_until_caught_up("policy_graph_projection", timeout)`
+
+Step 2 snapshots its target head *after* step 1 proved the upstream drained, so there is no
+moving-target race — the ordering removes it rather than chasing it. This trades away NG-1
+(catacloud must declare "policy_bus depends on this saga"), but catacloud already owns that
+saga, so the knowledge costs nothing new.
+
+**Also verified:** `start_listener()` **spawns** its R2 catch-up and returns without awaiting
+it (`:1045` spawn, `~:1491` return). Today's catacloud warm-up is therefore safe against the
+original CLOUD-217 ordering race, but *not* for the reason its own code comment gives
+(`catacloud integration/src/lib.rs:1767-1780`) — the real mechanism is `subscribe()`'s
+synchronous catch-up, called earlier. Anyone editing that file trusting the comment could
+reintroduce the race.
+
+### 9.5 P1 and P2 verified; NG-1 partly vindicated by a real cycle
+
+- **P2 (synchronous dispatch): holds repo-wide.** All ~40 catacloud sagas were checked: zero
+  use `tokio::spawn`, unbounded channels, or fire-and-forget. Confirmed at
+  `integration/src/sagas/policy_lifecycle.rs:46,223`.
+- **P1 (no concurrent writers): holds, more strongly than §6 credits.** Nine-plus periodic
+  writers exist (`stale_machine_checker`, `job_timeout_checker`, credit/bundle/storage/
+  subscription checkers, …) but every `spawn_*_checker` sits at
+  `web-admin/src/bin/catacloud_web.rs:852-942`, strictly after `initialize_aggregates()`
+  (`:644`), and `HttpServer::bind()` (`:986-987`) comes after those.
+- **Coordinated mode is moot today.** `InstanceMode` is never referenced in catacloud; every
+  bus uses `..Default::default()`, and the default is `SingleInstance`. It becomes a live risk
+  only if catacloud is horizontally scaled, and nothing would detect peer writes then.
+- **NG-1 survives as a general constraint, because a real cycle exists.** The
+  organization-deletion cascade runs `iam_bus` → {`files`, `annotations`, `jobs`, `compute`,
+  `billing`} → back to `iam_bus` (via `IamCleanupPort::acknowledge_cleanup`, implemented by
+  `OrganizationAggregate`, `iam/src/port.rs:29`, then
+  `iam/src/sagas/organization_deletion_finalizer.rs:14`) — a genuine cycle through 6 of the 9
+  buses. Topological sequencing (9.4) therefore works for the policy case but **cannot**
+  generalize. Automatic derivation of the graph from saga registrations is not cheap either:
+  `SagaAdapter::new` declares the source bus, but the destination bus is implicit in whichever
+  port the saga holds, with no registry linking them.
+
+### 9.6 A cross-repo blocker no gate design can fix
+
+`PolicyLifecycleSagaError` is **uninhabited** (`enum PolicyLifecycleSagaError {}`,
+`catacloud integration/src/sagas/policy_lifecycle.rs:204`) and `dispatch_all` (`:46-51`) logs
+and swallows every dispatch error. `handle_event` therefore always returns `Ok`,
+`SagaHandler::on_event` never sees a failure, and the listener advances the checkpoint
+regardless. **If `policy_port.dispatch` fails even transiently, the saga's checkpoint still
+reaches head, so every readiness gate — 0024's or any 0025 design — correctly reports "caught
+up" while the policy command was permanently lost.**
+
+The method's own docstring justifies this by saying "a partial failure followed by a bus retry
+is safe", but because the error never propagates there **is no retry**: the justification
+depends on a mechanism the code disables. This is a permanent silent-loss bug, not a race, and
+it is unique to this saga (every other catacloud saga propagates real errors). **It is
+strictly higher priority than this spec**: deleting the warm-up behind any gate while this
+stands would trade a working belt-and-braces for a gate that cannot detect the actual failure
+mode. Fix belongs in catacloud, not epoch.
+
+### 9.7 Revised open decision
+
+§7's three questions are now largely answerable:
+
+1. **Predicate** — per-subscriber `(position, has_unresolved_gap_below_head)` stands, with the
+   opposite-safe-directions correction from 9.2.
+2. **Exposure** — **D-1**, hardened with **E** if the in-flight-at-gate-start horn matters.
+   Runner-up B, rejected: it buys always-current reads with a real hot-path lock rewrite when
+   D-1 gets equivalent safety from a busy/idle tri-state.
+3. **Refuse vs warn** — still genuinely open, and now sharper, because E's cluster-wide `xmin`
+   stall (9.3) and the backstop escape hatch mean a hard refusal can wedge startup on
+   something entirely outside the probed buses.
+
+**What should happen first, in order:** (a) fix the catacloud swallow bug (9.6); (b) delete the
+warm-up behind the two ordered `wait_until_caught_up` calls (9.4) and keep the existing
+CLOUD-217 regression test as the guard; (c) build D-1 only when a consumer actually needs a
+cascade gate with no declarable order — the cyclic org-deletion cascade (9.5) is the honest
+candidate, and it is not what this spec was written for. Steps (a) and (b) need no epoch
+change at all, which means **this spec is no longer blocking its own forcing consumer.**
+
+Still unknown / not probed: the worst-case duration of the move-out window (bounded by
+`process_event_with_retry`'s retry-and-backoff behaviour, unmeasured); whether
+`unwrap_or_else(SubscriberState::new(0))` at `mod.rs:1436` is reachable at all (suspected dead,
+unconfirmed); and empirical validation of the 9.4 ordering claim against a running catacloud
+(the existing regression test at
+`catacloud integration/tests/dao_integration/dao_integration_policy_graph_warmup_ordering.rs`
+was read, not executed).
