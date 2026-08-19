@@ -1655,6 +1655,14 @@ where
     /// is spec 0025's concern). Returns `Ok(true)` if caught up, `Ok(false)`
     /// on timeout.
     ///
+    /// # Hazard: burned/in-flight tail
+    /// `target` is `head_sequence()`, which can be a burned or in-flight
+    /// `nextval` (spec 0019) that only ever becomes visible via the gap
+    /// backstop. When the tail is such a sequence, `position` cannot reach
+    /// `target` until the gap timeout elapses, so callers must pass a
+    /// `timeout` larger than the subscriber's `gap_timeout` to avoid a
+    /// spurious `Ok(false)`.
+    ///
     /// # Hazard: this is a LOCAL readiness check
     /// This gates only *this* subscriber against *this* bus's head at call
     /// time. It is **unsafe as a startup gate for any consumer whose sagas

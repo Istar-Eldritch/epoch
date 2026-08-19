@@ -4948,3 +4948,65 @@ async fn test_readiness_unknown_subscriber_errors() {
         "wait_until_caught_up for unknown id must return SubscriberNotFound, got: {wait_result:?}"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn test_wait_until_all_caught_up_gates_every_subscriber() {
+    // Two subscribers, one shared head snapshot: wait_until_all_caught_up
+    // returns true only once both have processed up to head.
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    let sub_a = format!("projection:all-a:{}", Uuid::new_v4());
+    let sub_b = format!("projection:all-b:{}", Uuid::new_v4());
+    event_bus
+        .subscribe(ProjectionHandler::new(TestProjection::with_subscriber_id(
+            sub_a.clone(),
+        )))
+        .await
+        .expect("Failed to subscribe A");
+    event_bus
+        .subscribe(ProjectionHandler::new(TestProjection::with_subscriber_id(
+            sub_b.clone(),
+        )))
+        .await
+        .expect("Failed to subscribe B");
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("setup_trigger failed");
+    event_bus
+        .start_listener()
+        .await
+        .expect("start_listener failed");
+
+    let stream_id = Uuid::new_v4();
+    for v in 1..=3u64 {
+        event_store
+            .store_event(new_event(stream_id, v, &format!("e{v}")))
+            .await
+            .expect("store_event failed");
+    }
+
+    let all_caught_up = event_bus
+        .wait_until_all_caught_up(tokio::time::Duration::from_secs(3))
+        .await
+        .expect("wait_until_all_caught_up failed");
+    assert!(all_caught_up, "both subscribers should be caught up");
+
+    assert_eq!(
+        event_bus.subscriber_lag(&sub_a).await.expect("lag A"),
+        0,
+        "subscriber A lag should be 0"
+    );
+    assert_eq!(
+        event_bus.subscriber_lag(&sub_b).await.expect("lag B"),
+        0,
+        "subscriber B lag should be 0"
+    );
+
+    event_bus.shutdown().await.expect("shutdown failed");
+}
