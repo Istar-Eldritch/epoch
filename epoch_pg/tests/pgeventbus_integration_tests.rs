@@ -54,6 +54,7 @@ impl EventApplicatorState for TestState {
 struct TestProjection {
     state_store: InMemoryStateStore<TestState>,
     subscriber_id: String,
+    subscription_mode: SubscriptionMode,
 }
 
 impl TestProjection {
@@ -65,6 +66,17 @@ impl TestProjection {
         TestProjection {
             state_store: InMemoryStateStore::new(),
             subscriber_id,
+            subscription_mode: SubscriptionMode::Checkpointed,
+        }
+    }
+
+    /// A ReplayAlways projection: replays from 0 every process start and never
+    /// reads or writes a persisted checkpoint (R5).
+    pub fn replay_always(subscriber_id: String) -> Self {
+        TestProjection {
+            state_store: InMemoryStateStore::new(),
+            subscriber_id,
+            subscription_mode: SubscriptionMode::ReplayAlways,
         }
     }
 }
@@ -101,7 +113,11 @@ impl EventApplicator<TestEventData> for TestProjection {
     }
 }
 
-impl Projection<TestEventData> for TestProjection {}
+impl Projection<TestEventData> for TestProjection {
+    fn subscription_mode(&self) -> SubscriptionMode {
+        self.subscription_mode
+    }
+}
 
 async fn setup() -> Option<(
     PgPool,
@@ -4386,4 +4402,305 @@ async fn test_subscribe_warns_when_trigger_absent() {
         common::captured_logs_contain("no NOTIFY trigger"),
         "Async subscribe without a trigger should emit a WARN naming the missing trigger"
     );
+}
+
+// ==================== Phase 3: R5 ReplayAlways + in-memory HWM ====================
+
+/// Reads the current head (max global_sequence) of the default events table.
+async fn events_head(pool: &PgPool) -> u64 {
+    let head: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(global_sequence), 0) FROM epoch_events")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    head as u64
+}
+
+/// R-5: a ReplayAlways subscriber ignores a persisted checkpoint that a prior
+/// run parked at head and still replays every event from 0. The bus never reads
+/// or writes that checkpoint on its behalf.
+#[tokio::test]
+#[serial]
+async fn test_replay_always_replays_from_zero() {
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    // Commit N events with no subscriber registered.
+    let stream_id = Uuid::new_v4();
+    let n = 5u64;
+    for v in 1..=n {
+        event_store
+            .store_event(new_event(stream_id, v, &format!("e{v}")))
+            .await
+            .expect("Failed to store event");
+    }
+    let head = events_head(&pool).await;
+
+    // Simulate a prior seed run that fast-forwarded this subscriber's checkpoint
+    // to head (the CLOUD-217 shape that suppresses replay for a Checkpointed
+    // subscriber).
+    let subscriber_id = format!("projection:replay-always:{}", Uuid::new_v4());
+    event_bus
+        .update_checkpoint(&subscriber_id, head, Uuid::new_v4())
+        .await
+        .expect("Failed to plant checkpoint");
+
+    // A ReplayAlways subscriber must replay all N from 0 despite the head checkpoint.
+    let projection = TestProjection::replay_always(subscriber_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe ReplayAlways projection");
+
+    let state = store
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("ReplayAlways subscriber should have replayed events");
+    assert_eq!(
+        state.0.len(),
+        n as usize,
+        "ReplayAlways must replay every event from 0, ignoring the head checkpoint"
+    );
+
+    // The bus never advanced or cleared the checkpoint; the only row present is
+    // the one we planted, left untouched.
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("Failed to read checkpoint");
+    assert_eq!(
+        checkpoint,
+        Some(head),
+        "the bus must not read, advance, or clear a ReplayAlways subscriber's checkpoint"
+    );
+}
+
+/// R-5: `fast_forward_all_subscribers` skips ReplayAlways subscribers (leaving no
+/// checkpoint row) while still parking Checkpointed subscribers at head.
+#[tokio::test]
+#[serial]
+async fn test_fast_forward_skips_replay_always() {
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    // Register both kinds before any events exist, so subscribe()'s own catch-up
+    // writes nothing.
+    let cp_id = format!("projection:checkpointed:{}", Uuid::new_v4());
+    let ra_id = format!("projection:replay-always:{}", Uuid::new_v4());
+    event_bus
+        .subscribe(ProjectionHandler::new(TestProjection::with_subscriber_id(
+            cp_id.clone(),
+        )))
+        .await
+        .expect("Failed to subscribe Checkpointed projection");
+    event_bus
+        .subscribe(ProjectionHandler::new(TestProjection::replay_always(
+            ra_id.clone(),
+        )))
+        .await
+        .expect("Failed to subscribe ReplayAlways projection");
+
+    // Commit events with no listener running.
+    let stream_id = Uuid::new_v4();
+    for v in 1..=3u64 {
+        event_store
+            .store_event(new_event(stream_id, v, &format!("e{v}")))
+            .await
+            .expect("Failed to store event");
+    }
+    let head = events_head(&pool).await;
+
+    event_bus
+        .fast_forward_all_subscribers()
+        .await
+        .expect("fast_forward failed");
+
+    assert_eq!(
+        event_bus.get_checkpoint(&cp_id).await.unwrap(),
+        Some(head),
+        "fast_forward must park a Checkpointed subscriber at head"
+    );
+    assert_eq!(
+        event_bus.get_checkpoint(&ra_id).await.unwrap(),
+        None,
+        "fast_forward must skip a ReplayAlways subscriber (no checkpoint row written)"
+    );
+}
+
+/// R-5 (Correction 2): after subscribe()'s catch-up advances the in-memory HWM,
+/// the listener seeds a ReplayAlways subscriber's state from that HWM rather than
+/// the (absent) checkpoint row, so the first live batch delivers only new events
+/// rather than re-delivering the entire history.
+#[tokio::test]
+#[serial]
+async fn test_replay_always_listener_does_not_redeliver_history() {
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    // Commit N events, then subscribe ReplayAlways (catch-up replays all N and
+    // sets the HWM to head).
+    let stream_id = Uuid::new_v4();
+    let n = 4u64;
+    for v in 1..=n {
+        event_store
+            .store_event(new_event(stream_id, v, &format!("e{v}")))
+            .await
+            .expect("Failed to store event");
+    }
+
+    let subscriber_id = format!("projection:replay-always:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(subscriber_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe ReplayAlways projection");
+
+    assert_eq!(
+        store.get_state(stream_id).await.unwrap().unwrap().0.len(),
+        n as usize,
+        "subscribe catch-up should replay all N events"
+    );
+
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    // One new event after the listener is up.
+    event_store
+        .store_event(new_event(stream_id, n + 1, "new"))
+        .await
+        .expect("Failed to store event");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+
+    let len = store.get_state(stream_id).await.unwrap().unwrap().0.len();
+    assert_eq!(
+        len,
+        (n + 1) as usize,
+        "listener must seed from the HWM and deliver only the new event, not re-deliver history"
+    );
+
+    event_bus.shutdown().await.expect("Failed to shutdown");
+}
+
+/// R-5 (Correction 3): a fresh subscribe of a ReplayAlways subscriber resets the
+/// HWM to 0 before catch-up, so re-subscribing the same id rebuilds the model
+/// from 0 rather than resuming from the prior lifecycle's HWM.
+#[tokio::test]
+#[serial]
+async fn test_replay_always_hwm_reset_on_resubscribe() {
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    let stream_id = Uuid::new_v4();
+    let n = 5u64;
+    for v in 1..=n {
+        event_store
+            .store_event(new_event(stream_id, v, &format!("e{v}")))
+            .await
+            .expect("Failed to store event");
+    }
+
+    let subscriber_id = format!("projection:replay-always:{}", Uuid::new_v4());
+
+    // First subscribe: replays all N and advances the HWM to head.
+    let proj1 = TestProjection::replay_always(subscriber_id.clone());
+    event_bus
+        .subscribe(ProjectionHandler::new(proj1))
+        .await
+        .expect("Failed to subscribe ReplayAlways projection");
+
+    // Re-subscribe the same id with a fresh model. If the HWM were NOT reset,
+    // catch-up would resume from head and this projection would receive nothing.
+    let proj2 = TestProjection::replay_always(subscriber_id.clone());
+    let store2 = proj2.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(proj2))
+        .await
+        .expect("Failed to re-subscribe ReplayAlways projection");
+
+    assert_eq!(
+        store2.get_state(stream_id).await.unwrap().unwrap().0.len(),
+        n as usize,
+        "re-subscribe must reset the HWM to 0 and replay every event into the fresh model"
+    );
+}
+
+/// R-5 (Correction 3 revised): after shutdown() + start_listener() in the same
+/// process the ReplayAlways model survives, so catch-up proceeds from the
+/// surviving HWM (only events missed during downtime) rather than replaying from
+/// 0 into the non-empty model.
+#[tokio::test]
+#[serial]
+async fn test_replay_always_listener_restart_from_hwm() {
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    let stream_id = Uuid::new_v4();
+    let n = 4u64;
+    for v in 1..=n {
+        event_store
+            .store_event(new_event(stream_id, v, &format!("e{v}")))
+            .await
+            .expect("Failed to store event");
+    }
+
+    let subscriber_id = format!("projection:replay-always:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(subscriber_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe ReplayAlways projection");
+
+    assert_eq!(
+        store.get_state(stream_id).await.unwrap().unwrap().0.len(),
+        n as usize,
+        "subscribe catch-up should replay all N events"
+    );
+
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+    event_bus.shutdown().await.expect("Failed to shutdown");
+
+    // Event missed during downtime.
+    event_store
+        .store_event(new_event(stream_id, n + 1, "missed"))
+        .await
+        .expect("Failed to store event");
+
+    // Restart: the projection object (and its model) survived shutdown, so the
+    // catch-up must resume from the surviving HWM and deliver only the missed
+    // event, not replay from 0 into the already-built model.
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to restart listener");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+
+    let len = store.get_state(stream_id).await.unwrap().unwrap().0.len();
+    assert_eq!(
+        len,
+        (n + 1) as usize,
+        "listener restart must catch up from the surviving HWM, not replay history from 0"
+    );
+
+    event_bus.shutdown().await.expect("Failed to shutdown");
 }

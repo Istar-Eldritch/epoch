@@ -21,7 +21,7 @@ pub use retry::calculate_retry_delay_no_jitter;
 
 use crate::event_store::PgDBEvent;
 use epoch_core::event::{Event, EventData};
-use epoch_core::event_store::EventBus;
+use epoch_core::event_store::{EventBus, SubscriptionMode};
 use epoch_core::prelude::EventObserver;
 use log::{error, info, warn};
 use serde::de::DeserializeOwned;
@@ -68,6 +68,10 @@ struct BatchContext {
     config: ReliableDeliveryConfig,
     dlq_pool: PgPool,
     checkpoint_pool: PgPool,
+    /// Per-subscriber in-memory high-water mark for `ReplayAlways` subscribers
+    /// (§4.5). Live processing routes checkpoint advancement here instead of the
+    /// checkpoints table for such a subscriber.
+    hwm: Arc<Mutex<HashMap<String, u64>>>,
     /// The transaction-id snapshot captured once for this batch (CLOUD-180), or
     /// `None` when fencing is disabled, no gaps were active, or the snapshot
     /// query failed (graceful timeout-only fallback for the batch).
@@ -200,7 +204,12 @@ where
         dlq_pool,
         checkpoint_pool,
         snapshot,
+        hwm,
     } = ctx;
+    // R5: a ReplayAlways subscriber advances its in-memory HWM instead of the
+    // persisted checkpoint (§4.5).
+    let replay_always =
+        { projection.lock().await.subscription_mode() == SubscriptionMode::ReplayAlways };
     let contiguous_before = state.contiguous_checkpoint;
     let mut processed_any = false;
     let mut last_event_id = last_event_id_in;
@@ -432,44 +441,61 @@ where
             .unwrap_or_else(Uuid::nil);
 
         last_event_id = Some(checkpoint_event_id);
-        cached_checkpoint = Some(new_contiguous);
 
-        match &mut pending_checkpoint {
-            Some(p) => {
-                p.global_sequence = new_contiguous;
-                p.event_id = checkpoint_event_id;
-            }
-            None => {
-                pending_checkpoint =
-                    Some(PendingCheckpoint::new(new_contiguous, checkpoint_event_id));
-            }
-        }
+        if replay_always {
+            // Route advancement to the in-memory HWM; never touch the
+            // checkpoints table for a ReplayAlways subscriber.
+            hwm.lock()
+                .await
+                .insert(subscriber_id.clone(), new_contiguous);
+        } else {
+            cached_checkpoint = Some(new_contiguous);
 
-        // Flush checkpoint to DB if threshold reached.
-        if let Some(pending) =
-            pending_checkpoint.take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
-        {
-            let mut local_cache = HashMap::new();
-            match flush_checkpoint(
-                &checkpoint_pool,
-                &config.events_table,
-                &subscriber_id,
-                &pending,
-                &mut local_cache,
-            )
-            .await
+            match &mut pending_checkpoint {
+                Some(p) => {
+                    p.global_sequence = new_contiguous;
+                    p.event_id = checkpoint_event_id;
+                }
+                None => {
+                    pending_checkpoint =
+                        Some(PendingCheckpoint::new(new_contiguous, checkpoint_event_id));
+                }
+            }
+
+            // Flush checkpoint to DB if threshold reached.
+            if let Some(pending) =
+                pending_checkpoint.take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
             {
-                Ok(()) => {
-                    if let Some(val) = local_cache.get(&subscriber_id) {
-                        cached_checkpoint = Some(*val);
+                let mut local_cache = HashMap::new();
+                match flush_checkpoint(
+                    &checkpoint_pool,
+                    &config.events_table,
+                    &subscriber_id,
+                    &pending,
+                    &mut local_cache,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        if let Some(val) = local_cache.get(&subscriber_id) {
+                            cached_checkpoint = Some(*val);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to flush checkpoint for '{}': {}", subscriber_id, e);
+                        pending_checkpoint = Some(pending);
                     }
                 }
-                Err(e) => {
-                    error!("Failed to flush checkpoint for '{}': {}", subscriber_id, e);
-                    pending_checkpoint = Some(pending);
-                }
             }
         }
+    }
+
+    // A ReplayAlways subscriber must never leave a pending checkpoint behind: the
+    // listener's periodic/shutdown flushes would otherwise persist it to the
+    // checkpoints table, defeating replay-from-zero.
+    if replay_always {
+        pending_checkpoint = None;
+        cached_checkpoint = None;
     }
 
     SubscriberBatchOutcome {
@@ -695,6 +721,11 @@ where
     listener_state: Arc<Mutex<Option<ListenerState>>>,
     /// Inline-dispatch queue. Unused in `DispatchMode::Async`.
     inline_state: Arc<Mutex<InlineDispatchState<D>>>,
+    /// Per-subscriber in-memory high-water mark for [`SubscriptionMode::ReplayAlways`]
+    /// subscribers (§4.5). Never persisted: a crash loses it and the next boot
+    /// replays from 0, which is the intended contract. Shared across `Clone`s so
+    /// `subscribe`, the listener task, and readiness queries observe the same value.
+    hwm: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl<D> PgEventBus<D>
@@ -719,6 +750,7 @@ where
             config,
             listener_state: Arc::new(Mutex::new(None)),
             inline_state: Arc::new(Mutex::new(InlineDispatchState::default())),
+            hwm: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -956,6 +988,7 @@ where
         let channel_name = self.channel_name.clone();
         let projections = self.projections.clone();
         let config = self.config.clone();
+        let hwm = self.hwm.clone();
 
         // Create shutdown signal channel
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1009,6 +1042,7 @@ where
                         &subscriber_id,
                         &config,
                         &checkpoint_pool,
+                        &hwm,
                     )
                     .await
                     {
@@ -1187,31 +1221,43 @@ where
 
                 // Initialize per-subscriber state for any new subscribers.
                 for projection in projections_guard.iter() {
-                    let subscriber_id = {
+                    let (subscriber_id, replay_always) = {
                         let guard = projection.lock().await;
-                        guard.subscriber_id().to_string()
+                        (
+                            guard.subscriber_id().to_string(),
+                            guard.subscription_mode() == SubscriptionMode::ReplayAlways,
+                        )
                     };
                     if !subscriber_states.contains_key(&subscriber_id) {
-                        let checkpoint = match sqlx::query_as::<_, (i64,)>(
-                            r#"
-                            SELECT last_global_sequence
-                            FROM epoch_event_bus_checkpoints
-                            WHERE bus_name = $1 AND subscriber_id = $2
-                            "#,
-                        )
-                        .bind(&config.events_table)
-                        .bind(&subscriber_id)
-                        .fetch_optional(&checkpoint_pool)
-                        .await
-                        {
-                            Ok(Some((seq,))) => seq as u64,
-                            Ok(None) => 0,
-                            Err(e) => {
-                                warn!(
-                                    "Failed to load checkpoint for '{}': {}, starting from 0",
-                                    subscriber_id, e
-                                );
-                                0
+                        // R5 (Correction 2): a ReplayAlways subscriber has no
+                        // checkpoint row, so seeding from the checkpoint table would
+                        // give 0 and re-deliver the entire history on the first live
+                        // batch. Seed from the in-memory HWM (set at the end of
+                        // subscribe()'s / the R2 pass's catch-up) instead.
+                        let checkpoint = if replay_always {
+                            hwm.lock().await.get(&subscriber_id).copied().unwrap_or(0)
+                        } else {
+                            match sqlx::query_as::<_, (i64,)>(
+                                r#"
+                                SELECT last_global_sequence
+                                FROM epoch_event_bus_checkpoints
+                                WHERE bus_name = $1 AND subscriber_id = $2
+                                "#,
+                            )
+                            .bind(&config.events_table)
+                            .bind(&subscriber_id)
+                            .fetch_optional(&checkpoint_pool)
+                            .await
+                            {
+                                Ok(Some((seq,))) => seq as u64,
+                                Ok(None) => 0,
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to load checkpoint for '{}': {}, starting from 0",
+                                        subscriber_id, e
+                                    );
+                                    0
+                                }
                             }
                         };
                         subscriber_states
@@ -1342,6 +1388,7 @@ where
                                         dlq_pool: dlq_pool.clone(),
                                         checkpoint_pool: checkpoint_pool.clone(),
                                         snapshot: batch_snapshot,
+                                        hwm: hwm.clone(),
                                     },
                                 )
                             })
@@ -1529,12 +1576,17 @@ where
         };
 
         // Snapshot the registered subscriber ids (avoid holding the lock across
-        // the awaited DB writes).
+        // the awaited DB writes). R5: skip ReplayAlways subscribers — they have no
+        // persisted checkpoint, and parking one at head would suppress the
+        // replay-from-zero their next boot depends on.
         let subscriber_ids: Vec<String> = {
             let guard = self.projections.lock().await;
             let mut ids = Vec::with_capacity(guard.len());
             for observer in guard.iter() {
                 let o = observer.lock().await;
+                if o.subscription_mode() == SubscriptionMode::ReplayAlways {
+                    continue;
+                }
                 ids.push(o.subscriber_id().to_string());
             }
             ids
@@ -2127,25 +2179,89 @@ where
     }
 }
 
-/// Runs one checkpoint-driven catch-up pass for a single subscriber.
+/// Records catch-up progress for one event.
 ///
-/// Reads the subscriber's persisted checkpoint, then paginates
-/// `global_sequence > checkpoint` in `catch_up_batch_size` chunks, dispatching
-/// each event through [`process_event_with_retry`] and advancing the checkpoint.
-/// Returns the highest `global_sequence` reached (the persisted checkpoint after
-/// the pass). Shared by `subscribe` and the pre-loop pass in `start_listener` so
-/// the two catch-up paths cannot drift apart.
+/// For a `Checkpointed` subscriber this advances the batched pending checkpoint
+/// and flushes it to the checkpoints table when the mode threshold is reached.
+/// For a `ReplayAlways` subscriber it instead advances the in-memory high-water
+/// mark and never touches the checkpoints table (§4.5).
+#[allow(clippy::too_many_arguments)]
+async fn record_catchup_progress(
+    replay_always: bool,
+    hwm: &Arc<Mutex<HashMap<String, u64>>>,
+    subscriber_id: &str,
+    event_global_seq: u64,
+    event_id: Uuid,
+    pending_checkpoint: &mut Option<PendingCheckpoint>,
+    checkpoint_cache: &mut HashMap<String, u64>,
+    config: &ReliableDeliveryConfig,
+    pool: &PgPool,
+) {
+    if replay_always {
+        hwm.lock()
+            .await
+            .insert(subscriber_id.to_string(), event_global_seq);
+        return;
+    }
+
+    match pending_checkpoint {
+        Some(pending) => pending.update(event_global_seq, event_id),
+        None => *pending_checkpoint = Some(PendingCheckpoint::new(event_global_seq, event_id)),
+    }
+
+    if let Some(pending) =
+        pending_checkpoint.take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
+        && let Err(e) = flush_checkpoint(
+            pool,
+            &config.events_table,
+            subscriber_id,
+            &pending,
+            checkpoint_cache,
+        )
+        .await
+    {
+        error!(
+            "Catch-up: failed to flush checkpoint for '{}': {}",
+            subscriber_id, e
+        );
+        *pending_checkpoint = Some(pending);
+    }
+}
+
+/// Runs one catch-up pass for a single subscriber.
+///
+/// For a `Checkpointed` subscriber this reads the persisted checkpoint, then
+/// paginates `global_sequence > checkpoint` in `catch_up_batch_size` chunks,
+/// dispatching each event through [`process_event_with_retry`] and advancing the
+/// checkpoint.
+///
+/// For a [`SubscriptionMode::ReplayAlways`] subscriber (R5) it ignores the
+/// persisted checkpoint entirely, starting from the surviving in-memory
+/// high-water mark (0 on a fresh `subscribe`, which resets it; the retained
+/// value on a listener restart) and routing advancement to that HWM instead of
+/// the checkpoints table, which is never written for such a subscriber.
+///
+/// Returns the highest `global_sequence` reached. Shared by `subscribe` and the
+/// pre-loop pass in `start_listener` so the two catch-up paths cannot drift apart.
 pub(crate) async fn catch_up_from_checkpoint<ED>(
     observer: &Arc<Mutex<dyn EventObserver<ED>>>,
     subscriber_id: &str,
     config: &ReliableDeliveryConfig,
     pool: &PgPool,
+    hwm: &Arc<Mutex<HashMap<String, u64>>>,
 ) -> Result<u64, SqlxError>
 where
     ED: EventData + Send + Sync + DeserializeOwned + 'static,
 {
-    // Get the last checkpoint for this subscriber
-    let last_sequence = {
+    // R5: a ReplayAlways subscriber ignores the persisted checkpoint and starts
+    // from its surviving in-memory HWM, so a prior fast_forward-to-head does not
+    // suppress replay.
+    let replay_always =
+        { observer.lock().await.subscription_mode() == SubscriptionMode::ReplayAlways };
+
+    let last_sequence = if replay_always {
+        hwm.lock().await.get(subscriber_id).copied().unwrap_or(0)
+    } else {
         let result: Option<(i64,)> = sqlx::query_as(
             r#"
             SELECT last_global_sequence
@@ -2214,32 +2330,18 @@ where
                     // undeserializable event to avoid an infinite retry loop.
                     current_sequence = event_global_seq;
                     total_caught_up += 1;
-                    match &mut pending_checkpoint {
-                        Some(pending) => {
-                            pending.update(event_global_seq, event_id);
-                        }
-                        None => {
-                            pending_checkpoint =
-                                Some(PendingCheckpoint::new(event_global_seq, event_id));
-                        }
-                    }
-                    if let Some(pending) = pending_checkpoint
-                        .take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
-                        && let Err(flush_err) = flush_checkpoint(
-                            pool,
-                            &config.events_table,
-                            subscriber_id,
-                            &pending,
-                            &mut checkpoint_cache,
-                        )
-                        .await
-                    {
-                        error!(
-                            "Catch-up: failed to flush checkpoint for '{}': {}",
-                            subscriber_id, flush_err
-                        );
-                        pending_checkpoint = Some(pending);
-                    }
+                    record_catchup_progress(
+                        replay_always,
+                        hwm,
+                        subscriber_id,
+                        event_global_seq,
+                        event_id,
+                        &mut pending_checkpoint,
+                        &mut checkpoint_cache,
+                        config,
+                        pool,
+                    )
+                    .await;
                     continue;
                 }
             };
@@ -2266,35 +2368,18 @@ where
             let result =
                 process_event_with_retry(observer, &event, subscriber_id, config, pool).await;
 
-            // Track pending checkpoint for batched mode
-            match &mut pending_checkpoint {
-                Some(pending) => {
-                    pending.update(event_global_seq, event_id);
-                }
-                None => {
-                    pending_checkpoint = Some(PendingCheckpoint::new(event_global_seq, event_id));
-                }
-            }
-
-            // Check if we should flush the checkpoint
-            if let Some(pending) =
-                pending_checkpoint.take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
-                && let Err(e) = flush_checkpoint(
-                    pool,
-                    &config.events_table,
-                    subscriber_id,
-                    &pending,
-                    &mut checkpoint_cache,
-                )
-                .await
-            {
-                error!(
-                    "Catch-up: failed to flush checkpoint for '{}': {}",
-                    subscriber_id, e
-                );
-                // Re-insert pending checkpoint for retry
-                pending_checkpoint = Some(pending);
-            }
+            record_catchup_progress(
+                replay_always,
+                hwm,
+                subscriber_id,
+                event_global_seq,
+                event_id,
+                &mut pending_checkpoint,
+                &mut checkpoint_cache,
+                config,
+                pool,
+            )
+            .await;
 
             current_sequence = event_global_seq;
             total_caught_up += 1;
@@ -2376,6 +2461,7 @@ where
         let pool = self.pool.clone();
         let config = self.config.clone();
         let channel_name = self.channel_name.clone();
+        let hwm = self.hwm.clone();
 
         let inline_state = self.inline_state.clone();
         Box::pin(async move {
@@ -2395,11 +2481,24 @@ where
                 return Ok(());
             }
 
-            // Get subscriber_id for catch-up
-            let subscriber_id = {
+            // Get subscriber_id (and subscription mode) for catch-up
+            let (subscriber_id, replay_always) = {
                 let guard = observer.lock().await;
-                guard.subscriber_id().to_string()
+                (
+                    guard.subscriber_id().to_string(),
+                    guard.subscription_mode() == SubscriptionMode::ReplayAlways,
+                )
             };
+
+            // R5 (Correction 3): a fresh subscribe (including re-subscribe after
+            // unsubscribe) of a ReplayAlways subscriber rebuilds its in-memory
+            // model from empty, so reset the HWM to 0 before catch-up. Readiness
+            // therefore never reads a stale high value from a prior subscription
+            // lifecycle while the model is being rebuilt; catch-up re-seeds it as
+            // it progresses.
+            if replay_always {
+                hwm.lock().await.insert(subscriber_id.clone(), 0);
+            }
 
             // R4 (defence-in-depth): in Async mode, delivery of newly committed
             // events depends on the AFTER INSERT NOTIFY trigger. If it is absent
@@ -2540,7 +2639,7 @@ where
             // retry/DLQ-backed pass that start_listener runs before entering its
             // loop (R2), so the two paths cannot drift.
             let mut current_sequence =
-                catch_up_from_checkpoint(&observer, &subscriber_id, &config, &pool).await?;
+                catch_up_from_checkpoint(&observer, &subscriber_id, &config, &pool, &hwm).await?;
 
             // Pending checkpoint / local cache for the buffer-drain phase below.
             let mut pending_checkpoint: Option<PendingCheckpoint> = None;
@@ -2662,32 +2761,20 @@ where
                         }
 
                         // Common checkpoint tracking — runs for both the deserialization-
-                        // error path and the successful-processing path.
-                        match &mut pending_checkpoint {
-                            Some(pending) => pending.update(event_global_seq, event_id),
-                            None => {
-                                pending_checkpoint =
-                                    Some(PendingCheckpoint::new(event_global_seq, event_id))
-                            }
-                        }
-                        if let Some(pending) = pending_checkpoint
-                            .take_if(|p| should_flush_checkpoint(p, &config.checkpoint_mode))
-                            && let Err(e) = flush_checkpoint(
-                                &pool,
-                                &config.events_table,
-                                &subscriber_id,
-                                &pending,
-                                &mut checkpoint_cache,
-                            )
-                            .await
-                        {
-                            error!(
-                                "Buffer processing: failed to flush checkpoint for '{}': {}",
-                                subscriber_id, e
-                            );
-                            // Re-insert pending checkpoint for retry
-                            pending_checkpoint = Some(pending);
-                        }
+                        // error path and the successful-processing path. Routes to the
+                        // in-memory HWM for a ReplayAlways subscriber (§4.5).
+                        record_catchup_progress(
+                            replay_always,
+                            &hwm,
+                            &subscriber_id,
+                            event_global_seq,
+                            event_id,
+                            &mut pending_checkpoint,
+                            &mut checkpoint_cache,
+                            &config,
+                            &pool,
+                        )
+                        .await;
 
                         current_sequence = event_global_seq;
                     }

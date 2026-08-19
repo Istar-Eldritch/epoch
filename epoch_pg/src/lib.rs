@@ -60,6 +60,7 @@ pub mod state_store;
 pub mod snapshot_store;
 
 pub use aggregate::*;
+pub use epoch_core::SubscriptionMode;
 pub use event_bus::{
     CheckpointMode, DispatchMode, DlqCallback, DlqEntry, DlqInsertionInfo, GapTimeoutCallback,
     GapTimeoutEntry, GapTimeoutInfo, InstanceMode, PgEventBus, PgEventBusError,
