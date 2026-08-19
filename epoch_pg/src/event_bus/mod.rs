@@ -992,8 +992,38 @@ where
 
         // R4: fold trigger creation into start_listener so an Async bus is never
         // left relying on the timer tick because setup_trigger was never called.
-        // Idempotent, so an explicit setup_trigger call remains harmless.
-        self.ensure_trigger().await?;
+        // Only create when absent (probed via trigger_exists) rather than
+        // unconditionally dropping and recreating: DROP TRIGGER takes an ACCESS
+        // EXCLUSIVE lock on the events table on every boot, and a fixed trigger
+        // name means a second bus on the same table would otherwise silently
+        // steal/rebind the first bus's trigger on every start_listener call.
+        // Never hard-fail here either: an app role without DDL rights (trigger
+        // created out-of-band by a migration/DBA) must still be able to start a
+        // listener — the periodic timer tick plus the R2 catch-up pass below keep
+        // delivery correct without it. The explicit setup_trigger() path below
+        // keeps the old unconditional drop+create, hard-failing on error, for a
+        // caller that deliberately wants to force a rebind.
+        match trigger_exists(&self.pool, &self.config.events_table).await {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(e) = self.ensure_trigger().await {
+                    warn!(
+                        "start_listener: failed to create NOTIFY trigger on '{}' \
+                         (continuing without it; delivery falls back to the periodic \
+                         timer tick and the startup catch-up pass): {}",
+                        self.config.events_table, e
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "start_listener: failed to check for an existing NOTIFY trigger on '{}' \
+                     (continuing; delivery falls back to the periodic timer tick and the \
+                     startup catch-up pass): {}",
+                    self.config.events_table, e
+                );
+            }
+        }
 
         let listener_pool = self.pool.clone();
         let checkpoint_pool = self.pool.clone();
@@ -1043,28 +1073,41 @@ where
             // tick. Transient DB errors are logged and retried on the next loop
             // iteration; the listener still starts (at-least-once discipline,
             // matching subscribe()).
-            {
+            //
+            // Snapshot the subscriber list and release the projections lock before
+            // awaiting the (potentially long) per-subscriber replay: holding the
+            // lock across it would block every other caller of subscribe_lag /
+            // wait_until_caught_up / wait_until_all_caught_up (which also lock
+            // projections) for the full duration of this pass, defeating their
+            // bounded `timeout`, and risks a deadlock if an observer's own
+            // `on_event` re-enters the bus. Mirrors fast_forward_all_subscribers.
+            let projections_snapshot: Vec<_> = {
                 let guard = projections.lock().await;
-                for projection in guard.iter() {
-                    let subscriber_id = {
-                        let obs = projection.lock().await;
-                        obs.subscriber_id().to_string()
-                    };
-                    if let Err(e) = catch_up_from_checkpoint(
-                        projection,
-                        &subscriber_id,
-                        &config,
-                        &checkpoint_pool,
-                        &hwm,
+                guard.iter().cloned().collect()
+            };
+            for projection in &projections_snapshot {
+                let (subscriber_id, replay_always) = {
+                    let obs = projection.lock().await;
+                    (
+                        obs.subscriber_id().to_string(),
+                        obs.subscription_mode() == SubscriptionMode::ReplayAlways,
                     )
-                    .await
-                    {
-                        warn!(
-                            "start_listener: initial catch-up for '{}' failed: {}; \
-                             the listener will retry on its next loop iteration",
-                            subscriber_id, e
-                        );
-                    }
+                };
+                if let Err(e) = catch_up_from_checkpoint(
+                    projection,
+                    &subscriber_id,
+                    replay_always,
+                    &config,
+                    &checkpoint_pool,
+                    &hwm,
+                )
+                .await
+                {
+                    warn!(
+                        "start_listener: initial catch-up for '{}' failed: {}; \
+                         the listener will retry on its next loop iteration",
+                        subscriber_id, e
+                    );
                 }
             }
 
@@ -1585,8 +1628,15 @@ where
         &self,
         subscriber_id: &str,
     ) -> Result<SubscriptionMode, PgEventBusError> {
-        let guard = self.projections.lock().await;
-        for obs in guard.iter() {
+        // Snapshot the observer list and release the projections lock before
+        // locking each observer's own mutex, so a slow or re-entrant observer
+        // doesn't hold up other callers of subscribe()/unsubscribe() for the
+        // whole scan.
+        let snapshot: Vec<_> = {
+            let guard = self.projections.lock().await;
+            guard.iter().cloned().collect()
+        };
+        for obs in &snapshot {
             let o = obs.lock().await;
             if o.subscriber_id() == subscriber_id {
                 return Ok(o.subscription_mode());
@@ -2450,9 +2500,14 @@ async fn record_catchup_progress(
 ///
 /// Returns the highest `global_sequence` reached. Shared by `subscribe` and the
 /// pre-loop pass in `start_listener` so the two catch-up paths cannot drift apart.
+///
+/// `replay_always` is resolved once by the caller (it reads the observer's own
+/// mutex) rather than re-derived here, so a single `subscribe()` call only
+/// resolves the subscription mode once.
 pub(crate) async fn catch_up_from_checkpoint<ED>(
     observer: &Arc<Mutex<dyn EventObserver<ED>>>,
     subscriber_id: &str,
+    replay_always: bool,
     config: &ReliableDeliveryConfig,
     pool: &PgPool,
     hwm: &Arc<Mutex<HashMap<String, u64>>>,
@@ -2463,9 +2518,6 @@ where
     // R5: a ReplayAlways subscriber ignores the persisted checkpoint and starts
     // from its surviving in-memory HWM, so a prior fast_forward-to-head does not
     // suppress replay.
-    let replay_always =
-        { observer.lock().await.subscription_mode() == SubscriptionMode::ReplayAlways };
-
     let last_sequence = if replay_always {
         hwm.lock().await.get(subscriber_id).copied().unwrap_or(0)
     } else {
@@ -2845,8 +2897,15 @@ where
             // Catch up from the persisted checkpoint. Reuses the same paginated,
             // retry/DLQ-backed pass that start_listener runs before entering its
             // loop (R2), so the two paths cannot drift.
-            let mut current_sequence =
-                catch_up_from_checkpoint(&observer, &subscriber_id, &config, &pool, &hwm).await?;
+            let mut current_sequence = catch_up_from_checkpoint(
+                &observer,
+                &subscriber_id,
+                replay_always,
+                &config,
+                &pool,
+                &hwm,
+            )
+            .await?;
 
             // Pending checkpoint / local cache for the buffer-drain phase below.
             let mut pending_checkpoint: Option<PendingCheckpoint> = None;
