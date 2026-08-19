@@ -1579,50 +1579,54 @@ where
         Ok(row.0.map(|v| v as u64))
     }
 
+    /// Returns the `SubscriptionMode` for `subscriber_id`, or
+    /// `SubscriberNotFound` if it is not registered.
+    async fn subscriber_mode(
+        &self,
+        subscriber_id: &str,
+    ) -> Result<SubscriptionMode, PgEventBusError> {
+        let guard = self.projections.lock().await;
+        for obs in guard.iter() {
+            let o = obs.lock().await;
+            if o.subscriber_id() == subscriber_id {
+                return Ok(o.subscription_mode());
+            }
+        }
+        Err(PgEventBusError::SubscriberNotFound(
+            subscriber_id.to_string(),
+        ))
+    }
+
+    /// Reads the current position for `subscriber_id` given its already-resolved
+    /// `mode`, without touching the projections registry.
+    async fn position_for_mode(
+        &self,
+        subscriber_id: &str,
+        mode: SubscriptionMode,
+    ) -> Result<u64, PgEventBusError> {
+        match mode {
+            SubscriptionMode::Checkpointed => {
+                Ok(self.get_checkpoint(subscriber_id).await?.unwrap_or(0))
+            }
+            SubscriptionMode::ReplayAlways => Ok(self
+                .hwm
+                .lock()
+                .await
+                .get(subscriber_id)
+                .copied()
+                .unwrap_or(0)),
+            _ => Ok(self.get_checkpoint(subscriber_id).await?.unwrap_or(0)),
+        }
+    }
+
     /// Resolves the current position of `subscriber_id`.
     ///
     /// - `Checkpointed` → DB checkpoint (0 if no row yet).
     /// - `ReplayAlways` → in-memory HWM (0 if not yet seeded).
     /// - Not registered → `Err(PgEventBusError::SubscriberNotFound)`.
     async fn subscriber_position(&self, subscriber_id: &str) -> Result<u64, PgEventBusError> {
-        // Look up the registered observer to determine subscription_mode.
-        let mode = {
-            let guard = self.projections.lock().await;
-            let mut found = None;
-            for obs in guard.iter() {
-                let o = obs.lock().await;
-                if o.subscriber_id() == subscriber_id {
-                    found = Some(o.subscription_mode());
-                    break;
-                }
-            }
-            found
-        };
-
-        let mode =
-            mode.ok_or_else(|| PgEventBusError::SubscriberNotFound(subscriber_id.to_string()))?;
-
-        match mode {
-            SubscriptionMode::Checkpointed => {
-                let pos = self.get_checkpoint(subscriber_id).await?.unwrap_or(0);
-                Ok(pos)
-            }
-            SubscriptionMode::ReplayAlways => {
-                let pos = self
-                    .hwm
-                    .lock()
-                    .await
-                    .get(subscriber_id)
-                    .copied()
-                    .unwrap_or(0);
-                Ok(pos)
-            }
-            _ => {
-                // Future modes default to checkpoint-based
-                let pos = self.get_checkpoint(subscriber_id).await?.unwrap_or(0);
-                Ok(pos)
-            }
-        }
+        let mode = self.subscriber_mode(subscriber_id).await?;
+        self.position_for_mode(subscriber_id, mode).await
     }
 
     /// Events this subscriber is behind the current head, for monitoring.
@@ -1665,9 +1669,10 @@ where
         subscriber_id: &str,
         timeout: Duration,
     ) -> Result<bool, PgEventBusError> {
-        // Validate subscriber first (Correction 4: fail with SubscriberNotFound
-        // even when the bus is empty, before reading head_sequence).
-        self.subscriber_position(subscriber_id).await?;
+        // Validate subscriber and resolve mode once (Correction 4: fail with
+        // SubscriberNotFound even when the bus is empty, before reading
+        // head_sequence). Mode can't change during the wait, so resolve once.
+        let mode = self.subscriber_mode(subscriber_id).await?;
 
         let target = match self.head_sequence().await? {
             Some(h) => h,
@@ -1676,7 +1681,7 @@ where
 
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let pos = self.subscriber_position(subscriber_id).await?;
+            let pos = self.position_for_mode(subscriber_id, mode).await?;
             if pos >= target {
                 return Ok(true);
             }
@@ -1702,25 +1707,27 @@ where
             None => return Ok(true), // empty bus — trivially caught up
         };
 
-        // Snapshot subscriber ids once (avoid holding projections lock in loop).
-        let subscriber_ids: Vec<String> = {
+        // Snapshot ids and modes once; mode can't change during the wait and
+        // this avoids a full registry scan on every 25 ms poll iteration.
+        let subscribers: Vec<(String, SubscriptionMode)> = {
             let guard = self.projections.lock().await;
-            let mut ids = Vec::with_capacity(guard.len());
+            let mut items = Vec::with_capacity(guard.len());
             for obs in guard.iter() {
-                ids.push(obs.lock().await.subscriber_id().to_string());
+                let o = obs.lock().await;
+                items.push((o.subscriber_id().to_string(), o.subscription_mode()));
             }
-            ids
+            items
         };
 
-        if subscriber_ids.is_empty() {
+        if subscribers.is_empty() {
             return Ok(true);
         }
 
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let mut all_caught_up = true;
-            for id in &subscriber_ids {
-                let pos = self.subscriber_position(id).await?;
+            for (id, mode) in &subscribers {
+                let pos = self.position_for_mode(id, *mode).await?;
                 if pos < target {
                     all_caught_up = false;
                     break;
