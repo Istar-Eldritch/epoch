@@ -52,6 +52,16 @@ impl EventApplicatorState for TestState {
     }
 }
 
+/// Single stable LISTEN channel for this binary's buses.
+///
+/// The NOTIFY trigger's name is derived from the channel, so a fresh random
+/// channel per test would leave a fresh trigger behind on the shared
+/// `epoch_events` table on every run: those accumulate, and every INSERT then
+/// fires all of them. A stable name keeps it at one trigger no matter how often
+/// the suite runs. Buses sharing a channel is harmless -- they already share the
+/// table, and each subscriber only processes events above its own checkpoint.
+const TEST_CHANNEL: &str = "test_channel_shared";
+
 struct TestProjection {
     state_store: InMemoryStateStore<TestState>,
     subscriber_id: String,
@@ -135,7 +145,7 @@ async fn setup() -> Option<(
         .expect("Failed to run migrations");
     common::truncate_epoch_tables(&pool).await;
 
-    let channel_name = format!("test_channel_{}", Uuid::new_v4().simple());
+    let channel_name = TEST_CHANNEL.to_string();
     let event_bus = PgEventBus::new(pool.clone(), channel_name);
     let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
 
@@ -887,7 +897,7 @@ async fn test_catchup_with_batching() {
         catch_up_batch_size: 5, // Small batch size
         ..Default::default()
     };
-    let channel_name = format!("test_batch_channel_{}", Uuid::new_v4().simple());
+    let channel_name = "test_batch_channel".to_string();
     let event_bus_batched =
         epoch_pg::event_bus::PgEventBus::with_config(pool.clone(), channel_name, config);
 
@@ -1200,7 +1210,7 @@ async fn test_coordinated_mode_acquires_lock_on_subscribe() {
         instance_mode: epoch_pg::event_bus::InstanceMode::Coordinated,
         ..Default::default()
     };
-    let channel_name = format!("test_coord_channel_{}", Uuid::new_v4().simple());
+    let channel_name = "test_coord_channel".to_string();
     let event_bus: PgEventBus<TestEventData> =
         epoch_pg::event_bus::PgEventBus::with_config(pool.clone(), channel_name, config);
 
@@ -1293,7 +1303,7 @@ async fn test_coordinated_mode_skips_subscribe_if_lock_held() {
         instance_mode: epoch_pg::event_bus::InstanceMode::Coordinated,
         ..Default::default()
     };
-    let channel_name = format!("test_coord_skip_channel_{}", Uuid::new_v4().simple());
+    let channel_name = "test_coord_skip_channel".to_string();
     let event_bus: PgEventBus<TestEventData> =
         epoch_pg::event_bus::PgEventBus::with_config(pool.clone(), channel_name, config);
 
@@ -1379,7 +1389,7 @@ async fn test_coordinated_mode_allows_different_subscribers_on_same_instance() {
         instance_mode: epoch_pg::event_bus::InstanceMode::Coordinated,
         ..Default::default()
     };
-    let channel_name = format!("test_coord_multi_channel_{}", Uuid::new_v4().simple());
+    let channel_name = "test_coord_multi_channel".to_string();
     let event_bus: PgEventBus<TestEventData> =
         epoch_pg::event_bus::PgEventBus::with_config(pool.clone(), channel_name, config);
     let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
@@ -1466,7 +1476,7 @@ async fn test_batched_checkpoint_flushes_at_batch_size() {
         ..Default::default()
     };
 
-    let channel_name = format!("test_batched_bs_{}", Uuid::new_v4().simple());
+    let channel_name = "test_batched_bs".to_string();
     let event_bus =
         epoch_pg::event_bus::PgEventBus::with_config(pool.clone(), channel_name, config);
 
@@ -1555,7 +1565,7 @@ async fn test_batched_checkpoint_flushes_at_max_delay() {
         ..Default::default()
     };
 
-    let channel_name = format!("test_batched_delay_{}", Uuid::new_v4().simple());
+    let channel_name = "test_batched_delay".to_string();
     let event_bus =
         epoch_pg::event_bus::PgEventBus::with_config(pool.clone(), channel_name, config);
 
@@ -1626,7 +1636,7 @@ async fn test_batched_checkpoint_during_catchup() {
     common::truncate_epoch_tables(&pool).await;
 
     // First, store some events before subscribing (these will be caught up)
-    let channel_name = format!("test_batched_catchup_{}", Uuid::new_v4().simple());
+    let channel_name = "test_batched_catchup".to_string();
 
     // Use a separate event bus just for storing events (with default config)
     let store_bus = epoch_pg::event_bus::PgEventBus::new(pool.clone(), channel_name.clone());
@@ -1721,7 +1731,7 @@ async fn test_synchronous_checkpoint_still_works() {
         ..Default::default()
     };
 
-    let channel_name = format!("test_sync_checkpoint_{}", Uuid::new_v4().simple());
+    let channel_name = "test_sync_checkpoint".to_string();
     let event_bus =
         epoch_pg::event_bus::PgEventBus::with_config(pool.clone(), channel_name, config);
 
@@ -1784,7 +1794,7 @@ async fn setup_without_listener() -> Option<(PgPool, PgEventBus<TestEventData>)>
         .expect("Failed to run migrations");
     common::truncate_epoch_tables(&pool).await;
 
-    let channel_name = format!("test_channel_{}", Uuid::new_v4().simple());
+    let channel_name = TEST_CHANNEL.to_string();
     let event_bus = PgEventBus::new(pool.clone(), channel_name);
 
     Some((pool, event_bus))
@@ -1931,7 +1941,7 @@ async fn test_shutdown_flushes_batched_checkpoints() {
         ..Default::default()
     };
 
-    let channel_name = format!("test_shutdown_flush_{}", Uuid::new_v4().simple());
+    let channel_name = "test_shutdown_flush".to_string();
     let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
     let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
 
@@ -2189,7 +2199,7 @@ async fn test_rolled_back_transaction_gap_resolved() {
         gap_timeout: std::time::Duration::from_secs(1),
         ..Default::default()
     };
-    let channel_name = format!("test_gap_resolve_{}", Uuid::new_v4().simple());
+    let channel_name = "test_gap_resolve".to_string();
     let event_bus = epoch_pg::event_bus::PgEventBus::<TestEventData>::with_config(
         pool.clone(),
         channel_name,
@@ -2558,7 +2568,7 @@ async fn test_batched_checkpoint_with_gap_tracking() {
         ..Default::default()
     };
 
-    let channel_name = format!("test_batched_gap_{}", Uuid::new_v4().simple());
+    let channel_name = "test_batched_gap".to_string();
     let event_bus = epoch_pg::event_bus::PgEventBus::<TestEventData>::with_config(
         pool.clone(),
         channel_name,
@@ -2756,7 +2766,7 @@ async fn test_graceful_shutdown_flushes_subscriber_states() {
         ..Default::default()
     };
 
-    let channel_name = format!("test_shutdown_states_{}", Uuid::new_v4().simple());
+    let channel_name = "test_shutdown_states".to_string();
     let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
     let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
 
@@ -2909,7 +2919,7 @@ async fn start_gap_test_bus(
     // timeout-only path. The fence-aware behaviour is covered separately by the
     // dedicated CLOUD-180 integration tests.
     config.snapshot_fencing = false;
-    let channel_name = format!("test_gap_obs_{}", Uuid::new_v4().simple());
+    let channel_name = "test_gap_obs".to_string();
     let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
     event_bus
         .setup_trigger()
@@ -3456,7 +3466,7 @@ async fn test_buffer_drain_pagination_processes_all_events() {
         catch_up_batch_size: 3,
         ..Default::default()
     };
-    let channel_name = format!("test_drain_page_{}", Uuid::new_v4().simple());
+    let channel_name = "test_drain_page".to_string();
     let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
     event_bus.setup_trigger().await.expect("setup trigger");
     event_bus.start_listener().await.expect("start listener");
@@ -3560,7 +3570,7 @@ async fn test_buffer_drain_deser_error_advances_checkpoint() {
         catch_up_batch_size: 2,
         ..Default::default()
     };
-    let channel_name = format!("test_drain_deser_{}", Uuid::new_v4().simple());
+    let channel_name = "test_drain_deser".to_string();
     let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
     event_bus.setup_trigger().await.expect("setup trigger");
     event_bus.start_listener().await.expect("start listener");
@@ -3731,7 +3741,7 @@ async fn start_fence_test_bus(
     String,
     InMemoryStateStore<TestState>,
 ) {
-    let channel_name = format!("test_fence_{}", Uuid::new_v4().simple());
+    let channel_name = "test_fence".to_string();
     let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
     event_bus
         .setup_trigger()
@@ -4409,7 +4419,7 @@ async fn test_subscribe_warns_when_trigger_absent() {
         .expect("Failed to run migrations");
     common::truncate_epoch_tables(&pool).await;
 
-    let channel_name = format!("test_channel_{}", Uuid::new_v4().simple());
+    let channel_name = TEST_CHANNEL.to_string();
     let event_bus = PgEventBus::new(pool.clone(), channel_name);
 
     // A freshly migrated database never had the trigger created on it (no
@@ -5009,7 +5019,7 @@ async fn test_readiness_inline_dispatch_errors() {
         .expect("Failed to run migrations");
     common::truncate_epoch_tables(&pool).await;
 
-    let channel_name = format!("test_channel_{}", Uuid::new_v4().simple());
+    let channel_name = TEST_CHANNEL.to_string();
     let config = ReliableDeliveryConfig {
         dispatch_mode: DispatchMode::Inline,
         ..Default::default()
@@ -5157,11 +5167,13 @@ async fn test_wait_until_all_caught_up_gates_every_subscriber() {
         !all_caught_up,
         "must be false while subscriber B is still blocked on the gate"
     );
-    assert_eq!(
-        event_bus.subscriber_lag(&sub_a).await.expect("lag A"),
-        0,
-        "subscriber A should already be caught up even while B is gated"
-    );
+    // A's own position is deliberately NOT asserted here. Subscribers in a
+    // priority group are processed together under one `join_all`, so the batch
+    // loop cannot start the next batch until every subscriber in the group
+    // finishes: while B is gated, A can only be as far as the last batch that
+    // completed, which depends on how the writes happened to be split across
+    // NOTIFY wakeups. Asserting `lag(A) == 0` here passes or fails on that
+    // timing, not on the behaviour under test.
 
     // Release B; both must now be reported caught up.
     released.store(true, std::sync::atomic::Ordering::Release);
@@ -5420,14 +5432,14 @@ async fn test_second_bus_on_same_table_gets_its_own_trigger() {
     common::truncate_epoch_tables(&pool).await;
 
     // Two independent buses on the same events table, each with its own channel.
-    let first_channel = format!("test_channel_{}", Uuid::new_v4().simple());
+    let first_channel = format!("{TEST_CHANNEL}_multibus_a");
     let first_bus: PgEventBus<TestEventData> = PgEventBus::new(pool.clone(), first_channel.clone());
     first_bus
         .start_listener()
         .await
         .expect("first start_listener failed");
 
-    let second_channel = format!("test_channel_{}", Uuid::new_v4().simple());
+    let second_channel = format!("{TEST_CHANNEL}_multibus_b");
     let second_bus: PgEventBus<TestEventData> =
         PgEventBus::new(pool.clone(), second_channel.clone());
 
