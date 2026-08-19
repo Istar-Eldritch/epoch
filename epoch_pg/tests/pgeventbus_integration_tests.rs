@@ -4704,3 +4704,247 @@ async fn test_replay_always_listener_restart_from_hwm() {
 
     event_bus.shutdown().await.expect("Failed to shutdown");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4 — R1 lag / readiness (R-1, R-6)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn test_subscriber_lag_reports_behind() {
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    let subscriber_id = format!("projection:lag:{}", Uuid::new_v4());
+    let projection = TestProjection::with_subscriber_id(subscriber_id.clone());
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+
+    // Write N events without a running listener so the checkpoint stays at 0.
+    let stream_id = Uuid::new_v4();
+    let n = 5u64;
+    for v in 1..=n {
+        event_store
+            .store_event(new_event(stream_id, v, &format!("e{v}")))
+            .await
+            .expect("store_event failed");
+    }
+
+    let lag = event_bus
+        .subscriber_lag(&subscriber_id)
+        .await
+        .expect("subscriber_lag failed");
+    assert!(
+        lag >= n,
+        "subscriber should be behind by at least {n} events, got lag={lag}"
+    );
+
+    // Start the listener and wait for catch-up.
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("setup_trigger failed");
+    event_bus
+        .start_listener()
+        .await
+        .expect("start_listener failed");
+
+    // R2 ensures catch-up runs before the loop, so lag should resolve quickly.
+    let caught_up = event_bus
+        .wait_until_caught_up(&subscriber_id, tokio::time::Duration::from_secs(3))
+        .await
+        .expect("wait_until_caught_up failed");
+    assert!(
+        caught_up,
+        "subscriber should be caught up after listener start"
+    );
+
+    let lag_after = event_bus
+        .subscriber_lag(&subscriber_id)
+        .await
+        .expect("subscriber_lag after catch-up failed");
+    assert_eq!(lag_after, 0, "lag should be 0 after catch-up");
+
+    event_bus.shutdown().await.expect("shutdown failed");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_wait_until_caught_up_gates_on_head() {
+    // Subscribe, then write events; wait_until_caught_up returns true well
+    // under 1 s (proves R2 removed the flush_interval tick cost).
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    let subscriber_id = format!("projection:catchup:{}", Uuid::new_v4());
+    let projection = TestProjection::with_subscriber_id(subscriber_id.clone());
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("setup_trigger failed");
+    event_bus
+        .start_listener()
+        .await
+        .expect("start_listener failed");
+
+    let stream_id = Uuid::new_v4();
+    for v in 1..=3u64 {
+        event_store
+            .store_event(new_event(stream_id, v, &format!("e{v}")))
+            .await
+            .expect("store_event failed");
+    }
+
+    let start = std::time::Instant::now();
+    let caught_up = event_bus
+        .wait_until_caught_up(&subscriber_id, tokio::time::Duration::from_secs(3))
+        .await
+        .expect("wait_until_caught_up failed");
+    let elapsed = start.elapsed();
+
+    assert!(caught_up, "subscriber should be caught up");
+    assert!(
+        elapsed.as_millis() < 1000,
+        "wait_until_caught_up took {}ms, expected < 1000ms (R2 should have removed flush_interval cost)",
+        elapsed.as_millis()
+    );
+
+    event_bus.shutdown().await.expect("shutdown failed");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_wait_until_caught_up_times_out() {
+    // Without a listener the checkpoint never advances; the call must return
+    // Ok(false) at timeout, not hang.
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    let subscriber_id = format!("projection:timeout:{}", Uuid::new_v4());
+    let projection = TestProjection::with_subscriber_id(subscriber_id.clone());
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+
+    let stream_id = Uuid::new_v4();
+    event_store
+        .store_event(new_event(stream_id, 1, "stuck"))
+        .await
+        .expect("store_event failed");
+
+    // Short timeout; listener is not running so position stays at 0.
+    let start = std::time::Instant::now();
+    let result = event_bus
+        .wait_until_caught_up(&subscriber_id, tokio::time::Duration::from_millis(200))
+        .await
+        .expect("wait_until_caught_up should not error");
+    let elapsed = start.elapsed();
+
+    assert!(
+        !result,
+        "should time out (position never advances without listener)"
+    );
+    // Should return around the timeout, not much later.
+    assert!(
+        elapsed.as_millis() < 2000,
+        "timed out too late: {}ms",
+        elapsed.as_millis()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_replay_always_readiness_via_hwm() {
+    // A ReplayAlways subscriber's lag / wait_until_caught_up resolve via the
+    // in-memory HWM, never via the checkpoint table (R-6).
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+    let event_store = PgEventStore::new(pool.clone(), event_bus.clone());
+
+    let stream_id = Uuid::new_v4();
+    let n = 4u64;
+    for v in 1..=n {
+        event_store
+            .store_event(new_event(stream_id, v, &format!("e{v}")))
+            .await
+            .expect("store_event failed");
+    }
+
+    let subscriber_id = format!("projection:replay-ready:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(subscriber_id.clone());
+    // subscribe() triggers a catch-up pass, so the HWM is advanced to head.
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+
+    // After subscribe, the HWM should have been advanced during catch-up.
+    let lag = event_bus
+        .subscriber_lag(&subscriber_id)
+        .await
+        .expect("subscriber_lag failed");
+    assert_eq!(
+        lag, 0,
+        "ReplayAlways lag should be 0 after subscribe catch-up (HWM at head)"
+    );
+
+    let caught_up = event_bus
+        .wait_until_caught_up(&subscriber_id, tokio::time::Duration::from_millis(500))
+        .await
+        .expect("wait_until_caught_up failed");
+    assert!(
+        caught_up,
+        "ReplayAlways subscriber should be caught up immediately after subscribe"
+    );
+
+    // Confirm no checkpoint row was written (the position is purely HWM-based).
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("get_checkpoint failed");
+    assert!(
+        checkpoint.is_none(),
+        "ReplayAlways subscriber must not write a checkpoint row"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_readiness_unknown_subscriber_errors() {
+    use epoch_pg::PgEventBusError;
+
+    let Some((_pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+
+    let nonexistent = format!("projection:ghost:{}", Uuid::new_v4());
+
+    let lag_result = event_bus.subscriber_lag(&nonexistent).await;
+    assert!(
+        matches!(lag_result, Err(PgEventBusError::SubscriberNotFound(_))),
+        "subscriber_lag for unknown id must return SubscriberNotFound, got: {lag_result:?}"
+    );
+
+    let wait_result = event_bus
+        .wait_until_caught_up(&nonexistent, tokio::time::Duration::from_millis(100))
+        .await;
+    assert!(
+        matches!(wait_result, Err(PgEventBusError::SubscriberNotFound(_))),
+        "wait_until_caught_up for unknown id must return SubscriberNotFound, got: {wait_result:?}"
+    );
+}

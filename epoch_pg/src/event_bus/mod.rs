@@ -585,6 +585,14 @@ pub enum PgEventBusError {
     /// returned from `on_event`.
     #[error("Inline subscriber dispatch failed: {0}")]
     InlineDispatchError(Box<dyn std::error::Error + Send + Sync>),
+    /// The requested subscriber id is not registered on this bus.
+    /// Returned by readiness methods when the caller passes an id that has
+    /// not been registered via [`PgEventBus::subscribe`].  Silently falling
+    /// back to a checkpoint read would yield a false-ready for a
+    /// [`SubscriptionMode::ReplayAlways`] subscriber whose checkpoint was
+    /// fast-forwarded to head (Correction 4).
+    #[error("subscriber '{0}' is not registered on this bus")]
+    SubscriberNotFound(String),
 }
 
 /// Type alias for the projections collection to reduce type complexity.
@@ -727,6 +735,11 @@ where
     /// `subscribe`, the listener task, and readiness queries observe the same value.
     hwm: Arc<Mutex<HashMap<String, u64>>>,
 }
+
+/// Poll cadence for `wait_until_caught_up` / `wait_until_all_caught_up`.
+/// Shorter than the 1 s `flush_interval` so the gate resolves as soon as
+/// processing completes rather than on the next timer tick.
+pub(crate) const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 impl<D> PgEventBus<D>
 where
@@ -1542,6 +1555,185 @@ where
         .await?;
 
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // R1 — Subscriber lag / readiness
+    // -------------------------------------------------------------------------
+
+    /// The highest `global_sequence` currently present on this bus's events
+    /// table, or `None` if the table is empty.
+    ///
+    /// Note: with non-transactional `nextval` (spec 0019) the head may be a
+    /// burned/in-flight value that never becomes visible; readiness treats such
+    /// a tail via the gap backstop (§7.2).
+    pub async fn head_sequence(&self) -> Result<Option<u64>, SqlxError> {
+        // `SELECT MAX(...)` always returns exactly one row (NULL when the
+        // table is empty), so use fetch_one with Option<i64>.
+        let row: (Option<i64>,) = sqlx::query_as(&format!(
+            "SELECT MAX(global_sequence) FROM {}",
+            self.config.events_table,
+        ))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0.map(|v| v as u64))
+    }
+
+    /// Resolves the current position of `subscriber_id`.
+    ///
+    /// - `Checkpointed` → DB checkpoint (0 if no row yet).
+    /// - `ReplayAlways` → in-memory HWM (0 if not yet seeded).
+    /// - Not registered → `Err(PgEventBusError::SubscriberNotFound)`.
+    async fn subscriber_position(&self, subscriber_id: &str) -> Result<u64, PgEventBusError> {
+        // Look up the registered observer to determine subscription_mode.
+        let mode = {
+            let guard = self.projections.lock().await;
+            let mut found = None;
+            for obs in guard.iter() {
+                let o = obs.lock().await;
+                if o.subscriber_id() == subscriber_id {
+                    found = Some(o.subscription_mode());
+                    break;
+                }
+            }
+            found
+        };
+
+        let mode =
+            mode.ok_or_else(|| PgEventBusError::SubscriberNotFound(subscriber_id.to_string()))?;
+
+        match mode {
+            SubscriptionMode::Checkpointed => {
+                let pos = self.get_checkpoint(subscriber_id).await?.unwrap_or(0);
+                Ok(pos)
+            }
+            SubscriptionMode::ReplayAlways => {
+                let pos = self
+                    .hwm
+                    .lock()
+                    .await
+                    .get(subscriber_id)
+                    .copied()
+                    .unwrap_or(0);
+                Ok(pos)
+            }
+            _ => {
+                // Future modes default to checkpoint-based
+                let pos = self.get_checkpoint(subscriber_id).await?.unwrap_or(0);
+                Ok(pos)
+            }
+        }
+    }
+
+    /// Events this subscriber is behind the current head, for monitoring.
+    ///
+    /// `head − position`, saturating at 0. `position` is the persisted
+    /// checkpoint for a [`SubscriptionMode::Checkpointed`] subscriber, or the
+    /// in-memory high-water mark for a [`SubscriptionMode::ReplayAlways`] one.
+    /// Point-in-time; the head may move under a cascade.
+    ///
+    /// Returns [`PgEventBusError::SubscriberNotFound`] if `subscriber_id` is
+    /// not registered on this bus.
+    pub async fn subscriber_lag(&self, subscriber_id: &str) -> Result<u64, PgEventBusError> {
+        // Validate subscriber first so unknown ids get SubscriberNotFound
+        // even when the bus has no events (Correction 4).
+        let pos = self.subscriber_position(subscriber_id).await?;
+        let head = self.head_sequence().await?.unwrap_or(0);
+        Ok(head.saturating_sub(pos))
+    }
+
+    /// Awaits until `subscriber_id` has processed every event up to the head
+    /// observed **at call time** (`target = head_sequence()`), or `timeout`
+    /// elapses.
+    ///
+    /// Snapshots `target` once and polls `position >= target`; it deliberately
+    /// does NOT chase a head that grows during the wait (cross-bus convergence
+    /// is spec 0025's concern). Returns `Ok(true)` if caught up, `Ok(false)`
+    /// on timeout.
+    ///
+    /// # Hazard: this is a LOCAL readiness check
+    /// This gates only *this* subscriber against *this* bus's head at call
+    /// time. It is **unsafe as a startup gate for any consumer whose sagas
+    /// cascade across buses**: a subscriber can be "caught up" to the current
+    /// head while an upstream saga on another bus is still about to extend it.
+    /// Cross-bus readiness needs the fixed-point gate in **spec 0025**.
+    ///
+    /// Returns [`PgEventBusError::SubscriberNotFound`] if `subscriber_id` is
+    /// not registered on this bus.
+    pub async fn wait_until_caught_up(
+        &self,
+        subscriber_id: &str,
+        timeout: Duration,
+    ) -> Result<bool, PgEventBusError> {
+        // Validate subscriber first (Correction 4: fail with SubscriberNotFound
+        // even when the bus is empty, before reading head_sequence).
+        self.subscriber_position(subscriber_id).await?;
+
+        let target = match self.head_sequence().await? {
+            Some(h) => h,
+            None => return Ok(true), // empty bus — trivially caught up
+        };
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let pos = self.subscriber_position(subscriber_id).await?;
+            if pos >= target {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            sleep(READINESS_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Bus-wide variant: [`wait_until_caught_up`][Self::wait_until_caught_up]
+    /// for every registered subscriber against a single head snapshot taken at
+    /// call time, under one shared timeout.
+    ///
+    /// Returns `Ok(true)` only if **all** registered subscribers are caught up
+    /// before the timeout, `Ok(false)` otherwise.
+    pub async fn wait_until_all_caught_up(
+        &self,
+        timeout: Duration,
+    ) -> Result<bool, PgEventBusError> {
+        let target = match self.head_sequence().await? {
+            Some(h) => h,
+            None => return Ok(true), // empty bus — trivially caught up
+        };
+
+        // Snapshot subscriber ids once (avoid holding projections lock in loop).
+        let subscriber_ids: Vec<String> = {
+            let guard = self.projections.lock().await;
+            let mut ids = Vec::with_capacity(guard.len());
+            for obs in guard.iter() {
+                ids.push(obs.lock().await.subscriber_id().to_string());
+            }
+            ids
+        };
+
+        if subscriber_ids.is_empty() {
+            return Ok(true);
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let mut all_caught_up = true;
+            for id in &subscriber_ids {
+                let pos = self.subscriber_position(id).await?;
+                if pos < target {
+                    all_caught_up = false;
+                    break;
+                }
+            }
+            if all_caught_up {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            sleep(READINESS_POLL_INTERVAL).await;
+        }
     }
 
     /// Fast-forwards every currently-registered subscriber's checkpoint to the
