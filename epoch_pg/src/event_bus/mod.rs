@@ -3496,4 +3496,412 @@ mod tests {
         assert_eq!(entry.bus_name, cloned.bus_name);
         assert_eq!(entry.skipped_sequence, cloned.skipped_sequence);
     }
+
+    // =========================================================================
+    // Contiguous-prefix unit tests (Phase 3, spec 0026)
+    // =========================================================================
+    //
+    // These tests exercise `catch_up_from_checkpoint` directly, so they need a
+    // real database. They do NOT hold transactions across sleep() calls; all
+    // "holes" are either an open (but not yet rolled-back/committed) transaction
+    // on the same Tokio task, or a permanently rolled-back sequence consumed
+    // by `create_permanent_hole`. Each test gets a unique subscriber ID to stay
+    // independent of every other concurrently-running test.
+
+    /// Minimal event type used only inside these unit tests.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct CuTestEvent {
+        v: u32,
+    }
+    impl epoch_core::event::EventData for CuTestEvent {
+        fn event_type(&self) -> &'static str {
+            "CuTestEvent"
+        }
+    }
+
+    /// A noop observer that satisfies `EventObserver<CuTestEvent>` but does
+    /// nothing with the events.
+    struct CuNoop {
+        id: String,
+        mode: SubscriptionMode,
+    }
+    impl epoch_core::SubscriberId for CuNoop {
+        fn subscriber_id(&self) -> &str {
+            &self.id
+        }
+    }
+    #[async_trait::async_trait]
+    impl EventObserver<CuTestEvent> for CuNoop {
+        async fn on_event(
+            &self,
+            _event: Arc<Event<CuTestEvent>>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn subscription_mode(&self) -> SubscriptionMode {
+            self.mode
+        }
+    }
+
+    /// Returns a pool connected to the test database, with all migrations run.
+    /// Returns `None` when the database is unreachable (CI without Postgres
+    /// skips gracefully; set `EPOCH_REQUIRE_DB=1` to make unavailability fail).
+    async fn cu_pool() -> Option<PgPool> {
+        // Load epoch_pg/.env if present (mirrors common::try_get_pg_pool).
+        let env_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
+        dotenvy::from_path(env_path).ok();
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:postgres@localhost:5432/epoch_pg_test".to_string()
+        });
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(&url)
+            .await
+            .ok();
+        match pool {
+            None => {
+                if std::env::var("EPOCH_REQUIRE_DB").is_ok_and(|v| v == "1") {
+                    panic!("EPOCH_REQUIRE_DB=1 but Postgres is unreachable");
+                }
+                None
+            }
+            Some(p) => {
+                crate::Migrator::new(p.clone())
+                    .run()
+                    .await
+                    .expect("migration failed");
+                Some(p)
+            }
+        }
+    }
+
+    fn cu_observer(
+        sub_id: String,
+        mode: SubscriptionMode,
+    ) -> Arc<Mutex<dyn EventObserver<CuTestEvent>>> {
+        Arc::new(Mutex::new(CuNoop { id: sub_id, mode }))
+    }
+
+    fn cu_config(batch_size: u32) -> ReliableDeliveryConfig {
+        ReliableDeliveryConfig {
+            catch_up_batch_size: batch_size,
+            ..Default::default()
+        }
+    }
+
+    async fn cu_insert(pool: &PgPool, stream_id: Uuid, version: i64) -> (Uuid, i64) {
+        let id = Uuid::new_v4();
+        let data = serde_json::to_value(CuTestEvent { v: version as u32 }).unwrap();
+        let seq: i64 = sqlx::query_scalar(
+            r#"INSERT INTO epoch_events
+                   (id, stream_id, stream_version, event_type, data, created_at)
+               VALUES ($1, $2, $3, 'CuTestEvent', $4, NOW())
+               RETURNING global_sequence"#,
+        )
+        .bind(id)
+        .bind(stream_id)
+        .bind(version)
+        .bind(&data)
+        .fetch_one(pool)
+        .await
+        .expect("cu_insert");
+        (id, seq)
+    }
+
+    async fn cu_read_checkpoint(pool: &PgPool, sub_id: &str) -> Option<(u64, Uuid)> {
+        sqlx::query_as::<_, (i64, Uuid)>(
+            "SELECT last_global_sequence, last_event_id \
+             FROM epoch_event_bus_checkpoints \
+             WHERE bus_name = 'epoch_events' AND subscriber_id = $1",
+        )
+        .bind(sub_id)
+        .fetch_optional(pool)
+        .await
+        .expect("cu_read_checkpoint")
+        .map(|(seq, id)| (seq as u64, id))
+    }
+
+    /// Pre-sets the persisted checkpoint for a subscriber so that
+    /// `catch_up_from_checkpoint` starts from `seq` rather than 0.
+    /// Using `s1 - 1` isolates a test from older events in the shared table.
+    async fn cu_set_checkpoint(pool: &PgPool, sub_id: &str, seq: u64) {
+        sqlx::query(
+            "INSERT INTO epoch_event_bus_checkpoints \
+             (bus_name, subscriber_id, last_global_sequence, last_event_id, updated_at) \
+             VALUES ('epoch_events', $1, $2, $3, NOW()) \
+             ON CONFLICT (bus_name, subscriber_id) DO UPDATE SET \
+                 last_global_sequence = EXCLUDED.last_global_sequence, \
+                 last_event_id = EXCLUDED.last_event_id, \
+                 updated_at = NOW()",
+        )
+        .bind(sub_id)
+        .bind(seq as i64)
+        .bind(Uuid::nil())
+        .execute(pool)
+        .await
+        .expect("cu_set_checkpoint");
+    }
+
+    /// Verifies R4: `last_event_id` in the checkpoint row corresponds to the
+    /// event that actually sits at `last_global_sequence` in the events table.
+    /// Robust to interleaving: looks up the event by seq instead of comparing
+    /// a hard-coded id captured before the pass.
+    async fn cu_assert_r4(pool: &PgPool, sub_id: &str) {
+        let Some((cp_seq, cp_id)) = cu_read_checkpoint(pool, sub_id).await else {
+            return;
+        };
+        let db_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM epoch_events WHERE global_sequence = $1")
+                .bind(cp_seq as i64)
+                .fetch_one(pool)
+                .await
+                .expect("event at checkpoint seq must exist for R4 check");
+        assert_eq!(
+            cp_id, db_id,
+            "R4: last_event_id must correspond to last_global_sequence"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 1: hole stops the contiguous prefix, cursor still reaches head (R1, R3)
+    //
+    // Pre-sets the checkpoint to s1-1 so the pass sees only this test's events,
+    // isolating it from accumulated events left by previous runs or concurrent
+    // integration-test binaries that share the same epoch_events table.
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn catchup_prefix_stops_at_hole() {
+        let Some(pool) = cu_pool().await else {
+            return;
+        };
+        let stream_id = Uuid::new_v4();
+        let sub_id = format!("test:cu_hole:{}", Uuid::new_v4());
+        let config = cu_config(100);
+        let hwm = Arc::new(Mutex::new(HashMap::new()));
+        let observer = cu_observer(sub_id.clone(), SubscriptionMode::Checkpointed);
+
+        let (_, s1) = cu_insert(&pool, stream_id, 1).await;
+        // Anchor the catch-up pass to start just before our first event.
+        cu_set_checkpoint(&pool, &sub_id, s1 as u64 - 1).await;
+        let (id2, s2) = cu_insert(&pool, stream_id, 2).await;
+
+        // Hold s3 in an open (uncommitted) transaction — invisible to other
+        // connections under READ COMMITTED.
+        let mut hole_tx = pool.begin().await.expect("begin hole tx");
+        let hole_data = serde_json::to_value(CuTestEvent { v: 3 }).unwrap();
+        let s3: i64 = sqlx::query_scalar(
+            r#"INSERT INTO epoch_events
+                   (id, stream_id, stream_version, event_type, data, created_at)
+               VALUES ($1, $2, 3, 'CuTestEvent', $3, NOW())
+               RETURNING global_sequence"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(stream_id)
+        .bind(&hole_data)
+        .fetch_one(&mut *hole_tx)
+        .await
+        .expect("insert held event");
+
+        let (_, s4) = cu_insert(&pool, stream_id, 4).await;
+        let (_, s5) = cu_insert(&pool, stream_id, 5).await;
+
+        // Run catch-up while s3 is invisible.
+        let (cursor, contiguous) =
+            catch_up_from_checkpoint(&observer, &sub_id, false, &config, &pool, &hwm)
+                .await
+                .expect("catch_up_from_checkpoint");
+
+        // Commit fills the sequence slot — no permanent gap in the shared
+        // table after this test. The assertions are about the values already
+        // captured; a post-fact commit does not retroactively invalidate them.
+        hole_tx.commit().await.expect("commit hole");
+
+        // Prefix must stop before the hole. Another concurrent process could
+        // have inserted at seqs between s2 and s3 (extending the contiguous run)
+        // but the prefix must never cross s3. Using < rather than == is robust
+        // to that interleaving while still enforcing R1.
+        assert!(
+            contiguous < s3 as u64,
+            "prefix (={contiguous}) must stop below the hole (={s3})"
+        );
+        assert!(cursor >= s5 as u64, "cursor must reach at least s5");
+        assert!(s3 > s2 && s3 < s4, "sequence ordering sanity check");
+
+        // Persisted checkpoint must be below the hole (R1) with a matching
+        // event_id (R4). id2 is the exact id only when no concurrent insertion
+        // extended the contiguous run past s2; R4 is verified via DB lookup.
+        let cp = cu_read_checkpoint(&pool, &sub_id).await;
+        assert!(
+            cp.is_some_and(|(seq, _)| seq < s3 as u64),
+            "checkpoint must not cross the hole"
+        );
+        cu_assert_r4(&pool, &sub_id).await;
+        let _ = (s1, id2);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 2: hole on a non-final page — prefix does NOT resume after page turn
+    //
+    // The hole is permanent (immediately rolled back). batch_size=2 means the
+    // hole falls on the boundary between pages, proving the prefix counter
+    // survives a page transition without restarting.
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn catchup_multi_page_hole_prefix_does_not_resume() {
+        let Some(pool) = cu_pool().await else {
+            return;
+        };
+        let stream_id = Uuid::new_v4();
+        let sub_id = format!("test:cu_multipage:{}", Uuid::new_v4());
+        // batch_size=2: page 1 = [s1,s2], hole at s3, page 2 = [s4,s5]
+        let config = cu_config(2);
+        let hwm = Arc::new(Mutex::new(HashMap::new()));
+        let observer = cu_observer(sub_id.clone(), SubscriptionMode::Checkpointed);
+
+        let (_, s1) = cu_insert(&pool, stream_id, 1).await;
+        cu_set_checkpoint(&pool, &sub_id, s1 as u64 - 1).await;
+        let (id2, s2) = cu_insert(&pool, stream_id, 2).await;
+
+        // Hold s3 in an open transaction (invisible to other connections
+        // under READ COMMITTED). Committed after assertions to avoid leaving
+        // a permanent hole in the shared table.
+        let mut hole_tx = pool.begin().await.expect("begin hole tx");
+        let hole_data = serde_json::to_value(CuTestEvent { v: 3 }).unwrap();
+        let s3: i64 = sqlx::query_scalar(
+            r#"INSERT INTO epoch_events
+                   (id, stream_id, stream_version, event_type, data, created_at)
+               VALUES ($1, $2, 3, 'CuTestEvent', $3, NOW())
+               RETURNING global_sequence"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(stream_id)
+        .bind(&hole_data)
+        .fetch_one(&mut *hole_tx)
+        .await
+        .expect("insert hole event");
+
+        // Events on the second page (s3 still invisible during catch-up).
+        let (_, s4) = cu_insert(&pool, stream_id, 4).await;
+        let (_, s5) = cu_insert(&pool, stream_id, 5).await;
+
+        let (cursor, contiguous) =
+            catch_up_from_checkpoint(&observer, &sub_id, false, &config, &pool, &hwm)
+                .await
+                .expect("catch_up_from_checkpoint");
+
+        // Commit fills the sequence slot after assertions — no permanent gap.
+        hole_tx.commit().await.expect("commit hole");
+
+        assert!(
+            contiguous < s3 as u64,
+            "prefix (={contiguous}) must not resume past the hole (={s3}) after a page boundary"
+        );
+        assert!(cursor >= s5 as u64, "cursor must reach at least s5");
+        assert!(s3 > s2 && s3 < s4, "gap sanity check");
+
+        let cp = cu_read_checkpoint(&pool, &sub_id).await;
+        assert!(
+            cp.is_some_and(|(seq, _)| seq < s3 as u64),
+            "checkpoint must not cross the hole"
+        );
+        cu_assert_r4(&pool, &sub_id).await;
+        let _ = (s1, id2);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 3: positive control — no hole, checkpoint advances to head (R1, R4)
+    //
+    // Without this test an implementation that never advances would pass the
+    // two hole tests. The checkpoint must advance at least to s3, and
+    // last_event_id must correspond to last_global_sequence (R4).
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn catchup_positive_control_no_hole() {
+        let Some(pool) = cu_pool().await else {
+            return;
+        };
+        let stream_id = Uuid::new_v4();
+        let sub_id = format!("test:cu_positive:{}", Uuid::new_v4());
+        let config = cu_config(100);
+        let hwm = Arc::new(Mutex::new(HashMap::new()));
+        let observer = cu_observer(sub_id.clone(), SubscriptionMode::Checkpointed);
+
+        // Pre-set to s1-1 so catch-up only processes our three events, then
+        // assert contiguous reached at least s3 (it would equal s3 in the
+        // absence of concurrent inserts, or be higher if they are contiguous).
+        let (_, s1) = cu_insert(&pool, stream_id, 1).await;
+        cu_set_checkpoint(&pool, &sub_id, s1 as u64 - 1).await;
+        let (_, _s2) = cu_insert(&pool, stream_id, 2).await;
+        let (_, s3) = cu_insert(&pool, stream_id, 3).await;
+
+        let (cursor, contiguous) =
+            catch_up_from_checkpoint(&observer, &sub_id, false, &config, &pool, &hwm)
+                .await
+                .expect("catch_up_from_checkpoint");
+
+        // Both must reach at least s3 (proving the prefix advanced).
+        assert!(
+            contiguous >= s3 as u64,
+            "prefix (={contiguous}) must advance at least to s3 (={s3})"
+        );
+        assert!(
+            cursor >= s3 as u64,
+            "cursor (={cursor}) must reach at least s3 (={s3})"
+        );
+
+        // R4: last_event_id must correspond to last_global_sequence.
+        let cp = cu_read_checkpoint(&pool, &sub_id).await;
+        assert!(cp.is_some(), "checkpoint must be written");
+        cu_assert_r4(&pool, &sub_id).await;
+        let _ = s1;
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 4: ReplayAlways unchanged — HWM updated, checkpoints table untouched (R6)
+    //
+    // For ReplayAlways, advance_catchup_prefix updates the in-memory HWM but
+    // never touches `contiguous` or the checkpoints table. The returned
+    // `contiguous` is the HWM seed (s1-1 pre-seeded here) not the max seq.
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn catchup_replay_always_unchanged() {
+        let Some(pool) = cu_pool().await else {
+            return;
+        };
+        let stream_id = Uuid::new_v4();
+        let sub_id = format!("test:cu_replay:{}", Uuid::new_v4());
+        let config = cu_config(100);
+        let hwm: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        let observer = cu_observer(sub_id.clone(), SubscriptionMode::ReplayAlways);
+
+        let (_, _s1) = cu_insert(&pool, stream_id, 1).await;
+        let (_, _s2) = cu_insert(&pool, stream_id, 2).await;
+        let (_, s3) = cu_insert(&pool, stream_id, 3).await;
+
+        // Pre-seed HWM so the pass starts just before our events (mirrors
+        // cu_set_checkpoint for Checkpointed subscribers).
+        hwm.lock().await.insert(sub_id.clone(), s3 as u64 - 3);
+
+        let (cursor, _contiguous) =
+            catch_up_from_checkpoint(&observer, &sub_id, true, &config, &pool, &hwm)
+                .await
+                .expect("catch_up_from_checkpoint");
+
+        // Cursor must reach at least s3.
+        assert!(cursor >= s3 as u64, "cursor must reach at least s3");
+
+        // The HWM must be updated to at least s3.
+        assert!(
+            hwm.lock().await.get(&sub_id).copied().unwrap_or(0) >= s3 as u64,
+            "ReplayAlways must update the in-memory HWM to at least s3"
+        );
+
+        // The checkpoints table must NOT be written for a ReplayAlways subscriber.
+        let cp = cu_read_checkpoint(&pool, &sub_id).await;
+        assert!(
+            cp.is_none(),
+            "ReplayAlways must not write to the checkpoints table"
+        );
+    }
 }
