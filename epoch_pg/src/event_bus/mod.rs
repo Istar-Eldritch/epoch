@@ -1121,35 +1121,16 @@ where
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
         let handle = tokio::spawn(async move {
-            // Sort subscribers by priority so projections (priority 0) are
-            // processed before sagas (priority 100). This ensures read models
-            // are up-to-date when sagas query them. Stable sort preserves
-            // registration order within the same priority level.
-            {
-                let mut guard = projections.lock().await;
-                let mut priorities: Vec<u8> = Vec::with_capacity(guard.len());
-                for p in guard.iter() {
-                    let obs = p.lock().await;
-                    priorities.push(obs.priority());
-                }
-                log::debug!(
-                    "Event bus: sorting {} subscribers. Priorities before sort: {:?}",
-                    guard.len(),
-                    priorities
-                );
-                let mut indices: Vec<usize> = (0..guard.len()).collect();
-                indices.sort_by_key(|&i| priorities[i]);
-                let sorted: Vec<_> = indices.iter().map(|&i| guard[i].clone()).collect();
-                *guard = sorted;
-
-                // Log the sorted order
-                let mut sorted_info = Vec::new();
-                for p in guard.iter() {
-                    let obs = p.lock().await;
-                    sorted_info.push(format!("{}(p={})", obs.subscriber_id(), obs.priority()));
-                }
-                log::debug!("Event bus: processing order after sort: {:?}", sorted_info);
-            }
+            // No priority sort of `projections` here. The batch loop below reads
+            // each subscriber's priority per wake and dispatches in ascending
+            // priority order, and inline dispatch sorts independently, so the
+            // stored order carries no meaning. Sorting it once at startup was
+            // both redundant and unsafe: reading priorities requires locking each
+            // observer, and `process_event_with_retry` holds an observer's mutex
+            // across its `on_event` await, so doing that under the `projections`
+            // guard let one slow handler block every `subscribe()`; doing it off
+            // the guard and writing the result back instead dropped any
+            // subscriber that registered while the sort was in flight.
 
             // R2: run one checkpoint-driven catch-up pass over every registered
             // subscriber before entering the select loop, so a readiness gate
@@ -1959,14 +1940,18 @@ where
             return Ok(());
         };
 
-        // Snapshot the registered subscriber ids (avoid holding the lock across
-        // the awaited DB writes). R5: skip ReplayAlways subscribers — they have no
-        // persisted checkpoint, and parking one at head would suppress the
-        // replay-from-zero their next boot depends on.
+        // Snapshot the observer list and release the `projections` guard before
+        // locking each observer: `process_event_with_retry` holds an observer's
+        // mutex across its `on_event` await, so doing this under `projections`
+        // would let one slow handler block every other caller of `subscribe()`/
+        // `start_listener()` for as long as that handler runs. R5: skip
+        // ReplayAlways subscribers — they have no persisted checkpoint, and
+        // parking one at head would suppress the replay-from-zero their next
+        // boot depends on.
+        let snapshot: Vec<_> = { self.projections.lock().await.iter().cloned().collect() };
         let subscriber_ids: Vec<String> = {
-            let guard = self.projections.lock().await;
-            let mut ids = Vec::with_capacity(guard.len());
-            for observer in guard.iter() {
+            let mut ids = Vec::with_capacity(snapshot.len());
+            for observer in &snapshot {
                 let o = observer.lock().await;
                 if o.subscription_mode() == SubscriptionMode::ReplayAlways {
                     continue;
@@ -2514,16 +2499,20 @@ where
                         };
 
                         // Snapshot the subscribers and sort by priority
-                        // (projections before sagas). We can drop the lock
-                        // before invoking handlers because re-entrant
-                        // subscribes are not supported during dispatch
-                        // (handlers may publish but not subscribe).
+                        // (projections before sagas). We can drop the `projections`
+                        // lock before locking each observer to read its priority,
+                        // and before invoking handlers, because re-entrant
+                        // subscribes are not supported during dispatch (handlers
+                        // may publish but not subscribe): a slow handler here would
+                        // otherwise hold up every other caller of `subscribe()`/
+                        // `start_listener()` for as long as `on_event` runs.
                         let sorted: Vec<Arc<Mutex<dyn EventObserver<D>>>> = {
-                            let guard = projections.lock().await;
-                            let mut tagged = Vec::with_capacity(guard.len());
-                            for p in guard.iter() {
+                            let snapshot: Vec<_> =
+                                { projections.lock().await.iter().cloned().collect() };
+                            let mut tagged = Vec::with_capacity(snapshot.len());
+                            for p in snapshot {
                                 let priority = p.lock().await.priority();
-                                tagged.push((priority, p.clone()));
+                                tagged.push((priority, p));
                             }
                             tagged.sort_by_key(|(prio, _)| *prio);
                             tagged.into_iter().map(|(_, p)| p).collect()
