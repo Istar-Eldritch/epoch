@@ -5635,7 +5635,9 @@ async fn test_catchup_hole_delivers_after_commit_and_reports_ready() {
     let projection_events = projection.get_state_store().clone();
 
     // Plant the checkpoint just below the hole so catch-up only walks our own
-    // events, not the shared table's accumulated history.
+    // events, not the shared table's accumulated history. The Uuid::new_v4()
+    // event_id does not correspond to a real event — deliberate throwaway seed
+    // state that gets overwritten once the hole fills and catch-up runs.
     event_bus
         .update_checkpoint(&subscriber_id, seq_n as u64 - 1, Uuid::new_v4())
         .await
@@ -5708,19 +5710,22 @@ async fn test_catchup_hole_delivers_after_commit_and_reports_ready() {
     event_bus.shutdown().await.expect("shutdown");
 }
 
-/// Test 5 (R2): `subscribe()`'s buffer-drain pass must not overwrite the
-/// conservative checkpoint catch-up parked below a hole.
+/// Test 5 (R1, subscribe path): `subscribe()`'s catch-up pass must not
+/// advance the checkpoint past a held hole when the listener is already running.
 ///
-/// This is the test that would have caught the *second* writer: `subscribe()`
-/// runs catch-up and then a separately-coded buffer drain, and `flush_checkpoint`
-/// is a blind, non-monotonic upsert, so a drain that flushed a linear maximum
-/// would clobber the conservative checkpoint inside the same call. With the
-/// listener already running, `subscribe()` takes the buffer/drain path. The
-/// hole is held across the whole call, so neither writer may advance the
-/// checkpoint past it.
+/// With `start_listener` already active, `subscribe()` takes the catch-up +
+/// buffer-drain path. This test covers the catch-up half: with a hole at
+/// `seq_n` and committed events above it, `catch_up_from_checkpoint` must
+/// park the checkpoint at `seq_n - 1`, not skip to the linear maximum.
+///
+/// The buffer-drain half (R2) is not exercised here: the two above-hole events
+/// are committed before `subscribe()` is called, so their NOTIFYs fire before
+/// the buffer listener starts and the buffer is empty when drained. Exercising
+/// R2 deterministically requires events to arrive mid-catch-up (inherently
+/// racy); that coverage is deferred to Phase 5.
 #[tokio::test]
 #[serial]
-async fn test_subscribe_drain_does_not_overwrite_checkpoint_below_hole() {
+async fn test_subscribe_catchup_parks_at_hole_when_listener_running() {
     common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
