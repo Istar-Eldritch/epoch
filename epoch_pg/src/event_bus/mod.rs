@@ -923,7 +923,10 @@ where
     /// event_bus.setup_trigger().await?;
     /// ```
     ///
-    /// This method is idempotent - it will drop and recreate the trigger if it exists.
+    /// Idempotent, but not by dropping and recreating: re-running this is a
+    /// no-op once this bus's trigger exists, rather than a drop-and-recreate,
+    /// which would take an ACCESS EXCLUSIVE lock on the events table on every
+    /// call for no benefit.
     pub async fn setup_trigger(&self) -> Result<(), SqlxError> {
         // CLOUD-180: ensure the `txid` column exists on a custom events table so
         // snapshot-fencing forensics work. The default `epoch_events` table is
@@ -958,14 +961,19 @@ where
         // if an earlier version left one behind. Only done here, never in
         // start_listener: this call already hard-fails on DDL errors and is under
         // the caller's control, whereas dropping a trigger implicitly on every boot
-        // would take an ACCESS EXCLUSIVE lock on the events table and could cut
-        // delivery for a still-running older instance mid-deploy.
-        if let Err(e) = sqlx::query(&format!(
-            "DROP TRIGGER IF EXISTS {LEGACY_NOTIFY_TRIGGER} ON {};",
-            self.config.events_table,
-        ))
-        .execute(&self.pool)
-        .await
+        // is not free even when there is nothing to drop: `DROP TRIGGER IF EXISTS`
+        // resolves the trigger by first taking an ACCESS EXCLUSIVE lock on the
+        // relation, and `IF EXISTS` only suppresses the error once that lock is
+        // held, not the lock itself. Probe with a catalog read first, so the lock
+        // is paid at most once per database rather than once per boot per bus, and
+        // only when there is actually a legacy trigger to remove.
+        if trigger_exists(&self.pool, &self.config.events_table, LEGACY_NOTIFY_TRIGGER).await?
+            && let Err(e) = sqlx::query(&format!(
+                "DROP TRIGGER IF EXISTS {LEGACY_NOTIFY_TRIGGER} ON {};",
+                self.config.events_table,
+            ))
+            .execute(&self.pool)
+            .await
         {
             warn!(
                 "setup_trigger: failed to drop the legacy '{}' trigger on '{}' \
@@ -999,7 +1007,7 @@ where
 
         // The trigger name is prefix + hex from md5, so it needs no quoting. The
         // channel is a function argument, with single quotes escaped.
-        sqlx::query(&format!(
+        let result = sqlx::query(&format!(
             "CREATE TRIGGER {} \
              AFTER INSERT ON {} \
              FOR EACH ROW \
@@ -1009,7 +1017,24 @@ where
             self.channel_name.replace('\'', "''")
         ))
         .execute(&self.pool)
-        .await?;
+        .await;
+
+        // The exists-check above is not atomic with this CREATE: two replicas
+        // booting on the same channel at once can both see `false`. The loser
+        // gets SQLSTATE 42710 (duplicate_object), which is semantically success
+        // here — the trigger this call wanted now exists — so treat it as such
+        // rather than failing a boot on a race that resolved in our favour.
+        const DUPLICATE_OBJECT: &str = "42710";
+        if let Err(e) = &result {
+            let is_duplicate = e
+                .as_database_error()
+                .and_then(|db_err| db_err.code())
+                .is_some_and(|code| code == DUPLICATE_OBJECT);
+            if is_duplicate {
+                return Ok(());
+            }
+        }
+        result?;
 
         Ok(())
     }
