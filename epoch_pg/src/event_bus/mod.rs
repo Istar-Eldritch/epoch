@@ -3502,11 +3502,13 @@ mod tests {
     // =========================================================================
     //
     // These tests exercise `catch_up_from_checkpoint` directly, so they need a
-    // real database. They do NOT hold transactions across sleep() calls; all
-    // "holes" are either an open (but not yet rolled-back/committed) transaction
-    // on the same Tokio task, or a permanently rolled-back sequence consumed
-    // by `create_permanent_hole`. Each test gets a unique subscriber ID to stay
-    // independent of every other concurrently-running test.
+    // real database. Holes are created by consuming a sequence slot via
+    // `SELECT nextval(...)` without inserting a row, so no transaction is held
+    // open during the catch-up call and concurrent TRUNCATE operations in other
+    // test binaries are never blocked. Integration tests truncate with
+    // RESTART IDENTITY so the consumed slot is irrelevant to them; Phase 3
+    // tests isolate themselves from the shared table via `cu_set_checkpoint`.
+    // Each test gets a unique subscriber ID to stay independent.
 
     /// Minimal event type used only inside these unit tests.
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -3686,36 +3688,22 @@ mod tests {
         cu_set_checkpoint(&pool, &sub_id, s1 as u64 - 1).await;
         let (id2, s2) = cu_insert(&pool, stream_id, 2).await;
 
-        // Hold s3 in an open (uncommitted) transaction — invisible to other
-        // connections under READ COMMITTED.
-        let mut hole_tx = pool.begin().await.expect("begin hole tx");
-        let hole_data = serde_json::to_value(CuTestEvent { v: 3 }).unwrap();
-        let s3: i64 = sqlx::query_scalar(
-            r#"INSERT INTO epoch_events
-                   (id, stream_id, stream_version, event_type, data, created_at)
-               VALUES ($1, $2, 3, 'CuTestEvent', $3, NOW())
-               RETURNING global_sequence"#,
-        )
-        .bind(Uuid::new_v4())
-        .bind(stream_id)
-        .bind(&hole_data)
-        .fetch_one(&mut *hole_tx)
-        .await
-        .expect("insert held event");
+        // Consume s3's sequence slot without inserting a row so it appears as
+        // a gap to catch_up_from_checkpoint. Using nextval rather than an open
+        // transaction avoids holding a table lock that would block concurrent
+        // TRUNCATE calls in other test binaries.
+        let s3: i64 = sqlx::query_scalar("SELECT nextval('epoch_events_global_sequence_seq')")
+            .fetch_one(&pool)
+            .await
+            .expect("consume hole sequence slot");
 
         let (_, s4) = cu_insert(&pool, stream_id, 4).await;
         let (_, s5) = cu_insert(&pool, stream_id, 5).await;
 
-        // Run catch-up while s3 is invisible.
         let (cursor, contiguous) =
             catch_up_from_checkpoint(&observer, &sub_id, false, &config, &pool, &hwm)
                 .await
                 .expect("catch_up_from_checkpoint");
-
-        // Commit fills the sequence slot — no permanent gap in the shared
-        // table after this test. The assertions are about the values already
-        // captured; a post-fact commit does not retroactively invalidate them.
-        hole_tx.commit().await.expect("commit hole");
 
         // Prefix must stop before the hole. Another concurrent process could
         // have inserted at seqs between s2 and s3 (extending the contiguous run)
@@ -3728,9 +3716,6 @@ mod tests {
         assert!(cursor >= s5 as u64, "cursor must reach at least s5");
         assert!(s3 > s2 && s3 < s4, "sequence ordering sanity check");
 
-        // Persisted checkpoint must be below the hole (R1) with a matching
-        // event_id (R4). id2 is the exact id only when no concurrent insertion
-        // extended the contiguous run past s2; R4 is verified via DB lookup.
         let cp = cu_read_checkpoint(&pool, &sub_id).await;
         assert!(
             cp.is_some_and(|(seq, _)| seq < s3 as u64),
@@ -3763,25 +3748,15 @@ mod tests {
         cu_set_checkpoint(&pool, &sub_id, s1 as u64 - 1).await;
         let (id2, s2) = cu_insert(&pool, stream_id, 2).await;
 
-        // Hold s3 in an open transaction (invisible to other connections
-        // under READ COMMITTED). Committed after assertions to avoid leaving
-        // a permanent hole in the shared table.
-        let mut hole_tx = pool.begin().await.expect("begin hole tx");
-        let hole_data = serde_json::to_value(CuTestEvent { v: 3 }).unwrap();
-        let s3: i64 = sqlx::query_scalar(
-            r#"INSERT INTO epoch_events
-                   (id, stream_id, stream_version, event_type, data, created_at)
-               VALUES ($1, $2, 3, 'CuTestEvent', $3, NOW())
-               RETURNING global_sequence"#,
-        )
-        .bind(Uuid::new_v4())
-        .bind(stream_id)
-        .bind(&hole_data)
-        .fetch_one(&mut *hole_tx)
-        .await
-        .expect("insert hole event");
+        // Consume s3's sequence slot without inserting a row (same technique
+        // as test 1). No open transaction means no TRUNCATE lock contention
+        // with concurrently running integration-test binaries.
+        let s3: i64 = sqlx::query_scalar("SELECT nextval('epoch_events_global_sequence_seq')")
+            .fetch_one(&pool)
+            .await
+            .expect("consume hole sequence slot");
 
-        // Events on the second page (s3 still invisible during catch-up).
+        // Events on the second page (s3 is absent).
         let (_, s4) = cu_insert(&pool, stream_id, 4).await;
         let (_, s5) = cu_insert(&pool, stream_id, 5).await;
 
@@ -3789,9 +3764,6 @@ mod tests {
             catch_up_from_checkpoint(&observer, &sub_id, false, &config, &pool, &hwm)
                 .await
                 .expect("catch_up_from_checkpoint");
-
-        // Commit fills the sequence slot after assertions — no permanent gap.
-        hole_tx.commit().await.expect("commit hole");
 
         assert!(
             contiguous < s3 as u64,
