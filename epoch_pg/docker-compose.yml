@@ -13,4 +13,8 @@ services:
       start_period: 10s
       timeout: 10s
     ports:
-      - ${POSTGRES_PORT:-5432}:5432
+      # Bound to loopback deliberately. Without an explicit host address Docker
+      # publishes on 0.0.0.0 and inserts its own iptables rules, so a test
+      # database with default credentials ends up reachable from the internet
+      # on any host with a public interface, whatever the host firewall says.
+      - 127.0.0.1:${POSTGRES_PORT:-5432}:5432
