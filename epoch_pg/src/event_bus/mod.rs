@@ -68,8 +68,8 @@ struct BatchContext {
     config: ReliableDeliveryConfig,
     dlq_pool: PgPool,
     checkpoint_pool: PgPool,
-    /// Per-subscriber in-memory high-water mark for `ReplayAlways` subscribers
-    /// (§4.5). Live processing routes checkpoint advancement here instead of the
+    /// Per-subscriber in-memory high-water mark for `ReplayAlways` subscribers.
+    /// Live processing routes checkpoint advancement here instead of the
     /// checkpoints table for such a subscriber.
     hwm: Arc<Mutex<HashMap<String, u64>>>,
     /// The transaction-id snapshot captured once for this batch (CLOUD-180), or
@@ -616,10 +616,11 @@ pub enum PgEventBusError {
     InlineDispatchError(Box<dyn std::error::Error + Send + Sync>),
     /// The requested subscriber id is not registered on this bus.
     /// Returned by readiness methods when the caller passes an id that has
-    /// not been registered via [`PgEventBus::subscribe`].  Silently falling
-    /// back to a checkpoint read would yield a false-ready for a
-    /// [`SubscriptionMode::ReplayAlways`] subscriber whose checkpoint was
-    /// fast-forwarded to head (Correction 4).
+    /// not been registered via [`PgEventBus::subscribe`]. Silently falling back
+    /// to a checkpoint read instead would report a false-ready for a
+    /// [`SubscriptionMode::ReplayAlways`] subscriber: that mode has no
+    /// persisted checkpoint, so the read would find none and could be
+    /// misread as "already at head" rather than "not registered".
     #[error("subscriber '{0}' is not registered on this bus")]
     SubscriberNotFound(String),
     /// Readiness gating (`subscriber_lag` / `wait_until_caught_up` /
@@ -770,8 +771,8 @@ where
     /// Inline-dispatch queue. Unused in `DispatchMode::Async`.
     inline_state: Arc<Mutex<InlineDispatchState<D>>>,
     /// Per-subscriber in-memory high-water mark for [`SubscriptionMode::ReplayAlways`]
-    /// subscribers (§4.5). Never persisted: a crash loses it and the next boot
-    /// replays from 0, which is the intended contract. Shared across `Clone`s so
+    /// subscribers. Never persisted: a crash loses it and the next boot replays
+    /// from 0, which is the intended contract. Shared across `Clone`s so
     /// `subscribe`, the listener task, and readiness queries observe the same value.
     hwm: Arc<Mutex<HashMap<String, u64>>>,
     /// `subscriber_id` -> [`SubscriptionMode`] for every registered subscriber.
@@ -906,8 +907,10 @@ where
 
     /// Sets up the channel-specific trigger for event notifications.
     ///
-    /// This method creates or replaces the trigger that sends NOTIFY messages
-    /// when events are inserted. The trigger uses this event bus's channel name.
+    /// Creates the trigger that sends NOTIFY messages on this event bus's
+    /// channel when events are inserted, if it does not already exist, and
+    /// removes the pre-per-channel fixed-name trigger left behind by an earlier
+    /// version, if present.
     ///
     /// # Usage
     ///
@@ -1708,8 +1711,12 @@ where
     /// table, or `None` if the table is empty.
     ///
     /// Note: with non-transactional `nextval` (spec 0019) the head may be a
-    /// burned/in-flight value that never becomes visible; readiness treats such
-    /// a tail via the gap backstop (§7.2).
+    /// burned/in-flight value that never becomes visible, because the
+    /// transaction that reserved it rolled back or is still open. Readiness
+    /// does not wait on such a value directly: the listener's gap-timeout
+    /// mechanism advances a subscriber's contiguous checkpoint past a sequence
+    /// like this once it has been missing long enough to conclude it never
+    /// will become visible.
     pub async fn head_sequence(&self) -> Result<Option<u64>, PgEventBusError> {
         // `SELECT MAX(...)` always returns exactly one row (NULL when the
         // table is empty), so use fetch_one with Option<i64>.
@@ -1806,6 +1813,13 @@ where
     /// not registered on this bus, or [`PgEventBusError::InlineDispatchNotSupported`]
     /// if this bus is [`DispatchMode::Inline`](crate::DispatchMode::Inline) (Inline
     /// dispatch tracks no checkpoint or HWM position to measure lag against).
+    ///
+    /// # Hazard: one slow subscriber can hold up the rest
+    /// Subscribers in the same priority group are processed together, and the
+    /// batch loop cannot fetch the next batch until every subscriber in the
+    /// group has finished the current one. A slow or wedged `on_event` on a
+    /// peer therefore holds this subscriber's own lag non-zero even while its
+    /// own handler is healthy and fast.
     pub async fn subscriber_lag(&self, subscriber_id: &str) -> Result<u64, PgEventBusError> {
         self.require_non_inline_dispatch()?;
         // Validate subscriber first so unknown ids get SubscriberNotFound
@@ -1868,6 +1882,14 @@ where
     /// head while an upstream saga on another bus is still about to extend it.
     /// Cross-bus readiness needs the fixed-point gate in **spec 0025**.
     ///
+    /// # Hazard: one slow subscriber can hold up the rest
+    /// Subscribers in the same priority group are processed together, and the
+    /// batch loop cannot start fetching the next batch until every subscriber
+    /// in the group has finished the current one. A single slow or wedged
+    /// `on_event` on a peer therefore stalls this subscriber's progress too,
+    /// for the rest of the backlog, even though this subscriber's own handler
+    /// is healthy.
+    ///
     /// Returns [`PgEventBusError::SubscriberNotFound`] if `subscriber_id` is
     /// not registered on this bus, or [`PgEventBusError::InlineDispatchNotSupported`]
     /// if this bus is [`DispatchMode::Inline`](crate::DispatchMode::Inline).
@@ -1900,6 +1922,22 @@ where
     /// before the timeout, `Ok(false)` otherwise. Returns
     /// [`PgEventBusError::InlineDispatchNotSupported`] if this bus is
     /// [`DispatchMode::Inline`](crate::DispatchMode::Inline).
+    ///
+    /// # Hazard: an empty registry is trivially "caught up"
+    /// If no subscribers are registered yet, this returns `Ok(true)`
+    /// immediately rather than waiting: there is nothing to be caught up
+    /// *with*. The likeliest way to hit this is calling it as a startup gate
+    /// before `subscribe()` has been called for every consumer that should be
+    /// covered, which reports ready before those subscribers even exist rather
+    /// than before they are caught up.
+    ///
+    /// # Hazard: one slow subscriber can hold up the rest
+    /// Subscribers in the same priority group are processed together, and the
+    /// batch loop cannot start fetching the next batch until every subscriber
+    /// in the group has finished the current one. A single slow or wedged
+    /// `on_event` therefore stalls every other subscriber in its group for the
+    /// rest of the backlog, not just its own progress, and this call cannot
+    /// return `true` for any of them until it clears.
     pub async fn wait_until_all_caught_up(
         &self,
         timeout: Duration,
@@ -2951,15 +2989,6 @@ where
                 guard.push(observer);
                 return Ok(());
             }
-
-            // Get subscriber_id (and subscription mode) for catch-up
-            let (subscriber_id, replay_always) = {
-                let guard = observer.lock().await;
-                (
-                    guard.subscriber_id().to_string(),
-                    guard.subscription_mode() == SubscriptionMode::ReplayAlways,
-                )
-            };
 
             // R5 (Correction 3): a fresh subscribe (including re-subscribe after
             // unsubscribe) of a ReplayAlways subscriber rebuilds its in-memory

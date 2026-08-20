@@ -19,16 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `Saga::subscription_mode()` likewise defaulted and forwarded by
     `ProjectionHandler`, `SagaHandler`, `SagaAdapter`, and the `impl Saga for Arc<S>`
     blanket. Existing observers that override nothing are byte-for-byte unchanged.
-  - **`epoch_pg`** — `PgEventBus` gains `head_sequence() -> Result<Option<u64>, SqlxError>`,
-    `subscriber_lag(id) -> Result<u64>` (returns `Err(SubscriberNotFound)` for unregistered ids),
-    `wait_until_caught_up(id, timeout) -> Result<bool>`, and
-    `wait_until_all_caught_up(timeout) -> Result<bool>`; readiness position dispatches on
-    `subscription_mode` (checkpoint for `Checkpointed`, in-memory HWM for `ReplayAlways`).
-    `start_listener` runs a full catch-up pass before entering the select loop (closing
-    the subscribe → first-batch window) and calls idempotent `ensure_trigger` so Async
-    buses always have the NOTIFY trigger. `subscribe` WARNs when subscribing in Async
-    without a trigger already present. `fast_forward_all_subscribers` skips `ReplayAlways`
-    subscribers (no checkpoint row to update). No schema migration; no new dependency.
+  - **`epoch_pg`** — `PgEventBus` gains `head_sequence() -> Result<Option<u64>, PgEventBusError>`,
+    `subscriber_lag(id) -> Result<u64, PgEventBusError>` (returns `Err(SubscriberNotFound)` for
+    unregistered ids), `wait_until_caught_up(id, timeout) -> Result<bool, PgEventBusError>`, and
+    `wait_until_all_caught_up(timeout) -> Result<bool, PgEventBusError>`; readiness position
+    dispatches on `subscription_mode` (checkpoint for `Checkpointed`, in-memory HWM for
+    `ReplayAlways`). `start_listener` runs a full catch-up pass before entering the select loop
+    (closing the subscribe → first-batch window) and calls idempotent `ensure_trigger` so Async
+    buses always have their own per-channel NOTIFY trigger (see **Changed**, below, for the
+    trigger rename this depends on). `subscribe` WARNs when subscribing in Async without a
+    trigger already present. `fast_forward_all_subscribers` skips `ReplayAlways` subscribers
+    (no checkpoint row to update). No schema migration; no new dependency.
 
 - **`read_events_range` bounded-replay primitive** (`epoch_core`, `epoch_pg`, `epoch_mem`, CLOUD-183) —
   a new `EventStoreBackend::read_events_range(stream_id, from: Option<u64>, to: Option<u64>)`
@@ -202,6 +203,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING** (`epoch_pg`, CLOUD-221): the NOTIFY trigger is now per-channel
+  (`epoch_event_bus_notify_trigger_<digest>`) instead of one fixed name
+  (`epoch_event_bus_notify_trigger`) shared by every bus on an events table. With a
+  single shared name, a second bus on the same table either stole the first bus's
+  trigger or, once creation was gated on existence, was left deaf and silently
+  downgraded to the periodic timer tick. **Upgrade step**: after upgrading, call
+  `setup_trigger()` once per bus to drop the legacy fixed-name trigger; leaving it in
+  place is not unsafe, only redundant — it produces one duplicate NOTIFY per insert,
+  which is discarded by the per-event checkpoint check.
+- **BREAKING** (`epoch_pg`): `PgEventBusError` gains two new variants,
+  `SubscriberNotFound` and `InlineDispatchNotSupported`. The enum is not
+  `#[non_exhaustive]`, so a downstream exhaustive `match` on it will stop compiling.
+- Released the `projections` lock across the listener's batch drain instead of
+  holding it for the whole backlog (`epoch_pg`, CLOUD-225): every readiness method
+  also locks `projections`, so `subscriber_lag`, `wait_until_caught_up`, and
+  `wait_until_all_caught_up` could queue behind an in-progress drain for longer than
+  the timeout their caller passed.
+- Readiness now resolves a subscriber's `SubscriptionMode` from a bus-level registry
+  populated at `subscribe()` time, rather than by locking the observer directly
+  (`epoch_pg`): `process_event_with_retry` holds an observer's mutex across its
+  `on_event` await, so a slow or blocked subscriber could previously make a readiness
+  call wait for its whole handler, unboundedly, regardless of the timeout requested.
+- Bound the test Postgres container (`epoch_pg/docker-compose.yml`) to `127.0.0.1`.
+  Without an explicit host address, Docker publishes on `0.0.0.0` and installs its own
+  firewall rules, so the test database's default credentials were reachable from
+  outside the host on any machine with a public interface.
 - **BREAKING**: `EventStoreBackend::store_events()` no longer has a default implementation
   (`epoch_core`, CLOUD-171). It is now a required trait method. Third-party backends that
   previously relied on the (non-atomic) default loop must provide an explicit implementation.

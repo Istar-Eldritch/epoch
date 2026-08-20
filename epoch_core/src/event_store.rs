@@ -204,12 +204,12 @@ pub enum SubscriptionMode {
     ///
     /// # Caveat: re-subscribing does not rebuild your model for you
     /// A backend that implements this mode resets its own high-water mark to 0
-    /// on every `subscribe()` call (including a re-subscribe of the same
-    /// `subscriber_id` after `unsubscribe()`), so catch-up replays the full
-    /// history again. If you pass in an observer that wraps a model instance
-    /// which **survived** from a previous subscription (rather than a fresh
-    /// one), that model will have the same history applied to it twice. Build
-    /// a fresh model before every `subscribe()` call for a `ReplayAlways`
+    /// on every `subscribe()` call, including calling `subscribe()` again with
+    /// a `subscriber_id` already in use, so catch-up replays the full history
+    /// again. If you pass in an observer that wraps a model instance which
+    /// **survived** from a previous subscription (rather than a fresh one),
+    /// that model will have the same history applied to it twice. Build a
+    /// fresh model before every `subscribe()` call for a `ReplayAlways`
     /// subscriber, or ensure `apply` is idempotent under re-application.
     ReplayAlways,
 }

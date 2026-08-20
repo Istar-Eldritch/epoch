@@ -199,6 +199,10 @@ impossible bus-scalar collapse.
 
 ### 4.5 Why the replacement is not yet approved — the listener ownership problem
 
+> **Superseded by §9.2:** this is treated below as one monolithic problem. It is two, and one
+> (position) is already solved without any concurrency-model change; only the per-subscriber
+> gap flag is genuinely missing.
+
 The replacement predicate needs to **read every subscriber's live state** (its position and
 whether it holds an unfenced, pre-backstop gap below head) while the listener is running.
 The current listener makes that read unsafe:
@@ -278,6 +282,9 @@ here and not in 0024.
 ---
 
 ## 7. Open Decision (blocks any delivery plan)
+
+> **Superseded by §9.7:** two of the three questions below are now largely answerable; see
+> §9.7 for the revised state of each and what should happen first.
 
 **The concurrency-model question must be settled before this spec gets a delivery plan.**
 Concretely, one of these must be decided and agreed:

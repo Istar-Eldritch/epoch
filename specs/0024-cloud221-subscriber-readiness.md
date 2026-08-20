@@ -56,7 +56,7 @@ Unimplementable on the current listener: the gap fence is per-subscriber, histor
 
 ### 4.4 R4 — Async trigger-absence hazard
 
-1. **Implicit trigger (primary):** `start_listener()` (Async) probes `trigger_exists()` and calls `ensure_trigger()` only when absent, before the R2 pass; events written pre-trigger are recovered by the R2 pass regardless of NOTIFY. A failure here (missing DDL rights, or the existence probe itself failing) is logged via `warn!` and does not fail `start_listener()` — the timer tick + R2 pass keep delivery correct without it. Explicit `setup_trigger()` callers are unaffected and keep the unconditional drop+create, hard-failing on error, for a caller that deliberately wants to force a rebind.
+1. **Implicit trigger (primary):** `start_listener()` (Async) probes `trigger_exists()` and calls `ensure_trigger()` only when absent, before the R2 pass; events written pre-trigger are recovered by the R2 pass regardless of NOTIFY. A failure here (missing DDL rights, or the existence probe itself failing) is logged via `warn!` and does not fail `start_listener()` — the timer tick + R2 pass keep delivery correct without it. Explicit `setup_trigger()` callers are unaffected and hard-fail on error, as before. (Superseded by c53e6c6: the trigger is per-channel and `ensure_trigger` is purely additive — create-if-absent, never drop-and-recreate — so `setup_trigger()` no longer forces a rebind either; it only adds a one-time cleanup of the pre-per-channel fixed-name trigger.)
 2. **Loud report (defence-in-depth):** `subscribe()` in Async probes `pg_trigger` and emits a `WARN` naming bus + channel if absent.
 
 No hard error — the timer fallback + R2 pass keep delivery correct.
