@@ -5064,32 +5064,31 @@ async fn test_readiness_inline_dispatch_errors() {
 /// subscriber happened to catch up immediately.
 struct GatedObserver {
     subscriber_id: String,
-    is_released: Arc<std::sync::atomic::AtomicBool>,
-    notify: Arc<tokio::sync::Notify>,
+    released_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl GatedObserver {
-    /// Returns the observer plus the flag/notify pair the test uses to release
-    /// it later. Set the flag and call `notify_waiters()` to release: events
-    /// already blocked in `on_event` wake immediately, and any event that
-    /// arrives after release sees the flag set and never blocks.
-    fn new(
-        subscriber_id: String,
-    ) -> (
-        Self,
-        Arc<std::sync::atomic::AtomicBool>,
-        Arc<tokio::sync::Notify>,
-    ) {
-        let is_released = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let notify = Arc::new(tokio::sync::Notify::new());
+    /// Returns the observer plus a sender the test uses to release it later.
+    /// `send(true)` releases: events already blocked in `on_event` wake
+    /// immediately, and any event that arrives after release sees the current
+    /// value already `true` and never blocks.
+    ///
+    /// A `watch` channel rather than an `AtomicBool` + `Notify` pair: with
+    /// `Notify::notify_waiters()`, a call that reads the flag as `false` and is
+    /// preempted before it starts waiting misses the wakeup and blocks forever,
+    /// since `notify_waiters()` stores no permit for waiters that register
+    /// after it runs. `watch` has no such gap because the released state is
+    /// itself the value being watched: checking it and waiting for it to
+    /// change are the same operation, so there is no window in which a change
+    /// can happen invisibly between them.
+    fn new(subscriber_id: String) -> (Self, tokio::sync::watch::Sender<bool>) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
         (
             Self {
                 subscriber_id,
-                is_released: is_released.clone(),
-                notify: notify.clone(),
+                released_rx: rx,
             },
-            is_released,
-            notify,
+            tx,
         )
     }
 }
@@ -5106,8 +5105,11 @@ impl EventObserver<TestEventData> for GatedObserver {
         &self,
         _event: Arc<Event<TestEventData>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !self.is_released.load(std::sync::atomic::Ordering::Acquire) {
-            self.notify.notified().await;
+        let mut rx = self.released_rx.clone();
+        while !*rx.borrow() {
+            if rx.changed().await.is_err() {
+                break; // Sender dropped; nothing left to wait for.
+            }
         }
         Ok(())
     }
@@ -5133,7 +5135,7 @@ async fn test_wait_until_all_caught_up_gates_every_subscriber() {
         )))
         .await
         .expect("Failed to subscribe A");
-    let (gated_b, released, notify) = GatedObserver::new(sub_b.clone());
+    let (gated_b, released) = GatedObserver::new(sub_b.clone());
     event_bus
         .subscribe(gated_b)
         .await
@@ -5158,11 +5160,18 @@ async fn test_wait_until_all_caught_up_gates_every_subscriber() {
 
     // B is blocked in on_event and cannot advance its checkpoint: this must be
     // false, proving the gate actually checks B rather than short-circuiting
-    // on A alone.
-    let all_caught_up = event_bus
-        .wait_until_all_caught_up(tokio::time::Duration::from_millis(300))
-        .await
-        .expect("wait_until_all_caught_up failed");
+    // on A alone. Wrapped in an outer timeout: this is the only regression test
+    // for 449a769 (readiness resolving subscriber mode from a registry rather
+    // than locking each observer), and without that fix this call can block
+    // forever behind B's held observer lock rather than honouring its own
+    // 300ms deadline, wedging the whole suite instead of failing it.
+    let all_caught_up = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        event_bus.wait_until_all_caught_up(tokio::time::Duration::from_millis(300)),
+    )
+    .await
+    .expect("wait_until_all_caught_up blocked behind subscriber B's held observer lock")
+    .expect("wait_until_all_caught_up failed");
     assert!(
         !all_caught_up,
         "must be false while subscriber B is still blocked on the gate"
@@ -5176,13 +5185,17 @@ async fn test_wait_until_all_caught_up_gates_every_subscriber() {
     // timing, not on the behaviour under test.
 
     // Release B; both must now be reported caught up.
-    released.store(true, std::sync::atomic::Ordering::Release);
-    notify.notify_waiters();
+    released
+        .send(true)
+        .expect("GatedObserver's receiver was dropped");
 
-    let all_caught_up = event_bus
-        .wait_until_all_caught_up(tokio::time::Duration::from_secs(3))
-        .await
-        .expect("wait_until_all_caught_up failed");
+    let all_caught_up = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        event_bus.wait_until_all_caught_up(tokio::time::Duration::from_secs(3)),
+    )
+    .await
+    .expect("wait_until_all_caught_up blocked past its own timeout after releasing B")
+    .expect("wait_until_all_caught_up failed");
     assert!(
         all_caught_up,
         "both subscribers should be caught up after releasing B"
@@ -5341,7 +5354,7 @@ async fn test_readiness_not_blocked_by_in_progress_drain() {
         )))
         .await
         .expect("Failed to subscribe free subscriber");
-    let (gated, released, notify) = GatedObserver::new(sub_gated.clone());
+    let (gated, released) = GatedObserver::new(sub_gated.clone());
     event_bus
         .subscribe(gated)
         .await
@@ -5407,8 +5420,9 @@ async fn test_readiness_not_blocked_by_in_progress_drain() {
     assert!(caught_up, "the free subscriber is at head");
 
     // Release the gated subscriber so the listener can finish and shut down.
-    released.store(true, std::sync::atomic::Ordering::Release);
-    notify.notify_waiters();
+    released
+        .send(true)
+        .expect("GatedObserver's receiver was dropped");
 
     event_bus.shutdown().await.expect("shutdown failed");
 }
@@ -5479,7 +5493,12 @@ async fn test_second_bus_on_same_table_gets_its_own_trigger() {
     );
 
     // And delivery must actually work on the second bus, promptly (i.e. via
-    // NOTIFY, not by waiting out the 1s timer tick).
+    // NOTIFY, not by waiting out the 1s timer tick). `flush_interval` is 1s with
+    // arbitrary phase relative to this write, so a 900ms deadline would be
+    // satisfied by a plain timer tick most of the time and prove little; 200ms
+    // is meaningfully sub-tick and actually discriminates NOTIFY delivery from
+    // the fallback. The `pg_trigger` assertions above are the real proof that
+    // c53e6c6's per-channel trigger exists; this only adds that it fires.
     let event_store = PgEventStore::new(pool.clone(), second_bus.clone());
     let stream_id = Uuid::new_v4();
     event_store
@@ -5488,7 +5507,7 @@ async fn test_second_bus_on_same_table_gets_its_own_trigger() {
         .expect("store_event failed");
 
     let caught_up = second_bus
-        .wait_until_caught_up(&subscriber_id, std::time::Duration::from_millis(900))
+        .wait_until_caught_up(&subscriber_id, std::time::Duration::from_millis(200))
         .await
         .expect("wait_until_caught_up failed");
     assert!(

@@ -151,6 +151,17 @@ impl Saga<TargetEvent> for CounterSaga {
     }
 }
 
+// Stable LISTEN channels for this binary's two buses. The NOTIFY trigger's
+// name is derived from the channel, so a fresh random channel per test left a
+// fresh trigger behind on the shared `epoch_events` table on every run: those
+// accumulated, and every INSERT then fired all of them (measured: +8 per
+// `cargo test --workspace` run). Stable names keep the trigger count fixed no
+// matter how often the suite runs. `SourceEvent` and `TargetEvent` are
+// distinct types sharing the default `epoch_events` table on distinct
+// channels; nothing requires those channels to change between runs.
+const SOURCE_CHANNEL: &str = "test_saga_adapter_source";
+const TARGET_CHANNEL: &str = "test_saga_adapter_target";
+
 // === Shared setup: one DB, two buses with distinct channels ===
 
 async fn setup_two_buses() -> Option<(
@@ -164,11 +175,8 @@ async fn setup_two_buses() -> Option<(
     let pool = common::try_get_pg_pool().await?;
     Migrator::new(pool.clone()).run().await.unwrap();
 
-    let source_channel = format!("src_{}", Uuid::new_v4().simple());
-    let target_channel = format!("tgt_{}", Uuid::new_v4().simple());
-
-    let source_bus = PgEventBus::<SourceEvent>::new(pool.clone(), source_channel);
-    let target_bus = PgEventBus::<TargetEvent>::new(pool.clone(), target_channel);
+    let source_bus = PgEventBus::<SourceEvent>::new(pool.clone(), SOURCE_CHANNEL);
+    let target_bus = PgEventBus::<TargetEvent>::new(pool.clone(), TARGET_CHANNEL);
 
     let source_store = PgEventStore::new(pool.clone(), source_bus.clone());
     let target_store = PgEventStore::new(pool.clone(), target_bus.clone());
