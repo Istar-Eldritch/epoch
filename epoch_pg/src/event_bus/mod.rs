@@ -2588,12 +2588,41 @@ async fn try_flush_pending_checkpoint(
     }
 }
 
+/// Records `subscriber_id -> mode` in the registry, warning if the id is
+/// already present.
+///
+/// The listener seeds `subscriber_states` and the per-priority dispatch list
+/// first-wins on a duplicate id (mod.rs `subscriber_states.contains_key`), so a
+/// second `subscribe()` of an id already registered gets full catch-up history
+/// and then never receives a live event: the first observer keeps driving the
+/// subscriber silently. This is reachable through the documented `ReplayAlways`
+/// re-subscribe path (spec 0024 §4.5 Correction 3), not just a copy-pasted id, so
+/// it is a warning rather than an error — flagging it, not blocking it.
+async fn warn_if_subscriber_id_reused(
+    subscriber_modes: &Arc<Mutex<HashMap<String, SubscriptionMode>>>,
+    subscriber_id: &str,
+    mode: SubscriptionMode,
+) {
+    let previous = subscriber_modes
+        .lock()
+        .await
+        .insert(subscriber_id.to_string(), mode);
+    if previous.is_some() {
+        warn!(
+            "subscribe(): subscriber id '{}' is already registered on this bus. The \
+             existing observer keeps receiving events; this new subscription will not \
+             receive any live event (first-registration wins).",
+            subscriber_id
+        );
+    }
+}
+
 /// Records catch-up progress for one event.
 ///
 /// For a `Checkpointed` subscriber this advances the batched pending checkpoint
 /// and flushes it to the checkpoints table when the mode threshold is reached.
 /// For a `ReplayAlways` subscriber it instead advances the in-memory high-water
-/// mark and never touches the checkpoints table (§4.5).
+/// mark and never touches the checkpoints table.
 #[allow(clippy::too_many_arguments)]
 async fn record_catchup_progress(
     replay_always: bool,
@@ -2874,20 +2903,25 @@ where
             let observer: Arc<Mutex<dyn EventObserver<Self::EventType>>> =
                 Arc::new(Mutex::new(projector));
 
-            // Record id -> mode up front, while nothing can be holding the
-            // observer's lock, so readiness never has to lock it later.
-            {
+            // Read id + mode once, while nothing else can be holding the
+            // observer's lock. Recorded into `subscriber_modes` only on the
+            // paths below that actually register the observer: a Coordinated-mode
+            // subscribe that loses the advisory-lock race must NOT appear in the
+            // registry, or `wait_until_all_caught_up` would poll a subscriber this
+            // process never drives, burning its whole timeout every time (a
+            // ReplayAlways position is a per-process HWM that would then never
+            // advance here).
+            let (subscriber_id, mode) = {
                 let o = observer.lock().await;
-                subscriber_modes
-                    .lock()
-                    .await
-                    .insert(o.subscriber_id().to_string(), o.subscription_mode());
-            }
+                (o.subscriber_id().to_string(), o.subscription_mode())
+            };
+            let replay_always = mode == SubscriptionMode::ReplayAlways;
 
             // Inline dispatch: no LISTEN task, no NOTIFY channel, no catch-up.
             // Just register the subscriber and return. Any events published
             // before subscription are not replayed (intentional for tests).
             if config.dispatch_mode == config::DispatchMode::Inline {
+                warn_if_subscriber_id_reused(&subscriber_modes, &subscriber_id, mode).await;
                 // Touch inline_state so the field isn't considered unused on
                 // the subscribe path; ensures the queue is initialized.
                 let _ = inline_state.lock().await;
@@ -2977,6 +3011,10 @@ where
                     subscriber_id
                 );
             }
+
+            // Past the Coordinated-mode gate: this instance will actually drive
+            // the subscriber, so it is safe to make it visible to readiness.
+            warn_if_subscriber_id_reused(&subscriber_modes, &subscriber_id, mode).await;
 
             // === Gap-free catch-up with event buffering ===
             // To prevent race conditions between catch-up and real-time events:
