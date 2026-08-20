@@ -1403,6 +1403,28 @@ where
                 // Shared batch loop: fetch events once from the minimum checkpoint,
                 // then fan out to all subscribers in priority order.
                 loop {
+                    // Cooperative shutdown check. This loop can run for the whole
+                    // backlog and only the outer `select!` observes
+                    // `shutdown_rx.changed()` between wakes, so without this a
+                    // `shutdown()` caller would wait unbounded for a drain that
+                    // never looks at the signal. Checked at the top of the loop,
+                    // after the previous batch's outcomes are already merged back
+                    // into `subscriber_states`/`pending_checkpoints` (never
+                    // mid-batch), so breaking here abandons nothing: already-
+                    // flushed checkpoints stay correct and the outer loop's
+                    // shutdown branch still runs the final flush. `borrow()`
+                    // rather than `changed()`: it must not consume the pending
+                    // change, or the outer `select!`'s own `shutdown_rx.changed()`
+                    // arm would never fire and the listener would spin on the
+                    // timer tick forever instead of shutting down.
+                    if *shutdown_rx.borrow() {
+                        info!(
+                            "Shutdown signal received mid-drain; stopping the batch \
+                             loop at the next batch boundary"
+                        );
+                        break;
+                    }
+
                     // Find the minimum contiguous checkpoint across all subscribers.
                     let min_checkpoint = subscriber_states
                         .values()
