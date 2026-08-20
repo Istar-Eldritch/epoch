@@ -2751,12 +2751,55 @@ async fn record_catchup_progress(
     .await;
 }
 
+/// Advances the contiguous-prefix checkpoint for one caught-up event (R1/R3/R4).
+///
+/// Rows arrive in ascending `global_sequence` order, so the highest contiguous
+/// prefix from where the pass started is a running counter, not a set. The
+/// prefix advances only when the row exactly extends it (`seq == contiguous + 1`)
+/// and freezes for the rest of the pass at the first hole: every later sequence
+/// is `> contiguous + 1`, so the condition never fires again. This is why the
+/// pass can never persist a checkpoint above a sequence that is still missing.
+///
+/// For a `ReplayAlways` subscriber it instead advances the in-memory high-water
+/// mark and never touches the prefix or the checkpoints table (§4.5, R6).
+async fn advance_catchup_prefix(
+    replay_always: bool,
+    hwm: &Arc<Mutex<HashMap<String, u64>>>,
+    subscriber_id: &str,
+    event_global_seq: u64,
+    event_id: Uuid,
+    contiguous: &mut u64,
+    checkpoint_event_id: &mut Option<Uuid>,
+) {
+    if replay_always {
+        hwm.lock()
+            .await
+            .insert(subscriber_id.to_string(), event_global_seq);
+        return;
+    }
+
+    if event_global_seq == *contiguous + 1 {
+        *contiguous = event_global_seq;
+        *checkpoint_event_id = Some(event_id);
+    }
+}
+
 /// Runs one catch-up pass for a single subscriber.
 ///
 /// For a `Checkpointed` subscriber this reads the persisted checkpoint, then
 /// paginates `global_sequence > checkpoint` in `catch_up_batch_size` chunks,
-/// dispatching each event through [`process_event_with_retry`] and advancing the
-/// checkpoint.
+/// dispatching each event through [`process_event_with_retry`].
+///
+/// The persisted checkpoint is the highest *contiguous* prefix from where the
+/// pass started, tracked by [`advance_catchup_prefix`], not the maximum sequence
+/// seen (R1). `global_sequence` is assigned by a non-transactional `nextval()`
+/// (spec 0019), so a visible page can contain a hole a still-open transaction
+/// fills in later; checkpointing the maximum would strand that event below the
+/// seed of the live loop. The prefix freezes at the first hole and is flushed
+/// once at the end of the pass (§4.2). A hole that never fills leaves the
+/// checkpoint below it, so the live loop re-reads from there and delivers it;
+/// the pass still terminates because the pagination cursor keeps advancing by
+/// the maximum sequence seen (§4.1, R3).
 ///
 /// For a [`SubscriptionMode::ReplayAlways`] subscriber (R5) it ignores the
 /// persisted checkpoint entirely, starting from the surviving in-memory
@@ -2802,11 +2845,16 @@ where
         result.map(|(seq,)| seq as u64).unwrap_or(0)
     };
 
+    // Pagination cursor: advances by the maximum sequence seen so the pass
+    // terminates at head even past an unfilled hole (§4.1).
     let mut current_sequence = last_sequence;
     let mut total_caught_up = 0u64;
 
-    // Pending checkpoint for batched mode during catch-up
-    let mut pending_checkpoint: Option<PendingCheckpoint> = None;
+    // Contiguous-prefix checkpoint (R1/R4): seeded from where the pass started,
+    // advanced only across an unbroken run by advance_catchup_prefix, flushed
+    // once at the end of the pass.
+    let mut contiguous = last_sequence;
+    let mut checkpoint_event_id: Option<Uuid> = None;
     // Local checkpoint cache for flush_checkpoint
     let mut checkpoint_cache: HashMap<String, u64> = HashMap::new();
 
@@ -2851,20 +2899,19 @@ where
                              been removed from the application enum. Advancing checkpoint past this event.",
                         event_id, row.event_type, event_global_seq, subscriber_id, e
                     );
-                    // Advance current_sequence and checkpoint past the
-                    // undeserializable event to avoid an infinite retry loop.
+                    // Advance current_sequence and the contiguous prefix past
+                    // the undeserializable event to avoid an infinite retry loop;
+                    // a skipped-past event counts as processed for the prefix.
                     current_sequence = event_global_seq;
                     total_caught_up += 1;
-                    record_catchup_progress(
+                    advance_catchup_prefix(
                         replay_always,
                         hwm,
                         subscriber_id,
                         event_global_seq,
                         event_id,
-                        &mut pending_checkpoint,
-                        &mut checkpoint_cache,
-                        config,
-                        pool,
+                        &mut contiguous,
+                        &mut checkpoint_event_id,
                     )
                     .await;
                     continue;
@@ -2893,16 +2940,14 @@ where
             let result =
                 process_event_with_retry(observer, &event, subscriber_id, config, pool).await;
 
-            record_catchup_progress(
+            advance_catchup_prefix(
                 replay_always,
                 hwm,
                 subscriber_id,
                 event_global_seq,
                 event_id,
-                &mut pending_checkpoint,
-                &mut checkpoint_cache,
-                config,
-                pool,
+                &mut contiguous,
+                &mut checkpoint_event_id,
             )
             .await;
 
@@ -2924,13 +2969,17 @@ where
         }
     }
 
-    // Flush any remaining pending checkpoint after catch-up
-    if let Some(pending) = pending_checkpoint.take()
+    // Flush the contiguous prefix once at the end of the pass (§4.2). Nothing to
+    // do for a ReplayAlways subscriber (routed to the HWM) or when the prefix
+    // never advanced past the seed. `checkpoint_event_id` is Some exactly when
+    // `contiguous` advanced, so `last_event_id` always matches (R4).
+    if !replay_always
+        && let Some(event_id) = checkpoint_event_id
         && let Err(e) = flush_checkpoint(
             pool,
             &config.events_table,
             subscriber_id,
-            &pending,
+            &PendingCheckpoint::new(contiguous, event_id),
             &mut checkpoint_cache,
         )
         .await
@@ -2943,8 +2992,8 @@ where
 
     if total_caught_up > 0 {
         info!(
-            "Catch-up complete for '{}': processed {} events, checkpoint now at {}",
-            subscriber_id, total_caught_up, current_sequence
+            "Catch-up complete for '{}': processed {} events, cursor at {}, checkpoint now at {}",
+            subscriber_id, total_caught_up, current_sequence, contiguous
         );
     }
 
