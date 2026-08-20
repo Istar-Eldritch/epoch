@@ -970,7 +970,24 @@ where
         // held, not the lock itself. Probe with a catalog read first, so the lock
         // is paid at most once per database rather than once per boot per bus, and
         // only when there is actually a legacy trigger to remove.
-        if trigger_exists(&self.pool, &self.config.events_table, LEGACY_NOTIFY_TRIGGER).await?
+        // A probe failure must not be fatal. This whole block is optional cleanup,
+        // and the drop it guards was deliberately warn-only; propagating a
+        // transient catalog-read error here would skip `ensure_trigger()` below and
+        // leave the bus with no trigger of its own, which is far worse than failing
+        // to remove a legacy one. Treat an unreadable catalog as "nothing to drop".
+        let legacy_present =
+            trigger_exists(&self.pool, &self.config.events_table, LEGACY_NOTIFY_TRIGGER)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(
+                        "setup_trigger: could not check for the legacy '{}' trigger on '{}'; \
+                 skipping that cleanup and continuing: {}",
+                        LEGACY_NOTIFY_TRIGGER, self.config.events_table, e
+                    );
+                    false
+                });
+
+        if legacy_present
             && let Err(e) = sqlx::query(&format!(
                 "DROP TRIGGER IF EXISTS {LEGACY_NOTIFY_TRIGGER} ON {};",
                 self.config.events_table,
@@ -1153,14 +1170,29 @@ where
                 let guard = projections.lock().await;
                 guard.iter().cloned().collect()
             };
+
+            // Replay in priority order, so a saga (priority 100) does not catch up
+            // against a read model (priority 0) that has not yet seen the same
+            // events. Each replay below is awaited sequentially, so this ordering is
+            // the only thing establishing it. Sorted here, on the snapshot and off
+            // the `projections` guard, rather than by reordering the shared vector:
+            // reading a priority means locking an observer, and an observer's mutex
+            // is held across its `on_event`.
+            let mut tagged = Vec::with_capacity(projections_snapshot.len());
             for projection in &projections_snapshot {
-                let (subscriber_id, replay_always) = {
+                let (priority, subscriber_id, replay_always) = {
                     let obs = projection.lock().await;
                     (
+                        obs.priority(),
                         obs.subscriber_id().to_string(),
                         obs.subscription_mode() == SubscriptionMode::ReplayAlways,
                     )
                 };
+                tagged.push((priority, subscriber_id, replay_always, projection));
+            }
+            tagged.sort_by_key(|(priority, _, _, _)| *priority);
+
+            for (_, subscriber_id, replay_always, projection) in tagged {
                 if let Err(e) = catch_up_from_checkpoint(
                     projection,
                     &subscriber_id,
@@ -2990,16 +3022,6 @@ where
                 return Ok(());
             }
 
-            // R5 (Correction 3): a fresh subscribe (including re-subscribe after
-            // unsubscribe) of a ReplayAlways subscriber rebuilds its in-memory
-            // model from empty, so reset the HWM to 0 before catch-up. Readiness
-            // therefore never reads a stale high value from a prior subscription
-            // lifecycle while the model is being rebuilt; catch-up re-seeds it as
-            // it progresses.
-            if replay_always {
-                hwm.lock().await.insert(subscriber_id.clone(), 0);
-            }
-
             // R4 (defence-in-depth): in Async mode, delivery of newly committed
             // events depends on the AFTER INSERT NOTIFY trigger. If it is absent
             // (e.g. subscribe() called before start_listener/setup_trigger created
@@ -3066,6 +3088,22 @@ where
             // Past the Coordinated-mode gate: this instance will actually drive
             // the subscriber, so it is safe to make it visible to readiness.
             warn_if_subscriber_id_reused(&subscriber_modes, &subscriber_id, mode).await;
+
+            // A fresh subscribe of a ReplayAlways subscriber rebuilds its in-memory
+            // model from empty, so reset the HWM before catch-up: readiness must not
+            // report a stale high position from a previous subscription lifecycle
+            // while the model is being rebuilt. Catch-up re-seeds it as it
+            // progresses.
+            //
+            // Must sit after the Coordinated-mode gate, not before it. The HWM is
+            // shared by every clone of this bus, so zeroing it on a subscribe that
+            // then loses the advisory-lock race would knock the *winning*
+            // subscription's readiness position back to 0 with nothing left to
+            // advance it, reporting a healthy at-head subscriber as permanently
+            // behind.
+            if replay_always {
+                hwm.lock().await.insert(subscriber_id.clone(), 0);
+            }
 
             // === Gap-free catch-up with event buffering ===
             // To prevent race conditions between catch-up and real-time events:

@@ -1355,6 +1355,26 @@ async fn test_coordinated_mode_skips_subscribe_if_lock_held() {
         "Projection should NOT have received events when lock was already held"
     );
 
+    // A subscriber this instance declined to drive must also stay invisible to
+    // readiness. It is not registered, so it has no position here, and the bus-wide
+    // gate must not wait on one: it would never advance and would burn the caller's
+    // whole timeout on every call.
+    assert!(
+        matches!(
+            event_bus.subscriber_lag(&subscriber_id).await,
+            Err(epoch_pg::PgEventBusError::SubscriberNotFound(_))
+        ),
+        "a Coordinated-mode subscribe that lost the advisory-lock race must not be \
+         visible to readiness on this instance"
+    );
+    assert!(
+        event_bus
+            .wait_until_all_caught_up(tokio::time::Duration::from_millis(300))
+            .await
+            .expect("wait_until_all_caught_up failed"),
+        "the bus-wide gate must not wait on a subscriber this instance does not drive"
+    );
+
     // Clean up - release the lock
     let _: (bool,) = sqlx::query_as(
         r#"
@@ -5506,8 +5526,13 @@ async fn test_second_bus_on_same_table_gets_its_own_trigger() {
         .await
         .expect("store_event failed");
 
+    // 500ms, not 200ms: the budget has to cover NOTIFY dispatch, a batch SELECT on
+    // a table other tests are concurrently TRUNCATEing, the handler, a synchronous
+    // checkpoint upsert, and up to one 25ms readiness poll. Checkpoint writes in
+    // this suite have been measured stalling for seconds under load. 500ms is still
+    // well under the 1s timer tick, which is all this assertion needs.
     let caught_up = second_bus
-        .wait_until_caught_up(&subscriber_id, std::time::Duration::from_millis(200))
+        .wait_until_caught_up(&subscriber_id, std::time::Duration::from_millis(500))
         .await
         .expect("wait_until_caught_up failed");
     assert!(
