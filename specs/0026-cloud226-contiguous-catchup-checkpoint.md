@@ -223,6 +223,20 @@ they do not leak NOTIFY triggers (CLOUD-230).
    suite shares one database across five binaries and contains at least one known load-sensitive
    test, so a green pair proves less than it appears to.
 
+## Phases (JSON)
+
+```json
+{
+  "phases": [
+    { "phase": 1, "focus": "epoch_pg: replace catch_up_from_checkpoint's linear PendingCheckpoint with a contiguous-prefix counter seeded from the starting checkpoint; advance only on seq == contiguous + 1 and stop advancing permanently at the first hole; keep the pagination cursor advancing by max-seen so the pass still terminates; return the pagination cursor; flush once at pass end from the prefix and the event_id of the row that last advanced it", "effort": "M", "difficulty": "subtle", "requirements": ["R1","R3","R4"] },
+    { "phase": 2, "focus": "epoch_pg: make subscribe()'s buffer-drain pass continue the same prefix counter over the drained range instead of flushing a linear max; it keeps using the returned pagination cursor as its lower bound but must never flush above the contiguous value, since flush_checkpoint is a blind non-monotonic upsert and would otherwise overwrite the conservative checkpoint inside the same subscribe() call", "effort": "M", "difficulty": "subtle", "requirements": ["R2","R4"] },
+    { "phase": 3, "focus": "epoch_pg unit tests beside the code: prefix counter stops at the first hole and the returned cursor is above it; multi-page case with catch_up_batch_size 2 and the hole on a non-final page proving the counter does not resume after the hole; positive control with no hole advancing to head with a matching last_event_id; ReplayAlways unchanged. Deterministic, no sleeps", "effort": "M", "difficulty": "standard", "requirements": ["R1","R3","R4","R6"] },
+    { "phase": 4, "focus": "epoch_pg integration tests: end-to-end delivery of an event committed after a catch-up pass, subscribing before start_listener so the R2 pass is what is exercised, using a bounded wait_until_caught_up rather than a fixed sleep; plus a test that subscribe()'s drain does not overwrite a conservative checkpoint. All assertions relative to sequences captured via INSERT ... RETURNING global_sequence, reusing start_fence_test_bus and insert_committed_event, with stable channel names", "effort": "M", "difficulty": "subtle", "requirements": ["R1","R2","R5"] },
+    { "phase": 5, "focus": "Hygiene and docs: CHANGELOG Fixed entry calling out the R5 readiness behaviour change (a gate that previously returned true over a lost event now blocks until the hole resolves); mark spec 0024 OQ-4 resolved here; rustdoc on both catch-up paths stating the contiguous-checkpoint contract; cargo fmt, clippy --all-targets -p epoch_pg -p epoch_core -D warnings; verify the existing gap-fence and gap-timeout tests pass unmodified, and verify mechanically that reverting the source change makes the phase-3 hole test and the phase-4 drain test fail", "effort": "S", "difficulty": "standard", "requirements": ["R5","R7"] }
+  ]
+}
+```
+
 ## 10. Open Questions
 
 - **OQ-1.** Should catch-up report that it stopped below a hole, so a readiness gate can
