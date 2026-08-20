@@ -2648,9 +2648,8 @@ where
 /// configured threshold is met; a no-op otherwise. On flush failure the
 /// pending checkpoint is put back so the next call retries, and the error is
 /// logged with `context` (a short label identifying the caller for the log
-/// line). Shared by [`record_catchup_progress`] and
-/// `process_subscriber_for_batch` so the flush-and-retry-on-error dance can't
-/// drift between the catch-up and live-batch paths.
+/// line). Shared by the live-batch path (via `process_subscriber_for_batch`) so
+/// the flush-and-retry-on-error dance can't drift between callers.
 async fn try_flush_pending_checkpoint(
     pending_checkpoint: &mut Option<PendingCheckpoint>,
     context: &str,
@@ -2709,48 +2708,6 @@ async fn warn_if_subscriber_id_reused(
     }
 }
 
-/// Records catch-up progress for one event.
-///
-/// For a `Checkpointed` subscriber this advances the batched pending checkpoint
-/// and flushes it to the checkpoints table when the mode threshold is reached.
-/// For a `ReplayAlways` subscriber it instead advances the in-memory high-water
-/// mark and never touches the checkpoints table.
-#[allow(clippy::too_many_arguments)]
-async fn record_catchup_progress(
-    replay_always: bool,
-    hwm: &Arc<Mutex<HashMap<String, u64>>>,
-    subscriber_id: &str,
-    event_global_seq: u64,
-    event_id: Uuid,
-    pending_checkpoint: &mut Option<PendingCheckpoint>,
-    checkpoint_cache: &mut HashMap<String, u64>,
-    config: &ReliableDeliveryConfig,
-    pool: &PgPool,
-) {
-    if replay_always {
-        hwm.lock()
-            .await
-            .insert(subscriber_id.to_string(), event_global_seq);
-        return;
-    }
-
-    match pending_checkpoint {
-        Some(pending) => pending.update(event_global_seq, event_id),
-        None => *pending_checkpoint = Some(PendingCheckpoint::new(event_global_seq, event_id)),
-    }
-
-    try_flush_pending_checkpoint(
-        pending_checkpoint,
-        "Catch-up",
-        &config.events_table,
-        subscriber_id,
-        &config.checkpoint_mode,
-        pool,
-        checkpoint_cache,
-    )
-    .await;
-}
-
 /// Advances the contiguous-prefix checkpoint for one caught-up event (R1/R3/R4).
 ///
 /// Rows arrive in ascending `global_sequence` order, so the highest contiguous
@@ -2807,8 +2764,13 @@ async fn advance_catchup_prefix(
 /// value on a listener restart) and routing advancement to that HWM instead of
 /// the checkpoints table, which is never written for such a subscriber.
 ///
-/// Returns the highest `global_sequence` reached. Shared by `subscribe` and the
-/// pre-loop pass in `start_listener` so the two catch-up paths cannot drift apart.
+/// Returns `(pagination_cursor, contiguous_prefix)`. The cursor is the highest
+/// `global_sequence` reached and is the correct `> cursor` lower bound for the
+/// `subscribe()` buffer drain; the contiguous prefix is what was actually
+/// persisted, so the drain can continue the *same* counter over the drained
+/// range and never flush above the hole (§4.3, R2). Shared by `subscribe` and
+/// the pre-loop pass in `start_listener` so the two catch-up paths cannot drift
+/// apart.
 ///
 /// `replay_always` is resolved once by the caller (it reads the observer's own
 /// mutex) rather than re-derived here, so a single `subscribe()` call only
@@ -2820,7 +2782,7 @@ pub(crate) async fn catch_up_from_checkpoint<ED>(
     config: &ReliableDeliveryConfig,
     pool: &PgPool,
     hwm: &Arc<Mutex<HashMap<String, u64>>>,
-) -> Result<u64, SqlxError>
+) -> Result<(u64, u64), SqlxError>
 where
     ED: EventData + Send + Sync + DeserializeOwned + 'static,
 {
@@ -2997,7 +2959,7 @@ where
         );
     }
 
-    Ok(current_sequence)
+    Ok((current_sequence, contiguous))
 }
 
 impl<D> EventBus for PgEventBus<D>
@@ -3241,7 +3203,11 @@ where
             // Catch up from the persisted checkpoint. Reuses the same paginated,
             // retry/DLQ-backed pass that start_listener runs before entering its
             // loop (R2), so the two paths cannot drift.
-            let mut current_sequence = catch_up_from_checkpoint(
+            // `current_sequence` is the pagination cursor (max seen), the correct
+            // `> current_sequence` lower bound for the drain below. `contiguous`
+            // is what catch-up actually persisted; the drain continues this same
+            // counter so it can never flush above a hole catch-up stopped at (R2).
+            let (mut current_sequence, mut contiguous) = catch_up_from_checkpoint(
                 &observer,
                 &subscriber_id,
                 replay_always,
@@ -3251,8 +3217,11 @@ where
             )
             .await?;
 
-            // Pending checkpoint / local cache for the buffer-drain phase below.
-            let mut pending_checkpoint: Option<PendingCheckpoint> = None;
+            // Continues catch-up's contiguous-prefix counter over the drained
+            // range (§4.3). `checkpoint_event_id` is Some exactly when the drain
+            // advanced the prefix, so a flushed `last_event_id` always matches
+            // its sequence (R4).
+            let mut checkpoint_event_id: Option<Uuid> = None;
             let mut checkpoint_cache: HashMap<String, u64> = HashMap::new();
 
             // Stop the buffer listener
@@ -3371,18 +3340,17 @@ where
                         }
 
                         // Common checkpoint tracking — runs for both the deserialization-
-                        // error path and the successful-processing path. Routes to the
-                        // in-memory HWM for a ReplayAlways subscriber (§4.5).
-                        record_catchup_progress(
+                        // error path and the successful-processing path. Advances the
+                        // contiguous prefix carried over from catch-up, or the in-memory
+                        // HWM for a ReplayAlways subscriber (§4.3, §4.5).
+                        advance_catchup_prefix(
                             replay_always,
                             &hwm,
                             &subscriber_id,
                             event_global_seq,
                             event_id,
-                            &mut pending_checkpoint,
-                            &mut checkpoint_cache,
-                            &config,
-                            &pool,
+                            &mut contiguous,
+                            &mut checkpoint_event_id,
                         )
                         .await;
 
@@ -3395,13 +3363,21 @@ where
                 }
             }
 
-            // Flush any remaining pending checkpoint after buffer processing
-            if let Some(pending) = pending_checkpoint.take()
+            // Flush the contiguous prefix once after buffer processing (R2/R4).
+            // `flush_checkpoint` is a blind, non-monotonic upsert, so flushing
+            // anything above `contiguous` would overwrite catch-up's conservative
+            // checkpoint inside this same subscribe() call — "flush only the
+            // contiguous value" is the requirement, not an optimisation (§4.3).
+            // `checkpoint_event_id` is Some exactly when the drain advanced the
+            // prefix; when it did not (e.g. the drained rows all sit above a hole
+            // catch-up stopped at) catch-up's flush already persisted `contiguous`.
+            if !replay_always
+                && let Some(event_id) = checkpoint_event_id
                 && let Err(e) = flush_checkpoint(
                     &pool,
                     &config.events_table,
                     &subscriber_id,
-                    &pending,
+                    &PendingCheckpoint::new(contiguous, event_id),
                     &mut checkpoint_cache,
                 )
                 .await
@@ -3420,7 +3396,7 @@ where
                     subscriber_id,
                     processed_from_buffer,
                     max_buffered_seq,
-                    current_sequence
+                    contiguous
                 );
             }
 
