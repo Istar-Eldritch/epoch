@@ -6396,9 +6396,9 @@ async fn test_live_shutdown_does_not_publish_above_held_hole() {
         seq_hole > seq_below,
         "the hole must sit above the below-hole event"
     );
-    let (_above1_id, seq_above1) =
+    let (above1_id, seq_above1) =
         insert_committed_event(&pool, &table, hole_stream, 2, "above1").await;
-    let (_above2_id, seq_above2) =
+    let (above2_id, seq_above2) =
         insert_committed_event(&pool, &table, hole_stream, 3, "above2").await;
     assert!(
         seq_above1 > seq_hole && seq_above2 > seq_above1,
@@ -6412,7 +6412,7 @@ async fn test_live_shutdown_does_not_publish_above_held_hole() {
     for _ in 0..40 {
         if let Some(state) = store.get_state(hole_stream).await.unwrap() {
             let seen: Vec<Uuid> = state.0.iter().map(|e| e.id).collect();
-            if seen.contains(&_above1_id) && seen.contains(&_above2_id) {
+            if seen.contains(&above1_id) && seen.contains(&above2_id) {
                 delivered = true;
                 break;
             }
