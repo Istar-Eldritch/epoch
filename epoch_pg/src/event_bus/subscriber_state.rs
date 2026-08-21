@@ -8,6 +8,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 use tokio::time::Instant;
+use uuid::Uuid;
 
 /// A point-in-time view of PostgreSQL transaction-id boundaries used to fence
 /// gap resolution. Captured once per catch-up batch from the reader's session
@@ -92,6 +93,12 @@ pub(crate) struct SubscriberState {
     /// This is the value persisted to the database checkpoint.
     pub contiguous_checkpoint: u64,
 
+    /// The `event_id` paired with `contiguous_checkpoint`, used to seed an eager
+    /// [`PendingCheckpoint`](super::checkpoint::PendingCheckpoint) so its
+    /// persisted `last_event_id` stays paired with `last_global_sequence` (spec
+    /// 0026 R4 / spec 0027 §4 Q1). `Uuid::nil()` when no paired id is known.
+    pub contiguous_event_id: Uuid,
+
     /// Global sequences that have been processed but are above `contiguous_checkpoint`.
     /// These are events processed "ahead" of a gap. Bounded by the number of
     /// concurrent uncommitted transactions (typically 0–2 entries).
@@ -113,6 +120,23 @@ impl SubscriberState {
     pub fn new(checkpoint: u64) -> Self {
         Self {
             contiguous_checkpoint: checkpoint,
+            contiguous_event_id: Uuid::nil(),
+            processed_ahead: HashSet::new(),
+            gap_first_seen: HashMap::new(),
+        }
+    }
+
+    /// Creates a new `SubscriberState` seeded with both the persisted contiguous
+    /// checkpoint and its paired `event_id`.
+    ///
+    /// Used by the production seeding site (`start_listener`), which reads both
+    /// `last_global_sequence` and `last_event_id` from the checkpoints table so
+    /// an eager [`PendingCheckpoint`](super::checkpoint::PendingCheckpoint) can
+    /// be seeded with a correctly paired id.
+    pub fn new_with_event_id(checkpoint: u64, event_id: Uuid) -> Self {
+        Self {
+            contiguous_checkpoint: checkpoint,
+            contiguous_event_id: event_id,
             processed_ahead: HashSet::new(),
             gap_first_seen: HashMap::new(),
         }
