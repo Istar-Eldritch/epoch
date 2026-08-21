@@ -65,6 +65,17 @@ pub(crate) fn should_flush_checkpoint(pending: &PendingCheckpoint, mode: &Checkp
 ///
 /// This writes the checkpoint and updates the in-memory cache.
 ///
+/// # Hazard: this is a blind, non-monotonic write
+/// `DO UPDATE SET last_global_sequence = EXCLUDED...` overwrites whatever is
+/// currently persisted unconditionally — there is no `WHERE
+/// EXCLUDED.last_global_sequence > last_global_sequence` guard (deliberately
+/// deferred; see spec 0026 §2 non-goals). A caller can therefore move a
+/// checkpoint *backwards* by passing a `pending` value lower than what is
+/// already stored. Every caller MUST pass only a value it is willing to
+/// publish as the subscriber's current position; this is exactly why the
+/// contiguous-prefix catch-up counter (spec 0026 R1/R2) never flushes above a
+/// sequence it hasn't proven contiguous.
+///
 /// # Returns
 ///
 /// Returns `Ok(())` if the checkpoint was successfully written, or an error if the

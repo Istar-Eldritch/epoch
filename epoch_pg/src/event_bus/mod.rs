@@ -1709,6 +1709,14 @@ where
     ///
     /// This is an upsert operation - it will create a new checkpoint if one doesn't exist,
     /// or update the existing one.
+    ///
+    /// # Hazard: this is a blind, non-monotonic write
+    /// Like this bus's internal flush primitive, the underlying `DO UPDATE SET
+    /// last_global_sequence = EXCLUDED...` has no guard against moving the
+    /// checkpoint backwards. Pass only a `global_sequence` this subscriber has
+    /// actually finished processing up to a contiguous prefix (spec 0026 R1);
+    /// passing anything else can strand events below the seed of a subsequent
+    /// listener restart the same way the bug this crate fixes did.
     pub async fn update_checkpoint(
         &self,
         subscriber_id: &str,
@@ -1736,7 +1744,7 @@ where
     }
 
     // -------------------------------------------------------------------------
-    // R1 — Subscriber lag / readiness
+    // spec 0024 R1 — Subscriber lag / readiness
     // -------------------------------------------------------------------------
 
     /// The highest `global_sequence` currently present on this bus's events
@@ -1836,10 +1844,11 @@ where
 
     /// Events this subscriber is behind the current head, for monitoring.
     ///
-    /// `head − position`, saturating at 0. `position` is the persisted
-    /// checkpoint for a [`SubscriptionMode::Checkpointed`] subscriber, or the
-    /// in-memory high-water mark for a [`SubscriptionMode::ReplayAlways`] one.
-    /// Point-in-time; the head may move under a cascade.
+    /// `head − position`, saturating at 0. `position` is the highest
+    /// *contiguous* prefix persisted for a [`SubscriptionMode::Checkpointed`]
+    /// subscriber, or the in-memory high-water mark for a
+    /// [`SubscriptionMode::ReplayAlways`] one. Point-in-time; the head may move
+    /// under a cascade.
     ///
     /// Returns [`PgEventBusError::SubscriberNotFound`] if `subscriber_id` is
     /// not registered on this bus, or [`PgEventBusError::InlineDispatchNotSupported`]
@@ -1852,6 +1861,14 @@ where
     /// group has finished the current one. A slow or wedged `on_event` on a
     /// peer therefore holds this subscriber's own lag non-zero even while its
     /// own handler is healthy and fast.
+    ///
+    /// # Hazard: readiness is measured on the contiguous checkpoint
+    /// `position` is the highest *contiguous* prefix processed, not the
+    /// highest sequence seen (spec 0026 R1). A hole ANYWHERE in the backlog —
+    /// not only at the tail, which is all the burned/in-flight hazard above
+    /// covers — pins `position` at the hole's location until it resolves, so
+    /// lag can stay non-zero even though every event visible so far has
+    /// actually been processed. See spec 0026 R5.
     pub async fn subscriber_lag(&self, subscriber_id: &str) -> Result<u64, PgEventBusError> {
         self.require_non_inline_dispatch()?;
         // Validate subscriber first so unknown ids get SubscriberNotFound
@@ -1922,6 +1939,14 @@ where
     /// for the rest of the backlog, even though this subscriber's own handler
     /// is healthy.
     ///
+    /// # Hazard: readiness is measured on the contiguous checkpoint
+    /// `position` is the highest *contiguous* prefix processed, not the
+    /// highest sequence seen (spec 0026 R1). A hole ANYWHERE in the backlog —
+    /// not only at the tail, which is all the burned/in-flight hazard above
+    /// covers — pins `position` at the hole's location until it resolves, so
+    /// this call can stay pending even though every event visible so far has
+    /// actually been processed. See spec 0026 R5.
+    ///
     /// Returns [`PgEventBusError::SubscriberNotFound`] if `subscriber_id` is
     /// not registered on this bus, or [`PgEventBusError::InlineDispatchNotSupported`]
     /// if this bus is [`DispatchMode::Inline`](crate::DispatchMode::Inline).
@@ -1970,6 +1995,15 @@ where
     /// `on_event` therefore stalls every other subscriber in its group for the
     /// rest of the backlog, not just its own progress, and this call cannot
     /// return `true` for any of them until it clears.
+    ///
+    /// # Hazard: readiness is measured on the contiguous checkpoint
+    /// Each subscriber's `position` is the highest *contiguous* prefix
+    /// processed, not the highest sequence seen (spec 0026 R1). A hole
+    /// ANYWHERE in the backlog — not only at the tail, which is all the
+    /// burned/in-flight hazard on [`wait_until_caught_up`](Self::wait_until_caught_up)
+    /// covers — pins that subscriber's `position` at the hole's location until
+    /// it resolves, so this call can stay pending even though every event
+    /// visible so far has actually been processed. See spec 0026 R5.
     pub async fn wait_until_all_caught_up(
         &self,
         timeout: Duration,
@@ -2708,7 +2742,12 @@ async fn warn_if_subscriber_id_reused(
     }
 }
 
-/// Advances the contiguous-prefix checkpoint for one caught-up event (R1/R3/R4).
+/// Advances the contiguous-prefix checkpoint for one caught-up event (spec
+/// 0026 R1/R3/R4), then flushes it according to the configured
+/// `CheckpointMode` via [`try_flush_pending_checkpoint`] — a Synchronous pass
+/// must durably persist after every advance, not just once at the end, or a
+/// crash mid-pass redelivers the entire backlog instead of the "at most 1
+/// event" the mode's rustdoc promises (spec 0026 §4.2).
 ///
 /// Rows arrive in ascending `global_sequence` order, so the highest contiguous
 /// prefix from where the pass started is a running counter, not a set. The
@@ -2716,9 +2755,14 @@ async fn warn_if_subscriber_id_reused(
 /// and freezes for the rest of the pass at the first hole: every later sequence
 /// is `> contiguous + 1`, so the condition never fires again. This is why the
 /// pass can never persist a checkpoint above a sequence that is still missing.
+/// `pending_checkpoint` is only ever touched inside that same `seq ==
+/// contiguous + 1` branch, so a flush is impossible unless a matching
+/// sequence/event_id pair was set together (spec 0026 R4).
 ///
 /// For a `ReplayAlways` subscriber it instead advances the in-memory high-water
-/// mark and never touches the prefix or the checkpoints table (§4.5, R6).
+/// mark and never touches the prefix, `pending_checkpoint`, or the checkpoints
+/// table (spec 0026 §4.5, R6).
+#[allow(clippy::too_many_arguments)]
 async fn advance_catchup_prefix(
     replay_always: bool,
     hwm: &Arc<Mutex<HashMap<String, u64>>>,
@@ -2726,7 +2770,10 @@ async fn advance_catchup_prefix(
     event_global_seq: u64,
     event_id: Uuid,
     contiguous: &mut u64,
-    checkpoint_event_id: &mut Option<Uuid>,
+    pending_checkpoint: &mut Option<PendingCheckpoint>,
+    config: &ReliableDeliveryConfig,
+    pool: &PgPool,
+    checkpoint_cache: &mut HashMap<String, u64>,
 ) {
     if replay_always {
         hwm.lock()
@@ -2735,10 +2782,26 @@ async fn advance_catchup_prefix(
         return;
     }
 
-    if event_global_seq == *contiguous + 1 {
-        *contiguous = event_global_seq;
-        *checkpoint_event_id = Some(event_id);
+    if event_global_seq != *contiguous + 1 {
+        return;
     }
+
+    *contiguous = event_global_seq;
+    match pending_checkpoint {
+        Some(p) => p.update(event_global_seq, event_id),
+        None => *pending_checkpoint = Some(PendingCheckpoint::new(event_global_seq, event_id)),
+    }
+
+    try_flush_pending_checkpoint(
+        pending_checkpoint,
+        "Catch-up",
+        &config.events_table,
+        subscriber_id,
+        &config.checkpoint_mode,
+        pool,
+        checkpoint_cache,
+    )
+    .await;
 }
 
 /// Runs one catch-up pass for a single subscriber.
@@ -2749,28 +2812,37 @@ async fn advance_catchup_prefix(
 ///
 /// The persisted checkpoint is the highest *contiguous* prefix from where the
 /// pass started, tracked by [`advance_catchup_prefix`], not the maximum sequence
-/// seen (R1). `global_sequence` is assigned by a non-transactional `nextval()`
-/// (spec 0019), so a visible page can contain a hole a still-open transaction
-/// fills in later; checkpointing the maximum would strand that event below the
-/// seed of the live loop. The prefix freezes at the first hole and is flushed
-/// once at the end of the pass (§4.2). A hole that never fills leaves the
-/// checkpoint below it, so the live loop re-reads from there and delivers it;
-/// the pass still terminates because the pagination cursor keeps advancing by
-/// the maximum sequence seen (§4.1, R3).
+/// seen (spec 0026 R1). `global_sequence` is assigned by a non-transactional
+/// `nextval()` (spec 0019), so a visible page can contain a hole a still-open
+/// transaction fills in later; checkpointing the maximum would strand that
+/// event below the seed of the live loop. The prefix freezes at the first hole
+/// and is flushed according to the configured `CheckpointMode` as it advances
+/// (an unconditional final flush covers a Batched pass that ends without
+/// crossing its threshold) rather than once at the end regardless of mode,
+/// which would let a Synchronous pass redeliver its entire backlog on a
+/// mid-pass crash instead of honouring its "at most 1 event" durability
+/// contract (spec 0026 §4.2). A hole that never fills leaves the checkpoint
+/// below it, so the live loop re-reads from there and delivers it; the pass
+/// still terminates because the pagination cursor keeps advancing by the
+/// maximum sequence seen (§4.1, spec 0026 R3). Recovering a *permanent* hole
+/// (one that will never fill) is the live listener's job, not this pass's:
+/// catch-up has no gap fence, snapshot, or timeout backstop of its own (see
+/// spec 0026 §3).
 ///
-/// For a [`SubscriptionMode::ReplayAlways`] subscriber (R5) it ignores the
-/// persisted checkpoint entirely, starting from the surviving in-memory
-/// high-water mark (0 on a fresh `subscribe`, which resets it; the retained
-/// value on a listener restart) and routing advancement to that HWM instead of
-/// the checkpoints table, which is never written for such a subscriber.
+/// For a [`SubscriptionMode::ReplayAlways`] subscriber (spec 0024 R5) it
+/// ignores the persisted checkpoint entirely, starting from the surviving
+/// in-memory high-water mark (0 on a fresh `subscribe`, which resets it; the
+/// retained value on a listener restart) and routing advancement to that HWM
+/// instead of the checkpoints table, which is never written for such a
+/// subscriber.
 ///
 /// Returns `(pagination_cursor, contiguous_prefix)`. The cursor is the highest
 /// `global_sequence` reached and is the correct `> cursor` lower bound for the
 /// `subscribe()` buffer drain; the contiguous prefix is what was actually
 /// persisted, so the drain can continue the *same* counter over the drained
-/// range and never flush above the hole (§4.3, R2). Shared by `subscribe` and
-/// the pre-loop pass in `start_listener` so the two catch-up paths cannot drift
-/// apart.
+/// range and never flush above the hole (§4.3, spec 0026 R2). Shared by
+/// `subscribe` and the pre-loop pass in `start_listener` so the two catch-up
+/// paths cannot drift apart.
 ///
 /// `replay_always` is resolved once by the caller (it reads the observer's own
 /// mutex) rather than re-derived here, so a single `subscribe()` call only
@@ -2786,9 +2858,9 @@ pub(crate) async fn catch_up_from_checkpoint<ED>(
 where
     ED: EventData + Send + Sync + DeserializeOwned + 'static,
 {
-    // R5: a ReplayAlways subscriber ignores the persisted checkpoint and starts
-    // from its surviving in-memory HWM, so a prior fast_forward-to-head does not
-    // suppress replay.
+    // spec 0024 R5: a ReplayAlways subscriber ignores the persisted checkpoint
+    // and starts from its surviving in-memory HWM, so a prior
+    // fast_forward-to-head does not suppress replay.
     let last_sequence = if replay_always {
         hwm.lock().await.get(subscriber_id).copied().unwrap_or(0)
     } else {
@@ -2812,11 +2884,14 @@ where
     let mut current_sequence = last_sequence;
     let mut total_caught_up = 0u64;
 
-    // Contiguous-prefix checkpoint (R1/R4): seeded from where the pass started,
-    // advanced only across an unbroken run by advance_catchup_prefix, flushed
-    // once at the end of the pass.
+    // Contiguous-prefix checkpoint (spec 0026 R1/R4): seeded from where the
+    // pass started, advanced only across an unbroken run by
+    // advance_catchup_prefix, which also flushes according to the configured
+    // CheckpointMode after each advance (spec 0026 §4.2). The final flush
+    // below is unconditional so a Batched pass never ends with an unflushed
+    // advance.
     let mut contiguous = last_sequence;
-    let mut checkpoint_event_id: Option<Uuid> = None;
+    let mut pending_checkpoint: Option<PendingCheckpoint> = None;
     // Local checkpoint cache for flush_checkpoint
     let mut checkpoint_cache: HashMap<String, u64> = HashMap::new();
 
@@ -2873,7 +2948,10 @@ where
                         event_global_seq,
                         event_id,
                         &mut contiguous,
-                        &mut checkpoint_event_id,
+                        &mut pending_checkpoint,
+                        config,
+                        pool,
+                        &mut checkpoint_cache,
                     )
                     .await;
                     continue;
@@ -2909,7 +2987,10 @@ where
                 event_global_seq,
                 event_id,
                 &mut contiguous,
-                &mut checkpoint_event_id,
+                &mut pending_checkpoint,
+                config,
+                pool,
+                &mut checkpoint_cache,
             )
             .await;
 
@@ -2931,17 +3012,21 @@ where
         }
     }
 
-    // Flush the contiguous prefix once at the end of the pass (§4.2). Nothing to
-    // do for a ReplayAlways subscriber (routed to the HWM) or when the prefix
-    // never advanced past the seed. `checkpoint_event_id` is Some exactly when
-    // `contiguous` advanced, so `last_event_id` always matches (R4).
+    // Final unconditional flush (spec 0026 §4.2): per-advance flushing above
+    // already durably persists a Synchronous pass and any Batched threshold
+    // crossed mid-pass; this catches a Batched pass that ends without crossing
+    // one, so it can never leave an advance unflushed. Nothing to do for a
+    // ReplayAlways subscriber (routed to the HWM) or when the prefix never
+    // advanced past the seed. `pending_checkpoint` is only ever set together
+    // with its matching `event_id`, so a flushed `last_event_id` always
+    // matches `last_global_sequence` (spec 0026 R4).
     if !replay_always
-        && let Some(event_id) = checkpoint_event_id
+        && let Some(pending) = pending_checkpoint.take()
         && let Err(e) = flush_checkpoint(
             pool,
             &config.events_table,
             subscriber_id,
-            &PendingCheckpoint::new(contiguous, event_id),
+            &pending,
             &mut checkpoint_cache,
         )
         .await
@@ -3202,11 +3287,12 @@ where
 
             // Catch up from the persisted checkpoint. Reuses the same paginated,
             // retry/DLQ-backed pass that start_listener runs before entering its
-            // loop (R2), so the two paths cannot drift.
+            // loop (spec 0026 R2), so the two paths cannot drift.
             // `current_sequence` is the pagination cursor (max seen), the correct
             // `> current_sequence` lower bound for the drain below. `contiguous`
             // is what catch-up actually persisted; the drain continues this same
-            // counter so it can never flush above a hole catch-up stopped at (R2).
+            // counter so it can never flush above a hole catch-up stopped at
+            // (spec 0026 R2).
             let (mut current_sequence, mut contiguous) = catch_up_from_checkpoint(
                 &observer,
                 &subscriber_id,
@@ -3218,10 +3304,12 @@ where
             .await?;
 
             // Continues catch-up's contiguous-prefix counter over the drained
-            // range (§4.3). `checkpoint_event_id` is Some exactly when the drain
-            // advanced the prefix, so a flushed `last_event_id` always matches
-            // its sequence (R4).
-            let mut checkpoint_event_id: Option<Uuid> = None;
+            // range (§4.3). advance_catchup_prefix flushes according to the
+            // configured CheckpointMode as it advances (spec 0026 §4.2), same as
+            // the catch-up pass above; `pending_checkpoint` is only ever set
+            // together with its matching `event_id`, so a flushed `last_event_id`
+            // always matches its sequence (spec 0026 R4).
+            let mut pending_checkpoint: Option<PendingCheckpoint> = None;
             let mut checkpoint_cache: HashMap<String, u64> = HashMap::new();
 
             // Stop the buffer listener
@@ -3350,7 +3438,10 @@ where
                             event_global_seq,
                             event_id,
                             &mut contiguous,
-                            &mut checkpoint_event_id,
+                            &mut pending_checkpoint,
+                            &config,
+                            &pool,
+                            &mut checkpoint_cache,
                         )
                         .await;
 
@@ -3363,21 +3454,25 @@ where
                 }
             }
 
-            // Flush the contiguous prefix once after buffer processing (R2/R4).
-            // `flush_checkpoint` is a blind, non-monotonic upsert, so flushing
-            // anything above `contiguous` would overwrite catch-up's conservative
-            // checkpoint inside this same subscribe() call — "flush only the
-            // contiguous value" is the requirement, not an optimisation (§4.3).
-            // `checkpoint_event_id` is Some exactly when the drain advanced the
-            // prefix; when it did not (e.g. the drained rows all sit above a hole
-            // catch-up stopped at) catch-up's flush already persisted `contiguous`.
+            // Final unconditional flush after buffer processing (spec 0026
+            // §4.2/§4.3, R2, R4). `flush_checkpoint` is a blind, non-monotonic
+            // upsert, so flushing anything above `contiguous` would overwrite
+            // catch-up's conservative checkpoint inside this same subscribe()
+            // call — "flush only the contiguous value" is the requirement, not an
+            // optimisation. Per-advance flushing above already durably persists a
+            // Synchronous drain and any Batched threshold crossed mid-drain; this
+            // catches a Batched drain that ends without crossing one.
+            // `pending_checkpoint` is `Some` exactly when the drain advanced the
+            // prefix since its last flush; when it never advanced (e.g. the
+            // drained rows all sit above a hole catch-up stopped at) catch-up's
+            // own flush already persisted `contiguous`.
             if !replay_always
-                && let Some(event_id) = checkpoint_event_id
+                && let Some(pending) = pending_checkpoint.take()
                 && let Err(e) = flush_checkpoint(
                     &pool,
                     &config.events_table,
                     &subscriber_id,
-                    &PendingCheckpoint::new(contiguous, event_id),
+                    &pending,
                     &mut checkpoint_cache,
                 )
                 .await
@@ -3592,15 +3687,54 @@ mod tests {
         }
     }
 
-    async fn cu_insert(pool: &PgPool, stream_id: Uuid, version: i64) -> (Uuid, i64) {
+    /// Creates a table shaped like `epoch_events` with its OWN sequence backing
+    /// `global_sequence`, so a test can burn a `nextval()` to simulate a
+    /// permanent hole without leaving one in the shared `epoch_events` table,
+    /// which would stall every other test binary's catch-up and live loop
+    /// (a brand-new subscriber with no planted checkpoint walks from sequence
+    /// 0 and can hit it). `LIKE ... INCLUDING ALL` copies the DEFAULT
+    /// expression byte-for-byte, so it still points at
+    /// `epoch_events_global_sequence_seq` until repointed here; the new
+    /// sequence is `OWNED BY` the column, so dropping the table drops it too.
+    /// Caller is responsible for dropping the returned table at the end of the
+    /// test.
+    async fn cu_isolated_events_table(pool: &PgPool) -> String {
+        let table = format!("cu_isolated_events_{}", Uuid::new_v4().simple());
+        let seq = format!("{table}_seq");
+        sqlx::query(&format!(
+            "CREATE TABLE {table} (LIKE epoch_events INCLUDING ALL)"
+        ))
+        .execute(pool)
+        .await
+        .expect("create isolated events table");
+        sqlx::query(&format!("CREATE SEQUENCE {seq}"))
+            .execute(pool)
+            .await
+            .expect("create isolated sequence");
+        sqlx::query(&format!(
+            "ALTER TABLE {table} ALTER COLUMN global_sequence SET DEFAULT nextval('{seq}')"
+        ))
+        .execute(pool)
+        .await
+        .expect("repoint isolated table's global_sequence default");
+        sqlx::query(&format!(
+            "ALTER SEQUENCE {seq} OWNED BY {table}.global_sequence"
+        ))
+        .execute(pool)
+        .await
+        .expect("bind isolated sequence ownership");
+        table
+    }
+
+    async fn cu_insert(pool: &PgPool, table: &str, stream_id: Uuid, version: i64) -> (Uuid, i64) {
         let id = Uuid::new_v4();
         let data = serde_json::to_value(CuTestEvent { v: version as u32 }).unwrap();
-        let seq: i64 = sqlx::query_scalar(
-            r#"INSERT INTO epoch_events
+        let seq: i64 = sqlx::query_scalar(&format!(
+            r#"INSERT INTO {table}
                    (id, stream_id, stream_version, event_type, data, created_at)
                VALUES ($1, $2, $3, 'CuTestEvent', $4, NOW())
-               RETURNING global_sequence"#,
-        )
+               RETURNING global_sequence"#
+        ))
         .bind(id)
         .bind(stream_id)
         .bind(version)
@@ -3611,12 +3745,13 @@ mod tests {
         (id, seq)
     }
 
-    async fn cu_read_checkpoint(pool: &PgPool, sub_id: &str) -> Option<(u64, Uuid)> {
+    async fn cu_read_checkpoint(pool: &PgPool, table: &str, sub_id: &str) -> Option<(u64, Uuid)> {
         sqlx::query_as::<_, (i64, Uuid)>(
             "SELECT last_global_sequence, last_event_id \
              FROM epoch_event_bus_checkpoints \
-             WHERE bus_name = 'epoch_events' AND subscriber_id = $1",
+             WHERE bus_name = $1 AND subscriber_id = $2",
         )
+        .bind(table)
         .bind(sub_id)
         .fetch_optional(pool)
         .await
@@ -3627,16 +3762,17 @@ mod tests {
     /// Pre-sets the persisted checkpoint for a subscriber so that
     /// `catch_up_from_checkpoint` starts from `seq` rather than 0.
     /// Using `s1 - 1` isolates a test from older events in the shared table.
-    async fn cu_set_checkpoint(pool: &PgPool, sub_id: &str, seq: u64) {
+    async fn cu_set_checkpoint(pool: &PgPool, table: &str, sub_id: &str, seq: u64) {
         sqlx::query(
             "INSERT INTO epoch_event_bus_checkpoints \
              (bus_name, subscriber_id, last_global_sequence, last_event_id, updated_at) \
-             VALUES ('epoch_events', $1, $2, $3, NOW()) \
+             VALUES ($1, $2, $3, $4, NOW()) \
              ON CONFLICT (bus_name, subscriber_id) DO UPDATE SET \
                  last_global_sequence = EXCLUDED.last_global_sequence, \
                  last_event_id = EXCLUDED.last_event_id, \
                  updated_at = NOW()",
         )
+        .bind(table)
         .bind(sub_id)
         .bind(seq as i64)
         .bind(Uuid::nil())
@@ -3645,76 +3781,84 @@ mod tests {
         .expect("cu_set_checkpoint");
     }
 
-    /// Verifies R4: `last_event_id` in the checkpoint row corresponds to the
-    /// event that actually sits at `last_global_sequence` in the events table.
-    /// Robust to interleaving: looks up the event by seq instead of comparing
-    /// a hard-coded id captured before the pass.
-    async fn cu_assert_r4(pool: &PgPool, sub_id: &str) {
-        let Some((cp_seq, cp_id)) = cu_read_checkpoint(pool, sub_id).await else {
+    /// Verifies spec 0026 R4: `last_event_id` in the checkpoint row corresponds
+    /// to the event that actually sits at `last_global_sequence` in the events
+    /// table. Robust to interleaving: looks up the event by seq instead of
+    /// comparing a hard-coded id captured before the pass.
+    async fn cu_assert_r4(pool: &PgPool, table: &str, sub_id: &str) {
+        let Some((cp_seq, cp_id)) = cu_read_checkpoint(pool, table, sub_id).await else {
             return;
         };
         // A concurrent TRUNCATE in another test binary can delete the event
         // row this checkpoint points at. Treat an absent row as inconclusive
         // (skip) rather than panicking on `fetch_one`.
-        let Some(db_id) =
-            sqlx::query_scalar::<_, Uuid>("SELECT id FROM epoch_events WHERE global_sequence = $1")
-                .bind(cp_seq as i64)
-                .fetch_optional(pool)
-                .await
-                .expect("query event at checkpoint seq for R4 check")
-        else {
+        let Some(db_id) = sqlx::query_scalar::<_, Uuid>(&format!(
+            "SELECT id FROM {table} WHERE global_sequence = $1"
+        ))
+        .bind(cp_seq as i64)
+        .fetch_optional(pool)
+        .await
+        .expect("query event at checkpoint seq for R4 check") else {
             return;
         };
         assert_eq!(
             cp_id, db_id,
-            "R4: last_event_id must correspond to last_global_sequence"
+            "spec 0026 R4: last_event_id must correspond to last_global_sequence"
         );
     }
 
     // -------------------------------------------------------------------------
-    // Test 1: hole stops the contiguous prefix, cursor still reaches head (R1, R3)
+    // Test 1: hole stops the contiguous prefix, cursor still reaches head
+    // (spec 0026 R1, R3)
     //
-    // Pre-sets the checkpoint to s1-1 so the pass sees only this test's events,
-    // isolating it from accumulated events left by previous runs or concurrent
-    // integration-test binaries that share the same epoch_events table.
+    // Runs on its own isolated events table (own sequence too): the
+    // nextval() below burns a slot that is never filled, leaving a permanent
+    // hole. On the shared epoch_events table that hole would stall any other
+    // test binary's brand-new, checkpoint-less catch-up/live-loop pass that
+    // happens to walk over it.
     // -------------------------------------------------------------------------
     #[tokio::test]
     async fn catchup_prefix_stops_at_hole() {
         let Some(pool) = cu_pool().await else {
             return;
         };
+        let table = cu_isolated_events_table(&pool).await;
         let stream_id = Uuid::new_v4();
         let sub_id = format!("test:cu_hole:{}", Uuid::new_v4());
-        let config = cu_config(100);
+        let config = ReliableDeliveryConfig {
+            events_table: table.clone(),
+            ..cu_config(100)
+        };
         let hwm = Arc::new(Mutex::new(HashMap::new()));
         let observer = cu_observer(sub_id.clone(), SubscriptionMode::Checkpointed);
 
-        let (_, s1) = cu_insert(&pool, stream_id, 1).await;
+        let (_, s1) = cu_insert(&pool, &table, stream_id, 1).await;
         // Anchor the catch-up pass to start just before our first event.
-        cu_set_checkpoint(&pool, &sub_id, s1 as u64 - 1).await;
-        let (id2, s2) = cu_insert(&pool, stream_id, 2).await;
+        cu_set_checkpoint(&pool, &table, &sub_id, s1 as u64 - 1).await;
+        let (id2, s2) = cu_insert(&pool, &table, stream_id, 2).await;
 
         // Consume s3's sequence slot without inserting a row so it appears as
-        // a gap to catch_up_from_checkpoint. Using nextval rather than an open
-        // transaction avoids holding a table lock that would block concurrent
-        // TRUNCATE calls in other test binaries.
-        let s3: i64 = sqlx::query_scalar("SELECT nextval('epoch_events_global_sequence_seq')")
+        // a gap to catch_up_from_checkpoint. Using nextval on this table's OWN
+        // sequence rather than an open transaction avoids holding a table lock
+        // that would block concurrent TRUNCATE calls in other test binaries,
+        // and rather than the shared table's sequence avoids leaving a
+        // permanent hole anyone else could stumble on.
+        let s3: i64 = sqlx::query_scalar(&format!("SELECT nextval('{table}_seq')"))
             .fetch_one(&pool)
             .await
             .expect("consume hole sequence slot");
 
-        let (_, s4) = cu_insert(&pool, stream_id, 4).await;
-        let (_, s5) = cu_insert(&pool, stream_id, 5).await;
+        let (_, s4) = cu_insert(&pool, &table, stream_id, 4).await;
+        let (_, s5) = cu_insert(&pool, &table, stream_id, 5).await;
 
         let (cursor, contiguous) =
             catch_up_from_checkpoint(&observer, &sub_id, false, &config, &pool, &hwm)
                 .await
                 .expect("catch_up_from_checkpoint");
 
-        // Prefix must stop before the hole. Another concurrent process could
-        // have inserted at seqs between s2 and s3 (extending the contiguous run)
-        // but the prefix must never cross s3. Using < rather than == is robust
-        // to that interleaving while still enforcing R1.
+        // Prefix must stop before the hole. This table is exclusive to this
+        // test, so no concurrent process can extend the contiguous run; the
+        // prefix must never cross s3 (spec 0026 R1).
         assert!(
             contiguous < s3 as u64,
             "prefix (={contiguous}) must stop below the hole (={s3})"
@@ -3722,52 +3866,59 @@ mod tests {
         assert!(cursor >= s5 as u64, "cursor must reach at least s5");
         assert!(s3 > s2 && s3 < s4, "sequence ordering sanity check");
 
-        // A concurrent TRUNCATE in another test binary can delete the
-        // checkpoint row mid-test; treat an absent checkpoint as inconclusive
-        // rather than a failure. When present it must not cross the hole.
-        let cp = cu_read_checkpoint(&pool, &sub_id).await;
+        let cp = cu_read_checkpoint(&pool, &table, &sub_id).await;
         assert!(
             cp.is_none_or(|(seq, _)| seq < s3 as u64),
             "checkpoint must not cross the hole"
         );
-        cu_assert_r4(&pool, &sub_id).await;
+        cu_assert_r4(&pool, &table, &sub_id).await;
         let _ = (s1, id2);
+
+        sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+            .execute(&pool)
+            .await
+            .expect("drop isolated events table");
     }
 
     // -------------------------------------------------------------------------
     // Test 2: hole on a non-final page — prefix does NOT resume after page turn
+    // (spec 0026 R1)
     //
-    // The hole is permanent (immediately rolled back). batch_size=2 means the
-    // hole falls on the boundary between pages, proving the prefix counter
-    // survives a page transition without restarting.
+    // The hole is permanent (a nextval slot consumed, never inserted).
+    // batch_size=2 means the hole falls on the boundary between pages, proving
+    // the prefix counter survives a page transition without restarting. Runs
+    // on its own isolated events table for the same reason as test 1.
     // -------------------------------------------------------------------------
     #[tokio::test]
     async fn catchup_multi_page_hole_prefix_does_not_resume() {
         let Some(pool) = cu_pool().await else {
             return;
         };
+        let table = cu_isolated_events_table(&pool).await;
         let stream_id = Uuid::new_v4();
         let sub_id = format!("test:cu_multipage:{}", Uuid::new_v4());
         // batch_size=2: page 1 = [s1,s2], hole at s3, page 2 = [s4,s5]
-        let config = cu_config(2);
+        let config = ReliableDeliveryConfig {
+            events_table: table.clone(),
+            ..cu_config(2)
+        };
         let hwm = Arc::new(Mutex::new(HashMap::new()));
         let observer = cu_observer(sub_id.clone(), SubscriptionMode::Checkpointed);
 
-        let (_, s1) = cu_insert(&pool, stream_id, 1).await;
-        cu_set_checkpoint(&pool, &sub_id, s1 as u64 - 1).await;
-        let (id2, s2) = cu_insert(&pool, stream_id, 2).await;
+        let (_, s1) = cu_insert(&pool, &table, stream_id, 1).await;
+        cu_set_checkpoint(&pool, &table, &sub_id, s1 as u64 - 1).await;
+        let (id2, s2) = cu_insert(&pool, &table, stream_id, 2).await;
 
         // Consume s3's sequence slot without inserting a row (same technique
-        // as test 1). No open transaction means no TRUNCATE lock contention
-        // with concurrently running integration-test binaries.
-        let s3: i64 = sqlx::query_scalar("SELECT nextval('epoch_events_global_sequence_seq')")
+        // as test 1, on this test's own isolated sequence).
+        let s3: i64 = sqlx::query_scalar(&format!("SELECT nextval('{table}_seq')"))
             .fetch_one(&pool)
             .await
             .expect("consume hole sequence slot");
 
         // Events on the second page (s3 is absent).
-        let (_, s4) = cu_insert(&pool, stream_id, 4).await;
-        let (_, s5) = cu_insert(&pool, stream_id, 5).await;
+        let (_, s4) = cu_insert(&pool, &table, stream_id, 4).await;
+        let (_, s5) = cu_insert(&pool, &table, stream_id, 5).await;
 
         let (cursor, contiguous) =
             catch_up_from_checkpoint(&observer, &sub_id, false, &config, &pool, &hwm)
@@ -3781,19 +3932,23 @@ mod tests {
         assert!(cursor >= s5 as u64, "cursor must reach at least s5");
         assert!(s3 > s2 && s3 < s4, "gap sanity check");
 
-        // See test 1: an absent checkpoint means a concurrent TRUNCATE fired,
-        // so treat it as inconclusive rather than a failure.
-        let cp = cu_read_checkpoint(&pool, &sub_id).await;
+        let cp = cu_read_checkpoint(&pool, &table, &sub_id).await;
         assert!(
             cp.is_none_or(|(seq, _)| seq < s3 as u64),
             "checkpoint must not cross the hole"
         );
-        cu_assert_r4(&pool, &sub_id).await;
+        cu_assert_r4(&pool, &table, &sub_id).await;
         let _ = (s1, id2);
+
+        sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+            .execute(&pool)
+            .await
+            .expect("drop isolated events table");
     }
 
     // -------------------------------------------------------------------------
-    // Test 3: positive control — no hole, checkpoint advances to head (R1, R4)
+    // Test 3: positive control — no hole, checkpoint advances to head
+    // (spec 0026 R1, R4)
     //
     // Without this test an implementation that never advances would pass the
     // two hole tests. The checkpoint must advance at least to s3, and
@@ -3804,6 +3959,7 @@ mod tests {
         let Some(pool) = cu_pool().await else {
             return;
         };
+        let table = "epoch_events";
         let stream_id = Uuid::new_v4();
         let sub_id = format!("test:cu_positive:{}", Uuid::new_v4());
         let config = cu_config(100);
@@ -3813,10 +3969,10 @@ mod tests {
         // Pre-set to s1-1 so catch-up only processes our three events, then
         // assert contiguous reached at least s3 (it would equal s3 in the
         // absence of concurrent inserts, or be higher if they are contiguous).
-        let (_, s1) = cu_insert(&pool, stream_id, 1).await;
-        cu_set_checkpoint(&pool, &sub_id, s1 as u64 - 1).await;
-        let (_, _s2) = cu_insert(&pool, stream_id, 2).await;
-        let (_, s3) = cu_insert(&pool, stream_id, 3).await;
+        let (_, s1) = cu_insert(&pool, table, stream_id, 1).await;
+        cu_set_checkpoint(&pool, table, &sub_id, s1 as u64 - 1).await;
+        let (_, _s2) = cu_insert(&pool, table, stream_id, 2).await;
+        let (_, s3) = cu_insert(&pool, table, stream_id, 3).await;
 
         let (cursor, contiguous) =
             catch_up_from_checkpoint(&observer, &sub_id, false, &config, &pool, &hwm)
@@ -3848,16 +4004,17 @@ mod tests {
                 contiguous >= s3 as u64,
                 "prefix (={contiguous}) must advance at least to s3 (={s3})"
             );
-            // R4: last_event_id must correspond to last_global_sequence.
-            let cp = cu_read_checkpoint(&pool, &sub_id).await;
+            // spec 0026 R4: last_event_id must correspond to last_global_sequence.
+            let cp = cu_read_checkpoint(&pool, table, &sub_id).await;
             assert!(cp.is_some(), "checkpoint must be written");
-            cu_assert_r4(&pool, &sub_id).await;
+            cu_assert_r4(&pool, table, &sub_id).await;
         }
         let _ = s1;
     }
 
     // -------------------------------------------------------------------------
-    // Test 4: ReplayAlways unchanged — HWM updated, checkpoints table untouched (R6)
+    // Test 4: ReplayAlways unchanged — HWM updated, checkpoints table untouched
+    // (spec 0026 R6)
     //
     // For ReplayAlways, advance_catchup_prefix updates the in-memory HWM but
     // never touches `contiguous` or the checkpoints table. The returned
@@ -3868,15 +4025,16 @@ mod tests {
         let Some(pool) = cu_pool().await else {
             return;
         };
+        let table = "epoch_events";
         let stream_id = Uuid::new_v4();
         let sub_id = format!("test:cu_replay:{}", Uuid::new_v4());
         let config = cu_config(100);
         let hwm: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let observer = cu_observer(sub_id.clone(), SubscriptionMode::ReplayAlways);
 
-        let (_, _s1) = cu_insert(&pool, stream_id, 1).await;
-        let (_, _s2) = cu_insert(&pool, stream_id, 2).await;
-        let (_, s3) = cu_insert(&pool, stream_id, 3).await;
+        let (_, _s1) = cu_insert(&pool, table, stream_id, 1).await;
+        let (_, _s2) = cu_insert(&pool, table, stream_id, 2).await;
+        let (_, s3) = cu_insert(&pool, table, stream_id, 3).await;
 
         // Pre-seed HWM so the pass starts just before our events (mirrors
         // cu_set_checkpoint for Checkpointed subscribers).
@@ -3897,7 +4055,7 @@ mod tests {
         );
 
         // The checkpoints table must NOT be written for a ReplayAlways subscriber.
-        let cp = cu_read_checkpoint(&pool, &sub_id).await;
+        let cp = cu_read_checkpoint(&pool, table, &sub_id).await;
         assert!(
             cp.is_none(),
             "ReplayAlways must not write to the checkpoints table"
