@@ -1,247 +1,89 @@
-# Spec 0026: contiguous catch-up checkpoint
+# Spec 0026: Contiguous Catch-Up Checkpoint
 
-**Issue:** CLOUD-226 · **Status:** Draft · **Crates:** `epoch_pg`
-**Scope:** `fix(pg)` · no migration, no schema change, no public API change.
-**Found by:** round-1 concurrency review of the spec 0024 work.
-**Supersedes:** spec 0024 OQ-4, which named this hazard and deferred it.
-**Related:** CLOUD-227 (`ReplayAlways` HWM residual, out of scope here).
+**Issue:** CLOUD-226 · **Status:** Implemented · **Crate:** `epoch_pg`
+**Scope:** `fix(pg)` — no migration, schema, or public-API change.
+**Supersedes:** spec 0024 OQ-4 · **Related:** CLOUD-227 (`ReplayAlways` HWM, out of scope).
 
-> Anchors in this document are **symbol names, not line numbers**. An earlier draft
-> cited line numbers and every one of them had drifted by 40-135 lines within days.
-
----
+> Anchors are symbol names, not line numbers.
 
 ## 1. Problem
 
-The catch-up path persists a checkpoint it has not earned, so a committed event can be
-delivered to nobody while readiness reports success.
+The catch-up path persisted a checkpoint it had not earned. Because `global_sequence` is assigned by non-transactional `nextval()` (spec 0019), a page of committed rows can hold a gap that fills later (e.g. seq 4 in an open txn, seq 5 already committed).
 
-`global_sequence` is assigned by a non-transactional `nextval()` (spec 0019), so a page of
-committed rows can legitimately contain a hole that fills in later: sequence 4 claimed by a
-still-open transaction, sequence 5 already committed and visible.
+`catch_up_from_checkpoint` advanced a linear `PendingCheckpoint` per row *seen* and flushed the max: given `1,2,3,5` it persisted `5`. The listener then seeded `SubscriberState::new(5)`, so event 4, committing moments later, was delivered to nobody, silently: no WARN, no gap-timeout row, no DLQ entry, and `wait_until_caught_up` returned `Ok(true)` over a read model missing an event.
 
-`catch_up_from_checkpoint` walks pages of `global_sequence > checkpoint` and, for every row it
-*sees*, advances a linear `PendingCheckpoint` via `record_catchup_progress`, then flushes the
-maximum. Given `1,2,3,5` it persists `5`. The listener seeds `SubscriberState::new(5)` and every
-later batch queries `global_sequence > min_checkpoint`. Event 4 commits moments later and is
-never read by anyone: no WARN, no `epoch_event_bus_gap_timeouts` row, no DLQ entry.
-`wait_until_caught_up` returns `Ok(true)`, so a readiness gate certifies a read model that is
-silently missing an event.
+**Two writers, not one.** `subscribe()` runs `catch_up_from_checkpoint` *and* a second buffer-drain pass that also flushed a linear max. Since `flush_checkpoint` is a blind, non-monotonic `DO UPDATE SET last_global_sequence = EXCLUDED...`, the drain could overwrite a conservative checkpoint within the same call. Fixing only catch-up left the bug reachable.
 
-**There are two such writers, not one.** `subscribe()` calls `catch_up_from_checkpoint` and then
-runs a *second*, separately coded buffer-drain pass that also calls `record_catchup_progress`
-per row and flushes a linear maximum. `flush_checkpoint` is a blind
-`DO UPDATE SET last_global_sequence = EXCLUDED.last_global_sequence` and is **not monotonic**,
-so the drain overwrites a conservative checkpoint inside the same `subscribe()` call. Fixing
-only `catch_up_from_checkpoint` leaves the bug fully reachable on the `subscribe()` path.
-
-**What changed, and why this is now worth fixing.** The hazard predates this work inside
-`subscribe()`, where it fires once per subscriber. The R2 pass added in spec 0024 runs the same
-unfenced catch-up over *every registered subscriber on every* `start_listener()`. The blast
-radius moved from once-per-subscription to once-per-boot, and a boot under write load, a rolling
-restart, is exactly when in-flight transactions are most likely.
+**Why now:** spec 0024's R2 pass reran this unfenced catch-up over every subscriber on every `start_listener()`, moving the blast radius from once-per-subscription to once-per-boot, precisely when in-flight transactions are most likely (rolling restart under write load).
 
 ## 2. Goals / Non-Goals
 
-**Goals.** Neither catch-up writer may persist a checkpoint above a hole. Termination must be
-preserved when a hole never fills during the pass.
+**Goals.** Neither catch-up writer may persist a checkpoint above a hole; termination preserved when a hole never fills.
+**Non-Goals.** No change to the live path's gap machinery, public API, error types, or schema. Not fixing CLOUD-227/228/229/230.
 
-**Non-Goals.** No change to the live path's gap machinery. No change to public API, error types
-or schema. Not fixing the `ReplayAlways` HWM (CLOUD-227), head-of-line blocking (CLOUD-228),
-`shutdown()` bounding (CLOUD-229) or the trigger leak (CLOUD-230).
+## 3. Rejected: reuse the live-path fence
 
-## 3. Rejected design: reusing the live path's fence
+Giving catch-up a `SubscriberState` and calling `advance_contiguous_checkpoint` per page is unsound. That function's unstated precondition is that the visible-sequence set is *complete* from `contiguous_checkpoint` upward. The live path guarantees this by re-querying from `min_checkpoint` (below the gap) every batch. Catch-up cannot: its pagination cursor must advance past the hole (§4.1), so later pages query `> cursor` and structurally cannot re-observe the gap even after it commits. The resolver then sees a permanent hole and, once `xmin` passes the captured `fence_xmax`, reports `SkipReason::FenceCleared` — a *committed* event skipped permanently, more quietly than the original bug. The fence proves the writer **finished**, not **aborted**; that inference is only valid against a current view of the gap region.
 
-The obvious approach, and the one an earlier draft of this spec specified, is to give catch-up a
-`SubscriberState` and call `advance_contiguous_checkpoint` per page, reusing the snapshot fence
-and the `gap_timeout` backstop. **It is unsound, and worse than the bug.**
+Also: the `gap_timeout` backstop cannot fire inside a bounded pass (a gap is only recorded on first observation; verdicts need a later call that a pass ending at head never makes), and threading `SubscriberState` would allocate one `HashSet` entry per event above the hole on the boot path.
 
-`advance_contiguous_checkpoint` decides gap-ness from the visible-sequence set it is handed. Its
-unstated precondition is that the set is *complete* from `contiguous_checkpoint` upward. The
-live path satisfies this by construction: it re-queries from `min_checkpoint`, i.e. from *below*
-the gap, on every batch, so the gap region is re-observed until it fills.
+## 4. Design: contiguous-prefix counter
 
-Catch-up cannot satisfy it. Its pagination cursor must advance past the hole (see §4.1), so
-later pages query `global_sequence > cursor` and **structurally cannot contain the gap sequence
-even after it commits**. The resolver then sees a permanent hole, and once the holding writer
-commits and `xmin` passes the captured `fence_xmax`, it reports `SkipReason::FenceCleared`,
-which the system defines as a proven-lossless rollback and logs at `debug!` with no record and
-no callback. A *committed* event is skipped, permanently, more quietly than today.
+Catch-up need not resolve gaps; it just must stop lying about what it processed. The live loop is entered immediately after and already owns gap resolution.
 
-The fence proves the writer **finished**, not that it **aborted**. That inference is only valid
-against a current view of the gap region, which catch-up does not have.
-
-Two further findings pointed the same way:
-
-- The `gap_timeout` backstop cannot fire inside a bounded pass at all. A gap is only *recorded*
-  on first observation; fence and backstop verdicts require a *later* call. A pass that ends at
-  head never makes one, at any `gap_timeout`.
-- Threading `SubscriberState` through catch-up would put one `HashSet<u64>` entry per event
-  above the hole, undrained until the checkpoint advances. On a cold read model that is a
-  backlog-sized allocation on the boot path. `SubscriberState`'s own doc bounds
-  `processed_ahead` by concurrent uncommitted transactions, which would no longer be true.
-
-## 4. Design: a contiguous-prefix counter
-
-Catch-up does not need to resolve gaps. It needs to stop lying about what it processed. The live
-loop is entered immediately afterwards and already owns gap resolution, with persistent state
-and a working fence.
-
-### 4.1 Separate the pagination cursor from the persisted checkpoint
-
-- **Pagination cursor** keeps advancing by *max sequence seen in the page*. If it advanced only
-  contiguously, a hole that outlives the pass would make catch-up re-read the same page forever.
-- **Persisted checkpoint** becomes the highest contiguous prefix.
-
-### 4.2 The prefix counter
-
-Rows arrive in ascending `global_sequence` order, so the prefix is a running counter, not a set:
-
-- Seed `contiguous` from the checkpoint the pass started at.
-- Per processed row, if `seq == contiguous + 1`, set `contiguous = seq` and remember that row's
-  `event_id`. Otherwise stop advancing `contiguous` for the remainder of the pass.
-- Keep paginating to head regardless, processing rows as today.
-- Flush once at the end of the pass, from `contiguous` and its remembered `event_id`.
-
-O(1) memory. No `SubscriberState`, no `TxidSnapshot`, no fence, no backstop, no shared gap
-side-effect handler, and no per-page `seq -> event_id` map.
-
-A hole that fills mid-pass is simply not detected. That is deliberate: the checkpoint stays
-below it, and the live loop re-reads from there and delivers it. Detecting it would buy only the
-suppression of a re-delivery the system already permits (§4.4).
-
-### 4.3 The `subscribe()` buffer drain gets the same treatment
-
-The drain continues from where catch-up stopped and must not undo it. `catch_up_from_checkpoint`
-returns the **pagination cursor**, so the drain's `> current_sequence` lower bound stays correct
-and it does not reprocess the whole backlog; it must additionally receive the **contiguous**
-value, continue the same counter over the drained range, and flush only that. Because
-`flush_checkpoint` is not monotonic, "flush only the contiguous value" is a requirement, not an
-optimisation.
-
-### 4.4 At-least-once above a hole is the existing contract
-
-The listener re-seeds from the *persisted* checkpoint, so events processed above a gap are
-re-delivered after any restart. Re-delivery above a hole is therefore pre-existing accepted
-behaviour, not something this spec introduces.
-
-### 4.5 `ReplayAlways` is unchanged, and remains wrong
-
-`record_catchup_progress` early-returns to the in-memory HWM and never writes the checkpoints
-table, so the prefix counter does not apply. Note the HWM is **not** a "replays from zero every
-boot" story, as an earlier draft claimed: `catch_up_from_checkpoint` resumes a `ReplayAlways`
-subscriber from its *surviving* HWM, a linear maximum, so such a subscriber above a hole misses
-the event on an in-process listener restart and reports ready at the higher position. Left as is
-and tracked in CLOUD-227, because making the HWM contiguous changes readiness timing for every
-`ReplayAlways` subscriber.
+- **4.1 Split cursor from checkpoint.** Pagination cursor keeps advancing by *max sequence seen* (else a persistent hole re-reads the same page forever). Persisted checkpoint becomes the highest contiguous prefix.
+- **4.2 The counter.** Rows arrive ascending, so the prefix is an O(1) running counter: seed `contiguous` from the starting checkpoint; per row, if `seq == contiguous + 1` advance and remember its `event_id`, else stop advancing for the rest of the pass. Keep paginating to head. Flush once at pass end from `contiguous` and its `event_id`. No `SubscriberState`, snapshot, fence, or backstop. A hole that fills mid-pass is deliberately not detected: the live loop re-reads and delivers it.
+- **4.3 Drain gets the same treatment.** `catch_up_from_checkpoint` returns the **pagination cursor** (correct `> current_sequence` lower bound, no full-backlog reprocess) and the **contiguous** value; the drain continues the same counter and flushes only contiguous. Because `flush_checkpoint` is non-monotonic, this is a requirement, not an optimisation.
+- **4.4 At-least-once above a hole** is the existing restart contract; re-delivery is pre-existing accepted behaviour.
+- **4.5 `ReplayAlways` unchanged, still wrong.** `record_catchup_progress` early-returns to the in-memory HWM and never writes the table, so the counter doesn't apply. Resuming from a surviving linear-max HWM means such a subscriber above a hole still misses the event on in-process restart. Tracked in CLOUD-227.
 
 ## 5. Requirements
 
 - **R1.** `catch_up_from_checkpoint` MUST NOT persist a checkpoint above a hole.
-- **R2.** The `subscribe()` buffer drain MUST NOT flush a checkpoint above the contiguous value
-  carried over from catch-up.
-- **R3.** Both MUST terminate when a hole is held open for the entire pass.
-- **R4.** A checkpoint's `last_event_id` MUST correspond to its `last_global_sequence`.
-- **R5.** Readiness MUST NOT report caught-up while a subscriber's checkpoint is legitimately
-  held below a hole. This is an observable behaviour change: a gate that previously returned
-  `true` over a lost event now blocks until the hole resolves.
-- **R6.** `ReplayAlways` behaviour unchanged.
-- **R7.** No public API, error-type or schema change.
+- **R2.** The drain MUST NOT flush above the contiguous value carried from catch-up.
+- **R3.** Both MUST terminate when a hole is held open for the whole pass.
+- **R4.** A checkpoint's `last_event_id` MUST match its `last_global_sequence`.
+- **R5.** Readiness MUST NOT report caught-up while a checkpoint is legitimately held below a hole. *(Observable change: a gate that returned `true` over a lost event now blocks until the hole resolves.)*
+- **R6.** `ReplayAlways` unchanged. **R7.** No public API, error-type, or schema change.
 
 ## 6. Test Plan
 
-Two facts shape this plan.
+Two constraints: (a) absolute sequence numbers are unusable — five parallel binaries share `epoch_events` and `#[serial]` only serialises within a binary, so every assertion is relative to sequences from `INSERT ... RETURNING global_sequence`; (b) the open-transaction pattern (`test_in_flight_transaction_gap_is_held`, with `start_fence_test_bus` / `insert_committed_event`) already exists — reuse it, don't replicate its sleep-based shape five times. Prefer unit tests where they suffice.
 
-**Absolute sequence numbers are unusable.** `epoch_events` and its sequence are shared by five
-parallel test binaries, and `RESTART IDENTITY` truncation is issued from only one of them.
-`#[serial]` serialises within a binary, not across processes. Every assertion must be relative
-to sequences captured via `INSERT ... RETURNING global_sequence`, exactly as
-`test_in_flight_transaction_gap_is_held` already does.
-
-**The open-transaction pattern already exists.** That test opens `pool.begin()`, claims a
-sequence without committing, commits a later one on another connection, asserts the checkpoint
-does not pass the held sequence, then commits and asserts delivery. Reuse it and its
-`start_fence_test_bus` / `insert_committed_event` helpers rather than reinventing them. It is
-also a known load-sensitive test built on fixed multi-second sleeps, so its *shape* should not be
-replicated five times.
-
-Accordingly, prefer unit tests over integration tests where the unit suffices:
-
-1. **Unit: prefix counter stops at the first hole.** `catch_up_from_checkpoint` is `pub(crate)`.
-   Assert the persisted checkpoint sits below the held sequence, and that the returned
-   pagination cursor is above it. Deterministic, no sleeps. (R1, R3)
-2. **Unit: multi-page.** `catch_up_batch_size` of 2 with the hole on a non-final page, proving
-   the counter survives page boundaries and does not resume advancing after the hole. (R1)
-3. **Unit: positive control.** No hole: the checkpoint advances to head, with `last_event_id`
-   matching. Without this, an implementation that never advances passes every other test. (R1, R4)
-4. **Integration: end-to-end delivery.** Hold a transaction across a `start_listener()` catch-up,
-   commit it, assert the subscriber receives the event and readiness then reports caught-up. Use
-   a bounded `wait_until_caught_up`, not a fixed sleep. This must subscribe *before* starting the
-   listener, or it exercises `subscribe()`'s catch-up rather than the R2 pass that motivated the
-   fix. (R1, R5)
-5. **Integration: `subscribe()` drain does not overwrite.** Subscribe with a hole held open and
-   buffered events above it; assert the persisted checkpoint is still below the hole after
-   `subscribe()` returns. This is the test that would have caught the second writer. (R2)
-6. **Unit: `ReplayAlways` unchanged.** Regression guard only; it passes with and without the fix,
-   so it does not count toward proving anything. (R6)
-
-All parallel-safe, idempotent and independent per CLAUDE.md §8, with stable channel names so
-they do not leak NOTIFY triggers (CLOUD-230).
+1. **Unit:** prefix counter stops at first hole; checkpoint below held seq, returned cursor above it. (R1, R3)
+2. **Unit:** multi-page (`catch_up_batch_size` 2, hole on non-final page); counter survives boundaries, does not resume. (R1)
+3. **Unit:** positive control, no hole — advances to head with matching `last_event_id`. (R1, R4)
+4. **Integration:** end-to-end delivery of an event committed after catch-up; subscribe *before* `start_listener` so the R2 pass is exercised; bounded `wait_until_caught_up`. (R1, R5)
+5. **Integration:** `subscribe()` drain does not overwrite — checkpoint still below hole after return. Catches the second writer. (R2)
+6. **Unit:** `ReplayAlways` regression guard. (R6)
 
 ## 7. Failure Modes
 
-- A hole held for the entire pass leaves the checkpoint below it, so the live loop re-reads and
-  re-delivers the above-hole events. Accepted: identical to the restart contract (§4.4).
-- A long-running transaction pins the hole indefinitely, so the checkpoint stops advancing and
-  readiness blocks. Correct, and newly visible: the live path's `gap_timeout` backstop still
-  fires and records it, since the live path retains state across batches. Catch-up itself
-  contributes no gap-timeout rows, by design (§3).
-- A cold read model with a hole near the start re-delivers a large backlog on the next boot.
-  Bounded by the hole's lifetime, which the live path's backstop bounds in turn.
-- `ReplayAlways` retains its own loss window (§4.5, CLOUD-227).
+- Hole held all pass → checkpoint below it, live loop re-delivers (= restart contract).
+- Long txn pins hole → checkpoint stops, readiness blocks (correct, newly visible); the live path's `gap_timeout` still records it. Catch-up contributes no gap-timeout rows, by design.
+- Cold read model with an early hole re-delivers a backlog on next boot, bounded by the hole's lifetime.
+- `ReplayAlways` retains its own loss window (CLOUD-227).
 
-## 8. Files Changed
+## 8. Acceptance Criteria
 
-- `epoch_pg/src/event_bus/mod.rs` — `catch_up_from_checkpoint` (prefix counter, return the
-  cursor, flush contiguous), its `record_catchup_progress` usage, and the `subscribe()`
-  buffer-drain pass.
-- `epoch_pg/tests/pgeventbus_integration_tests.rs` — tests 4 and 5; unit tests 1-3 and 6 live
-  beside the code in `mod.rs`.
-- `CHANGELOG.md` — one `### Fixed` entry, noting the R5 readiness behaviour change.
-- `specs/0024-cloud221-subscriber-readiness.md` — mark OQ-4 resolved here.
+1. New tests pass; existing gap-fence/gap-timeout tests pass **unchanged** (proves live path untouched).
+2. Reverting the fix makes tests 1, 2, 5 fail — verified mechanically by stashing, not by inspection.
+3. `cargo clippy --all-targets -p epoch_pg -p epoch_core -- -D warnings` and `cargo fmt --check` clean.
+4. Event-bus binary passes in isolation and under a concurrent writer on `epoch_events`, on consecutive runs. (A green `--workspace` pair is a weak gate: shared DB, load-sensitive tests.)
 
-## 9. Acceptance Criteria
+## 9. Open Questions
 
-1. All new tests pass; existing gap-fence and gap-timeout tests pass **unchanged**, proving the
-   live path was not touched.
-2. Reverting the fix makes tests 1, 2 and 5 fail. Verified mechanically by stashing the source
-   change and re-running, not asserted by inspection.
-3. `cargo clippy --all-targets -p epoch_pg -p epoch_core -- -D warnings` clean;
-   `cargo fmt --check` clean.
-4. The event-bus binary passes in isolation and under a concurrent writer on `epoch_events`, on
-   consecutive runs. Note `cargo test --workspace` green twice is a weak gate on its own: the
-   suite shares one database across five binaries and contains at least one known load-sensitive
-   test, so a green pair proves less than it appears to.
+- **OQ-1.** Report that catch-up stopped below a hole, so a gate can distinguish "caught up" from "caught up to a hole"? Deferred: additive, and R5 already makes the gate honest.
+- **OQ-2.** Any consumer of the old linear-max return value? In-repo, only `subscribe()` (handled §4.3); out-of-repo impossible (`pub(crate)`).
 
-## Phases (JSON)
+## 10. Implementation Summary
 
-```json
-{
-  "phases": [
-    { "phase": 1, "focus": "epoch_pg: replace catch_up_from_checkpoint's linear PendingCheckpoint with a contiguous-prefix counter seeded from the starting checkpoint; advance only on seq == contiguous + 1 and stop advancing permanently at the first hole; keep the pagination cursor advancing by max-seen so the pass still terminates; return the pagination cursor; flush once at pass end from the prefix and the event_id of the row that last advanced it", "effort": "M", "difficulty": "hard", "requirements": ["R1","R3","R4"] },
-    { "phase": 2, "focus": "epoch_pg: make subscribe()'s buffer-drain pass continue the same prefix counter over the drained range instead of flushing a linear max; it keeps using the returned pagination cursor as its lower bound but must never flush above the contiguous value, since flush_checkpoint is a blind non-monotonic upsert and would otherwise overwrite the conservative checkpoint inside the same subscribe() call", "effort": "M", "difficulty": "hard", "requirements": ["R2","R4"] },
-    { "phase": 3, "focus": "epoch_pg unit tests beside the code: prefix counter stops at the first hole and the returned cursor is above it; multi-page case with catch_up_batch_size 2 and the hole on a non-final page proving the counter does not resume after the hole; positive control with no hole advancing to head with a matching last_event_id; ReplayAlways unchanged. Deterministic, no sleeps", "effort": "M", "difficulty": "standard", "requirements": ["R1","R3","R4","R6"] },
-    { "phase": 4, "focus": "epoch_pg integration tests: end-to-end delivery of an event committed after a catch-up pass, subscribing before start_listener so the R2 pass is what is exercised, using a bounded wait_until_caught_up rather than a fixed sleep; plus a test that subscribe()'s drain does not overwrite a conservative checkpoint. All assertions relative to sequences captured via INSERT ... RETURNING global_sequence, reusing start_fence_test_bus and insert_committed_event, with stable channel names", "effort": "M", "difficulty": "hard", "requirements": ["R1","R2","R5"] },
-    { "phase": 5, "focus": "Hygiene and docs: CHANGELOG Fixed entry calling out the R5 readiness behaviour change (a gate that previously returned true over a lost event now blocks until the hole resolves); mark spec 0024 OQ-4 resolved here; rustdoc on both catch-up paths stating the contiguous-checkpoint contract; cargo fmt, clippy --all-targets -p epoch_pg -p epoch_core -D warnings; verify the existing gap-fence and gap-timeout tests pass unmodified, and verify mechanically that reverting the source change makes the phase-3 hole test and the phase-4 drain test fail", "effort": "S", "difficulty": "standard", "requirements": ["R5","R7"] }
-  ]
-}
-```
+Delivered across 5 phases in `epoch_pg`:
 
-## 10. Open Questions
+- **P1 — prefix counter** (`89813b50`): replaced the linear `PendingCheckpoint` in `catch_up_from_checkpoint` with a contiguous-prefix counter; return the pagination cursor; flush contiguous + its `event_id`. Saga test relaxed for at-least-once above a hole (`2b3f3475`). *(R1, R3, R4)*
+- **P2 — drain** (`862d35e6`): consolidated prefix advancement into a shared function so `subscribe()`'s buffer drain continues the same counter and never flushes above contiguous. *(R2, R4)*
+- **P3 — unit tests** (`62393d4b`, review fixes `3dcebb41`): hole-stop, multi-page, positive control, `ReplayAlways`. Held-txn swapped for `nextval` to avoid TRUNCATE lock contention (`07852cb7`). *(R1, R3, R4, R6)*
+- **P4 — integration tests** (`df090e0b`, `71074e74`, `a6306b96`): end-to-end delayed delivery (subscribe before listener) and drain-no-overwrite; sequences captured via `RETURNING`, stable channel names. *(R1, R2, R5)*
+- **P5 — hygiene/docs** (`9602a237`, `d93fa3b6`): CHANGELOG `### Fixed` entry noting the R5 readiness change; spec 0024 OQ-4 marked resolved; saga checkpoint-advance assertion relaxed for contiguous-prefix hold. *(R5, R7)*
 
-- **OQ-1.** Should catch-up report that it stopped below a hole, so a readiness gate can
-  distinguish "caught up" from "caught up to a hole"? Deferred: additive, and R5 already makes
-  the gate honest by blocking rather than lying.
-- **OQ-2.** Does any consumer depend on the old linear-max checkpoint? In-repo, the only
-  consumer of `catch_up_from_checkpoint`'s return value is `subscribe()`, which §4.3 handles
-  explicitly. Out-of-repo consumers cannot depend on it: the function is `pub(crate)`.
+**Files:** `epoch_pg/src/event_bus/mod.rs`, `epoch_pg/tests/pgeventbus_integration_tests.rs`, `epoch_pg/tests/saga_adapter_integration_tests.rs`, `CHANGELOG.md`, `specs/0024-cloud221-subscriber-readiness.md`.
