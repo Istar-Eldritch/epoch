@@ -278,14 +278,37 @@ async fn saga_adapter_receives_events_from_foreign_bus() {
     let handled = saga.handled.lock().await;
     // At-least-once above a hole: if the R2 catch-up pass processes an event and
     // the live loop re-reads it due to a conservative checkpoint (§4.4), the saga
-    // sees it more than once. Deduplicate by event_id rather than loosening to a
-    // lower bound, which would keep tolerating duplicates while also accepting a
-    // subscriber registered twice or another test's events leaking in.
-    let unique_handled: HashSet<Uuid> = handled.iter().map(|r| r.event_id).collect();
+    // sees it more than once. Deduplicate by event_id so duplicates are tolerated
+    // without discarding the upper bound a lower bound would have thrown away.
+    // Asserting per-variant, and that the two ids differ, is what gives this teeth:
+    // a plain total-count check collapses the cross-delivery case, where the same
+    // event arrives via both the native subscription and the adapter, into one id
+    // and passes.
+    let unique_native: HashSet<Uuid> = handled
+        .iter()
+        .filter(|r| matches!(r.data, TargetEvent::NativeTick { .. }))
+        .map(|r| r.event_id)
+        .collect();
+    let unique_bridged: HashSet<Uuid> = handled
+        .iter()
+        .filter(|r| matches!(r.data, TargetEvent::BridgedTick { .. }))
+        .map(|r| r.event_id)
+        .collect();
     assert_eq!(
-        unique_handled.len(),
-        2,
-        "saga should see exactly both events (deduplicated), got {:?}",
+        unique_native.len(),
+        1,
+        "expected exactly one distinct native event, got {:?}",
+        handled
+    );
+    assert_eq!(
+        unique_bridged.len(),
+        1,
+        "expected exactly one distinct bridged event, got {:?}",
+        handled
+    );
+    assert!(
+        unique_native.is_disjoint(&unique_bridged),
+        "native and bridged deliveries must be distinct events, not one event cross-delivered: {:?}",
         handled
     );
     assert!(
@@ -572,16 +595,28 @@ async fn saga_adapter_resumes_from_checkpoint_after_restart() {
     .fetch_one(&pool)
     .await
     .expect("new event should exist");
-    let present: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM epoch_events WHERE global_sequence BETWEEN $1 AND $2",
-    )
-    .bind(cp_after_first as i64 + 1)
-    .bind(seq_new)
-    .fetch_one(&pool)
-    .await
-    .expect("count rows above the first-run checkpoint");
+    // Sample twice. A hole that was open while the second run walked the range
+    // and committed before this query would read back as gap-free, sending us
+    // into the strict branch even though re-delivery was legitimate. Requiring
+    // both samples to agree removes that false-strict race; the opposite
+    // direction is already safe, since sequences are claimed monotonically and
+    // seq_new was claimed before either sample.
+    let count_range = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT global_sequence) FROM epoch_events \
+             WHERE global_sequence BETWEEN $1 AND $2",
+        )
+        .bind(cp_after_first as i64 + 1)
+        .bind(seq_new)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows above the first-run checkpoint")
+    };
+    let expected_span = seq_new - cp_after_first as i64;
+    let present = count_range().await;
+    let present_again = count_range().await;
 
-    if present == seq_new - cp_after_first as i64 {
+    if present == expected_span && present_again == expected_span {
         let unique: HashSet<Uuid> = handled.iter().map(|r| r.event_id).collect();
         assert_eq!(
             unique.len(),
@@ -598,11 +633,8 @@ async fn saga_adapter_resumes_from_checkpoint_after_restart() {
     } else {
         eprintln!(
             "saga_adapter_resumes_from_checkpoint_after_restart: inconclusive, \
-             range ({}, {}] has {} of {} sequences present (concurrent hole)",
-            cp_after_first,
-            seq_new,
-            present,
-            seq_new - cp_after_first as i64
+             range ({}, {}] has {}/{} sequences present (concurrent hole)",
+            cp_after_first, seq_new, present, expected_span
         );
     }
 }

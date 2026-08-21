@@ -3660,7 +3660,7 @@ mod tests {
                 Box::pin(async move {
                     // Separate statements: sqlx::query uses the extended
                     // protocol, which rejects multiple `;`-separated commands.
-                    sqlx::query("SET lock_timeout = '15s'")
+                    sqlx::query("SET lock_timeout = '30s'")
                         .execute(&mut *conn)
                         .await?;
                     sqlx::query("SET idle_in_transaction_session_timeout = '60s'")
