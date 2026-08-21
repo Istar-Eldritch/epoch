@@ -26,6 +26,7 @@ use epoch_pg::event_bus::PgEventBus;
 use epoch_pg::event_store::PgEventStore;
 use serial_test::serial;
 use sqlx::PgPool;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -277,11 +278,14 @@ async fn saga_adapter_receives_events_from_foreign_bus() {
     let handled = saga.handled.lock().await;
     // At-least-once above a hole: if the R2 catch-up pass processes an event and
     // the live loop re-reads it due to a conservative checkpoint (§4.4), the saga
-    // sees it more than once. Assert presence of each expected event rather than
-    // an exact count.
-    assert!(
-        handled.len() >= 2,
-        "saga should see at least both events, got {:?}",
+    // sees it more than once. Deduplicate by event_id rather than loosening to a
+    // lower bound, which would keep tolerating duplicates while also accepting a
+    // subscriber registered twice or another test's events leaking in.
+    let unique_handled: HashSet<Uuid> = handled.iter().map(|r| r.event_id).collect();
+    assert_eq!(
+        unique_handled.len(),
+        2,
+        "saga should see exactly both events (deduplicated), got {:?}",
         handled
     );
     assert!(
@@ -431,26 +435,34 @@ async fn saga_adapter_advances_independent_checkpoints() {
     );
 
     let handled = saga.handled.lock().await;
-    let native_seen = handled
-        .iter()
-        .filter(|r| matches!(r.data, TargetEvent::NativeTick { .. }))
-        .count();
-    let bridged_seen = handled
-        .iter()
-        .filter(|r| matches!(r.data, TargetEvent::BridgedTick { .. }))
-        .count();
     // At-least-once above a hole: if the R2 catch-up pass processes an event
     // and the live loop re-reads it due to a conservative checkpoint (§4.4),
-    // the saga sees it more than once.
-    assert!(
-        native_seen >= 3,
-        "should see at least 3 native events, got {}",
-        native_seen
+    // the saga sees it more than once. Deduplicate by event_id so duplicates are
+    // tolerated without discarding the upper bound: this test exists to prove
+    // the native and adapter subscribers keep independent checkpoints, and a
+    // lower bound alone would pass even if the adapter bridged every event to
+    // both handlers.
+    let unique_native: HashSet<Uuid> = handled
+        .iter()
+        .filter(|r| matches!(r.data, TargetEvent::NativeTick { .. }))
+        .map(|r| r.event_id)
+        .collect();
+    let unique_bridged: HashSet<Uuid> = handled
+        .iter()
+        .filter(|r| matches!(r.data, TargetEvent::BridgedTick { .. }))
+        .map(|r| r.event_id)
+        .collect();
+    assert_eq!(
+        unique_native.len(),
+        3,
+        "should see exactly 3 distinct native events, got {}",
+        unique_native.len()
     );
-    assert!(
-        bridged_seen >= 2,
-        "should see at least 2 bridged events, got {}",
-        bridged_seen
+    assert_eq!(
+        unique_bridged.len(),
+        2,
+        "should see exactly 2 distinct bridged events, got {}",
+        unique_bridged.len()
     );
 }
 
@@ -529,14 +541,6 @@ async fn saga_adapter_resumes_from_checkpoint_after_restart() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
     let handled = saga2.handled.lock().await;
-    // At-least-once above a hole: if the checkpoint after the first run is below
-    // a sequence hole, the second run's catch-up re-delivers events from the first
-    // run. Assert at-least-1 and presence of the new event rather than an exact
-    // count or a fixed index (§4.4).
-    assert!(
-        !handled.is_empty(),
-        "after restart, saga should see at least the new event (not replay)"
-    );
     assert!(
         handled
             .iter()
@@ -546,15 +550,59 @@ async fn saga_adapter_resumes_from_checkpoint_after_restart() {
     );
 
     let cp_after_second = fetch_checkpoint(&pool, &foreign_sub_id).await.unwrap();
-    // Use >= rather than > because when the second event lands above a sequence hole
-    // (left by an aborted/in-flight transaction from a concurrent test), the
-    // contiguous-prefix checkpoint correctly refuses to advance past that hole (§4.4).
-    // The delivery assertions above already tolerate this; keep the checkpoint
-    // assertion consistent.
     assert!(
         cp_after_second >= cp_after_first,
         "checkpoint should not regress ({} -> {})",
         cp_after_first,
         cp_after_second
     );
+
+    // The point of this test is resume-from-checkpoint: the second run must see
+    // the new event and NOT replay the first run's. That is only assertable when
+    // the range the second run walks is free of holes; a hole left by a
+    // concurrent test's in-flight transaction legitimately pins the
+    // contiguous-prefix checkpoint and legitimately causes re-delivery (§4.4).
+    // So establish gap-freeness first and assert strictly under it, rather than
+    // weakening the assertions unconditionally and proving nothing in the case
+    // that actually matters.
+    let seq_new: i64 = sqlx::query_scalar(
+        "SELECT global_sequence FROM epoch_events WHERE stream_id = $1 AND stream_version = 2",
+    )
+    .bind(stream_id)
+    .fetch_one(&pool)
+    .await
+    .expect("new event should exist");
+    let present: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM epoch_events WHERE global_sequence BETWEEN $1 AND $2",
+    )
+    .bind(cp_after_first as i64 + 1)
+    .bind(seq_new)
+    .fetch_one(&pool)
+    .await
+    .expect("count rows above the first-run checkpoint");
+
+    if present == seq_new - cp_after_first as i64 {
+        let unique: HashSet<Uuid> = handled.iter().map(|r| r.event_id).collect();
+        assert_eq!(
+            unique.len(),
+            1,
+            "gap-free range: after restart the saga must see only the new event, not a replay; got {:?}",
+            *handled
+        );
+        assert!(
+            cp_after_second > cp_after_first,
+            "gap-free range: checkpoint must advance ({} -> {})",
+            cp_after_first,
+            cp_after_second
+        );
+    } else {
+        eprintln!(
+            "saga_adapter_resumes_from_checkpoint_after_restart: inconclusive, \
+             range ({}, {}] has {} of {} sequences present (concurrent hole)",
+            cp_after_first,
+            seq_new,
+            present,
+            seq_new - cp_after_first as i64
+        );
+    }
 }

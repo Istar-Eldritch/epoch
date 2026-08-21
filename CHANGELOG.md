@@ -277,7 +277,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a checkpoint that had silently skipped an in-flight event. It now blocks until the
   hole resolves and the checkpoint genuinely covers head. A readiness gate that
   previously reported ready through a lost event will now remain pending until the
-  gap closes.
+  gap closes. **Also note:** a conservative checkpoint makes the live loop re-read
+  from below the hole, so duplicate delivery of events above a hole becomes more
+  likely than before. Delivery was always at-least-once, but non-idempotent handlers
+  that happened to get away with it may now see repeats.
 
 ### Removed
 

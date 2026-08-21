@@ -233,6 +233,25 @@ pub async fn get_pg_pool() -> PgPool {
     PgPoolOptions::new()
         .max_connections(10)
         .acquire_timeout(Duration::from_secs(30))
+        // Test binaries share one database, so a test holding an open
+        // transaction on epoch_events can block a sibling's TRUNCATE, whose
+        // pending ACCESS EXCLUSIVE then queues ahead of every later reader and
+        // writer. The holder is idle in transaction rather than waiting, so
+        // Postgres sees no lock cycle and nothing ever breaks it. These turn
+        // that permanent wedge into a fast, loud failure.
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                // Separate statements: sqlx::query uses the extended protocol,
+                // which rejects multiple `;`-separated commands.
+                sqlx::query("SET lock_timeout = '15s'")
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("SET idle_in_transaction_session_timeout = '60s'")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(&database_url)
         .await
         .expect("Failed to create Postgres pool")

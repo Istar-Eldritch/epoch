@@ -5703,25 +5703,32 @@ async fn test_catchup_hole_delivers_after_commit_and_reports_ready() {
     // R5: while the hole is held, readiness must NOT report caught-up. The head
     // is at least `seq_after`, but the checkpoint is legitimately pinned below
     // the hole, so the honest answer is "not yet".
-    let caught_up = event_bus
+    //
+    // Both observations must be made while the hole is still held, so capture
+    // them and assert *after* committing. Asserting here would unwind with the
+    // transaction open, and an open transaction on epoch_events blocks a
+    // sibling binary's TRUNCATE, whose pending ACCESS EXCLUSIVE then queues
+    // ahead of every later reader and writer on the shared table.
+    let caught_up_while_held = event_bus
         .wait_until_caught_up(&subscriber_id, GapDuration::from_millis(800))
         .await
         .expect("wait_until_caught_up failed");
-    assert!(
-        !caught_up,
-        "readiness must block, not report caught-up, while the checkpoint is held below the hole"
-    );
-    let checkpoint = event_bus
+    let checkpoint_while_held = event_bus
         .get_checkpoint(&subscriber_id)
         .await
         .expect("get checkpoint");
-    assert!(
-        matches!(checkpoint, Some(s) if s < seq_n as u64),
-        "checkpoint ({checkpoint:?}) must stay below the held hole at {seq_n}"
-    );
 
     // Fill the hole.
     tx_a.commit().await.expect("commit in-flight tx A");
+
+    assert!(
+        !caught_up_while_held,
+        "readiness must block, not report caught-up, while the checkpoint is held below the hole"
+    );
+    assert!(
+        matches!(checkpoint_while_held, Some(s) if s < seq_n as u64),
+        "checkpoint ({checkpoint_while_held:?}) must stay below the held hole at {seq_n}"
+    );
 
     // Now readiness resolves via a bounded wait (not a fixed sleep). Generous
     // bound: the shared table may carry unrelated holes the backstop skips one

@@ -3653,6 +3653,22 @@ mod tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(5)
             .acquire_timeout(std::time::Duration::from_secs(5))
+            // See the same settings in tests/common: these bound a lock wait on
+            // the shared epoch_events table so a sibling binary's held
+            // transaction fails this test fast instead of hanging it forever.
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    // Separate statements: sqlx::query uses the extended
+                    // protocol, which rejects multiple `;`-separated commands.
+                    sqlx::query("SET lock_timeout = '15s'")
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query("SET idle_in_transaction_session_timeout = '60s'")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect(&url)
             .await
             .ok();
