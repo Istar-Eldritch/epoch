@@ -26,6 +26,7 @@ use epoch_pg::event_bus::PgEventBus;
 use epoch_pg::event_store::PgEventStore;
 use serial_test::serial;
 use sqlx::PgPool;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -275,10 +276,39 @@ async fn saga_adapter_receives_events_from_foreign_bus() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
     let handled = saga.handled.lock().await;
+    // At-least-once above a hole: if the R2 catch-up pass processes an event and
+    // the live loop re-reads it due to a conservative checkpoint (§4.4), the saga
+    // sees it more than once. Deduplicate by event_id so duplicates are tolerated
+    // without discarding the upper bound a lower bound would have thrown away.
+    // Asserting per-variant, and that the two ids differ, is what gives this teeth:
+    // a plain total-count check collapses the cross-delivery case, where the same
+    // event arrives via both the native subscription and the adapter, into one id
+    // and passes.
+    let unique_native: HashSet<Uuid> = handled
+        .iter()
+        .filter(|r| matches!(r.data, TargetEvent::NativeTick { .. }))
+        .map(|r| r.event_id)
+        .collect();
+    let unique_bridged: HashSet<Uuid> = handled
+        .iter()
+        .filter(|r| matches!(r.data, TargetEvent::BridgedTick { .. }))
+        .map(|r| r.event_id)
+        .collect();
     assert_eq!(
-        handled.len(),
-        2,
-        "saga should see both events, got {:?}",
+        unique_native.len(),
+        1,
+        "expected exactly one distinct native event, got {:?}",
+        handled
+    );
+    assert_eq!(
+        unique_bridged.len(),
+        1,
+        "expected exactly one distinct bridged event, got {:?}",
+        handled
+    );
+    assert!(
+        unique_native.is_disjoint(&unique_bridged),
+        "native and bridged deliveries must be distinct events, not one event cross-delivered: {:?}",
         handled
     );
     assert!(
@@ -343,8 +373,17 @@ async fn saga_adapter_preserves_event_metadata_through_conversion() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
     let handled = saga.handled.lock().await;
-    assert_eq!(handled.len(), 1, "saga should see exactly one event");
-    let r = &handled[0];
+    // At-least-once above a hole: allow duplicates (§4.4), but the event must
+    // appear at least once with all metadata intact.
+    assert!(
+        !handled.is_empty(),
+        "saga should see at least one event, got {:?}",
+        *handled
+    );
+    let r = handled
+        .iter()
+        .find(|r| r.event_id == event_id)
+        .expect("the stored event should appear in handled");
     assert_eq!(r.event_id, event_id, "event id preserved through adapter");
     assert_eq!(
         r.correlation_id,
@@ -419,16 +458,35 @@ async fn saga_adapter_advances_independent_checkpoints() {
     );
 
     let handled = saga.handled.lock().await;
-    let native_seen = handled
+    // At-least-once above a hole: if the R2 catch-up pass processes an event
+    // and the live loop re-reads it due to a conservative checkpoint (§4.4),
+    // the saga sees it more than once. Deduplicate by event_id so duplicates are
+    // tolerated without discarding the upper bound: this test exists to prove
+    // the native and adapter subscribers keep independent checkpoints, and a
+    // lower bound alone would pass even if the adapter bridged every event to
+    // both handlers.
+    let unique_native: HashSet<Uuid> = handled
         .iter()
         .filter(|r| matches!(r.data, TargetEvent::NativeTick { .. }))
-        .count();
-    let bridged_seen = handled
+        .map(|r| r.event_id)
+        .collect();
+    let unique_bridged: HashSet<Uuid> = handled
         .iter()
         .filter(|r| matches!(r.data, TargetEvent::BridgedTick { .. }))
-        .count();
-    assert_eq!(native_seen, 3, "should see 3 native events");
-    assert_eq!(bridged_seen, 2, "should see 2 bridged events");
+        .map(|r| r.event_id)
+        .collect();
+    assert_eq!(
+        unique_native.len(),
+        3,
+        "should see exactly 3 distinct native events, got {}",
+        unique_native.len()
+    );
+    assert_eq!(
+        unique_bridged.len(),
+        2,
+        "should see exactly 2 distinct bridged events, got {}",
+        unique_bridged.len()
+    );
 }
 
 #[tokio::test]
@@ -506,22 +564,77 @@ async fn saga_adapter_resumes_from_checkpoint_after_restart() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
     let handled = saga2.handled.lock().await;
-    assert_eq!(
-        handled.len(),
-        1,
-        "after restart, saga should only see the new event (not replay)"
-    );
     assert!(
-        matches!(handled[0].data, TargetEvent::BridgedTick { value: 2, .. }),
-        "the one event should be the new one (value=2), got {:?}",
-        handled[0].data
+        handled
+            .iter()
+            .any(|r| matches!(r.data, TargetEvent::BridgedTick { value: 2, .. })),
+        "the new event (value=2) should be present, got {:?}",
+        *handled
     );
 
     let cp_after_second = fetch_checkpoint(&pool, &foreign_sub_id).await.unwrap();
     assert!(
-        cp_after_second > cp_after_first,
-        "checkpoint should advance ({} -> {})",
+        cp_after_second >= cp_after_first,
+        "checkpoint should not regress ({} -> {})",
         cp_after_first,
         cp_after_second
     );
+
+    // The point of this test is resume-from-checkpoint: the second run must see
+    // the new event and NOT replay the first run's. That is only assertable when
+    // the range the second run walks is free of holes; a hole left by a
+    // concurrent test's in-flight transaction legitimately pins the
+    // contiguous-prefix checkpoint and legitimately causes re-delivery (§4.4).
+    // So establish gap-freeness first and assert strictly under it, rather than
+    // weakening the assertions unconditionally and proving nothing in the case
+    // that actually matters.
+    let seq_new: i64 = sqlx::query_scalar(
+        "SELECT global_sequence FROM epoch_events WHERE stream_id = $1 AND stream_version = 2",
+    )
+    .bind(stream_id)
+    .fetch_one(&pool)
+    .await
+    .expect("new event should exist");
+    // Sample twice. A hole that was open while the second run walked the range
+    // and committed before this query would read back as gap-free, sending us
+    // into the strict branch even though re-delivery was legitimate. Requiring
+    // both samples to agree removes that false-strict race; the opposite
+    // direction is already safe, since sequences are claimed monotonically and
+    // seq_new was claimed before either sample.
+    let count_range = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT global_sequence) FROM epoch_events \
+             WHERE global_sequence BETWEEN $1 AND $2",
+        )
+        .bind(cp_after_first as i64 + 1)
+        .bind(seq_new)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows above the first-run checkpoint")
+    };
+    let expected_span = seq_new - cp_after_first as i64;
+    let present = count_range().await;
+    let present_again = count_range().await;
+
+    if present == expected_span && present_again == expected_span {
+        let unique: HashSet<Uuid> = handled.iter().map(|r| r.event_id).collect();
+        assert_eq!(
+            unique.len(),
+            1,
+            "gap-free range: after restart the saga must see only the new event, not a replay; got {:?}",
+            *handled
+        );
+        assert!(
+            cp_after_second > cp_after_first,
+            "gap-free range: checkpoint must advance ({} -> {})",
+            cp_after_first,
+            cp_after_second
+        );
+    } else {
+        eprintln!(
+            "saga_adapter_resumes_from_checkpoint_after_restart: inconclusive, \
+             range ({}, {}] has {}/{} sequences present (concurrent hole)",
+            cp_after_first, seq_new, present, expected_span
+        );
+    }
 }

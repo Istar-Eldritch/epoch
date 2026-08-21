@@ -260,6 +260,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Upcast(epoch_core::upcasting::UpcastError)` variant. Match arms that previously
   exhaustively matched `PgEventStoreError` must add `Upcast(_)` (or use a wildcard arm).
 
+### Fixed
+
+- **Contiguous catch-up checkpoint** (`epoch_pg`, CLOUD-226): `catch_up_from_checkpoint`
+  and the `subscribe()` buffer-drain pass previously persisted the maximum
+  `global_sequence` seen during a pass, not the highest *contiguous* sequence from
+  the starting point. Because `global_sequence` is assigned by a non-transactional
+  `nextval()`, a visible page can contain a hole a still-open transaction fills in
+  later; checkpointing the maximum stranded such events permanently, with no warning
+  and no DLQ entry. Both paths now persist only the highest contiguous prefix (the
+  longest unbroken run from the starting checkpoint): pagination keeps advancing past
+  any hole so the pass terminates, but the persisted value stops advancing at the
+  first gap. The live loop, which does have gap-fence machinery, re-reads from the
+  conservative checkpoint and delivers the in-flight event once it commits.
+  **Behaviour change (R5):** `wait_until_caught_up` previously returned `true` over
+  a checkpoint that had silently skipped an in-flight event. It now blocks until the
+  hole resolves and the checkpoint genuinely covers head. A readiness gate that
+  previously reported ready through a lost event will now remain pending until the
+  gap closes. **Also note:** a conservative checkpoint makes the live loop re-read
+  from below the hole, so duplicate delivery of events above a hole becomes more
+  likely than before. Delivery was always at-least-once, but non-idempotent handlers
+  that happened to get away with it may now see repeats.
+
 ### Removed
 
 - Blanket `EventObserver` implementation for `Projection` (replaced with `ProjectionHandler`)

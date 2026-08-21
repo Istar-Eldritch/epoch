@@ -5085,6 +5085,14 @@ async fn test_readiness_inline_dispatch_errors() {
 struct GatedObserver {
     subscriber_id: String,
     released_rx: tokio::sync::watch::Receiver<bool>,
+    /// When present, `on_event` flips this to `true` on entry (before it blocks
+    /// on the gate), so a test can wait for the observer to be genuinely parked
+    /// rather than sleeping and hoping. `None` for callers that do not need it.
+    entered_tx: Option<tokio::sync::watch::Sender<bool>>,
+    /// Every `global_sequence` seen by `on_event`, in arrival order. Shared so
+    /// the test can assert which events were actually processed after the
+    /// observer has been consumed by `subscribe()`.
+    seen_seqs: Arc<tokio::sync::Mutex<Vec<u64>>>,
 }
 
 impl GatedObserver {
@@ -5107,9 +5115,39 @@ impl GatedObserver {
             Self {
                 subscriber_id,
                 released_rx: rx,
+                entered_tx: None,
+                seen_seqs: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             },
             tx,
         )
+    }
+
+    /// Like [`GatedObserver::new`] but also returns a receiver that flips to
+    /// `true` the moment `on_event` is first entered, letting a test observe
+    /// that catch-up is provably parked on an event before it acts.
+    fn new_with_entry_signal(
+        subscriber_id: String,
+    ) -> (
+        Self,
+        tokio::sync::watch::Sender<bool>,
+        tokio::sync::watch::Receiver<bool>,
+    ) {
+        let (released_tx, released_rx) = tokio::sync::watch::channel(false);
+        let (entered_tx, entered_rx) = tokio::sync::watch::channel(false);
+        (
+            Self {
+                subscriber_id,
+                released_rx,
+                entered_tx: Some(entered_tx),
+                seen_seqs: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            },
+            released_tx,
+            entered_rx,
+        )
+    }
+
+    fn seen_seqs(&self) -> Arc<tokio::sync::Mutex<Vec<u64>>> {
+        Arc::clone(&self.seen_seqs)
     }
 }
 
@@ -5123,8 +5161,14 @@ impl epoch_core::SubscriberId for GatedObserver {
 impl EventObserver<TestEventData> for GatedObserver {
     async fn on_event(
         &self,
-        _event: Arc<Event<TestEventData>>,
+        event: Arc<Event<TestEventData>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(seq) = event.global_sequence {
+            self.seen_seqs.lock().await.push(seq);
+        }
+        if let Some(entered_tx) = &self.entered_tx {
+            let _ = entered_tx.send(true);
+        }
         let mut rx = self.released_rx.clone();
         while !*rx.borrow() {
             if rx.changed().await.is_err() {
@@ -5542,4 +5586,349 @@ async fn test_second_bus_on_same_table_gets_its_own_trigger() {
 
     second_bus.shutdown().await.expect("second shutdown failed");
     first_bus.shutdown().await.expect("first shutdown failed");
+}
+
+// ============================================================================
+// Spec 0026 / CLOUD-226: contiguous catch-up checkpoint integration tests
+//
+// These exercise the two catch-up writers end-to-end against a live Postgres
+// while a hole in `global_sequence` is held open by an uncommitted transaction.
+// All assertions are relative to sequences captured via `INSERT ... RETURNING
+// global_sequence`; absolute values are unusable because `epoch_events` and its
+// sequence are shared by five parallel test binaries (spec §6). Both use stable
+// channel names so they do not leak a fresh NOTIFY trigger per run (CLOUD-230).
+// ============================================================================
+
+/// Claims the next `global_sequence` inside `tx` without committing, producing a
+/// permanent-until-commit hole no other transaction can fill (the value is
+/// allocated to `tx`). Returns `(event_id, held_sequence)`.
+async fn claim_hole_uncommitted(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    stream_id: Uuid,
+) -> (Uuid, i64) {
+    let id = Uuid::new_v4();
+    let data = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: "held_hole".to_string(),
+    }))
+    .unwrap();
+    let seq: i64 = sqlx::query_scalar(
+        r#"INSERT INTO epoch_events (id, stream_id, stream_version, event_type, data, created_at)
+           VALUES ($1, $2, 1, 'MyEvent', $3, NOW())
+           RETURNING global_sequence"#,
+    )
+    .bind(id)
+    .bind(stream_id)
+    .bind(&data)
+    .fetch_one(&mut **tx)
+    .await
+    .expect("claim held sequence in tx");
+    (id, seq)
+}
+
+/// Test 4 (R1, R5): an event committed after a catch-up pass that ran over a
+/// held hole is still delivered, and readiness only reports caught-up once the
+/// hole resolves.
+///
+/// The subscriber is registered *before* `start_listener`, so the R2 pre-loop
+/// catch-up pass (the once-per-boot writer that motivated this fix) is what runs
+/// over the hole. Readiness uses a bounded `wait_until_caught_up`, never a fixed
+/// sleep. The persisted checkpoint is pre-planted just below the hole so the
+/// pass is isolated from unrelated history left by sibling test binaries on the
+/// shared table.
+#[tokio::test]
+#[serial]
+async fn test_catchup_hole_delivers_after_commit_and_reports_ready() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
+
+    // gap_timeout comfortably longer than the ~800ms window we hold the hole for
+    // the not-ready observation, so the backstop cannot skip our hole before we
+    // commit it; short enough that the final wait tolerates an unrelated
+    // permanent hole from a sibling binary being backstop-skipped.
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(2),
+        ..Default::default()
+    };
+    let channel_name = "test_catchup_e2e".to_string();
+    let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+
+    let stream_id = Uuid::new_v4();
+
+    // Hold a hole open, then commit an event above it.
+    let mut tx_a = pool.begin().await.expect("begin in-flight tx A");
+    let (in_flight_id, seq_n) = claim_hole_uncommitted(&mut tx_a, stream_id).await;
+    let (after_id, seq_after) = insert_committed_event(&pool, stream_id, 2, "after_hole").await;
+    assert!(
+        seq_after > seq_n,
+        "the committed event must own a later global_sequence than the held hole"
+    );
+
+    let subscriber_id = format!("projection:catchup-e2e:{}", Uuid::new_v4());
+    let projection = TestProjection::with_subscriber_id(subscriber_id.clone());
+    let projection_events = projection.get_state_store().clone();
+
+    // Plant the checkpoint just below the hole so catch-up only walks our own
+    // events, not the shared table's accumulated history. The Uuid::new_v4()
+    // event_id does not correspond to a real event — deliberate throwaway seed
+    // state that gets overwritten once the hole fills and catch-up runs.
+    event_bus
+        .update_checkpoint(&subscriber_id, seq_n as u64 - 1, Uuid::new_v4())
+        .await
+        .expect("plant checkpoint below hole");
+
+    // Register before start_listener so the R2 pre-loop pass covers this
+    // subscriber (subscribing after would run the loop with no subscribers, and
+    // exercise subscribe()'s own catch-up instead).
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    // R5: while the hole is held, readiness must NOT report caught-up. The head
+    // is at least `seq_after`, but the checkpoint is legitimately pinned below
+    // the hole, so the honest answer is "not yet".
+    //
+    // Both observations must be made while the hole is still held, so capture
+    // them and assert *after* committing. Asserting here would unwind with the
+    // transaction open, and an open transaction on epoch_events blocks a
+    // sibling binary's TRUNCATE, whose pending ACCESS EXCLUSIVE then queues
+    // ahead of every later reader and writer on the shared table.
+    let caught_up_while_held = event_bus
+        .wait_until_caught_up(&subscriber_id, GapDuration::from_millis(800))
+        .await
+        .expect("wait_until_caught_up failed");
+    let checkpoint_while_held = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("get checkpoint");
+
+    // Fill the hole.
+    tx_a.commit().await.expect("commit in-flight tx A");
+
+    assert!(
+        !caught_up_while_held,
+        "readiness must block, not report caught-up, while the checkpoint is held below the hole"
+    );
+    assert!(
+        matches!(checkpoint_while_held, Some(s) if s < seq_n as u64),
+        "checkpoint ({checkpoint_while_held:?}) must stay below the held hole at {seq_n}"
+    );
+
+    // Now readiness resolves via a bounded wait (not a fixed sleep). Generous
+    // bound: the shared table may carry unrelated holes the backstop skips one
+    // gap_timeout apart before this subscriber reaches the head snapshot.
+    let caught_up = event_bus
+        .wait_until_caught_up(&subscriber_id, GapDuration::from_secs(15))
+        .await
+        .expect("wait_until_caught_up failed");
+    assert!(
+        caught_up,
+        "readiness must report caught-up once the hole resolves"
+    );
+
+    // Both the previously-held event and the one above it must be delivered.
+    let state = projection_events
+        .get_state(stream_id)
+        .await
+        .unwrap()
+        .expect("subscriber should have received events once the hole filled");
+    let ids: Vec<Uuid> = state.0.iter().map(|e| e.id).collect();
+    assert!(
+        ids.contains(&in_flight_id),
+        "the previously-held event must be delivered after its commit"
+    );
+    assert!(
+        ids.contains(&after_id),
+        "the event above the hole must be delivered"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+}
+
+/// Test 5 (R2, subscribe drain path): `subscribe()`'s buffer-drain pass must
+/// not flush a checkpoint above a held hole, even when it drains above-hole
+/// events that catch-up never saw. This is the test that would have caught the
+/// second writer (spec §6 test 5).
+///
+/// The drain reuses catch-up's `contiguous` prefix counter and must flush only
+/// that value. Because `flush_checkpoint` is a blind, non-monotonic upsert, a
+/// drain that flushed its own linear maximum would overwrite catch-up's
+/// conservative checkpoint inside the same `subscribe()` call.
+///
+/// Giving the drain power over R2 requires a buffered event strictly *above*
+/// catch-up's returned pagination cursor, i.e. one catch-up never saw. Rather
+/// than race a concurrent writer against catch-up (only load-sensitively
+/// reliable), this drives the boundary deterministically with a gated observer:
+///
+///   1. Two above-hole events pre-exist. With the default `catch_up_batch_size`
+///      (100) they form catch-up's single short page, so catch-up breaks after
+///      processing them **without a re-query**.
+///   2. The gated observer parks catch-up on the first of those two events —
+///      after its page query has run — and signals that it is parked.
+///   3. A third above-hole event is committed while catch-up is parked. Its
+///      NOTIFY is buffered, but catch-up never re-queries, so it lands strictly
+///      above the pagination cursor and the drain must process it.
+///
+/// The persisted checkpoint is read immediately, while the hole is still held,
+/// so the drain's flush is the only thing that could have moved it. Catch-up
+/// itself leaves the checkpoint at the planted `seq_n - 1` (its contiguous
+/// prefix never advances past the hole and its flush is skipped), so a checkpoint
+/// at or above `seq_n` can only come from the drain.
+///
+/// Reverting the Phase 2 drain fix makes this fail: the pre-fix drain advanced
+/// a linear `PendingCheckpoint` per drained row and flushed its maximum, pushing
+/// the checkpoint past the hole (acceptance §9.2).
+#[tokio::test]
+#[serial]
+async fn test_subscribe_drain_does_not_flush_above_held_hole() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    common::truncate_epoch_tables(&pool).await;
+
+    // Default catch_up_batch_size (100) so the two pre-existing events are
+    // catch-up's single short page and it breaks without a re-query. Generous
+    // gap_timeout: we read the checkpoint immediately after subscribe() returns
+    // while the hole is still held, so the live path's backstop must not skip
+    // the hole in the meantime.
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        ..Default::default()
+    };
+    let channel_name = "test_catchup_drain".to_string();
+    let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+    // Start the listener first so subscribe() takes the buffer/drain path.
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    let stream_id = Uuid::new_v4();
+
+    // Hold a hole open (claim_hole_uncommitted uses stream_version 1), then
+    // commit two events above it. Catch-up fetches both in its single page,
+    // parks on the first via the gated observer, and its contiguous prefix
+    // stays at seq_n - 1 (the hole is never seen).
+    let mut tx_a = pool.begin().await.expect("begin in-flight tx A");
+    let (_hole_id, seq_n) = claim_hole_uncommitted(&mut tx_a, stream_id).await;
+    let (_above1_id, seq1) = insert_committed_event(&pool, stream_id, 2, "above1").await;
+    let (_above2_id, seq2) = insert_committed_event(&pool, stream_id, 3, "above2").await;
+    assert!(
+        seq1 > seq_n && seq2 > seq1,
+        "the pre-existing events must sit above the held hole"
+    );
+
+    let subscriber_id = format!("projection:catchup-drain:{}", Uuid::new_v4());
+    let (gated, released, mut entered_rx) =
+        GatedObserver::new_with_entry_signal(subscriber_id.clone());
+
+    // Plant the checkpoint just below the hole so catch-up walks only above-hole
+    // events, isolating the assertion from shared-table history.
+    event_bus
+        .update_checkpoint(&subscriber_id, seq_n as u64 - 1, Uuid::new_v4())
+        .await
+        .expect("plant checkpoint below hole");
+
+    // Run subscribe() concurrently: it parks inside catch-up on the first event
+    // until we release the gate.
+    let seen_seqs = gated.seen_seqs();
+    let bus_for_task = event_bus.clone();
+    let subscribe_task = tokio::spawn(async move { bus_for_task.subscribe(gated).await });
+
+    // Wait until catch-up is provably parked on the first event. Its page query
+    // (fetching both pre-existing events) has run by now, so anything committed
+    // from here on is invisible to catch-up.
+    tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+        while !*entered_rx.borrow() {
+            entered_rx
+                .changed()
+                .await
+                .expect("entered signal sender dropped");
+        }
+    })
+    .await
+    .expect("catch-up did not reach the gated observer");
+
+    // Let the buffer listener finish connecting and LISTENing before we commit
+    // the buffered event: a NOTIFY is only delivered to sessions already
+    // listening at commit time. Safe as a fixed wait because the gate holds
+    // catch-up parked — this is a lower bound on connect latency, not a race.
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    // Commit a third above-hole event while catch-up is parked. Its NOTIFY is
+    // buffered, but catch-up breaks after its single short page (no re-query),
+    // so it lands strictly above the pagination cursor: the drain must process
+    // it (spec §4.3, R2).
+    let (_above3_id, seq3) = insert_committed_event(&pool, stream_id, 4, "buffered_above").await;
+    assert!(
+        seq3 > seq2,
+        "the buffered event must sit above the pre-existing events"
+    );
+
+    // Let the buffered NOTIFY reach the buffer channel before releasing catch-up
+    // to drain it. Again a safe fixed wait: the gate still holds catch-up.
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    // Release catch-up; it processes the two pre-existing events, breaks, then
+    // drains the buffered above-hole event.
+    released
+        .send(true)
+        .expect("GatedObserver's receiver was dropped");
+    subscribe_task
+        .await
+        .expect("subscribe task panicked")
+        .expect("Failed to subscribe");
+
+    // R2: the drain processed an above-hole event, but must not have flushed a
+    // checkpoint above the still-held hole. Read immediately, before filling it.
+    let checkpoint = event_bus
+        .get_checkpoint(&subscriber_id)
+        .await
+        .expect("get checkpoint");
+
+    // Fill the hole and shut down *before* asserting so a failing revert-check
+    // (spec §9.2) does not leave the held transaction or the listener alive and
+    // hang the test process on exit.
+    tx_a.commit().await.expect("commit in-flight tx A");
+    event_bus.shutdown().await.expect("shutdown");
+
+    assert!(
+        matches!(checkpoint, Some(s) if s < seq_n as u64),
+        "checkpoint ({checkpoint:?}) must stay below the held hole at {seq_n} after subscribe()"
+    );
+    // The drain must have actually delivered the buffered event. If the NOTIFY
+    // was missed (buffer listener not yet LISTENing at commit time), nothing is
+    // drained and the checkpoint stays put — the R2 assertion above passes but
+    // proves nothing. Asserting seq3 was delivered converts a silent false-pass
+    // into an explicit failure.
+    let seen = seen_seqs.lock().await;
+    assert!(
+        seen.contains(&(seq3 as u64)),
+        "drain must have delivered the buffered event (seq {seq3}); actually saw: {seen:?}"
+    );
 }

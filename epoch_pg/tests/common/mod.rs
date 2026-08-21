@@ -193,6 +193,30 @@ async fn try_get_pg_pool_at(database_url: &str) -> Option<PgPool> {
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .acquire_timeout(Duration::from_secs(5))
+        // Test binaries share one database, so a test holding an open
+        // transaction on epoch_events can block a sibling's TRUNCATE, whose
+        // pending ACCESS EXCLUSIVE then queues ahead of every later reader and
+        // writer. The holder is idle in transaction rather than waiting, so
+        // Postgres sees no lock cycle and nothing ever breaks it: a run wedged
+        // for over five hours this way. These turn that permanent wedge into a
+        // fast, loud failure.
+        //
+        // 30s, not 15s: legitimate holds in this suite reach ~13s (the sentinel
+        // transaction spans two 6s poll loops), so a tighter bound would trade
+        // the wedge for a flake under load.
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                // Separate statements: sqlx::query uses the extended protocol,
+                // which rejects multiple `;`-separated commands.
+                sqlx::query("SET lock_timeout = '30s'")
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("SET idle_in_transaction_session_timeout = '60s'")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(database_url)
         .await;
 
@@ -213,29 +237,6 @@ async fn try_get_pg_pool_at(database_url: &str) -> Option<PgPool> {
             None
         }
     }
-}
-
-/// Gets a connection pool to the test database.
-///
-/// Automatically creates the database if it doesn't exist.
-#[allow(dead_code)]
-pub async fn get_pg_pool() -> PgPool {
-    let database_url = database_url();
-
-    // Ensure the database exists before trying to connect
-    if let Err(e) = ensure_test_database_exists(&database_url).await {
-        eprintln!(
-            "Warning: Could not ensure test database exists: {}. Attempting to connect anyway...",
-            e
-        );
-    }
-
-    PgPoolOptions::new()
-        .max_connections(10)
-        .acquire_timeout(Duration::from_secs(30))
-        .connect(&database_url)
-        .await
-        .expect("Failed to create Postgres pool")
 }
 
 /// Truncates all epoch tables and resets the global-sequence counter.
