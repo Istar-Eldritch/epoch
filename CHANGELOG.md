@@ -262,6 +262,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Live-path contiguous checkpoint** (`epoch_pg`, CLOUD-232): the live listener
+  path (`process_subscriber_for_batch`) previously updated the pending checkpoint with
+  the maximum `global_sequence` seen in each batch, not the highest *contiguous*
+  sequence from the current position. When a batch contained an event whose writer
+  was still open (a sequence hole), the pending carried a value above the hole and
+  was published on the next flush without a contiguity check. The holding
+  transaction's event, once committed, sat below the persisted checkpoint and was
+  delivered to nobody, with no warning and no DLQ entry. Affected flush sites:
+  `flush_all_pending_checkpoints` (called on **reconnect and shutdown in every
+  checkpoint mode**) and `flush_expired_checkpoints` (called on the **`Batched`
+  timer tick**). Both now refuse to publish a pending that has not advanced beyond
+  its seed position, so a hole held open at shutdown or across a reconnect no longer
+  poisons the next boot's starting position. **Behaviour change (`Batched` mode
+  only):** subscribers using `Batched` checkpointing may now report not-caught-up
+  while a hole is open; the delay is bounded by `gap_timeout` (default 5 s), after
+  which the backstop skips the hole and the checkpoint resumes. Under `Synchronous`
+  (the default), steady-state readiness is unaffected: the persisted value already
+  held at a hole; only the shutdown/reconnect boundary was exposed.
+
 - **Contiguous catch-up checkpoint** (`epoch_pg`, CLOUD-226): `catch_up_from_checkpoint`
   and the `subscribe()` buffer-drain pass previously persisted the maximum
   `global_sequence` seen during a pass, not the highest *contiguous* sequence from

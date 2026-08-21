@@ -116,8 +116,9 @@ pub(crate) fn should_flush_checkpoint(pending: &PendingCheckpoint, mode: &Checkp
 /// checkpoint *backwards* by passing a `pending` value lower than what is
 /// already stored. Every caller MUST pass only a value it is willing to
 /// publish as the subscriber's current position; this is exactly why the
-/// contiguous-prefix catch-up counter (spec 0026 R1/R2) never flushes above a
-/// sequence it hasn't proven contiguous.
+/// contiguous-prefix catch-up counter (spec 0026 R1/R2) and the live listener
+/// path (spec 0027 R1) never flush above a sequence they haven't proven
+/// contiguous.
 ///
 /// # Returns
 ///

@@ -1,6 +1,6 @@
 # Spec 0027: Live-Path Contiguous Checkpoint
 
-**Issue:** CLOUD-232 · **Status:** Reviewed, ready to implement · **Crate:** `epoch_pg`
+**Issue:** CLOUD-232 · **Status:** Implemented · **Crate:** `epoch_pg`
 **Scope:** `fix(pg)` — no migration, schema, or public-API change.
 **Sequel to:** spec 0026 (CLOUD-226), same problem domain and vocabulary.
 **Input:** `specs/briefs/0027-cloud232-live-path-contiguous-checkpoint-brief.md` (discovery, verified on `main`).
@@ -310,7 +310,18 @@ Each phase is independently committable and leaves the suite green. Positive con
 5. No `unwrap()`/`expect()` added in library code (tests exempt). New/changed `pub(crate)` items carry rustdoc.
 6. `git diff --stat` shows no migration file and no change under any `pub` signature (R7).
 
-## 10. Out of scope
+## 10. Implementation Summary
+
+Delivered across 4 phases in `epoch_pg`:
+
+- **P1 — test infrastructure and positive controls** (`0456843`): isolated-events-table helper (private sequence, `setup_trigger` before `start_listener`, `Uuid`-unique channel name); `table` parameter added to `claim_hole_uncommitted`, `insert_committed_event`, and their caller `create_sequence_gap`; event writes converted to `PgEventStore::with_table`; `test_batched_checkpoint_flushes_at_batch_size`, `test_batched_checkpoint_flushes_at_max_delay`, and `test_synchronous_checkpoint_still_works` hardened to exact-value assertions on the isolated table (the last stores 2 events for cadence coverage); `test_backstop_hole_still_advances_checkpoint` added (mandatory positive control, `snapshot_fencing: false`, `gap_timeout: 500ms`, zero load sensitivity); `test_fence_cleared_hole_still_advances_checkpoint` added as `#[ignore]` with explanatory doc comment. *(R2, R3, R4)*
+- **P2 — the fix** (`5657e69`, spec correction `83bc5b9`, event-id wiring `c1ad226`): `PendingCheckpoint::record_processed` (count-only, leaves position/id/timer untouched); `PendingCheckpoint::seeded` (eager-seed constructor, born unpublishable, `seed_sequence == global_sequence`); `PendingCheckpoint::is_publishable` predicate (`global_sequence > seed_sequence`); unit tests for all three; `SubscriberState::contiguous_event_id` field and `SubscriberState::new_with_event_id` constructor; `start_listener` seeding SELECT extended to `(i64, Option<Uuid>)`; per-event sites in `process_subscriber_for_batch` switch from `update` to `record_processed` with eager seeding from `state.contiguous_checkpoint`; contiguous branch switches from direct field assignment to `update()`; `try_flush_pending_checkpoint` moved outside the advance branch, guarded by `!replay_always`; `cached_checkpoint` sourced only from `local_cache`; publishable predicate applied inside `take_if` in `try_flush_pending_checkpoint` and inside the filter in both `flush_expired_checkpoints` and `flush_all_pending_checkpoints`. *(R1, R3, R4, R5, R6, R7)*
+- **P3 — regression tests** (`55787f3`): `test_live_shutdown_does_not_publish_above_held_hole` (PRIMARY; default `Synchronous`, commented as such; also asserts persisted `last_event_id` equals the below-hole event's id — the only DB-level R5 check); `test_live_batched_flush_does_not_publish_above_held_hole` (`Batched { batch_size: 1000, max_delay_ms: 300 }`; fixed sleep `>= 2x flush_interval`, taken after delivery is verified); `test_live_deser_skip_above_hole_does_not_publish_above_hole` (valid JSON of unknown variant, WARN asserted via `captured_logs_contain_since`); `ReplayAlways` guard. All three fail with P2 reverted. *(R1, R5, R6)*
+- **P4 — hygiene/docs** (this commit): CHANGELOG `### Fixed` entry scoped per §6; `flush_checkpoint` hazard rustdoc extended to cite spec 0027 R1 alongside spec 0026 R1/R2; spec marked Implemented. *(R7)*
+
+**Files:** `epoch_pg/src/event_bus/checkpoint.rs`, `epoch_pg/src/event_bus/mod.rs`, `epoch_pg/src/event_bus/subscriber_state.rs`, `epoch_pg/tests/pgeventbus_integration_tests.rs`, `CHANGELOG.md`, `specs/0027-cloud232-live-path-contiguous-checkpoint.md`.
+
+## 11. Out of scope
 
 - Merging `advance_catchup_prefix` with `advance_contiguous_checkpoint` (§2; already rejected).
 - A monotonic `WHERE` guard on `flush_checkpoint` (§4 Q3; breaks deliberate rewind via `update_checkpoint`).
