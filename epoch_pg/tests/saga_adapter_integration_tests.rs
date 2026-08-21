@@ -546,9 +546,14 @@ async fn saga_adapter_resumes_from_checkpoint_after_restart() {
     );
 
     let cp_after_second = fetch_checkpoint(&pool, &foreign_sub_id).await.unwrap();
+    // Use >= rather than > because when the second event lands above a sequence hole
+    // (left by an aborted/in-flight transaction from a concurrent test), the
+    // contiguous-prefix checkpoint correctly refuses to advance past that hole (§4.4).
+    // The delivery assertions above already tolerate this; keep the checkpoint
+    // assertion consistent.
     assert!(
-        cp_after_second > cp_after_first,
-        "checkpoint should advance ({} -> {})",
+        cp_after_second >= cp_after_first,
+        "checkpoint should not regress ({} -> {})",
         cp_after_first,
         cp_after_second
     );
