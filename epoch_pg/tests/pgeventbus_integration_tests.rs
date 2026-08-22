@@ -1548,13 +1548,20 @@ async fn test_batched_checkpoint_flushes_at_batch_size() {
     // Store the 5th event - should trigger the batch_size checkpoint flush.
     let (_id5, seq5) = insert_committed_event(&pool, &table, stream_id, 5, "batched_event_5").await;
 
-    // Give time for the checkpoint to be flushed
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    let checkpoint = event_bus
-        .get_checkpoint(&subscriber_id)
-        .await
-        .expect("Failed to get checkpoint");
+    // Poll for the exact expected value rather than a fixed sleep: this has a
+    // genuine positive edge (checkpoint == Some(seq5)), so a fixed sleep risks
+    // flaking red under a loaded shared Postgres.
+    let mut checkpoint = None;
+    for _ in 0..40 {
+        checkpoint = event_bus
+            .get_checkpoint(&subscriber_id)
+            .await
+            .expect("Failed to get checkpoint");
+        if checkpoint == Some(seq5 as u64) {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
 
     event_bus.shutdown().await.expect("shutdown");
     drop_isolated_events_table(&pool, &table).await;
@@ -1632,15 +1639,23 @@ async fn test_batched_checkpoint_flushes_at_max_delay() {
         last_seq = seq;
     }
 
-    // Wait for the max_delay to trigger. flush_interval is a hard-coded 1s and
-    // max_delay is 500ms, so the periodic flush lands within ~1.5s; 2s gives
-    // margin for the timer tick's arbitrary phase.
-    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-
-    let checkpoint = event_bus
-        .get_checkpoint(&subscriber_id)
-        .await
-        .expect("Failed to get checkpoint");
+    // Poll for the exact expected value rather than a fixed sleep: this has a
+    // genuine positive edge (checkpoint == Some(last_seq)), so a fixed sleep
+    // risks flaking red under a loaded shared Postgres. flush_interval is a
+    // hard-coded 1s and max_delay is 500ms, so the periodic flush lands within
+    // ~1.5s; the 4s poll budget gives margin for the timer tick's arbitrary
+    // phase.
+    let mut checkpoint = None;
+    for _ in 0..40 {
+        checkpoint = event_bus
+            .get_checkpoint(&subscriber_id)
+            .await
+            .expect("Failed to get checkpoint");
+        if checkpoint == Some(last_seq as u64) {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
 
     event_bus.shutdown().await.expect("shutdown");
     drop_isolated_events_table(&pool, &table).await;
@@ -1807,13 +1822,20 @@ async fn test_synchronous_checkpoint_still_works() {
         last_seq = seq;
     }
 
-    // Give time for the events to be processed and checkpointed.
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    let checkpoint = event_bus
-        .get_checkpoint(&subscriber_id)
-        .await
-        .expect("Failed to get checkpoint");
+    // Poll for the exact expected value rather than a fixed sleep: this has a
+    // genuine positive edge (checkpoint == Some(last_seq)), so a fixed sleep
+    // risks flaking red under a loaded shared Postgres.
+    let mut checkpoint = None;
+    for _ in 0..40 {
+        checkpoint = event_bus
+            .get_checkpoint(&subscriber_id)
+            .await
+            .expect("Failed to get checkpoint");
+        if checkpoint == Some(last_seq as u64) {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
 
     event_bus.shutdown().await.expect("shutdown");
     drop_isolated_events_table(&pool, &table).await;
@@ -6581,6 +6603,180 @@ async fn test_live_batched_flush_does_not_publish_above_held_hole() {
     );
 }
 
+/// R4 coverage gap closed after 0027 review round 1: ahead-of-gap events must
+/// still count toward the `Batched` `batch_size` threshold (`record_processed`
+/// feeds the counter), but a threshold crossing while a hole is held must still
+/// be unable to publish above the hole (the `is_publishable` predicate blocks
+/// it). The sibling test above deliberately sets `batch_size: 1000` to isolate
+/// the `max_delay` timer path; this test isolates the `batch_size` path by
+/// setting `max_delay_ms` long enough that only a `batch_size` crossing can
+/// fire.
+///
+/// Every processed row bumps the shared counter, including the below-hole
+/// event itself (`record_processed` runs at both the success and deser-skip
+/// per-row sites, regardless of contiguity), so `batch_size: 3` is chosen
+/// deliberately: the below-hole event alone contributes 1, which is not close
+/// to the threshold, so crossing it requires **both** above-hole events to be
+/// processed (1 + 1 + 1 = 3). A smaller `batch_size: 2` would let the
+/// below-hole event's own count plus a single ahead event cross the threshold,
+/// which would not cleanly demonstrate that ahead-of-gap events themselves are
+/// being counted.
+///
+/// This closes a real gap: without `record_processed` feeding the counter,
+/// `events_since_checkpoint` would freeze and this crossing would never fire at
+/// all (the bug §3.1 describes for the naive per-event `update()` deletion);
+/// without the predicate, the crossing would publish `seq_above2`. Reverting
+/// either `record_processed`'s counter bump or the `is_publishable` guard in
+/// `try_flush_pending_checkpoint`'s `take_if` closure makes this test fail —
+/// reasoned through the code below, not executed against a reverted tree,
+/// since only one worktree may write here at a time. Reverting the counter
+/// bump: the pending would stay below `batch_size` since events accrue only
+/// via `record_processed`, `should_flush_checkpoint` would never return `true`
+/// from the `batch_size` arm, and the checkpoint poll below would time out at
+/// `None`/the below-hole value never reached by this path, since nothing would
+/// flush without the size trigger. Reverting the predicate: the `take_if`
+/// would flush the pending unconditionally once `events_since_checkpoint >=
+/// batch_size`, publishing `seq_above2` instead of stalling at `seq_below`, and
+/// the final `assert_eq!` below would observe `seq_above2` — the same failure
+/// mode the sibling `max_delay` test pins.
+#[tokio::test]
+#[serial]
+async fn test_live_batched_flush_counts_ahead_events_but_does_not_publish_above_held_hole() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+
+    // batch_size small enough that the below-hole event plus both ahead-of-gap
+    // events cross it (see the deliberate batch_size: 3 reasoning above);
+    // max_delay long so only the batch_size trigger can fire. gap_timeout long
+    // so the backstop cannot skip the hole inside the test window.
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        checkpoint_mode: epoch_pg::event_bus::CheckpointMode::Batched {
+            batch_size: 3,
+            max_delay_ms: 60000,
+        },
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        ..Default::default()
+    };
+
+    let channel_name = format!("test_live_batched_bs_{}", Uuid::new_v4().simple());
+    let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+
+    let subscriber_id = format!("projection:live-batched-bs:{}", Uuid::new_v4());
+    let projection = TestProjection::with_subscriber_id(subscriber_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("Failed to subscribe");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    // Below-hole event. Deliberately NOT established via a poll before opening
+    // the hole (unlike the sibling tests): this event's own processing
+    // contributes only 1 toward the counter, well short of batch_size: 3, so no
+    // flush is expected here and there is nothing to poll for yet.
+    let below_stream = Uuid::new_v4();
+    let (below_id, seq_below) =
+        insert_committed_event(&pool, &table, below_stream, 1, "below_hole").await;
+
+    // Hold a hole, then commit two above-hole events. Combined with the
+    // below-hole event's own count, this reaches batch_size: 3 (1 + 1 + 1)
+    // while the hole is still open.
+    let hole_stream = Uuid::new_v4();
+    let mut tx = pool.begin().await.expect("begin hole tx");
+    let (_hole_id, seq_hole) = claim_hole_uncommitted(&mut tx, &table, hole_stream).await;
+    assert!(
+        seq_hole > seq_below,
+        "the hole must sit above the below-hole event"
+    );
+    let (above1_id, seq_above1) =
+        insert_committed_event(&pool, &table, hole_stream, 2, "above1").await;
+    let (above2_id, seq_above2) =
+        insert_committed_event(&pool, &table, hole_stream, 3, "above2").await;
+    assert!(
+        seq_above1 > seq_hole && seq_above2 > seq_above1,
+        "the above-hole events must sit above the hole"
+    );
+
+    // Bounded poll proving both above-hole events were delivered (and so
+    // counted via record_processed), before asserting on the checkpoint.
+    let mut delivered = false;
+    for _ in 0..40 {
+        if let Some(state) = store.get_state(hole_stream).await.unwrap() {
+            let seen: Vec<Uuid> = state.0.iter().map(|e| e.id).collect();
+            if seen.contains(&above1_id) && seen.contains(&above2_id) {
+                delivered = true;
+                break;
+            }
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    assert!(
+        delivered,
+        "both above-hole events must be delivered, proving they were counted toward batch_size"
+    );
+
+    // The batch_size threshold has now been crossed (1 below-hole event + 2
+    // ahead-of-gap events = 3 >= batch_size: 3). Poll for the checkpoint to
+    // reach exactly the below-hole sequence: reaching it proves the crossing
+    // triggered a flush attempt (record_processed fed the counter for the
+    // ahead-of-gap events); never exceeding it proves the predicate still
+    // blocked publishing the ahead-of-gap max.
+    let mut checkpoint = None;
+    for _ in 0..40 {
+        checkpoint = event_bus
+            .get_checkpoint(&subscriber_id)
+            .await
+            .expect("get checkpoint");
+        if checkpoint == Some(seq_below as u64) {
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+
+    tx.rollback().await.expect("rollback hole tx");
+    event_bus.shutdown().await.expect("shutdown");
+    let persisted = read_persisted_checkpoint(&pool, &table, &subscriber_id).await;
+    drop_isolated_events_table(&pool, &table).await;
+
+    assert_eq!(
+        checkpoint,
+        Some(seq_below as u64),
+        "the batch_size crossing over ahead-of-gap events must persist exactly the below-hole \
+         sequence ({seq_below}), proving record_processed fed the counter without publishing \
+         above the held hole (a version that never counted ahead-of-gap events would time out \
+         at None here instead; a version without the publishable predicate would show \
+         {seq_above2})"
+    );
+    let (persisted_seq, persisted_id) =
+        persisted.expect("a checkpoint row must exist after the batch_size-triggered flush");
+    assert_eq!(
+        persisted_seq, seq_below,
+        "the persisted checkpoint must never exceed the below-hole sequence ({seq_below})"
+    );
+    assert_eq!(
+        persisted_id,
+        Some(below_id),
+        "the persisted last_event_id must stay paired to the below-hole event"
+    );
+}
+
 /// R1 regression test for the SECOND unconditional write site: the
 /// deserialization-skip branch. No existing test covers this branch above a
 /// hole. The above-hole rows are raw inserts whose `data` is VALID JSON that is
@@ -6699,9 +6895,17 @@ async fn test_live_deser_skip_above_hole_does_not_publish_above_hole() {
 
     // Substitute for the impossible delivery poll: wait until the deser-skip
     // WARN fires, proving the branch ran and populated pending_checkpoint.
+    //
+    // "failed to deserialize" alone is not scoped to this subscriber: it also
+    // appears in the catch-up, buffer-processing and read_all_events_since skip
+    // sites, so a leftover listener task from an earlier test in this binary
+    // could satisfy it for the wrong reason. The live-path WARN formats
+    // `for '{subscriber_id}': failed to deserialize`, so require that exact
+    // adjacency rather than the bare message substring.
+    let needle = format!("for '{subscriber_id}': failed to deserialize");
     let mut warned = false;
     for _ in 0..40 {
-        if common::captured_logs_contain_since(log_start, "failed to deserialize") {
+        if common::captured_logs_contain_since(log_start, &needle) {
             warned = true;
             break;
         }
@@ -6709,7 +6913,7 @@ async fn test_live_deser_skip_above_hole_does_not_publish_above_hole() {
     }
     assert!(
         warned,
-        "the deserialization-skip WARN must fire, proving the branch above the hole ran"
+        "the deserialization-skip WARN for this subscriber must fire, proving the branch above the hole ran"
     );
 
     // Shut down with the hole still held; observe, then release, then assert.
