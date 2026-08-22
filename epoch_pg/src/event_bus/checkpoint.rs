@@ -62,10 +62,30 @@ impl PendingCheckpoint {
 
     /// Updates the pending checkpoint with a new event, moving the published
     /// position and bumping the counter.
+    ///
+    /// This is the catch-up advancer's method: one call corresponds to exactly
+    /// one newly-observed event, so bumping the counter here is correct. **Do
+    /// not use this on the live path's contiguous-advance branch** — see
+    /// [`Self::advance`].
     pub fn update(&mut self, global_sequence: u64, event_id: Uuid) {
         self.global_sequence = global_sequence;
         self.event_id = event_id;
         self.events_since_checkpoint += 1;
+    }
+
+    /// Moves the published position and paired id **without** touching the
+    /// counter or timer.
+    ///
+    /// This is the live path's contiguous-advance branch's method. Unlike
+    /// [`Self::update`], it must not bump `events_since_checkpoint`: on that
+    /// branch, every event contributing to this advance was already counted
+    /// individually by [`Self::record_processed`] at its per-event site.
+    /// Calling `update()` here instead would double-count those events and
+    /// inflate the counter past the true number of unflushed events, tripping
+    /// the `Batched` `batch_size` threshold early.
+    pub fn advance(&mut self, global_sequence: u64, event_id: Uuid) {
+        self.global_sequence = global_sequence;
+        self.event_id = event_id;
     }
 
     /// Counts a processed event toward the `Batched` threshold **without** moving
@@ -284,6 +304,24 @@ mod tests {
         // A pending created by the advance path is publishable from birth.
         let checkpoint = PendingCheckpoint::new(100, Uuid::new_v4());
         assert!(checkpoint.is_publishable());
+    }
+
+    #[test]
+    fn advance_moves_position_but_not_count() {
+        let event_id1 = Uuid::new_v4();
+        let event_id2 = Uuid::new_v4();
+        let mut checkpoint = PendingCheckpoint::new(100, event_id1);
+        let events_since_checkpoint = checkpoint.events_since_checkpoint;
+        let first_event_time = checkpoint.first_event_time;
+
+        checkpoint.advance(101, event_id2);
+
+        assert_eq!(checkpoint.global_sequence, 101);
+        assert_eq!(checkpoint.event_id, event_id2);
+        // Unlike `update`, the counter and timer are untouched: the live path
+        // has already counted each contributing event via `record_processed`.
+        assert_eq!(checkpoint.events_since_checkpoint, events_since_checkpoint);
+        assert_eq!(checkpoint.first_event_time, first_event_time);
     }
 
     #[test]

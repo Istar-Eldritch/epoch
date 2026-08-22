@@ -507,8 +507,7 @@ where
                 // control). `is_publishable()` becomes true because the position
                 // now leads the seed.
                 Some(p) => {
-                    p.global_sequence = new_contiguous;
-                    p.event_id = checkpoint_event_id;
+                    p.advance(new_contiguous, checkpoint_event_id);
                 }
                 // Publishable advance constructor: reachable when every row hit
                 // the `processed_ahead` early-continue and the gap was then

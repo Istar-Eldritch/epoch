@@ -35,7 +35,7 @@ Default `checkpoint_mode` is `Synchronous`, and `flush_expired_checkpoints` earl
 
 1. Added `PendingCheckpoint::record_processed` — bumps `events_since_checkpoint` only.
 2. Both per-event sites call `record_processed`, seeding the pending on first use from `state.contiguous_checkpoint` and its paired id (stable across the row loop).
-3. The contiguous branch switches to `update()`, so an advance bumps the counter and records the paired `event_id`.
+3. The contiguous branch calls `PendingCheckpoint::advance()` (a raw position/id move that leaves the counter untouched), NOT `update()`, so it records the paired `event_id` without bumping the counter. Using `update()` here would double-count: `record_processed` already counted each event at its per-event site, so bumping again on the same events at the advance would inflate `events_since_checkpoint` past the actual number of unflushed events.
 4. **Moved `try_flush_pending_checkpoint` out of `if new_contiguous > contiguous_before`** so it runs unconditionally, gated on `!replay_always`. Without this a `Batched` `batch_size` crossing could not flush while a hole was open.
 
 Eager seeding (not `Option<u64>`) keeps the field non-optional and preserves `max_delay_ms` measuring from the first unflushed event. The seed itself is **not publishable** (§4 Q1): while a hole is held the pending never publishes, and the counter/timer keep accruing, bounded by `gap_timeout`.
@@ -122,7 +122,7 @@ Plus a `ReplayAlways` guard (R6).
 ## 8. Phasing (as delivered)
 
 - **P1** `test(pg): exact-value and no-stall controls for live checkpointing` — isolated-table infra, `table` params, `with_table` conversion, hardened controls, backstop control live, fence-cleared `#[ignore]`d. (`04568437`)
-- **P2** `fix(pg): publish only contiguous checkpoints from the live listener path` — `record_processed`, `seed_sequence`, two constructors, predicate + unit tests; `SubscriberState.contiguous_event_id` + seeding `SELECT`; per-event sites → `record_processed`; contiguous branch → `update()`; flush moved out of the advance branch under `!replay_always`; `cached_checkpoint` from `local_cache` only; `debug_assert`; predicate inside all three selections. (`5657e69c`; spec-correction `83bc5b93`)
+- **P2** `fix(pg): publish only contiguous checkpoints from the live listener path` — `record_processed`, `seed_sequence`, two constructors, predicate + unit tests; `SubscriberState.contiguous_event_id` + seeding `SELECT`; per-event sites → `record_processed`; contiguous branch → `advance()` (NOT `update()`, which would double-count events already counted by `record_processed`); flush moved out of the advance branch under `!replay_always`; `cached_checkpoint` from `local_cache` only; `debug_assert`; predicate inside all three selections. (`5657e69c`; spec-correction `83bc5b93`)
 - **P3** `test(pg): pin the live path against publishing above a held hole` — the three regression tests + `ReplayAlways` guard; verified failing against P2 reverted. (`55787f37`, plus `c1ad2269` wiring event IDs into state verification)
 - **P4** `docs(pg): record the live-path contiguous checkpoint fix` — scoped CHANGELOG entry, rustdoc on new `pub(crate)` items, `flush_checkpoint` hazard doc cites 0027 R1, spec marked Implemented. (`5911caa9`)
 

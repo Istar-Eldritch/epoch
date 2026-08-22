@@ -314,7 +314,11 @@ pub enum CheckpointMode {
     ///
     /// This trades off a window of potential duplicate deliveries on crash
     /// for significantly improved throughput. On crash, up to `batch_size` events
-    /// may be redelivered.
+    /// may be redelivered — or more, while a subscriber is holding an open gap:
+    /// the live listener path suppresses flushes above a held gap regardless of
+    /// `batch_size`, so redelivery in that case is bounded by however many
+    /// events are processed while the gap is held (itself bounded by
+    /// `gap_timeout`), whichever bound is larger.
     ///
     /// **Use when:**
     /// - High event throughput (1000+ events/second)
