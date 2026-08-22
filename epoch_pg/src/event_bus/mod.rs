@@ -279,10 +279,17 @@ where
                 );
                 state.processed_ahead.insert(event_seq);
                 last_event_id = Some(event_id);
-                match &mut pending_checkpoint {
-                    Some(p) => p.update(event_seq, event_id),
-                    None => pending_checkpoint = Some(PendingCheckpoint::new(event_seq, event_id)),
-                }
+                // Count the event toward the `Batched` threshold, but never let
+                // an ahead-of-gap event become the published position (spec 0027
+                // R1). The eager seed is born at the current contiguous prefix.
+                pending_checkpoint
+                    .get_or_insert_with(|| {
+                        PendingCheckpoint::seeded(
+                            state.contiguous_checkpoint,
+                            state.contiguous_event_id,
+                        )
+                    })
+                    .record_processed();
                 processed_any = true;
                 continue;
             }
@@ -317,10 +324,14 @@ where
 
         state.processed_ahead.insert(event_seq);
         last_event_id = Some(event_id);
-        match &mut pending_checkpoint {
-            Some(p) => p.update(event_seq, event_id),
-            None => pending_checkpoint = Some(PendingCheckpoint::new(event_seq, event_id)),
-        }
+        // Count the event toward the `Batched` threshold, but never let an
+        // ahead-of-gap event become the published position (spec 0027 R1). The
+        // eager seed is born at the current contiguous prefix.
+        pending_checkpoint
+            .get_or_insert_with(|| {
+                PendingCheckpoint::seeded(state.contiguous_checkpoint, state.contiguous_event_id)
+            })
+            .record_processed();
         processed_any = true;
     }
 
@@ -476,6 +487,9 @@ where
             .unwrap_or_else(Uuid::nil);
 
         last_event_id = Some(checkpoint_event_id);
+        // Keep the paired id current so the next batch's eager seed pairs
+        // correctly (spec 0027 §4 Q1).
+        state.contiguous_event_id = checkpoint_event_id;
 
         if replay_always {
             // Route advancement to the in-memory HWM; never touch the
@@ -484,38 +498,58 @@ where
                 .await
                 .insert(subscriber_id.clone(), new_contiguous);
         } else {
-            cached_checkpoint = Some(new_contiguous);
-
             match &mut pending_checkpoint {
+                // Move the published position (and its paired id) without
+                // re-counting: each processed event was already counted once by
+                // `record_processed` at its per-event site, so bumping the
+                // counter here would double-count and trip the `Batched`
+                // `batch_size` threshold early (caught by the §7.3 exact-value
+                // control). `is_publishable()` becomes true because the position
+                // now leads the seed.
                 Some(p) => {
-                    p.global_sequence = new_contiguous;
-                    p.event_id = checkpoint_event_id;
+                    p.advance(new_contiguous, checkpoint_event_id);
                 }
+                // Publishable advance constructor: reachable when every row hit
+                // the `processed_ahead` early-continue and the gap was then
+                // closed by `advance_contiguous_checkpoint` (spec 0027 §3.4).
                 None => {
                     pending_checkpoint =
                         Some(PendingCheckpoint::new(new_contiguous, checkpoint_event_id));
                 }
             }
+        }
+    }
 
-            // Flush checkpoint to DB if threshold reached. Uses a fresh local
-            // cache (rather than a cache shared across concurrent subscriber
-            // tasks) purely to read back the flushed value for
-            // `cached_checkpoint`; the caller merges it into the listener-level
-            // cache once this task's `SubscriberBatchOutcome` is collected.
-            let mut local_cache = HashMap::new();
-            try_flush_pending_checkpoint(
-                &mut pending_checkpoint,
-                "process_subscriber_for_batch",
-                &config.events_table,
-                &subscriber_id,
-                &config.checkpoint_mode,
-                &checkpoint_pool,
-                &mut local_cache,
-            )
-            .await;
-            if let Some(val) = local_cache.get(&subscriber_id) {
-                cached_checkpoint = Some(*val);
-            }
+    // Flush unconditionally (spec 0027 §3.2/§3.4): moved out of the advance
+    // branch so a `Batched` `batch_size` crossing can flush even while a hole is
+    // held. The publishable predicate in `try_flush_pending_checkpoint` still
+    // holds a never-advanced seed back, so this never writes above a hole (R1).
+    // Gated on `!replay_always` so a ReplayAlways subscriber writes no row.
+    if !replay_always {
+        debug_assert!(
+            pending_checkpoint
+                .as_ref()
+                .is_none_or(|p| p.global_sequence <= state.contiguous_checkpoint),
+            "live path must never hold a pending above the contiguous prefix (spec 0027 R1/Q3)"
+        );
+        // Fresh local cache (rather than one shared across concurrent subscriber
+        // tasks) purely to read back the flushed value for `cached_checkpoint`;
+        // the caller merges it into the listener-level cache once this task's
+        // `SubscriberBatchOutcome` is collected. `cached_checkpoint` is set ONLY
+        // from a real flush, so it never records a value that was not persisted.
+        let mut local_cache = HashMap::new();
+        try_flush_pending_checkpoint(
+            &mut pending_checkpoint,
+            "process_subscriber_for_batch",
+            &config.events_table,
+            &subscriber_id,
+            &config.checkpoint_mode,
+            &checkpoint_pool,
+            &mut local_cache,
+        )
+        .await;
+        if let Some(val) = local_cache.get(&subscriber_id) {
+            cached_checkpoint = Some(*val);
         }
     }
 
@@ -1404,12 +1438,21 @@ where
                         // give 0 and re-deliver the entire history on the first live
                         // batch. Seed from the in-memory HWM (set at the end of
                         // subscribe()'s / the R2 pass's catch-up) instead.
-                        let checkpoint = if replay_always {
-                            hwm.lock().await.get(&subscriber_id).copied().unwrap_or(0)
+                        // Seed both the contiguous position and its paired
+                        // `event_id` (spec 0027 §4 Q1) so an eager
+                        // `PendingCheckpoint` keeps `last_event_id` paired with
+                        // `last_global_sequence` (spec 0026 R4). A NULL stored id
+                        // maps to nil, which is unpublishable by construction and
+                        // so is never re-written.
+                        let (checkpoint, checkpoint_event_id) = if replay_always {
+                            (
+                                hwm.lock().await.get(&subscriber_id).copied().unwrap_or(0),
+                                Uuid::nil(),
+                            )
                         } else {
-                            match sqlx::query_as::<_, (i64,)>(
+                            match sqlx::query_as::<_, (i64, Option<Uuid>)>(
                                 r#"
-                                SELECT last_global_sequence
+                                SELECT last_global_sequence, last_event_id
                                 FROM epoch_event_bus_checkpoints
                                 WHERE bus_name = $1 AND subscriber_id = $2
                                 "#,
@@ -1419,19 +1462,21 @@ where
                             .fetch_optional(&checkpoint_pool)
                             .await
                             {
-                                Ok(Some((seq,))) => seq as u64,
-                                Ok(None) => 0,
+                                Ok(Some((seq, id))) => (seq as u64, id.unwrap_or_else(Uuid::nil)),
+                                Ok(None) => (0, Uuid::nil()),
                                 Err(e) => {
                                     warn!(
                                         "Failed to load checkpoint for '{}': {}, starting from 0",
                                         subscriber_id, e
                                     );
-                                    0
+                                    (0, Uuid::nil())
                                 }
                             }
                         };
-                        subscriber_states
-                            .insert(subscriber_id.clone(), SubscriberState::new(checkpoint));
+                        subscriber_states.insert(
+                            subscriber_id.clone(),
+                            SubscriberState::new_with_event_id(checkpoint, checkpoint_event_id),
+                        );
                     }
                 }
 
@@ -2693,7 +2738,12 @@ async fn try_flush_pending_checkpoint(
     pool: &PgPool,
     checkpoint_cache: &mut HashMap<String, u64>,
 ) {
-    let Some(pending) = pending_checkpoint.take_if(|p| should_flush_checkpoint(p, mode)) else {
+    // Fold the publishable predicate INTO the `take_if` closure (spec 0027 §3.4):
+    // applying it after the `take_if` would silently drop a pending already
+    // moved out of the `Option`, losing its `first_event_time` / counter.
+    let Some(pending) =
+        pending_checkpoint.take_if(|p| p.is_publishable() && should_flush_checkpoint(p, mode))
+    else {
         return;
     };
     if let Err(e) = flush_checkpoint(

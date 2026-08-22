@@ -20,24 +20,87 @@ pub(crate) struct PendingCheckpoint {
     pub events_since_checkpoint: u32,
     /// When the first event was processed since last checkpoint write
     pub first_event_time: Instant,
+    /// The position this pending was seeded from (the last persisted contiguous
+    /// value). A pending is only publishable once `global_sequence` has advanced
+    /// beyond it (spec 0027 §4 Q1): re-writing the seed carries no new
+    /// information and can degrade a NULL `last_event_id` to nil.
+    pub seed_sequence: u64,
 }
 
 impl PendingCheckpoint {
-    /// Creates a new pending checkpoint.
+    /// Advance constructor: born **publishable**.
+    ///
+    /// Used where the contiguous prefix has provably moved (the live advance
+    /// branch and the catch-up advancer), so `seed_sequence` is set below
+    /// `global_sequence` and [`Self::is_publishable`] is true from the start.
     pub fn new(global_sequence: u64, event_id: Uuid) -> Self {
         Self {
             global_sequence,
             event_id,
             events_since_checkpoint: 1,
             first_event_time: Instant::now(),
+            seed_sequence: global_sequence.saturating_sub(1),
         }
     }
 
-    /// Updates the pending checkpoint with a new event.
+    /// Eager-seed constructor: born **unpublishable**.
+    ///
+    /// Seeds a pending at the subscriber's current contiguous position so the
+    /// `Batched` counters (`events_since_checkpoint`, `first_event_time`) start
+    /// accruing on the first processed event, without committing to publish that
+    /// position. `global_sequence == seed_sequence`, so [`Self::is_publishable`]
+    /// stays false until an advance moves the position beyond the seed.
+    pub fn seeded(seed_sequence: u64, event_id: Uuid) -> Self {
+        Self {
+            global_sequence: seed_sequence,
+            event_id,
+            events_since_checkpoint: 0,
+            first_event_time: Instant::now(),
+            seed_sequence,
+        }
+    }
+
+    /// Updates the pending checkpoint with a new event, moving the published
+    /// position and bumping the counter.
+    ///
+    /// This is the catch-up advancer's method: one call corresponds to exactly
+    /// one newly-observed event, so bumping the counter here is correct. **Do
+    /// not use this on the live path's contiguous-advance branch** — see
+    /// [`Self::advance`].
     pub fn update(&mut self, global_sequence: u64, event_id: Uuid) {
         self.global_sequence = global_sequence;
         self.event_id = event_id;
         self.events_since_checkpoint += 1;
+    }
+
+    /// Moves the published position and paired id **without** touching the
+    /// counter or timer.
+    ///
+    /// This is the live path's contiguous-advance branch's method. Unlike
+    /// [`Self::update`], it must not bump `events_since_checkpoint`: on that
+    /// branch, every event contributing to this advance was already counted
+    /// individually by [`Self::record_processed`] at its per-event site.
+    /// Calling `update()` here instead would double-count those events and
+    /// inflate the counter past the true number of unflushed events, tripping
+    /// the `Batched` `batch_size` threshold early.
+    pub fn advance(&mut self, global_sequence: u64, event_id: Uuid) {
+        self.global_sequence = global_sequence;
+        self.event_id = event_id;
+    }
+
+    /// Counts a processed event toward the `Batched` threshold **without** moving
+    /// the published position. Ahead-of-gap events must count (they will be
+    /// redelivered from whatever is persisted) but must never become the
+    /// published value.
+    pub fn record_processed(&mut self) {
+        self.events_since_checkpoint += 1;
+    }
+
+    /// Whether this pending carries a position worth persisting: it has advanced
+    /// beyond the seed it was created at. A never-advanced seed is unpublishable
+    /// (spec 0027 §4 Q1).
+    pub fn is_publishable(&self) -> bool {
+        self.global_sequence > self.seed_sequence
     }
 }
 
@@ -73,8 +136,9 @@ pub(crate) fn should_flush_checkpoint(pending: &PendingCheckpoint, mode: &Checkp
 /// checkpoint *backwards* by passing a `pending` value lower than what is
 /// already stored. Every caller MUST pass only a value it is willing to
 /// publish as the subscriber's current position; this is exactly why the
-/// contiguous-prefix catch-up counter (spec 0026 R1/R2) never flushes above a
-/// sequence it hasn't proven contiguous.
+/// contiguous-prefix catch-up counter (spec 0026 R1/R2) and the live listener
+/// path (spec 0027 R1) never flush above a sequence they haven't proven
+/// contiguous.
 ///
 /// # Returns
 ///
@@ -133,9 +197,12 @@ pub(crate) async fn flush_expired_checkpoints(
     };
 
     let max_delay = Duration::from_millis(*max_delay_ms);
+    // Select in the filter (not after a `remove`): an unpublishable pending must
+    // stay in the map with its counters intact (spec 0027 R1/R4), never be
+    // dropped along with its `first_event_time`.
     let expired: Vec<String> = pending_checkpoints
         .iter()
-        .filter(|(_, p)| p.first_event_time.elapsed() >= max_delay)
+        .filter(|(_, p)| p.is_publishable() && p.first_event_time.elapsed() >= max_delay)
         .map(|(k, _)| k.clone())
         .collect();
 
@@ -165,7 +232,13 @@ pub(crate) async fn flush_all_pending_checkpoints(
     pending_checkpoints: &mut HashMap<String, PendingCheckpoint>,
     checkpoint_cache: &mut HashMap<String, u64>,
 ) {
-    let subscriber_ids: Vec<String> = pending_checkpoints.keys().cloned().collect();
+    // Select in the filter (not after a `remove`): an unpublishable pending must
+    // stay in the map with its counters intact (spec 0027 R1), never be dropped.
+    let subscriber_ids: Vec<String> = pending_checkpoints
+        .iter()
+        .filter(|(_, p)| p.is_publishable())
+        .map(|(k, _)| k.clone())
+        .collect();
     for subscriber_id in subscriber_ids {
         if let Some(pending) = pending_checkpoints.remove(&subscriber_id)
             && let Err(e) =
@@ -191,6 +264,64 @@ mod tests {
         assert_eq!(checkpoint.global_sequence, 100);
         assert_eq!(checkpoint.event_id, event_id);
         assert_eq!(checkpoint.events_since_checkpoint, 1);
+    }
+
+    #[test]
+    fn record_processed_bumps_count_only() {
+        let event_id = Uuid::new_v4();
+        let mut checkpoint = PendingCheckpoint::new(100, event_id);
+        let first_event_time = checkpoint.first_event_time;
+
+        checkpoint.record_processed();
+
+        assert_eq!(checkpoint.events_since_checkpoint, 2);
+        // Position, id and timer are untouched.
+        assert_eq!(checkpoint.global_sequence, 100);
+        assert_eq!(checkpoint.event_id, event_id);
+        assert_eq!(checkpoint.first_event_time, first_event_time);
+    }
+
+    #[test]
+    fn eager_seed_is_not_publishable() {
+        // The eager seed sits at its seed position and carries no new
+        // information, so it must never be published (spec 0027 §4 Q1).
+        let mut checkpoint = PendingCheckpoint::seeded(100, Uuid::new_v4());
+        assert_eq!(checkpoint.events_since_checkpoint, 0);
+        assert!(!checkpoint.is_publishable());
+
+        // Counting processed events does not make it publishable.
+        checkpoint.record_processed();
+        checkpoint.record_processed();
+        assert!(!checkpoint.is_publishable());
+
+        // Only an advance beyond the seed does.
+        checkpoint.update(101, Uuid::new_v4());
+        assert!(checkpoint.is_publishable());
+    }
+
+    #[test]
+    fn advance_constructor_is_publishable() {
+        // A pending created by the advance path is publishable from birth.
+        let checkpoint = PendingCheckpoint::new(100, Uuid::new_v4());
+        assert!(checkpoint.is_publishable());
+    }
+
+    #[test]
+    fn advance_moves_position_but_not_count() {
+        let event_id1 = Uuid::new_v4();
+        let event_id2 = Uuid::new_v4();
+        let mut checkpoint = PendingCheckpoint::new(100, event_id1);
+        let events_since_checkpoint = checkpoint.events_since_checkpoint;
+        let first_event_time = checkpoint.first_event_time;
+
+        checkpoint.advance(101, event_id2);
+
+        assert_eq!(checkpoint.global_sequence, 101);
+        assert_eq!(checkpoint.event_id, event_id2);
+        // Unlike `update`, the counter and timer are untouched: the live path
+        // has already counted each contributing event via `record_processed`.
+        assert_eq!(checkpoint.events_since_checkpoint, events_since_checkpoint);
+        assert_eq!(checkpoint.first_event_time, first_event_time);
     }
 
     #[test]
