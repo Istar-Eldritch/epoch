@@ -3387,6 +3387,16 @@ async fn advance_catchup_prefix(
     checkpoint_cache: &mut HashMap<String, u64>,
 ) {
     if replay_always {
+        // CLOUD-227: apply the same contiguous-prefix guard as Checkpointed.
+        // Before this fix, the HWM was always the maximum sequence seen,
+        // meaning a hole in the catch-up window would cause the live listener
+        // to re-seed `contiguous_checkpoint` above the hole, permanently
+        // skipping the missing sequence. Now the HWM advances only across an
+        // unbroken prefix, matching the Checkpointed path exactly.
+        if event_global_seq != *contiguous + 1 {
+            return;
+        }
+        *contiguous = event_global_seq;
         hwm.lock()
             .await
             .insert(subscriber_id.to_string(), event_global_seq);

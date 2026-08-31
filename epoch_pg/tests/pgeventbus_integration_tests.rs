@@ -8857,3 +8857,355 @@ async fn test_wedged_deser_does_not_starve_peer_and_release_resumes() {
     event_bus.shutdown().await.expect("shutdown");
     drop_isolated_events_table(&pool, &table).await;
 }
+
+// ==================== P5: ReplayAlways contiguous HWM (CLOUD-227, T7/T7b/T10) ====================
+
+/// Polls until `on_halt` has been fired at least `min_count` times.
+async fn poll_halt_count_at_least(
+    halts: &Arc<StdMutex<Vec<HaltInfo>>>,
+    subscriber_id: &str,
+    min_count: usize,
+) -> bool {
+    for _ in 0..100 {
+        if halts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|h| h.subscriber_id == subscriber_id)
+            .count()
+            >= min_count
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// T7 (R9a): a fail-closed `ReplayAlways` subscriber whose catch-up halts at a
+/// corrupt event survives a listener restart with its HWM held at the last
+/// contiguous position — the restart's catch-up re-seeds from that HWM rather
+/// than from 0, so the good event below the corrupt one is NOT re-delivered to
+/// the observer, and the corrupt event is re-attempted (on_halt fires again).
+///
+/// This verifies the CLOUD-227 / P5 fix: before the fix `advance_catchup_prefix`
+/// set `hwm = event_global_seq` unconditionally, so the HWM could advance past a
+/// hole; after the fix it applies the same contiguous-prefix guard as the
+/// Checkpointed path and holds the HWM at the unbroken prefix before the failure.
+#[tokio::test]
+#[serial]
+async fn test_replay_always_fc_hold_survives_restart() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let ra_id = format!("projection:ra-fc-restart:{}", Uuid::new_v4());
+    let stream = Uuid::new_v4();
+
+    // Insert events before subscribing so the halt happens in the catch-up path.
+    let (valid1_id, _seq1) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (_corrupt_id, seq2) = insert_corrupt_event(&pool, &table, stream, 2).await;
+    let (_valid3_id, _seq3) = insert_committed_event(&pool, &table, stream, 3, "v3").await;
+
+    let ra = TestProjection::replay_always(ra_id.clone()).fail_closed();
+    let ra_store = ra.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(ra))
+        .await
+        .expect("subscribe fail-closed ReplayAlways");
+
+    // Wait for at least 2 on_halt firings: one from the catch-up inside
+    // subscribe() and one from the first live batch (subscriber_states seeded
+    // fresh, held_event=None, seq2 re-encountered).
+    assert!(
+        poll_halt_count_at_least(&halts, &ra_id, 2).await,
+        "on_halt must fire at least twice before restart (catch-up + first live batch)"
+    );
+
+    // Verify observer applied only seq1 and nothing above the halt point.
+    let ids_before = applied_ids(&ra_store, stream).await;
+    assert_eq!(
+        ids_before,
+        vec![valid1_id],
+        "only seq1 applied before restart"
+    );
+
+    let halt_count_before_restart = halts.lock().unwrap().len();
+
+    // Restart listener (no fresh subscribe — the in-memory HWM must survive).
+    event_bus.shutdown().await.expect("shutdown");
+    event_bus.start_listener().await.expect("restart listener");
+
+    // Wait for on_halt to fire again (restart catch-up re-attempts seq2).
+    assert!(
+        poll_halt_count_at_least(&halts, &ra_id, halt_count_before_restart + 1).await,
+        "on_halt must fire again after restart, proving seq2 was re-attempted"
+    );
+
+    // The HWM held at seq1: the restart catch-up starts from seq1, not 0, so
+    // seq1 is NOT applied again. Observer state must still show seq1 exactly once.
+    let ids_after = applied_ids(&ra_store, stream).await;
+    assert_eq!(
+        ids_after,
+        vec![valid1_id],
+        "seq1 must appear exactly once (HWM survived restart at seq1, no replay from 0)"
+    );
+
+    // Every on_halt must point at seq2 as the held sequence.
+    {
+        let hs = halts.lock().unwrap();
+        let ra_halts: Vec<_> = hs.iter().filter(|h| h.subscriber_id == ra_id).collect();
+        assert!(
+            ra_halts.iter().all(|h| h.held_below_sequence == seq2 as u64
+                && h.reason == HaltReason::DeserializeFailure),
+            "all on_halt entries must point at seq2 with DeserializeFailure: {ra_halts:?}"
+        );
+    }
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T7b (R9b): a fresh `subscribe()` call resets the in-memory HWM to 0 and
+/// triggers a full replay that re-holds at the same corrupt event, with no
+/// events above the bad row applied.
+#[tokio::test]
+#[serial]
+async fn test_replay_always_fc_fresh_subscribe_resets_hwm_and_reholds() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let ra_id = format!("projection:ra-fc-resubscribe:{}", Uuid::new_v4());
+    let stream = Uuid::new_v4();
+
+    // Pre-insert: valid, corrupt, valid (the last must never be applied).
+    let (valid1_id, seq2) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (_corrupt_id, seq_corrupt) = insert_corrupt_event(&pool, &table, stream, 2).await;
+    let (above_id, _seq_above) = insert_committed_event(&pool, &table, stream, 3, "v3").await;
+
+    // First subscribe: catch-up halts at the corrupt row.
+    let ra1 = TestProjection::replay_always(ra_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(ra1))
+        .await
+        .expect("first subscribe");
+
+    // Wait for the initial halt to be recorded.
+    assert!(
+        poll_halt_count_at_least(&halts, &ra_id, 1).await,
+        "on_halt must fire after first subscribe"
+    );
+
+    let halts_after_first = halts.lock().unwrap().len();
+
+    // Fresh subscribe(): resets HWM to 0, full replay from scratch.
+    let ra2 = TestProjection::replay_always(ra_id.clone()).fail_closed();
+    let store2 = ra2.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(ra2))
+        .await
+        .expect("fresh subscribe");
+
+    // Wait for on_halt to fire again from the fresh subscribe's catch-up.
+    assert!(
+        poll_halt_count_at_least(&halts, &ra_id, halts_after_first + 1).await,
+        "on_halt must fire again after fresh subscribe (full replay re-holds at corrupt row)"
+    );
+
+    // Full replay reached seq1 (applied to store2).
+    let ids2 = applied_ids(&store2, stream).await;
+    assert!(
+        ids2.contains(&valid1_id),
+        "fresh-subscribe full replay must apply seq1 (seq {seq2}): {ids2:?}"
+    );
+
+    // Nothing above the corrupt row must have been applied.
+    assert!(
+        !ids2.contains(&above_id),
+        "event above the corrupt row must NOT be applied after full replay halt: {ids2:?}"
+    );
+
+    // The halt must reference the corrupt sequence.
+    {
+        let hs = halts.lock().unwrap();
+        let last_halt = hs
+            .iter()
+            .filter(|h| h.subscriber_id == ra_id)
+            .next_back()
+            .unwrap();
+        assert_eq!(
+            last_halt.held_below_sequence, seq_corrupt as u64,
+            "fresh-subscribe halt must hold below the corrupt sequence"
+        );
+        assert_eq!(last_halt.reason, HaltReason::DeserializeFailure);
+    }
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T10 (R13 extended to ReplayAlways): a wedged fail-closed `ReplayAlways`
+/// subscriber does not starve a healthy `Checkpointed` peer on the same bus.
+/// The shared `min_checkpoint` floor excludes the wedged subscriber via
+/// `is_wedged()` / `compute_shared_floor`, so the healthy peer can advance well
+/// past `wedge_seq + catch_up_batch_size` while the wedge holds.
+#[tokio::test]
+#[serial]
+async fn test_wedged_replay_always_does_not_starve_peer() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    // Small batch cap so "beyond wedge + cap" is easy to prove.
+    const CAP: u32 = 5;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        catch_up_batch_size: CAP,
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let ra_id = format!("projection:ra-fc-starve:{}", Uuid::new_v4());
+    let peer_id = format!("projection:peer-starve:{}", Uuid::new_v4());
+    let stream = Uuid::new_v4();
+
+    // valid(seq1) -> corrupt(seq2) pre-inserted so both subscribers encounter
+    // them in catch-up.
+    let (_valid1_id, _seq1) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (_corrupt_id, seq2) = insert_corrupt_event(&pool, &table, stream, 2).await;
+
+    // Fail-closed ReplayAlways subscriber (will wedge at seq2).
+    let ra = TestProjection::replay_always(ra_id.clone()).fail_closed();
+    let ra_store = ra.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(ra))
+        .await
+        .expect("subscribe fail-closed ReplayAlways");
+
+    // Healthy fail-open Checkpointed peer.
+    let peer = TestProjection::with_subscriber_id(peer_id.clone());
+    let peer_store = peer.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(peer))
+        .await
+        .expect("subscribe healthy peer");
+
+    // Commit many valid events well beyond seq2 + CAP to prove liveness.
+    let mut above_ids = Vec::new();
+    let mut above_seqs = Vec::new();
+    for i in 0..12 {
+        let (id, seq) =
+            insert_committed_event(&pool, &table, stream, i + 3, &format!("v{}", i + 3)).await;
+        above_ids.push(id);
+        above_seqs.push(seq as u64);
+    }
+    let top_seq = *above_seqs.iter().max().unwrap();
+    assert!(
+        top_seq > seq2 as u64 + CAP as u64,
+        "must commit beyond wedge + batch cap to prove floor exclusion"
+    );
+
+    // Wait for the RA subscriber to halt (proving it's wedged).
+    assert!(
+        poll_halt_count_at_least(&halts, &ra_id, 1).await,
+        "on_halt must fire for the wedged ReplayAlways subscriber"
+    );
+
+    // R13: the healthy peer must advance to the tail despite the wedged RA subscriber.
+    assert!(
+        poll_checkpoint_at_least(&event_bus, &peer_id, top_seq, 120).await,
+        "healthy Checkpointed peer must advance to tail ({top_seq}) while RA subscriber is wedged"
+    );
+
+    // The RA subscriber must remain held: only seq1 should have been applied.
+    // (seq2 = corrupt, seqs above = not applied due to the hold.)
+    let ra_applied = applied_ids(&ra_store, stream).await;
+    assert!(
+        !ra_applied.iter().any(|id| above_ids.contains(id)),
+        "fail-closed ReplayAlways must not apply events above its hold point: {ra_applied:?}"
+    );
+
+    // The healthy peer (fail-open) applied all above-seq2 events.
+    let peer_applied = applied_ids(&peer_store, stream).await;
+    assert_eq!(
+        peer_applied.len(),
+        above_ids.len() + 1, // +1 for seq1
+        "fail-open peer must apply all valid events (seq1 + {} above): {peer_applied:?}",
+        above_ids.len()
+    );
+
+    // on_halt reason must be DeserializeFailure for the RA subscriber.
+    {
+        let hs = halts.lock().unwrap();
+        assert!(
+            hs.iter()
+                .filter(|h| h.subscriber_id == ra_id)
+                .any(|h| h.held_below_sequence == seq2 as u64
+                    && h.reason == HaltReason::DeserializeFailure),
+            "on_halt(DeserializeFailure) at seq2 must fire for wedged RA subscriber: {hs:?}"
+        );
+    }
+
+    // The RA subscriber must NOT have been assigned a contiguous checkpoint row
+    // (ReplayAlways never writes to the checkpoints table).
+    let ra_checkpoint = event_bus
+        .get_checkpoint(&ra_id)
+        .await
+        .expect("get_checkpoint");
+    assert!(
+        ra_checkpoint.is_none(),
+        "ReplayAlways subscriber must have no persisted checkpoint: {ra_checkpoint:?}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
