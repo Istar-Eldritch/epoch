@@ -54,8 +54,8 @@ pub trait DlqCallback: Send + Sync {
 /// Why a fail-closed subscriber's delivery halted.
 ///
 /// Passed inside a [`HaltInfo`] to the [`HaltCallback`]. The enum is
-/// `#[non_exhaustive]`: later delivery paths (gap refusal, operator release)
-/// contribute further reasons without breaking downstream `match` arms.
+/// `#[non_exhaustive]`: future delivery paths may contribute further reasons
+/// without breaking downstream `match` arms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum HaltReason {
@@ -95,8 +95,9 @@ pub enum HaltReason {
 
 /// Information about a fail-closed delivery halt, passed to the [`HaltCallback`].
 ///
-/// A halt fires once on entry (and, in later phases, on operator release), not
-/// on every re-attempt of a held event, so callbacks can drive alerting without
+/// A halt fires once on entry (and once more on operator release via
+/// [`HaltReason::Released`]), not on every re-attempt of a held event, so
+/// callbacks can drive alerting without
 /// per-batch spam.
 #[derive(Debug, Clone)]
 pub struct HaltInfo {
@@ -223,7 +224,22 @@ pub enum DispatchMode {
 
 /// Configuration for reliable event delivery.
 ///
-/// This struct controls retry behavior, checkpointing strategy, and multi-instance coordination.
+/// This struct controls retry behavior, checkpointing strategy, and
+/// multi-instance coordination.
+///
+/// # Source-compatibility
+///
+/// This struct is not `#[non_exhaustive]`. Fields have been added in minor
+/// releases; code that constructs it via struct-literal syntax (rather than
+/// `..Default::default()`) must add the new fields to the literal:
+///
+/// | Field added | Default |
+/// |---|---|
+/// | `on_gap_timeout` | `None` |
+/// | `on_halt` | `None` |
+/// | `snapshot_fencing` | `true` |
+///
+/// Using `..Default::default()` avoids this churn for all optional fields.
 #[derive(Clone)]
 pub struct ReliableDeliveryConfig {
     /// Maximum number of retry attempts for failed event processing.
@@ -314,9 +330,12 @@ pub struct ReliableDeliveryConfig {
     /// Optional callback invoked when a fail-closed subscriber halts delivery.
     ///
     /// Fires once on halt entry (deserialize failure, observer-retry
-    /// exhaustion, and in later phases an unproven gap or an operator release),
-    /// not on every re-attempt of a held event. Use this to alert operators
-    /// that a subscriber has stopped and needs its underlying cause resolved.
+    /// exhaustion, gap refusal, or operator release via
+    /// [`PgEventBus::release_halt`]), not on every re-attempt of a held
+    /// event. Use this to alert operators that a subscriber has stopped and
+    /// needs its underlying cause resolved.
+    ///
+    /// [`PgEventBus::release_halt`]: crate::event_bus::PgEventBus::release_halt
     ///
     /// Errors from the callback are logged but do not affect the halt — the
     /// checkpoint is held regardless of callback outcome.

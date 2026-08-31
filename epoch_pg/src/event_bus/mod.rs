@@ -2258,7 +2258,7 @@ where
     ///
     /// The release takes effect on a running bus without a restart. On success
     /// it writes the checkpoint row, logs a `WARN`, and fires the
-    /// [`HaltCallback`](crate::event_bus::HaltCallback) with
+    /// [`HaltCallback`] with
     /// [`HaltReason::Released`].
     ///
     /// # Errors
@@ -2440,7 +2440,7 @@ where
     ///
     /// Returns [`PgEventBusError::SubscriberNotFound`] if `subscriber_id` is
     /// not registered on this bus, or [`PgEventBusError::InlineDispatchNotSupported`]
-    /// if this bus is [`DispatchMode::Inline`](crate::DispatchMode::Inline) (Inline
+    /// if this bus is [`DispatchMode::Inline`] (Inline
     /// dispatch tracks no checkpoint or HWM position to measure lag against).
     ///
     /// # Hazard: one slow subscriber can hold up the rest
@@ -2537,7 +2537,7 @@ where
     ///
     /// Returns [`PgEventBusError::SubscriberNotFound`] if `subscriber_id` is
     /// not registered on this bus, or [`PgEventBusError::InlineDispatchNotSupported`]
-    /// if this bus is [`DispatchMode::Inline`](crate::DispatchMode::Inline).
+    /// if this bus is [`DispatchMode::Inline`].
     pub async fn wait_until_caught_up(
         &self,
         subscriber_id: &str,
@@ -2566,7 +2566,7 @@ where
     /// Returns `Ok(true)` only if **all** registered subscribers are caught up
     /// before the timeout, `Ok(false)` otherwise. Returns
     /// [`PgEventBusError::InlineDispatchNotSupported`] if this bus is
-    /// [`DispatchMode::Inline`](crate::DispatchMode::Inline).
+    /// [`DispatchMode::Inline`].
     ///
     /// # Hazard: an empty registry is trivially "caught up"
     /// If no subscribers are registered yet, this returns `Ok(true)`

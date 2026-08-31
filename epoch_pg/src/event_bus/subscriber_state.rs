@@ -1045,6 +1045,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fail_open_fence_cleared_still_advances() {
+        // Regression pin (R10): FenceCleared advances under FailOpen too. The
+        // fence branch in `advance_contiguous_checkpoint` is unconditional; only
+        // the backstop branch differentiates modes. This pin guards that the FC
+        // backstop refusal never accidentally reaches the fence arm.
+        let mut state = SubscriberState::new(5);
+        state.processed_ahead.insert(7);
+        state.processed_ahead.insert(8);
+        state
+            .gap_first_seen
+            .insert(6, obs_fenced(Instant::now(), 100));
+
+        let visible: BTreeSet<u64> = [7, 8].into_iter().collect();
+        let gap_timeout = Duration::from_secs(30);
+        let snap = TxidSnapshot {
+            xmin: 100,
+            xmax: 110,
+        };
+
+        let outcome = advance_contiguous_checkpoint(
+            &mut state,
+            &visible,
+            gap_timeout,
+            Some(snap),
+            FailureMode::FailOpen,
+        );
+
+        assert_eq!(
+            state.contiguous_checkpoint, 8,
+            "FenceCleared must advance FailOpen"
+        );
+        assert!(!state.gap_first_seen.contains_key(&6));
+        assert_eq!(outcome.skipped_gaps.len(), 1);
+        assert_eq!(outcome.skipped_gaps[0].reason, SkipReason::FenceCleared);
+        assert_eq!(
+            outcome.backstop_refused, None,
+            "FenceCleared path never sets backstop_refused"
+        );
+    }
+
     // ---- Wedged predicate + shared-floor exclusion (spec 0028 P4b) -------
 
     /// Builds a fail-closed subscriber wedged on a refused gap at `gap_seq`

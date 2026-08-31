@@ -45,7 +45,7 @@ impl<B: EventBus + Clone> PgEventStore<B> {
     /// with a configured [`UpcasterRegistry`].
     ///
     /// The registry is consulted on every read at the deserialization boundary
-    /// ([`pg_db_event_to_event`]): stored payloads are upcast forward to the
+    /// (`pg_db_event_to_event`): stored payloads are upcast forward to the
     /// current schema version before being deserialized into the domain
     /// [`EventData`] type, applying the registry's configured
     /// [`FailurePolicy`](epoch_core::upcasting::FailurePolicy). The default

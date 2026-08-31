@@ -129,8 +129,8 @@ where
 
     /// How this saga relates to persisted checkpoints.
     ///
-    /// Defaults to [`SubscriptionMode::Checkpointed`]. Override and return
-    /// [`SubscriptionMode::ReplayAlways`] for in-memory sagas that must
+    /// Defaults to [`crate::event_store::SubscriptionMode::Checkpointed`]. Override and return
+    /// [`crate::event_store::SubscriptionMode::ReplayAlways`] for in-memory sagas that must
     /// replay from sequence 0 on every process start.
     fn subscription_mode(&self) -> crate::event_store::SubscriptionMode {
         crate::event_store::SubscriptionMode::Checkpointed
@@ -138,8 +138,8 @@ where
 
     /// How the bus reacts when this saga cannot apply an event.
     ///
-    /// Defaults to [`FailureMode::FailOpen`]: log, skip, and advance past the
-    /// failed event. Override and return [`FailureMode::FailClosed`] for
+    /// Defaults to [`crate::event_store::FailureMode::FailOpen`]: log, skip, and advance past the
+    /// failed event. Override and return [`crate::event_store::FailureMode::FailClosed`] for
     /// sagas that must never silently diverge from the event log.
     fn failure_mode(&self) -> crate::event_store::FailureMode {
         crate::event_store::FailureMode::FailOpen

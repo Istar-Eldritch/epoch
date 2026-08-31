@@ -9209,3 +9209,140 @@ async fn test_wedged_replay_always_does_not_starve_peer() {
     event_bus.shutdown().await.expect("shutdown");
     drop_isolated_events_table(&pool, &table).await;
 }
+
+/// Regression pin (R10): a fail-open observer that exhausts its retry ladder
+/// has the event sent to the DLQ and continues advancing — no halt, no
+/// checkpoint hold, listener task alive. Uses `CountingFailingObserver` with
+/// `FailureMode::FailOpen` (regular error return, not a panic) to guard the
+/// non-panic FO observer failure path independently of the panic-containment
+/// path tested by `test_live_panicking_observer_fail_open_continues`.
+#[tokio::test]
+#[serial]
+async fn test_fail_open_observer_failure_dlq_continue_advance_pin() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::<HaltInfo>::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        max_retries: 2,
+        initial_retry_delay: GapDuration::from_millis(50),
+        max_retry_delay: GapDuration::from_millis(100),
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // Observer permanently unhealthy (never flipped true).
+    let healthy = Arc::new(AtomicBool::new(false));
+    let invocations = Arc::new(StdMutex::new(StdHashMap::new()));
+    let applied = Arc::new(StdMutex::new(Vec::<u64>::new()));
+    let fo_id = format!("observer:fo-fail-pin:{}", Uuid::new_v4());
+    event_bus
+        .subscribe(CountingFailingObserver {
+            subscriber_id: fo_id.clone(),
+            failure_mode: FailureMode::FailOpen,
+            healthy: healthy.clone(),
+            invocations: invocations.clone(),
+            applied: applied.clone(),
+        })
+        .await
+        .expect("subscribe fail-open failing observer");
+
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_e1, seq1) = insert_committed_event(&pool, &table, stream, 1, "e1").await;
+    let (_e2, seq2) = insert_committed_event(&pool, &table, stream, 2, "e2").await;
+
+    // DLQ: the failed event must be sent to the dead-letter queue.
+    let dlq = poll_dlq_rows(&pool, &fo_id).await;
+    assert!(
+        dlq.iter().any(|r| r.1 == seq1),
+        "fail-open observer must DLQ the failed event at seq {seq1}: {dlq:?}"
+    );
+
+    // Continue + advance: checkpoint reaches seq2 (past the DLQ'd event).
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fo_id, Some(seq2 as u64)).await,
+        "fail-open observer must advance past the DLQ'd event to seq {seq2}"
+    );
+
+    // No halt: fail-open mode never fires on_halt.
+    assert!(
+        halts.lock().unwrap().is_empty(),
+        "fail-open mode must not fire on_halt; got: {:?}",
+        halts.lock().unwrap()
+    );
+
+    assert!(
+        event_bus.is_running().await,
+        "listener task must stay alive"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// Regression pin: `update_checkpoint` writes to the same checkpoint upsert as
+/// `release_halt` (spec 0028 P4b). This pin proves that `update_checkpoint`'s
+/// public contract is intact after P4b landed: write, read-back, release, and
+/// write-again all succeed and do not interfere.
+#[tokio::test]
+#[serial]
+async fn test_update_checkpoint_contract_unchanged_pin() {
+    common::init_test_logger();
+    let Some((_pool, event_bus, _store)) = setup().await else {
+        return;
+    };
+
+    let sid = format!("projection:cp-pin:{}", Uuid::new_v4());
+    let eid1 = Uuid::new_v4();
+    let eid2 = Uuid::new_v4();
+
+    // Write seq=10 via update_checkpoint.
+    event_bus
+        .update_checkpoint(&sid, 10, eid1)
+        .await
+        .expect("update_checkpoint seq=10");
+    assert_eq!(
+        event_bus.get_checkpoint(&sid).await.expect("read"),
+        Some(10),
+        "update_checkpoint must persist seq=10"
+    );
+
+    // release_halt writes the same upsert internally; advance to seq=15.
+    event_bus
+        .release_halt(&sid, 15)
+        .await
+        .expect("release_halt seq=15");
+    assert_eq!(
+        event_bus
+            .get_checkpoint(&sid)
+            .await
+            .expect("read after release"),
+        Some(15),
+        "release_halt must advance the checkpoint to 15"
+    );
+
+    // update_checkpoint again after release_halt must still work.
+    event_bus
+        .update_checkpoint(&sid, 20, eid2)
+        .await
+        .expect("update_checkpoint seq=20 after release_halt");
+    assert_eq!(
+        event_bus.get_checkpoint(&sid).await.expect("read final"),
+        Some(20),
+        "update_checkpoint after release_halt must persist seq=20"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+}

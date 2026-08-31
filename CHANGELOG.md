@@ -16,15 +16,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     prelude); defaulted `failure_mode()` on `EventObserver`, `Projection`, and `Saga`,
     forwarded by `ProjectionHandler`, `SagaHandler`, `SagaAdapter`, and the
     `impl Saga for Arc<S>` blanket. Existing implementors are unchanged (default `FailOpen`).
-  - **`epoch_pg`** — on the live batch path a `FailClosed` subscriber that hits a
-    deserialize failure or an observer-retry exhaustion now holds its contiguous
-    checkpoint below the bad sequence (writing a `unrecoverable: deserialize: …` DLQ row
-    for the deserialize case), fires the new `on_halt` callback once on entry, and
-    self-heals on the next batch once the cause is fixed. A panicking observer is now
-    contained (caught in `process_event_with_retry`) instead of killing the listener
-    task — a deliberate fail-open behaviour change: the panic routes through the existing
-    retry/DLQ machinery. New `HaltCallback` / `HaltInfo` / `HaltReason` public API in
-    `epoch_pg::event_bus`. No schema migration.
+  - **Live batch path** — a `FailClosed` subscriber that hits a deserialize failure or an
+    observer-retry exhaustion holds its contiguous checkpoint below the bad sequence
+    (writing a `unrecoverable: deserialize: …` DLQ row for the deserialize case), fires
+    the new `on_halt` callback once on entry, and self-heals on the next batch once the
+    cause is fixed. A panicking observer is now contained (caught in
+    `process_event_with_retry`) instead of killing the listener task — a deliberate
+    fail-open behaviour change: the panic routes through the existing retry/DLQ
+    machinery.
+  - **Catch-up and drain paths** — the same hold semantics apply during initial catch-up
+    and inline-drain: a `FailClosed` subscriber that hits a bad row while catching up
+    halts at that row (the subscriber is still registered and the live listener takes
+    over from there), and self-heals once the cause is fixed.
+  - **Gap refusal** — a `FailClosed` subscriber refuses the `gap_timeout` backstop: if
+    the backstop would advance past an unproven gap, the subscriber halts with
+    `HaltReason::GapUnproven` and stays held until the gap is proven permanent (fence
+    clears) or an operator releases it. The fence-clear branch is untouched: a gap
+    proven never to have existed advances under both modes.
+  - **Wedge isolation** — a halted `FailClosed` subscriber is excluded from the shared
+    event-window floor and served by its own private re-seeding fetch each cycle, so a
+    permanently wedged subscriber cannot pin the delivery window of healthy peers.
+  - **`PgEventBus::release_halt(subscriber_id, past_sequence)`** — new operator API
+    for advancing a wedged subscriber's persisted checkpoint past a held sequence it
+    never finished. Forward-only (rejects `past_sequence` at or below the current
+    checkpoint with `PgEventBusError::BackwardRelease`). Fires the `on_halt` callback
+    with `HaltReason::Released` on success. Events already applied above the released
+    position are folded in without re-delivery.
+  - **`ReplayAlways` contiguous HWM** (CLOUD-227) — a `FailClosed` `ReplayAlways`
+    subscriber now tracks a contiguous high-water mark that advances only across the
+    unbroken prefix of successfully applied sequences, matching the checkpoint semantics
+    of `Checkpointed` subscribers. A wedged `ReplayAlways` subscriber is likewise
+    excluded from the shared floor; its remedy is a fresh `subscribe()` call for a full
+    replay (no `release_halt` — `ReplayAlways` has no persisted checkpoint row).
+  - New public API in `epoch_pg::event_bus`: `HaltCallback`, `HaltInfo`, `HaltReason`
+    (`#[non_exhaustive]`, variants: `DeserializeFailure`, `ObserverFailure`,
+    `GapUnproven`, `Released`). No schema migration.
 
 - **Subscriber readiness + startup safety** (`epoch_core`, `epoch_pg`, CLOUD-221) —
   first-class lag/readiness API on `PgEventBus`, a `ReplayAlways` subscription mode for
@@ -229,9 +255,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `setup_trigger()` once per bus to drop the legacy fixed-name trigger; leaving it in
   place is not unsafe, only redundant — it produces one duplicate NOTIFY per insert,
   which is discarded by the per-event checkpoint check.
-- **BREAKING** (`epoch_pg`): `PgEventBusError` gains two new variants,
-  `SubscriberNotFound` and `InlineDispatchNotSupported`. The enum is not
-  `#[non_exhaustive]`, so a downstream exhaustive `match` on it will stop compiling.
+- **BREAKING** (`epoch_pg`): `PgEventBusError` gains three new variants,
+  `SubscriberNotFound`, `InlineDispatchNotSupported`, and `BackwardRelease`
+  (returned by `release_halt` when `past_sequence` is at or below the current
+  persisted checkpoint). The enum is not `#[non_exhaustive]`, so a downstream
+  exhaustive `match` on it will stop compiling.
 - Released the `projections` lock across the listener's batch drain instead of
   holding it for the whole backlog (`epoch_pg`, CLOUD-225): every readiness method
   also locks `projections`, so `subscriber_lag`, `wait_until_caught_up`, and

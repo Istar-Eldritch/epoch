@@ -206,8 +206,8 @@ pub trait EventBus {
 /// subscriber* until the condition is resolved (the bad row is fixed, or an
 /// operator calls `release_halt`). The halt is **subscriber-local**: healthy
 /// subscribers keep advancing because a wedged subscriber is excluded from the
-/// shared `min_checkpoint` floor and served by a private re-seeding fetch
-/// (R13; floor exclusion is implemented in phase P4b).
+/// shared event-window floor and served by its own private re-seeding fetch,
+/// so it cannot pin the delivery window of any healthy peer.
 ///
 /// **Cross-group consequence (R12):** while the halted subscriber's read model
 /// is frozen, later priority groups keep running against that stale view. For a
@@ -343,7 +343,7 @@ where
 /// A reference-based event stream constructed from a slice.
 ///
 /// This is an optimized version of [`SliceEventStream`] that yields references
-/// to events instead of cloning them. Used internally by [`Aggregate::handle`]
+/// to events instead of cloning them. Used internally by `Aggregate::handle`
 /// to avoid cloning freshly created events during re-hydration.
 ///
 /// # Performance

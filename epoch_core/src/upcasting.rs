@@ -1,7 +1,7 @@
 //! Event schema evolution via forward-only **upcasting**.
 //!
 //! Once an event variant is persisted, its serialized shape is frozen in the store
-//! forever, yet the in-memory [`EventData`](crate::event::EventData) type it must
+//! forever, yet the in-memory [`EventData`] type it must
 //! deserialize into keeps changing as the domain evolves. Upcasting bridges that gap:
 //! a stored payload is transformed forward, **one version at a time**, to the current
 //! schema *before* it is deserialized into the domain type.
@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 use crate::event::EventData;
 
-/// Re-export [`SchemaVersion`](crate::event::SchemaVersion) from the event module so
+/// Re-export [`SchemaVersion`] from the event module so
 /// that code importing from this module gets a consistent, unambiguous type.
 pub use crate::event::SchemaVersion;
 
@@ -88,7 +88,7 @@ impl<'a> UpcastContext<'a> {
 /// projections.
 pub trait Upcaster: Send + Sync {
     /// The `event_type` (PascalCase, matching
-    /// [`EventData::event_type`](crate::event::EventData::event_type)) this step applies
+    /// [`EventData::event_type`]) this step applies
     /// to.
     fn event_type(&self) -> &str;
 
