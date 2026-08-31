@@ -164,6 +164,85 @@ impl SubscriberState {
             held_event: None,
         }
     }
+
+    /// Whether this subscriber is **wedged**: a fail-closed subscriber that has
+    /// halted and cannot advance on its own until the cause is fixed or an
+    /// operator releases it (spec 0028 §3.5). A wedged subscriber is excluded
+    /// from the shared `min_checkpoint` floor and driven by a private fetch so a
+    /// permanent hold on it never starves healthy peers (R13).
+    ///
+    /// A wedge is either a held event ([`held_event`](Self::held_event), set on
+    /// the deserialize- and observer-exhaustion halt paths) or a **refused** gap
+    /// (a `TimeoutBackstop` the fail-closed policy declined to skip, marked by
+    /// `GapObservation::halt_fired`). A brand-new, not-yet-refused gap does NOT
+    /// count: it may still fill or clear normally, exactly as it would for a
+    /// fail-open subscriber (R10 — fail-open subscribers are never wedged).
+    pub(crate) fn is_wedged(&self) -> bool {
+        matches!(self.failure_mode, FailureMode::FailClosed)
+            && (self.held_event.is_some() || self.gap_first_seen.values().any(|obs| obs.halt_fired))
+    }
+
+    /// Reconciles this subscriber's in-memory state forward to a persisted
+    /// `cursor` that an operator release (spec 0028 R14) moved past the held
+    /// position.
+    ///
+    /// The release is the one case the private fetch reconciles against the
+    /// persisted checkpoint. Events already applied at or below the new cursor
+    /// (`processed_ahead`) are folded into the contiguous position rather than
+    /// re-delivered (R6); any applied above it are retained so they are still
+    /// delivered exactly once. Gap bookkeeping and the held marker at or below
+    /// the cursor are cleared, since the release accepts the skip past them.
+    pub(crate) fn adopt_released_cursor(&mut self, cursor: u64, cursor_event_id: Uuid) {
+        self.processed_ahead.retain(|&seq| seq > cursor);
+        self.gap_first_seen.retain(|&seq, _| seq > cursor);
+        if let Some(held) = self.held_event
+            && held <= cursor
+        {
+            self.held_event = None;
+        }
+        self.contiguous_checkpoint = cursor;
+        self.contiguous_event_id = cursor_event_id;
+    }
+}
+
+/// Computes the shared-fetch floor for the live batch loop, excluding wedged
+/// subscribers (spec 0028 §3.5 / R13).
+///
+/// Returns:
+/// - `Some(min)` — the minimum contiguous checkpoint across all **non-wedged**
+///   subscribers: the `global_sequence` floor the shared fetch reads above. With
+///   no subscribers at all this is `Some(0)`, byte-identical to the pre-0028
+///   `min().unwrap_or(0)` behaviour, so the un-wedged shared-fetch path is
+///   unchanged.
+/// - `None` — every subscriber on the bus is wedged, so the shared fetch is
+///   skipped entirely for this cycle (no healthy consumer is left to serve);
+///   each wedged subscriber is driven by its own private fetch instead.
+///
+/// Pure and DB-free so the all-wedged and mixed-state decisions are
+/// unit-testable without a running bus.
+pub(crate) fn compute_shared_floor<'a>(
+    states: impl Iterator<Item = &'a SubscriberState>,
+) -> Option<u64> {
+    let mut any = false;
+    let mut floor: Option<u64> = None;
+    for state in states {
+        any = true;
+        if !state.is_wedged() {
+            floor = Some(match floor {
+                Some(current) => current.min(state.contiguous_checkpoint),
+                None => state.contiguous_checkpoint,
+            });
+        }
+    }
+    match (any, floor) {
+        // No subscribers at all: preserve the legacy `min().unwrap_or(0)`.
+        (false, _) => Some(0),
+        // At least one subscriber, but every one is wedged: skip the shared
+        // fetch this cycle.
+        (true, None) => None,
+        // Healthy floor across the non-wedged subscribers.
+        (true, Some(f)) => Some(f),
+    }
 }
 
 /// The return value of [`advance_contiguous_checkpoint`].
@@ -963,6 +1042,154 @@ mod tests {
         assert_eq!(
             outcome.backstop_refused, None,
             "FenceCleared path never sets backstop_refused"
+        );
+    }
+
+    // ---- Wedged predicate + shared-floor exclusion (spec 0028 P4b) -------
+
+    /// Builds a fail-closed subscriber wedged on a refused gap at `gap_seq`
+    /// (backstop refused, `halt_fired = true`).
+    fn wedged_gap(checkpoint: u64, gap_seq: u64) -> SubscriberState {
+        let mut s = SubscriberState::new(checkpoint);
+        s.failure_mode = FailureMode::FailClosed;
+        s.gap_first_seen.insert(
+            gap_seq,
+            GapObservation {
+                first_seen: Instant::now(),
+                fence_xmax: None,
+                halt_fired: true,
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn is_wedged_predicate_covers_both_halt_kinds() {
+        // Fail-open is never wedged, whatever it holds.
+        let mut fo = SubscriberState::new(5);
+        fo.held_event = Some(6);
+        assert!(!fo.is_wedged(), "fail-open subscribers are never wedged");
+
+        // Fail-closed deser/observer wedge: held_event set.
+        let mut fc_held = SubscriberState::new(5);
+        fc_held.failure_mode = FailureMode::FailClosed;
+        fc_held.held_event = Some(6);
+        assert!(
+            fc_held.is_wedged(),
+            "held_event wedges a fail-closed subscriber"
+        );
+
+        // Fail-closed refused-gap wedge.
+        assert!(
+            wedged_gap(5, 6).is_wedged(),
+            "a refused gap wedges fail-closed"
+        );
+
+        // Fail-closed with only a not-yet-refused (transient) gap is NOT wedged.
+        let mut fc_transient = SubscriberState::new(5);
+        fc_transient.failure_mode = FailureMode::FailClosed;
+        fc_transient.gap_first_seen.insert(6, obs(Instant::now())); // halt_fired = false
+        assert!(
+            !fc_transient.is_wedged(),
+            "a transient (not-yet-refused) gap must not count as wedged (R10 parity)"
+        );
+
+        // A clean fail-closed subscriber is not wedged.
+        let mut fc_clean = SubscriberState::new(5);
+        fc_clean.failure_mode = FailureMode::FailClosed;
+        assert!(!fc_clean.is_wedged());
+    }
+
+    #[test]
+    fn compute_shared_floor_all_wedged_skips_shared_fetch() {
+        // Two fail-closed subscribers, both wedged (one held_event, one refused
+        // gap): there is no healthy consumer, so the shared fetch is skipped.
+        let mut a = SubscriberState::new(5);
+        a.failure_mode = FailureMode::FailClosed;
+        a.held_event = Some(6);
+        let b = wedged_gap(9, 10);
+
+        let states = [a, b];
+        assert_eq!(
+            compute_shared_floor(states.iter()),
+            None,
+            "an all-wedged bus must skip the shared fetch (None)"
+        );
+    }
+
+    #[test]
+    fn compute_shared_floor_mixed_returns_healthy_floor() {
+        // Wedged fail-closed at 5 (excluded), healthy fail-open at 8, and a
+        // healthy fail-closed at 3 whose gap is only transient (not refused).
+        let mut wedged = SubscriberState::new(5);
+        wedged.failure_mode = FailureMode::FailClosed;
+        wedged.held_event = Some(6);
+
+        let healthy_fo = SubscriberState::new(8); // FailOpen default
+
+        let mut healthy_fc = SubscriberState::new(3);
+        healthy_fc.failure_mode = FailureMode::FailClosed;
+        healthy_fc.gap_first_seen.insert(4, obs(Instant::now())); // halt_fired = false
+
+        let states = [wedged, healthy_fo, healthy_fc];
+        // Floor is the min over non-wedged states only: min(8, 3) = 3, ignoring
+        // the wedge's lower checkpoint of 5.
+        assert_eq!(
+            compute_shared_floor(states.iter()),
+            Some(3),
+            "floor must be the min over non-wedged states, excluding the wedge"
+        );
+    }
+
+    #[test]
+    fn compute_shared_floor_no_subscribers_is_zero() {
+        let states: [SubscriberState; 0] = [];
+        assert_eq!(
+            compute_shared_floor(states.iter()),
+            Some(0),
+            "empty subscriber set preserves the legacy unwrap_or(0) floor"
+        );
+    }
+
+    #[test]
+    fn compute_shared_floor_no_wedge_is_plain_min() {
+        // With no wedge the floor is byte-identical to the former plain min.
+        let states = [
+            SubscriberState::new(5),
+            SubscriberState::new(2),
+            SubscriberState::new(9),
+        ];
+        assert_eq!(compute_shared_floor(states.iter()), Some(2));
+    }
+
+    #[test]
+    fn adopt_released_cursor_folds_processed_ahead_without_redelivery() {
+        // Wedged on a refused gap at 6, with events 7 and 8 already applied above
+        // it (processed_ahead) and a further one at 10.
+        let mut state = wedged_gap(5, 6);
+        state.processed_ahead.insert(7);
+        state.processed_ahead.insert(8);
+        state.processed_ahead.insert(10);
+
+        // Operator releases past 8: fold 7 and 8, retain 10 above the cursor.
+        state.adopt_released_cursor(8, Uuid::nil());
+
+        assert_eq!(state.contiguous_checkpoint, 8, "cursor adopted");
+        assert!(
+            !state.gap_first_seen.contains_key(&6),
+            "released gap below the cursor is cleared"
+        );
+        assert!(
+            !state.processed_ahead.contains(&7) && !state.processed_ahead.contains(&8),
+            "applied entries at or below the cursor are folded (not re-delivered)"
+        );
+        assert!(
+            state.processed_ahead.contains(&10),
+            "applied entries above the cursor are retained for exactly-once delivery"
+        );
+        assert!(
+            !state.is_wedged(),
+            "a released subscriber is no longer wedged"
         );
     }
 

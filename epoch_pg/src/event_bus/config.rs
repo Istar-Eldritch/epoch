@@ -83,6 +83,14 @@ pub enum HaltReason {
     ///
     /// [`FailClosed`]: epoch_core::FailureMode::FailClosed
     GapUnproven,
+    /// An operator explicitly released the subscriber past a held sequence it
+    /// never finished, via [`PgEventBus::release_halt`] (spec 0028 R14). Unlike
+    /// the other reasons this is not a failure but an audited, deliberate
+    /// forward skip: `held_below_sequence` carries the released `past_sequence`,
+    /// and delivery resumes from the next sequence on the running bus.
+    ///
+    /// [`PgEventBus::release_halt`]: crate::event_bus::PgEventBus::release_halt
+    Released,
 }
 
 /// Information about a fail-closed delivery halt, passed to the [`HaltCallback`].

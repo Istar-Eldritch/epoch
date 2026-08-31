@@ -15,7 +15,7 @@ pub(crate) use retry::{
     ProcessResult, invoke_observer_once, panic_payload_message, process_event_with_retry,
 };
 pub(crate) use subscriber_state::{
-    SkipReason, SubscriberState, TxidSnapshot, advance_contiguous_checkpoint,
+    SkipReason, SubscriberState, TxidSnapshot, advance_contiguous_checkpoint, compute_shared_floor,
 };
 
 #[cfg(test)]
@@ -765,6 +765,139 @@ where
     }
 }
 
+/// Runs one private-fetch cycle for a single wedged (halted) fail-closed
+/// `Checkpointed` subscriber (spec 0028 §3.5 / R13/R14).
+///
+/// A wedged subscriber is excluded from the shared `min_checkpoint` floor so a
+/// permanent hold on it never bounds the fetch window for healthy peers (R13).
+/// In exchange it fetches privately from its **own** persisted checkpoint, with
+/// its own `visible_seqs` and txid snapshot, so the shared window floating above
+/// the wedge is never mistaken for a gap. All wedge bookkeeping (contiguous
+/// position, `processed_ahead`, `gap_first_seen` including the first-captured
+/// `fence_xmax`, and `held_event`) is preserved across cycles: only the fetch
+/// cursor is re-seeded from the persisted row, and the sole reconciliation is
+/// the forward jump of an operator release (see
+/// [`SubscriberState::adopt_released_cursor`], R14).
+#[allow(clippy::too_many_arguments)]
+async fn private_fetch_for_wedged_subscriber<D>(
+    projection: Arc<Mutex<dyn EventObserver<D>>>,
+    subscriber_id: String,
+    mut state: SubscriberState,
+    pending_checkpoint: Option<PendingCheckpoint>,
+    last_event_id: Option<Uuid>,
+    config: &ReliableDeliveryConfig,
+    dlq_pool: &PgPool,
+    checkpoint_pool: &PgPool,
+    hwm: Arc<Mutex<HashMap<String, u64>>>,
+) -> SubscriberBatchOutcome
+where
+    D: EventData + Send + Sync + 'static,
+{
+    // Forward reconciliation (R14): re-read the persisted checkpoint each cycle.
+    // If an operator release moved it past the held position, adopt it — folding
+    // already-applied `processed_ahead` entries so nothing is re-delivered (R6).
+    match sqlx::query_as::<_, (i64, Option<Uuid>)>(
+        r#"
+        SELECT last_global_sequence, last_event_id
+        FROM epoch_event_bus_checkpoints
+        WHERE bus_name = $1 AND subscriber_id = $2
+        "#,
+    )
+    .bind(&config.events_table)
+    .bind(&subscriber_id)
+    .fetch_optional(checkpoint_pool)
+    .await
+    {
+        Ok(Some((seq, id))) => {
+            let cursor = seq as u64;
+            if cursor > state.contiguous_checkpoint {
+                state.adopt_released_cursor(cursor, id.unwrap_or_else(Uuid::nil));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                "Failed to re-read persisted checkpoint for wedged subscriber '{}': {}; \
+                 continuing from the in-memory position",
+                subscriber_id, e
+            );
+        }
+    }
+
+    // Private fetch: from this subscriber's own (possibly reconciled) contiguous
+    // position, capped at `catch_up_batch_size`, from its own query's rows.
+    let cursor = state.contiguous_checkpoint;
+    let query = format!(
+        "SELECT id, stream_id, stream_version, event_type, data, \
+         created_at, actor_id, purger_id, purged_at, \
+         global_sequence, causation_id, correlation_id, schema_version \
+         FROM {} WHERE global_sequence > $1 \
+         ORDER BY global_sequence ASC LIMIT $2",
+        config.events_table,
+    );
+    let rows: Vec<PgDBEvent> = match sqlx::query_as(&query)
+        .bind(cursor as i64)
+        .bind(config.catch_up_batch_size as i64)
+        .fetch_all(checkpoint_pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!(
+                "Private fetch for wedged subscriber '{}' failed: {}; state preserved",
+                subscriber_id, e
+            );
+            return SubscriberBatchOutcome {
+                subscriber_id,
+                state,
+                pending_checkpoint,
+                last_event_id,
+                cached_checkpoint: None,
+                processed_any: false,
+            };
+        }
+    };
+
+    let visible_seqs: BTreeSet<u64> = rows
+        .iter()
+        .filter_map(|r| r.global_sequence.map(|gs| gs as u64))
+        .collect();
+    let seq_to_id: HashMap<u64, Uuid> = rows
+        .iter()
+        .filter_map(|r| r.global_sequence.map(|gs| (gs as u64, r.id)))
+        .collect();
+
+    // Own txid snapshot, under the SAME gate the shared path uses
+    // (`snapshot_fencing` && a gap is active), so a gap-wedged subscriber's
+    // `FenceCleared` recovery can still fire from the private path.
+    let snapshot = if config.snapshot_fencing && !state.gap_first_seen.is_empty() {
+        query_txid_snapshot(checkpoint_pool).await
+    } else {
+        None
+    };
+
+    let ctx = BatchContext {
+        rows: Arc::new(rows),
+        visible_seqs: Arc::new(visible_seqs),
+        seq_to_id: Arc::new(seq_to_id),
+        config: config.clone(),
+        dlq_pool: dlq_pool.clone(),
+        checkpoint_pool: checkpoint_pool.clone(),
+        snapshot,
+        hwm,
+    };
+
+    process_subscriber_for_batch(
+        projection,
+        subscriber_id,
+        state,
+        pending_checkpoint,
+        last_event_id,
+        ctx,
+    )
+    .await
+}
+
 /// Represents an entry in the dead letter queue.
 ///
 /// DLQ entries are created when event processing fails after all retry attempts
@@ -862,6 +995,24 @@ pub enum PgEventBusError {
          dispatched synchronously from publish() and no checkpoint or HWM position is tracked"
     )]
     InlineDispatchNotSupported,
+    /// A [`PgEventBus::release_halt`] call passed a `past_sequence` at or below
+    /// the subscriber's current persisted checkpoint. A release is a forward-only
+    /// skip past a sequence the subscriber never finished (spec 0028 R14), not a
+    /// rewind; rewinding is the job of `update_checkpoint` or, for a
+    /// `ReplayAlways` subscriber, a fresh `subscribe()`.
+    #[error(
+        "release_halt for subscriber '{subscriber_id}' rejected: past_sequence {past_sequence} \
+         is not beyond the current persisted checkpoint {current}; a release is a forward-only \
+         skip past a sequence the subscriber never finished (R14), not a rewind"
+    )]
+    BackwardRelease {
+        /// The subscriber the release targeted.
+        subscriber_id: String,
+        /// The rejected release position.
+        past_sequence: u64,
+        /// The subscriber's current persisted checkpoint.
+        current: u64,
+    },
 }
 
 /// Type alias for the projections collection to reduce type complexity.
@@ -1626,6 +1777,13 @@ where
                 };
 
                 // Initialize per-subscriber state for any new subscribers.
+                //
+                // spec 0028 P4b: also record, per wake, an id -> projection map
+                // and which subscribers are `ReplayAlways`, so a wedged
+                // `Checkpointed` subscriber can be driven by a private fetch
+                // (below) without re-locking every observer a second time.
+                let mut sid_to_proj: Vec<(String, _)> = Vec::new();
+                let mut replay_always_by_sid: HashMap<String, bool> = HashMap::new();
                 for projection in projections_snapshot.iter() {
                     let (subscriber_id, replay_always, failure_mode) = {
                         let guard = projection.lock().await;
@@ -1635,6 +1793,8 @@ where
                             guard.failure_mode(),
                         )
                     };
+                    replay_always_by_sid.insert(subscriber_id.clone(), replay_always);
+                    sid_to_proj.push((subscriber_id.clone(), projection.clone()));
                     if !subscriber_states.contains_key(&subscriber_id) {
                         // R5 (Correction 2): a ReplayAlways subscriber has no
                         // checkpoint row, so seeding from the checkpoint table would
@@ -1687,6 +1847,67 @@ where
                     }
                 }
 
+                // === Private fetch pass for wedged subscribers (spec 0028 P4b) ===
+                //
+                // A wedged (halted) fail-closed `Checkpointed` subscriber is
+                // excluded from the shared `min_checkpoint` floor so it never
+                // starves healthy peers (R13). It is instead driven once per wake
+                // by a private fetch from its OWN persisted checkpoint, which also
+                // lets an operator release (R14) take effect on a running bus and
+                // lets a gap wedge self-heal via `FenceCleared` from the private
+                // path. The shared-row break conditions do not apply here: this is
+                // a single pass over every wedged subscriber, after which the
+                // cycle continues into the shared loop (or, when everyone is
+                // wedged, ends there and the timer tick re-enters).
+                //
+                // `ReplayAlways` wedges are out of P4b's scope (no persisted
+                // checkpoint row to re-seed from; the remedy is a fresh
+                // `subscribe()`, R9b) — the `ReplayAlways` floor-exclusion analogue
+                // lands in P5. This is the documented, bounded intra-pipeline gap.
+                let wedged_sids: Vec<String> = subscriber_states
+                    .iter()
+                    .filter(|(sid, s)| {
+                        s.is_wedged() && !replay_always_by_sid.get(*sid).copied().unwrap_or(false)
+                    })
+                    .map(|(sid, _)| sid.clone())
+                    .collect();
+                for sid in wedged_sids {
+                    let Some(projection) = sid_to_proj
+                        .iter()
+                        .find(|(s, _)| s == &sid)
+                        .map(|(_, p)| p.clone())
+                    else {
+                        continue;
+                    };
+                    let Some(state) = subscriber_states.remove(&sid) else {
+                        continue;
+                    };
+                    let pending = pending_checkpoints.remove(&sid);
+                    let last_id = last_event_ids.get(&sid).copied();
+                    let outcome = private_fetch_for_wedged_subscriber(
+                        projection,
+                        sid,
+                        state,
+                        pending,
+                        last_id,
+                        &config,
+                        &dlq_pool,
+                        &checkpoint_pool,
+                        hwm.clone(),
+                    )
+                    .await;
+                    if let Some(val) = outcome.cached_checkpoint {
+                        checkpoint_cache.insert(outcome.subscriber_id.clone(), val);
+                    }
+                    if let Some(id) = outcome.last_event_id {
+                        last_event_ids.insert(outcome.subscriber_id.clone(), id);
+                    }
+                    if let Some(p) = outcome.pending_checkpoint {
+                        pending_checkpoints.insert(outcome.subscriber_id.clone(), p);
+                    }
+                    subscriber_states.insert(outcome.subscriber_id, outcome.state);
+                }
+
                 // Shared batch loop: fetch events once from the minimum checkpoint,
                 // then fan out to all subscribers in priority order.
                 loop {
@@ -1712,12 +1933,16 @@ where
                         break;
                     }
 
-                    // Find the minimum contiguous checkpoint across all subscribers.
-                    let min_checkpoint = subscriber_states
-                        .values()
-                        .map(|s| s.contiguous_checkpoint)
-                        .min()
-                        .unwrap_or(0);
+                    // Find the shared-fetch floor: the minimum contiguous
+                    // checkpoint across all NON-wedged subscribers (spec 0028 P4b
+                    // / R13). `None` means every subscriber is wedged and is
+                    // already being driven by its own private fetch (above), so
+                    // the shared fetch is skipped for this cycle. With no wedge
+                    // this is byte-identical to the former `min().unwrap_or(0)`.
+                    let min_checkpoint = match compute_shared_floor(subscriber_states.values()) {
+                        Some(floor) => floor,
+                        None => break,
+                    };
 
                     let catchup_query = format!(
                         "SELECT id, stream_id, stream_version, event_type, data, \
@@ -1758,6 +1983,19 @@ where
                         .collect();
 
                     let mut any_subscriber_processed = false;
+
+                    // Wedged subscribers are driven by the private pass, never the
+                    // shared batch (spec 0028 P4b): they are excluded here so they
+                    // see their own `visible_seqs` and never mistake the shared
+                    // window (floated above the wedge) for a gap. Materialized as
+                    // an owned set so the immutable read of `subscriber_states`
+                    // ends before the per-priority `remove`/`insert` below. Empty
+                    // when nothing is wedged, leaving the shared path unchanged.
+                    let wedged_now: std::collections::HashSet<String> = subscriber_states
+                        .iter()
+                        .filter(|(_, s)| s.is_wedged())
+                        .map(|(sid, _)| sid.clone())
+                        .collect();
 
                     // Process the shared batch with concurrent dispatch within each
                     // priority group. Projections (priority 0) must complete before
@@ -1810,7 +2048,11 @@ where
                         let mut seen_sids = std::collections::HashSet::<String>::new();
                         let task_inputs: Vec<_> = tagged
                             .iter()
-                            .filter(|(p, sid, _)| *p == priority && seen_sids.insert(sid.clone()))
+                            .filter(|(p, sid, _)| {
+                                *p == priority
+                                    && !wedged_now.contains(sid.as_str())
+                                    && seen_sids.insert(sid.clone())
+                            })
                             .map(|(_, sid, proj)| {
                                 let state = subscriber_states
                                     .remove(sid)
@@ -1991,6 +2233,100 @@ where
         .bind(event_id)
         .execute(&self.pool)
         .await?;
+
+        Ok(())
+    }
+
+    /// Releases a wedged (halted) fail-closed `Checkpointed` subscriber by
+    /// advancing its persisted checkpoint *past* a held sequence it never
+    /// finished (spec 0028 §3.4 / R14).
+    ///
+    /// This is the explicit, audited operator remedy for a halt that cannot
+    /// self-heal — most importantly a genuinely lost sequence (an
+    /// abandoned/prepared transaction pinning `xmin` past `fence_xmax`) that the
+    /// `gap_timeout` backstop would skip for a fail-open subscriber but a
+    /// fail-closed subscriber holds indefinitely. It is deliberately distinct
+    /// from [`PgEventBus::update_checkpoint`], whose contract is a contiguous
+    /// prefix the subscriber *has* finished: a release, by definition, accepts a
+    /// skip past a sequence the subscriber never processed.
+    ///
+    /// `past_sequence` is the sequence to advance beyond: on success the
+    /// subscriber resumes delivery from `past_sequence + 1`. Any events already
+    /// applied above the released position (`processed_ahead`) are still
+    /// delivered exactly once, never re-delivered (R6): the running listener's
+    /// private re-seeding fetch folds them in on its next cycle.
+    ///
+    /// The release takes effect on a running bus without a restart. On success
+    /// it writes the checkpoint row, logs a `WARN`, and fires the
+    /// [`HaltCallback`](crate::event_bus::HaltCallback) with
+    /// [`HaltReason::Released`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PgEventBusError::BackwardRelease`] when `past_sequence` is at or
+    /// below the current persisted checkpoint: a release is forward-only, not a
+    /// rewind.
+    pub async fn release_halt(
+        &self,
+        subscriber_id: &str,
+        past_sequence: u64,
+    ) -> Result<(), PgEventBusError> {
+        let current = self.get_checkpoint(subscriber_id).await?.unwrap_or(0);
+        if past_sequence <= current {
+            return Err(PgEventBusError::BackwardRelease {
+                subscriber_id: subscriber_id.to_string(),
+                past_sequence,
+                current,
+            });
+        }
+
+        // Pair the released cursor with the event at `past_sequence` if one
+        // exists; a released sequence is often one that never committed, in
+        // which case `Uuid::nil()` is the honest (unpublishable) pairing.
+        let event_id: Uuid = sqlx::query_scalar(&format!(
+            "SELECT id FROM {} WHERE global_sequence = $1",
+            self.config.events_table,
+        ))
+        .bind(past_sequence as i64)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or_else(Uuid::nil);
+
+        sqlx::query(
+            r#"
+            INSERT INTO epoch_event_bus_checkpoints (bus_name, subscriber_id, last_global_sequence, last_event_id, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (bus_name, subscriber_id) DO UPDATE SET
+                last_global_sequence = EXCLUDED.last_global_sequence,
+                last_event_id = EXCLUDED.last_event_id,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(&self.config.events_table)
+        .bind(subscriber_id)
+        .bind(past_sequence as i64)
+        .bind(event_id)
+        .execute(&self.pool)
+        .await?;
+
+        warn!(
+            "Operator release: advanced subscriber '{}' past held sequence {} (was {}). \
+             Any sequence at or below {} the subscriber never finished is now skipped; \
+             delivery resumes from {}.",
+            subscriber_id,
+            past_sequence,
+            current,
+            past_sequence,
+            past_sequence + 1,
+        );
+
+        fire_on_halt(
+            &self.config,
+            subscriber_id,
+            past_sequence,
+            HaltReason::Released,
+        )
+        .await;
 
         Ok(())
     }

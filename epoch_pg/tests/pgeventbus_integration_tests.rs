@@ -8537,3 +8537,323 @@ async fn test_fail_open_gap_backstop_still_advances_pin() {
     event_bus.shutdown().await.expect("shutdown");
     drop_isolated_events_table(&pool, &table).await;
 }
+
+/// Polls until `subscriber_id`'s persisted checkpoint is at least `expected`.
+async fn poll_checkpoint_at_least(
+    event_bus: &PgEventBus<TestEventData>,
+    subscriber_id: &str,
+    expected: u64,
+    attempts: usize,
+) -> bool {
+    for _ in 0..attempts {
+        if matches!(
+            event_bus.get_checkpoint(subscriber_id).await.expect("get checkpoint"),
+            Some(s) if s >= expected
+        ) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Collects the distinct event ids a subscriber applied to `stream`.
+async fn applied_ids(store: &InMemoryStateStore<TestState>, stream: Uuid) -> Vec<Uuid> {
+    store
+        .get_state(stream)
+        .await
+        .unwrap()
+        .map(|s| s.0.iter().map(|e| e.id).collect())
+        .unwrap_or_default()
+}
+
+/// T9 variant (a) — refused-gap wedge (R13/R14/R6): a fail-closed `Checkpointed`
+/// subscriber wedged on a refused gap does NOT starve a healthy peer on the same
+/// bus (the peer advances well past `wedge + catch_up_batch_size`), and an
+/// operator `release_halt` past the gap resumes it in-process without a restart,
+/// with no duplicate delivery of the events it applied above the gap while
+/// wedged.
+///
+/// Isolated table + `snapshot_fencing: false` so the permanent (rolled-back)
+/// hole cannot self-heal via `FenceCleared` and race the release; small
+/// `catch_up_batch_size` (5) keeps the "beyond the batch cap" event count low.
+#[tokio::test]
+#[serial]
+async fn test_wedged_gap_does_not_starve_peer_and_release_resumes() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    const CAP: u32 = 5;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        catch_up_batch_size: CAP,
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // Fail-closed subscriber + healthy fail-open peer on the SAME bus.
+    let fc_id = format!("projection:fc-gap-wedge:{}", Uuid::new_v4());
+    let fc = TestProjection::with_subscriber_id(fc_id.clone()).fail_closed();
+    let fc_store = fc.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(fc))
+        .await
+        .expect("subscribe fail-closed");
+
+    let peer_id = format!("projection:peer-gap:{}", Uuid::new_v4());
+    let peer = TestProjection::with_subscriber_id(peer_id.clone());
+    let peer_store = peer.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(peer))
+        .await
+        .expect("subscribe peer");
+
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    // A below-hole event both subscribers reach before the hole is opened.
+    let below_stream = Uuid::new_v4();
+    let (below_id, seq_below) =
+        insert_committed_event(&pool, &table, below_stream, 1, "below").await;
+    assert!(poll_checkpoint_eq(&event_bus, &fc_id, Some(seq_below as u64)).await);
+    assert!(poll_checkpoint_eq(&event_bus, &peer_id, Some(seq_below as u64)).await);
+
+    // Open a hole, commit many events above it (well beyond CAP), then roll the
+    // hole back so the gap is permanent.
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_hole_id, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(seq_hole > seq_below);
+
+    let mut above_ids = Vec::new();
+    let mut above_seqs = Vec::new();
+    for i in 0..12 {
+        let (id, seq) =
+            insert_committed_event(&pool, &table, hole_stream, i + 2, &format!("above{i}")).await;
+        above_ids.push(id);
+        above_seqs.push(seq as u64);
+    }
+    tx_hole.rollback().await.expect("rollback hole tx");
+    let top_seq = *above_seqs.iter().max().unwrap();
+    assert!(
+        top_seq > seq_hole as u64 + CAP as u64,
+        "must commit beyond the wedge + batch cap to prove the exclusion"
+    );
+
+    // R13: the peer advances to the tail while the FC subscriber is wedged. Note
+    // that without the wedged-floor exclusion the peer would be pinned at
+    // seq_hole + CAP by the FC's held floor.
+    assert!(
+        poll_checkpoint_at_least(&event_bus, &peer_id, top_seq, 80).await,
+        "healthy peer must advance to the tail ({top_seq}) despite the wedge"
+    );
+
+    // The FC subscriber is held at the below-hole sequence.
+    let fc_cp = event_bus
+        .get_checkpoint(&fc_id)
+        .await
+        .expect("get checkpoint");
+    assert_eq!(
+        fc_cp,
+        Some(seq_below as u64),
+        "fail-closed subscriber must hold at seq {seq_below} while wedged"
+    );
+    // on_halt(GapUnproven) fired for the gap.
+    {
+        let halts = halts.lock().unwrap();
+        assert!(
+            halts.iter().any(|h| h.subscriber_id == fc_id
+                && h.reason == HaltReason::GapUnproven
+                && h.held_below_sequence == seq_hole as u64),
+            "on_halt(GapUnproven) must fire for the wedged FC subscriber: {halts:?}"
+        );
+    }
+
+    // R14: operator release past the gap. The FC subscriber resumes in-process.
+    event_bus
+        .release_halt(&fc_id, seq_hole as u64)
+        .await
+        .expect("release_halt past the gap");
+
+    assert!(
+        poll_checkpoint_at_least(&event_bus, &fc_id, top_seq, 120).await,
+        "released FC subscriber must resume without a restart and reach the tail ({top_seq})"
+    );
+
+    // R6: no duplicate delivery. The events applied above the gap while wedged
+    // are delivered exactly once across the whole lifecycle.
+    let fc_above = applied_ids(&fc_store, hole_stream).await;
+    let mut fc_above_sorted = fc_above.clone();
+    fc_above_sorted.sort();
+    fc_above_sorted.dedup();
+    assert_eq!(
+        fc_above_sorted.len(),
+        fc_above.len(),
+        "FC must not double-deliver any above-gap event (R6): {fc_above:?}"
+    );
+    let mut expected_above = above_ids.clone();
+    expected_above.sort();
+    assert_eq!(
+        fc_above_sorted, expected_above,
+        "FC must deliver every above-gap event exactly once after release"
+    );
+    // The below-hole event is applied exactly once, the hole never.
+    assert_eq!(applied_ids(&fc_store, below_stream).await, vec![below_id]);
+
+    // Peer applied the same above set exactly once (skipping the hole).
+    let peer_above = applied_ids(&peer_store, hole_stream).await;
+    assert_eq!(peer_above.len(), above_ids.len());
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T9 variant (b) — deserialize wedge (R13/R14/R6): a fail-closed `Checkpointed`
+/// subscriber wedged on a corrupt (undeserializable) row does NOT starve a
+/// healthy peer, and `release_halt` past the corrupt row resumes it in-process
+/// with no duplicate delivery. Relies on P2's `held_event` marker being set on
+/// the deserialize halt path, so the wedged predicate sees it exactly like a
+/// gap wedge.
+#[tokio::test]
+#[serial]
+async fn test_wedged_deser_does_not_starve_peer_and_release_resumes() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    const CAP: u32 = 5;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        catch_up_batch_size: CAP,
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let fc_id = format!("projection:fc-deser-wedge:{}", Uuid::new_v4());
+    let fc = TestProjection::with_subscriber_id(fc_id.clone()).fail_closed();
+    let fc_store = fc.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(fc))
+        .await
+        .expect("subscribe fail-closed");
+
+    let peer_id = format!("projection:peer-deser:{}", Uuid::new_v4());
+    let peer = TestProjection::with_subscriber_id(peer_id.clone());
+    let peer_store = peer.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(peer))
+        .await
+        .expect("subscribe peer");
+
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    // valid(seq1) -> corrupt(seq2) -> many valid rows above (well beyond CAP).
+    let stream = Uuid::new_v4();
+    let (valid1_id, seq1) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (corrupt_id, seq2) = insert_corrupt_event(&pool, &table, stream, 2).await;
+    let mut above_ids = Vec::new();
+    let mut above_seqs = Vec::new();
+    for i in 0..12 {
+        let (id, seq) =
+            insert_committed_event(&pool, &table, stream, i + 3, &format!("v{}", i + 3)).await;
+        above_ids.push(id);
+        above_seqs.push(seq as u64);
+    }
+    let top_seq = *above_seqs.iter().max().unwrap();
+    assert!(top_seq > seq2 as u64 + CAP as u64);
+
+    // R13: peer skips the corrupt row (fail-open) and advances to the tail while
+    // the FC subscriber is wedged at the corrupt row.
+    assert!(
+        poll_checkpoint_at_least(&event_bus, &peer_id, top_seq, 80).await,
+        "healthy peer must advance to the tail ({top_seq}) despite the deser wedge"
+    );
+    assert!(!applied_ids(&peer_store, stream).await.contains(&corrupt_id));
+
+    // FC held at the last good sequence below the corrupt row.
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(seq1 as u64)).await,
+        "fail-closed subscriber must hold at seq {seq1} (below the corrupt row)"
+    );
+    {
+        let halts = halts.lock().unwrap();
+        assert!(
+            halts.iter().any(|h| h.subscriber_id == fc_id
+                && h.reason == HaltReason::DeserializeFailure
+                && h.held_below_sequence == seq2 as u64),
+            "on_halt(DeserializeFailure) must fire for the wedged FC subscriber: {halts:?}"
+        );
+    }
+
+    // Backward release is rejected with an R14-explaining error.
+    let backward = event_bus.release_halt(&fc_id, seq1 as u64).await;
+    assert!(
+        matches!(
+            backward,
+            Err(epoch_pg::event_bus::PgEventBusError::BackwardRelease { .. })
+        ),
+        "a backward release must be rejected: {backward:?}"
+    );
+
+    // R14: operator release past the corrupt row resumes the FC subscriber.
+    event_bus
+        .release_halt(&fc_id, seq2 as u64)
+        .await
+        .expect("release_halt past the corrupt row");
+
+    assert!(
+        poll_checkpoint_at_least(&event_bus, &fc_id, top_seq, 120).await,
+        "released FC subscriber must resume without a restart and reach the tail ({top_seq})"
+    );
+
+    // R6: exactly-once, no corrupt row, no duplicates.
+    let fc_applied = applied_ids(&fc_store, stream).await;
+    let mut fc_sorted = fc_applied.clone();
+    fc_sorted.sort();
+    fc_sorted.dedup();
+    assert_eq!(
+        fc_sorted.len(),
+        fc_applied.len(),
+        "no duplicate delivery (R6)"
+    );
+    assert!(
+        !fc_applied.contains(&corrupt_id),
+        "the corrupt row is skipped by the release, never applied"
+    );
+    let mut expected: Vec<Uuid> = std::iter::once(valid1_id)
+        .chain(above_ids.clone())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        fc_sorted, expected,
+        "FC applies the good rows exactly once, skipping only the corrupt row"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
