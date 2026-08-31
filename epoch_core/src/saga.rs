@@ -136,6 +136,15 @@ where
         crate::event_store::SubscriptionMode::Checkpointed
     }
 
+    /// How the bus reacts when this saga cannot apply an event.
+    ///
+    /// Defaults to [`FailureMode::FailOpen`]: log, skip, and advance past the
+    /// failed event. Override and return [`FailureMode::FailClosed`] for
+    /// sagas that must never silently diverge from the event log.
+    fn failure_mode(&self) -> crate::event_store::FailureMode {
+        crate::event_store::FailureMode::FailOpen
+    }
+
     /// Processes an incoming event, applies it to the saga, and persists the resulting state.
     ///
     /// This method is called by the blanket [`EventObserver`] implementation. It handles:
@@ -230,6 +239,10 @@ where
     fn subscription_mode(&self) -> crate::event_store::SubscriptionMode {
         (**self).subscription_mode()
     }
+
+    fn failure_mode(&self) -> crate::event_store::FailureMode {
+        (**self).failure_mode()
+    }
 }
 
 /// A wrapper type that provides an [`EventObserver`] implementation for [`Saga`] types.
@@ -296,6 +309,10 @@ where
 
     fn subscription_mode(&self) -> crate::event_store::SubscriptionMode {
         self.0.subscription_mode()
+    }
+
+    fn failure_mode(&self) -> crate::event_store::FailureMode {
+        self.0.failure_mode()
     }
 }
 
@@ -457,6 +474,10 @@ where
 
     fn subscription_mode(&self) -> crate::event_store::SubscriptionMode {
         self.saga.subscription_mode()
+    }
+
+    fn failure_mode(&self) -> crate::event_store::FailureMode {
+        self.saga.failure_mode()
     }
 }
 

@@ -187,6 +187,52 @@ pub trait EventBus {
         T: EventObserver<Self::EventType> + Send + Sync + 'static;
 }
 
+/// How a subscriber reacts when an event cannot be applied.
+///
+/// Controls the bus's behaviour at every failure point (deserialisation error,
+/// observer error, unproven gap) for a given subscriber.
+///
+/// # Default
+///
+/// The default is [`FailureMode::FailOpen`]: on any failure the bus logs, skips
+/// the event, and advances the checkpoint past it. This is the correct choice
+/// for most subscribers.
+///
+/// # `FailClosed` and frozen read models
+///
+/// When a subscriber opts into [`FailureMode::FailClosed`], the bus halts
+/// delivery at the first unrecoverable failure: the subscriber's checkpoint is
+/// held below the bad event and no further events are applied to *that
+/// subscriber* until the condition is resolved (the bad row is fixed, or an
+/// operator calls `release_halt`). The halt is **subscriber-local**: healthy
+/// subscribers keep advancing because a wedged subscriber is excluded from the
+/// shared `min_checkpoint` floor and served by a private re-seeding fetch
+/// (R13; floor exclusion is implemented in phase P4b).
+///
+/// **Cross-group consequence (R12):** while the halted subscriber's read model
+/// is frozen, later priority groups keep running against that stale view. For a
+/// deny-heavy oracle (e.g. an auth projection), stale data errs on the side of
+/// denying rather than over-admitting — the freeze fails safe. Recovery is
+/// self-healing: once the cause is fixed, the held event and everything after
+/// it are applied exactly once in order on the next batch cycle. For a gap
+/// that never resolves, an operator release advances the subscriber's persisted
+/// position past the held sequence. A permanent unreleased halt means a
+/// permanently frozen read model for that subscriber; it does not starve or
+/// slow any other subscriber on the bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum FailureMode {
+    /// Default. On any delivery failure, log, skip, and advance the checkpoint
+    /// past the failed event. The read model may silently diverge from the
+    /// event log, but delivery continues unimpeded.
+    #[default]
+    FailOpen,
+    /// Halt delivery at the first unrecoverable failure. The checkpoint is held
+    /// below the bad event; no further events are applied until the condition
+    /// clears. See the [`FailureMode`] docs for the cross-group wedge risk.
+    FailClosed,
+}
+
 /// How a subscriber relates to persisted checkpoints.
 ///
 /// Controls whether the event bus reads and writes a checkpoint row for this
@@ -257,6 +303,15 @@ where
     /// replay from sequence 0 on every process start.
     fn subscription_mode(&self) -> SubscriptionMode {
         SubscriptionMode::Checkpointed
+    }
+
+    /// How the bus reacts when this subscriber cannot apply an event.
+    ///
+    /// Defaults to [`FailureMode::FailOpen`]: log, skip, and advance past the
+    /// failed event. Override and return [`FailureMode::FailClosed`] for
+    /// subscribers that must never silently diverge from the event log.
+    fn failure_mode(&self) -> FailureMode {
+        FailureMode::FailOpen
     }
 }
 

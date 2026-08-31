@@ -180,6 +180,15 @@ where
     fn subscription_mode(&self) -> crate::event_store::SubscriptionMode {
         crate::event_store::SubscriptionMode::Checkpointed
     }
+
+    /// How the bus reacts when this projection cannot apply an event.
+    ///
+    /// Defaults to [`FailureMode::FailOpen`]: log, skip, and advance past the
+    /// failed event. Override and return [`FailureMode::FailClosed`] for
+    /// projections that must never silently diverge from the event log.
+    fn failure_mode(&self) -> crate::event_store::FailureMode {
+        crate::event_store::FailureMode::FailOpen
+    }
 }
 
 /// Wraps a [`Projection`] to implement [`EventObserver`](crate::event_store::EventObserver)
@@ -259,6 +268,10 @@ where
 
     fn subscription_mode(&self) -> crate::event_store::SubscriptionMode {
         self.0.subscription_mode()
+    }
+
+    fn failure_mode(&self) -> crate::event_store::FailureMode {
+        self.0.failure_mode()
     }
 }
 
