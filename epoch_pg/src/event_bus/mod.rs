@@ -261,6 +261,13 @@ async fn insert_deser_halt_dlq_row(
 
 /// Fires the optional `on_halt` callback on halt entry (spec 0028 Q3). Fired
 /// once when a fail-closed subscriber enters a halt, never per re-attempt.
+///
+/// The invocation is panic-contained (spec 0028 §3.6, mirroring
+/// [`invoke_observer_once`]): a panicking `HaltCallback` is caught, logged as a
+/// WARN, and the halt proceeds — halt semantics are unaffected by the callback
+/// outcome. Call sites with a [`SubscriberState`] must commit the hold (e.g.
+/// `held_event`) *before* this fires, so a panicking callback can never lose
+/// the hold.
 async fn fire_on_halt(
     config: &ReliableDeliveryConfig,
     subscriber_id: &str,
@@ -268,13 +275,23 @@ async fn fire_on_halt(
     reason: HaltReason,
 ) {
     if let Some(callback) = &config.on_halt {
-        callback
-            .on_halt(HaltInfo {
-                subscriber_id: subscriber_id.to_string(),
-                held_below_sequence,
+        let info = HaltInfo {
+            subscriber_id: subscriber_id.to_string(),
+            held_below_sequence,
+            reason,
+        };
+        if let Err(payload) = AssertUnwindSafe(callback.on_halt(info))
+            .catch_unwind()
+            .await
+        {
+            warn!(
+                "on_halt callback panicked for '{}' (reason: {:?}): {}. \
+                 The panic is contained; the halt proceeds.",
+                subscriber_id,
                 reason,
-            })
-            .await;
+                panic_payload_message(payload)
+            );
+        }
     }
 }
 
@@ -377,6 +394,9 @@ where
                         )
                         .await;
                     }
+                    // Commit the hold BEFORE the on_halt callback fires so a
+                    // panicking callback cannot lose it (spec 0028 §3.6).
+                    state.held_event = Some(event_seq);
                     if is_reattempt {
                         log::debug!(
                             "Fail-closed subscriber '{}' still cannot deserialize held \
@@ -401,7 +421,6 @@ where
                         )
                         .await;
                     }
-                    state.held_event = Some(event_seq);
                     break;
                 }
                 // Fail-open (and any future non-fail-closed mode): log, skip,
@@ -484,6 +503,9 @@ where
                         record_applied!(event_seq, event_id);
                     }
                     ProcessResult::SentToDlq => {
+                        // Commit the hold BEFORE the on_halt callback fires so a
+                        // panicking callback cannot lose it (spec 0028 §3.6).
+                        state.held_event = Some(event_seq);
                         fire_on_halt(
                             &config,
                             &subscriber_id,
@@ -491,7 +513,6 @@ where
                             HaltReason::ObserverFailure,
                         )
                         .await;
-                        state.held_event = Some(event_seq);
                         break;
                     }
                 }

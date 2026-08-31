@@ -7138,6 +7138,25 @@ impl HaltCallback for CapturingHaltCallback {
     }
 }
 
+/// A `HaltCallback` that panics on its **first** `on_halt` invocation and
+/// records every later one, so a test can prove (a) a panicking callback does
+/// not kill the listener task, (b) the hold engages anyway, and (c) the panic
+/// did not poison future halt entries (the second halt is recorded).
+struct PanicOnceHaltCallback {
+    calls: AtomicU32,
+    halts: Arc<StdMutex<Vec<HaltInfo>>>,
+}
+
+#[async_trait]
+impl HaltCallback for PanicOnceHaltCallback {
+    async fn on_halt(&self, info: HaltInfo) {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("deterministic halt-callback panic");
+        }
+        self.halts.lock().unwrap().push(info);
+    }
+}
+
 /// Captures every `DlqInsertionInfo` the bus fires (observer-exhaustion path).
 struct CapturingDlqCallback {
     inserts: Arc<StdMutex<Vec<DlqInsertionInfo>>>,
@@ -7432,6 +7451,136 @@ async fn test_live_deser_halt_self_heals_after_fix() {
         seqs,
         vec![seq1 as u64, seq2 as u64, seq3 as u64],
         "recovery applies the held event and everything after it exactly once, in order"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T2b (spec 0028 §3.6 panic containment, halt-callback leg): a `HaltCallback`
+/// whose `on_halt` panics on a live-path deserialize halt must not kill the
+/// listener task or lose the hold. The panic is contained and logged, the
+/// checkpoint stays held below the bad sequence, the held event is
+/// re-attempted (never skipped) once the payload is fixed, and a later halt
+/// entry still fires — this callback panics only on its first invocation, so
+/// the second halt is recorded.
+#[tokio::test]
+#[serial]
+async fn test_live_deser_halt_survives_panicking_halt_callback() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let callback = Arc::new(PanicOnceHaltCallback {
+        calls: AtomicU32::new(0),
+        halts: halts.clone(),
+    });
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        on_halt: Some(callback.clone()),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let fc_id = format!("projection:fc-panic-halt:{}", Uuid::new_v4());
+    let fc = TestProjection::with_subscriber_id(fc_id.clone()).fail_closed();
+    let fc_store = fc.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(fc))
+        .await
+        .expect("subscribe fc");
+
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_valid1_id, seq1) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (_corrupt_id, seq2) = insert_corrupt_event(&pool, &table, stream, 2).await;
+    let (_valid3_id, seq3) = insert_committed_event(&pool, &table, stream, 3, "v3").await;
+
+    // (b) The hold engages even though the callback panicked on halt entry:
+    // the checkpoint stays at the last good sequence.
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(seq1 as u64)).await,
+        "checkpoint must hold at seq {seq1} despite the panicking halt callback"
+    );
+
+    // (a) The listener task survives the panic: fix the payload and the wedged
+    // subscriber re-attempts the held event on its next batch and self-heals.
+    fix_event_payload(&pool, &table, seq2, "recovered-after-panic").await;
+    let (_valid4_id, seq4) = insert_committed_event(&pool, &table, stream, 4, "v4").await;
+
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(seq4 as u64)).await,
+        "listener task must survive the panicking halt callback: after the payload \
+         fix the checkpoint must advance to the tail seq {seq4}"
+    );
+
+    // (b) The held event was re-attempted, not skipped: recovery applies
+    // seq1..seq4 exactly once, in order.
+    let fc_state = fc_store.get_state(stream).await.unwrap().unwrap();
+    let seqs: Vec<u64> = fc_state
+        .0
+        .iter()
+        .map(|e| e.global_sequence.unwrap())
+        .collect();
+    assert_eq!(
+        seqs,
+        vec![seq1 as u64, seq2 as u64, seq3 as u64, seq4 as u64],
+        "the previously-held event must be re-attempted (not skipped), in order"
+    );
+
+    // (c) The panic did not poison future halts: a second corrupt event halts
+    // again; this time the callback (past its first invocation) records the
+    // halt instead of panicking.
+    let (_corrupt2_id, seq5) = insert_corrupt_event(&pool, &table, stream, 5).await;
+
+    let mut recorded: Vec<HaltInfo> = Vec::new();
+    for _ in 0..80 {
+        recorded = halts.lock().unwrap().clone();
+        if !recorded.is_empty() {
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the second halt entry must fire and be recorded: {recorded:?}"
+    );
+    assert_eq!(recorded[0].subscriber_id, fc_id);
+    assert_eq!(recorded[0].held_below_sequence, seq5 as u64);
+    assert_eq!(recorded[0].reason, HaltReason::DeserializeFailure);
+
+    // The second halt holds the checkpoint below its bad sequence again.
+    assert_eq!(
+        event_bus
+            .get_checkpoint(&fc_id)
+            .await
+            .expect("get checkpoint"),
+        Some(seq4 as u64),
+        "the second halt must hold the checkpoint at seq {seq4}"
+    );
+
+    // Entry-only contract intact: exactly two on_halt invocations (the panicking
+    // first and the recorded second) — re-attempts of the held event never
+    // re-fire the callback.
+    assert_eq!(
+        callback.calls.load(Ordering::SeqCst),
+        2,
+        "on_halt must fire once per halt entry, never per re-attempt"
+    );
+
+    assert!(
+        event_bus.is_running().await,
+        "listener task must stay alive"
     );
 
     event_bus.shutdown().await.expect("shutdown");

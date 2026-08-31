@@ -95,10 +95,12 @@ pub enum HaltReason {
 
 /// Information about a fail-closed delivery halt, passed to the [`HaltCallback`].
 ///
-/// A halt fires once on entry (and once more on operator release via
-/// [`HaltReason::Released`]), not on every re-attempt of a held event, so
-/// callbacks can drive alerting without
-/// per-batch spam.
+/// A halt fires once per halt entry — not on every re-attempt of a held event,
+/// so callbacks can drive alerting without per-batch spam. A subscriber wedged
+/// during catch-up or drain fires once more when the live listener takes over
+/// its first batch (bounded per phase handoff, never per re-attempt). An
+/// operator release is its own halt entry and fires via
+/// [`HaltReason::Released`].
 #[derive(Debug, Clone)]
 pub struct HaltInfo {
     /// The subscriber whose delivery halted.
@@ -114,10 +116,11 @@ pub struct HaltInfo {
 /// Callback invoked when a fail-closed subscriber halts delivery.
 ///
 /// Implementations should be lightweight and avoid blocking for extended
-/// periods. Errors or panics inside the callback do not affect the halt itself
-/// (the checkpoint is held regardless of callback outcome). Use this to alert
-/// operators that a subscriber has stopped and needs the underlying cause
-/// (missing upcaster, broken observer, unproven gap) resolved.
+/// periods. Panics inside the callback are contained and logged; the halt
+/// itself proceeds regardless of the callback outcome (the checkpoint is
+/// held). Use this to alert operators that a subscriber has stopped and needs
+/// the underlying cause (missing upcaster, broken observer, unproven gap)
+/// resolved.
 ///
 /// # Example
 ///
@@ -337,8 +340,8 @@ pub struct ReliableDeliveryConfig {
     ///
     /// [`PgEventBus::release_halt`]: crate::event_bus::PgEventBus::release_halt
     ///
-    /// Errors from the callback are logged but do not affect the halt — the
-    /// checkpoint is held regardless of callback outcome.
+    /// Panics from the callback are contained and logged; the halt proceeds
+    /// regardless of the callback outcome — the checkpoint is held.
     ///
     /// Default: `None` (no callback)
     pub on_halt: Option<Arc<dyn HaltCallback>>,
