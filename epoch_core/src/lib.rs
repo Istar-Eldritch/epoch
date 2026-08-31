@@ -36,6 +36,7 @@ pub mod upcasting;
 #[cfg(feature = "testing")]
 pub mod testing;
 
+pub use event_store::FailureMode;
 pub use event_store::SubscriptionMode;
 pub use subscriber_id::SubscriberId;
 

@@ -5,6 +5,7 @@
 //! correct checkpoint advancement even when events are delivered or become visible
 //! out of order (e.g., due to PostgreSQL's non-transactional `nextval()` behavior).
 
+use epoch_core::event_store::FailureMode;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -71,6 +72,10 @@ pub(crate) struct GapObservation {
     /// `xmax` at first observation, or `None` if no snapshot was available then.
     /// The gap is permanent once a later `xmin >= fence_xmax`.
     pub fence_xmax: Option<u64>,
+    /// `true` once `on_halt(GapUnproven)` has been fired for this gap on a
+    /// fail-closed subscriber. Prevents per-batch halt spam: the callback fires
+    /// on halt ENTRY only (spec 0028 §3.4).
+    pub halt_fired: bool,
 }
 
 /// Tracks per-subscriber processing state for gap-aware checkpoint advancement.
@@ -108,6 +113,20 @@ pub(crate) struct SubscriberState {
     /// Key: the missing global_sequence. Value: the [`GapObservation`] captured
     /// when the gap was first noticed.
     pub gap_first_seen: HashMap<u64, GapObservation>,
+
+    /// This subscriber's fail-closed/fail-open policy, resolved once from the
+    /// observer at state-init (spec 0028). Read by the live batch path to decide
+    /// whether a failure holds the checkpoint (`FailClosed`) or advances past it
+    /// (`FailOpen`).
+    pub failure_mode: FailureMode,
+
+    /// The sequence a fail-closed subscriber has halted at, if any. Set on the
+    /// deserialize-failure and observer-exhaustion halt paths; the general
+    /// "halted-at" marker. While set, the next batch cycle re-attempts exactly
+    /// this sequence with a single observer invocation (no retry ladder, spec
+    /// 0028 §3.4); a successful re-attempt clears it. Always `None` for a
+    /// fail-open subscriber.
+    pub held_event: Option<u64>,
 }
 
 impl SubscriberState {
@@ -123,6 +142,8 @@ impl SubscriberState {
             contiguous_event_id: Uuid::nil(),
             processed_ahead: HashSet::new(),
             gap_first_seen: HashMap::new(),
+            failure_mode: FailureMode::FailOpen,
+            held_event: None,
         }
     }
 
@@ -133,14 +154,107 @@ impl SubscriberState {
     /// `last_global_sequence` and `last_event_id` from the checkpoints table so
     /// an eager [`PendingCheckpoint`](super::checkpoint::PendingCheckpoint) can
     /// be seeded with a correctly paired id.
-    pub fn new_with_event_id(checkpoint: u64, event_id: Uuid) -> Self {
+    pub fn new_with_event_id(checkpoint: u64, event_id: Uuid, failure_mode: FailureMode) -> Self {
         Self {
             contiguous_checkpoint: checkpoint,
             contiguous_event_id: event_id,
             processed_ahead: HashSet::new(),
             gap_first_seen: HashMap::new(),
+            failure_mode,
+            held_event: None,
         }
     }
+
+    /// Whether this subscriber is **wedged**: a fail-closed subscriber that has
+    /// halted and cannot advance on its own until the cause is fixed or an
+    /// operator releases it (spec 0028 §3.5). A wedged subscriber is excluded
+    /// from the shared `min_checkpoint` floor and driven by a private fetch so a
+    /// permanent hold on it never starves healthy peers (R13).
+    ///
+    /// A wedge is either a held event ([`held_event`](Self::held_event), set on
+    /// the deserialize- and observer-exhaustion halt paths) or a **refused** gap
+    /// (a `TimeoutBackstop` the fail-closed policy declined to skip, marked by
+    /// `GapObservation::halt_fired`). A brand-new, not-yet-refused gap does NOT
+    /// count: it may still fill or clear normally, exactly as it would for a
+    /// fail-open subscriber (R10 — fail-open subscribers are never wedged).
+    pub(crate) fn is_wedged(&self) -> bool {
+        matches!(self.failure_mode, FailureMode::FailClosed)
+            && (self.held_event.is_some() || self.gap_first_seen.values().any(|obs| obs.halt_fired))
+    }
+
+    /// Reconciles this subscriber's in-memory state forward to a persisted
+    /// `cursor` that an operator release (spec 0028 R14) moved past the held
+    /// position.
+    ///
+    /// The release is the one case the private fetch reconciles against the
+    /// persisted checkpoint. Events already applied at or below the new cursor
+    /// (`processed_ahead`) are folded into the contiguous position rather than
+    /// re-delivered (R6); any applied above it are retained so they are still
+    /// delivered exactly once. Gap bookkeeping and the held marker at or below
+    /// the cursor are cleared, since the release accepts the skip past them.
+    pub(crate) fn adopt_released_cursor(&mut self, cursor: u64, cursor_event_id: Uuid) {
+        self.processed_ahead.retain(|&seq| seq > cursor);
+        self.gap_first_seen.retain(|&seq, _| seq > cursor);
+        if let Some(held) = self.held_event
+            && held <= cursor
+        {
+            self.held_event = None;
+        }
+        self.contiguous_checkpoint = cursor;
+        self.contiguous_event_id = cursor_event_id;
+    }
+}
+
+/// Computes the shared-fetch floor for the live batch loop, excluding wedged
+/// subscribers (spec 0028 §3.5 / R13).
+///
+/// Returns:
+/// - `Some(min)` — the minimum contiguous checkpoint across all **non-wedged**
+///   subscribers: the `global_sequence` floor the shared fetch reads above. With
+///   no subscribers at all this is `Some(0)`, byte-identical to the pre-0028
+///   `min().unwrap_or(0)` behaviour, so the un-wedged shared-fetch path is
+///   unchanged.
+/// - `None` — every subscriber on the bus is wedged, so the shared fetch is
+///   skipped entirely for this cycle (no healthy consumer is left to serve);
+///   each wedged subscriber is driven by its own private fetch instead.
+///
+/// Pure and DB-free so the all-wedged and mixed-state decisions are
+/// unit-testable without a running bus.
+pub(crate) fn compute_shared_floor<'a>(
+    states: impl Iterator<Item = &'a SubscriberState>,
+) -> Option<u64> {
+    let mut any = false;
+    let mut floor: Option<u64> = None;
+    for state in states {
+        any = true;
+        if !state.is_wedged() {
+            floor = Some(match floor {
+                Some(current) => current.min(state.contiguous_checkpoint),
+                None => state.contiguous_checkpoint,
+            });
+        }
+    }
+    match (any, floor) {
+        // No subscribers at all: preserve the legacy `min().unwrap_or(0)`.
+        (false, _) => Some(0),
+        // At least one subscriber, but every one is wedged: skip the shared
+        // fetch this cycle.
+        (true, None) => None,
+        // Healthy floor across the non-wedged subscribers.
+        (true, Some(f)) => Some(f),
+    }
+}
+
+/// The return value of [`advance_contiguous_checkpoint`].
+pub(crate) struct AdvanceOutcome {
+    /// Gaps that were advanced past, either via fence-clear or the backstop
+    /// (fail-open only; a fail-closed subscriber never yields backstop entries).
+    pub skipped_gaps: Vec<SkippedGap>,
+    /// Fail-closed only: `Some(seq)` the **first** time the backstop would have
+    /// fired for `seq` but was refused because `state.failure_mode` is
+    /// `FailClosed`. `None` on subsequent batches for the same gap (halt already
+    /// recorded — fires `on_halt` only on entry). Always `None` for fail-open.
+    pub backstop_refused: Option<u64>,
 }
 
 /// Advances the contiguous checkpoint as far as possible given the current state.
@@ -167,6 +281,14 @@ impl SubscriberState {
 /// When `snapshot` is `None` (fencing disabled or the snapshot query failed), the
 /// function degrades to the legacy `gap_timeout`-only behaviour, byte-for-byte.
 ///
+/// # Fail-closed gap refusal (spec 0028 R5/R7)
+///
+/// When `failure_mode` is `FailClosed`, the backstop branch refuses to advance
+/// past the gap: `AdvanceOutcome::backstop_refused` is `Some(seq)` on the first
+/// refusal (caller must fire `on_halt(GapUnproven)`), `None` on subsequent calls
+/// for the same gap. The fence-clear branch is untouched: an event proven never
+/// to have existed is advanced past under both modes.
+///
 /// This function remains **pure, synchronous, and DB-free**: the snapshot bounds
 /// are passed in by the caller, which owns all DB/log/callback side-effects.
 ///
@@ -179,13 +301,17 @@ impl SubscriberState {
 ///   before skipping it anyway.
 /// * `snapshot` - The current transaction-id snapshot bounds, or `None` when
 ///   fencing is unavailable/disabled.
+/// * `failure_mode` - Whether to refuse the backstop (`FailClosed`) or advance
+///   past it (`FailOpen`).
 pub(crate) fn advance_contiguous_checkpoint(
     state: &mut SubscriberState,
     visible_seqs: &BTreeSet<u64>,
     gap_timeout: Duration,
     snapshot: Option<TxidSnapshot>,
-) -> Vec<SkippedGap> {
+    failure_mode: FailureMode,
+) -> AdvanceOutcome {
     let mut skipped = Vec::new();
+    let mut backstop_refused: Option<u64> = None;
     loop {
         let next = state.contiguous_checkpoint + 1;
 
@@ -246,22 +372,39 @@ pub(crate) fn advance_contiguous_checkpoint(
                 // timeout decision was made on.
                 let gap_duration = first_seen.elapsed();
                 if gap_duration > gap_timeout {
-                    log::debug!(
-                        "Advancing past gap at seq {} (timeout backstop after {:?})",
-                        next,
-                        gap_duration
-                    );
-                    skipped.push(SkippedGap {
-                        skipped_sequence: next,
-                        gap_duration,
-                        reason: SkipReason::TimeoutBackstop,
-                        fence_xmax,
-                    });
-                    state.gap_first_seen.remove(&next);
-                    state.contiguous_checkpoint = next;
-                    continue;
+                    match failure_mode {
+                        FailureMode::FailClosed => {
+                            // Refuse the backstop: hold the gap, do not push a
+                            // SkippedGap, do not remove from gap_first_seen, do not
+                            // re-capture the fence. Fire on_halt only on first entry
+                            // (halt_fired guards per-batch spam).
+                            if !observation.halt_fired {
+                                observation.halt_fired = true;
+                                backstop_refused = Some(next);
+                            }
+                        }
+                        _ => {
+                            // Fail-open (and any future non-fail-closed mode): advance
+                            // past the gap as before (byte-for-byte unchanged).
+                            log::debug!(
+                                "Advancing past gap at seq {} (timeout backstop after {:?})",
+                                next,
+                                gap_duration
+                            );
+                            skipped.push(SkippedGap {
+                                skipped_sequence: next,
+                                gap_duration,
+                                reason: SkipReason::TimeoutBackstop,
+                                fence_xmax,
+                            });
+                            state.gap_first_seen.remove(&next);
+                            state.contiguous_checkpoint = next;
+                            continue;
+                        }
+                    }
                 }
-                // Gap held: fence still pinned and backstop not yet fired.
+                // Gap held: fence still pinned and backstop not yet fired (or
+                // fail-closed backstop refused — either way, stop advancing).
             } else {
                 // First time seeing this gap — record timestamp and fence boundary.
                 state.gap_first_seen.insert(
@@ -269,6 +412,7 @@ pub(crate) fn advance_contiguous_checkpoint(
                     GapObservation {
                         first_seen: Instant::now(),
                         fence_xmax: snapshot.map(|s| s.xmax),
+                        halt_fired: false,
                     },
                 );
             }
@@ -281,7 +425,10 @@ pub(crate) fn advance_contiguous_checkpoint(
         // This case means the caller hasn't processed `next` yet — stop.
         break;
     }
-    skipped
+    AdvanceOutcome {
+        skipped_gaps: skipped,
+        backstop_refused,
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +440,7 @@ mod tests {
         GapObservation {
             first_seen,
             fence_xmax: None,
+            halt_fired: false,
         }
     }
 
@@ -301,7 +449,28 @@ mod tests {
         GapObservation {
             first_seen,
             fence_xmax: Some(fence_xmax),
+            halt_fired: false,
         }
+    }
+
+    /// Thin wrapper that calls [`advance_contiguous_checkpoint`] with
+    /// [`FailureMode::FailOpen`] and returns only the skipped gaps, preserving
+    /// the call shape of every existing unit test so they stay unaware of the
+    /// new `failure_mode` parameter.
+    fn advance_checkpoint_fo(
+        state: &mut SubscriberState,
+        visible_seqs: &BTreeSet<u64>,
+        gap_timeout: Duration,
+        snapshot: Option<TxidSnapshot>,
+    ) -> Vec<SkippedGap> {
+        advance_contiguous_checkpoint(
+            state,
+            visible_seqs,
+            gap_timeout,
+            snapshot,
+            FailureMode::FailOpen,
+        )
+        .skipped_gaps
     }
 
     #[test]
@@ -332,7 +501,7 @@ mod tests {
         let visible: BTreeSet<u64> = [6, 7, 8].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, None);
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, None);
 
         assert_eq!(state.contiguous_checkpoint, 8);
         assert!(state.processed_ahead.is_empty());
@@ -352,7 +521,7 @@ mod tests {
         let visible: BTreeSet<u64> = [7, 8].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, None);
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, None);
 
         assert_eq!(state.contiguous_checkpoint, 5);
         assert!(state.gap_first_seen.contains_key(&6));
@@ -380,7 +549,7 @@ mod tests {
         let visible: BTreeSet<u64> = [7, 8].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, None);
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, None);
 
         assert_eq!(state.contiguous_checkpoint, 8);
         assert!(state.processed_ahead.is_empty());
@@ -409,7 +578,7 @@ mod tests {
         let visible: BTreeSet<u64> = [6, 7, 8].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, None);
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, None);
 
         assert_eq!(state.contiguous_checkpoint, 6);
         assert!(!state.processed_ahead.contains(&6));
@@ -428,7 +597,7 @@ mod tests {
         let visible: BTreeSet<u64> = [6, 7, 8].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, None);
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, None);
 
         assert_eq!(state.contiguous_checkpoint, 8);
         assert!(state.processed_ahead.is_empty());
@@ -444,7 +613,7 @@ mod tests {
         let visible: BTreeSet<u64> = [8, 10].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, None);
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, None);
 
         assert_eq!(state.contiguous_checkpoint, 5);
         assert!(state.gap_first_seen.contains_key(&6));
@@ -465,7 +634,7 @@ mod tests {
         let visible: BTreeSet<u64> = [7, 8].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, None);
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, None);
 
         assert_eq!(state.contiguous_checkpoint, 5);
         // 7 and 8 should remain in processed_ahead since we couldn't advance past 6
@@ -487,7 +656,7 @@ mod tests {
         let visible: BTreeSet<u64> = BTreeSet::new();
         let gap_timeout = Duration::from_secs(5);
 
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, None);
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, None);
 
         assert_eq!(state.contiguous_checkpoint, 6);
         assert!(state.processed_ahead.is_empty());
@@ -508,7 +677,7 @@ mod tests {
         let visible: BTreeSet<u64> = [6, 7].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, None);
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, None);
 
         assert_eq!(state.contiguous_checkpoint, 7);
         assert!(!state.gap_first_seen.contains_key(&6));
@@ -535,7 +704,7 @@ mod tests {
         let visible: BTreeSet<u64> = [9, 10].into_iter().collect();
         let gap_timeout = Duration::from_secs(5);
 
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, None);
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, None);
 
         assert_eq!(state.contiguous_checkpoint, 10);
         assert!(state.processed_ahead.is_empty());
@@ -577,8 +746,7 @@ mod tests {
             xmin: 90,
             xmax: 100,
         };
-        let skipped =
-            advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, Some(snap_a));
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, Some(snap_a));
         assert_eq!(state.contiguous_checkpoint, 5);
         assert!(skipped.is_empty(), "first observation must hold");
         assert_eq!(state.gap_first_seen.get(&6).unwrap().fence_xmax, Some(100));
@@ -588,8 +756,7 @@ mod tests {
             xmin: 100,
             xmax: 105,
         };
-        let skipped =
-            advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, Some(snap_b));
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, Some(snap_b));
 
         assert_eq!(state.contiguous_checkpoint, 8);
         assert!(state.processed_ahead.is_empty());
@@ -618,7 +785,7 @@ mod tests {
             xmax: 110,
         };
 
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, Some(snap));
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, Some(snap));
 
         assert_eq!(state.contiguous_checkpoint, 5, "gap must be held");
         assert!(state.gap_first_seen.contains_key(&6));
@@ -643,7 +810,7 @@ mod tests {
             xmax: 110,
         };
 
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, Some(snap));
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, Some(snap));
 
         assert_eq!(state.contiguous_checkpoint, 8);
         assert!(!state.gap_first_seen.contains_key(&6));
@@ -666,7 +833,7 @@ mod tests {
         let gap_timeout = Duration::from_secs(30);
 
         // Batch 1: no snapshot → record gap with fence_xmax = None, held.
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, None);
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, None);
         assert!(skipped.is_empty());
         assert_eq!(state.gap_first_seen.get(&6).unwrap().fence_xmax, None);
 
@@ -675,8 +842,7 @@ mod tests {
             xmin: 90,
             xmax: 100,
         };
-        let skipped =
-            advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, Some(snap_a));
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, Some(snap_a));
         assert!(skipped.is_empty());
         assert_eq!(state.gap_first_seen.get(&6).unwrap().fence_xmax, Some(100));
         assert_eq!(state.contiguous_checkpoint, 5);
@@ -686,8 +852,7 @@ mod tests {
             xmin: 100,
             xmax: 120,
         };
-        let skipped =
-            advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, Some(snap_b));
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, Some(snap_b));
         assert_eq!(state.contiguous_checkpoint, 8);
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].reason, SkipReason::FenceCleared);
@@ -706,7 +871,7 @@ mod tests {
         let gap_timeout = Duration::from_secs(5);
 
         // Batch 1: record the gap (held, no snapshot).
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, None);
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, None);
         assert!(skipped.is_empty());
         assert_eq!(state.gap_first_seen.get(&6).unwrap().fence_xmax, None);
 
@@ -715,7 +880,7 @@ mod tests {
             Instant::now() - Duration::from_secs(10);
 
         // Batch 2: still no snapshot → backstop fires.
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, None);
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, None);
         assert_eq!(state.contiguous_checkpoint, 8);
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].reason, SkipReason::TimeoutBackstop);
@@ -740,11 +905,368 @@ mod tests {
             xmax: 110,
         };
 
-        let skipped = advance_contiguous_checkpoint(&mut state, &visible, gap_timeout, Some(snap));
+        let skipped = advance_checkpoint_fo(&mut state, &visible, gap_timeout, Some(snap));
 
         assert_eq!(state.contiguous_checkpoint, 7);
         assert!(!state.gap_first_seen.contains_key(&6));
         assert!(state.processed_ahead.is_empty());
         assert!(skipped.is_empty(), "gap filled normally, Vec must be empty");
+    }
+
+    // ---- Fail-closed gap refusal unit tests (spec 0028 P4) ---------------
+
+    #[test]
+    fn fail_closed_backstop_refused_on_first_cycle() {
+        // checkpoint=5, visible=[7,8], gap at 6 aged past timeout, FailClosed.
+        // processed_ahead={7,8} so we would advance if the backstop fired.
+        // Expected: checkpoint stays at 5, backstop_refused = Some(6),
+        // gap_first_seen still has 6 with halt_fired=true.
+        let mut state = SubscriberState::new(5);
+        state.processed_ahead.insert(7);
+        state.processed_ahead.insert(8);
+        state
+            .gap_first_seen
+            .insert(6, obs(Instant::now() - Duration::from_secs(10)));
+
+        let visible: BTreeSet<u64> = [7, 8].into_iter().collect();
+        let gap_timeout = Duration::from_secs(5);
+
+        let outcome = advance_contiguous_checkpoint(
+            &mut state,
+            &visible,
+            gap_timeout,
+            None,
+            FailureMode::FailClosed,
+        );
+
+        assert_eq!(
+            state.contiguous_checkpoint, 5,
+            "checkpoint must not advance"
+        );
+        assert!(
+            outcome.skipped_gaps.is_empty(),
+            "no SkippedGap pushed for FailClosed"
+        );
+        assert_eq!(
+            outcome.backstop_refused,
+            Some(6),
+            "first refusal returns Some(6)"
+        );
+        assert!(
+            state.gap_first_seen.contains_key(&6),
+            "gap_first_seen must be kept (not removed)"
+        );
+        assert!(
+            state.gap_first_seen[&6].halt_fired,
+            "halt_fired must be set to true after first refusal"
+        );
+        // processed_ahead is untouched: events above the gap are held.
+        assert!(state.processed_ahead.contains(&7));
+        assert!(state.processed_ahead.contains(&8));
+    }
+
+    #[test]
+    fn fail_closed_backstop_refused_second_cycle_no_repeat() {
+        // Second batch for the same gap: halt_fired=true → backstop_refused must be None
+        // (on_halt fires only on halt entry, not per-batch).
+        let mut state = SubscriberState::new(5);
+        state.processed_ahead.insert(7);
+        state.processed_ahead.insert(8);
+        // Gap already refused once: halt_fired = true.
+        state.gap_first_seen.insert(
+            6,
+            GapObservation {
+                first_seen: Instant::now() - Duration::from_secs(10),
+                fence_xmax: None,
+                halt_fired: true,
+            },
+        );
+
+        let visible: BTreeSet<u64> = [7, 8].into_iter().collect();
+        let gap_timeout = Duration::from_secs(5);
+
+        let outcome = advance_contiguous_checkpoint(
+            &mut state,
+            &visible,
+            gap_timeout,
+            None,
+            FailureMode::FailClosed,
+        );
+
+        assert_eq!(
+            state.contiguous_checkpoint, 5,
+            "checkpoint still not advanced"
+        );
+        assert!(outcome.skipped_gaps.is_empty());
+        assert_eq!(
+            outcome.backstop_refused, None,
+            "second cycle must return None"
+        );
+    }
+
+    #[test]
+    fn fail_closed_fence_cleared_still_advances() {
+        // The fence branch is untouched for FailClosed: a gap proven permanent by
+        // the snapshot fence MUST still advance the checkpoint (spec 0028 §3.6:
+        // FenceCleared advances under both modes).
+        let mut state = SubscriberState::new(5);
+        state.processed_ahead.insert(7);
+        state.processed_ahead.insert(8);
+        state
+            .gap_first_seen
+            .insert(6, obs_fenced(Instant::now(), 100));
+
+        let visible: BTreeSet<u64> = [7, 8].into_iter().collect();
+        let gap_timeout = Duration::from_secs(30);
+        // xmin >= fence_xmax proves the gap is permanent.
+        let snap = TxidSnapshot {
+            xmin: 100,
+            xmax: 110,
+        };
+
+        let outcome = advance_contiguous_checkpoint(
+            &mut state,
+            &visible,
+            gap_timeout,
+            Some(snap),
+            FailureMode::FailClosed,
+        );
+
+        assert_eq!(
+            state.contiguous_checkpoint, 8,
+            "FenceCleared must advance FailClosed"
+        );
+        assert!(!state.gap_first_seen.contains_key(&6));
+        assert_eq!(outcome.skipped_gaps.len(), 1);
+        assert_eq!(outcome.skipped_gaps[0].reason, SkipReason::FenceCleared);
+        assert_eq!(
+            outcome.backstop_refused, None,
+            "FenceCleared path never sets backstop_refused"
+        );
+    }
+
+    #[test]
+    fn fail_open_fence_cleared_still_advances() {
+        // Regression pin (R10): FenceCleared advances under FailOpen too. The
+        // fence branch in `advance_contiguous_checkpoint` is unconditional; only
+        // the backstop branch differentiates modes. This pin guards that the FC
+        // backstop refusal never accidentally reaches the fence arm.
+        let mut state = SubscriberState::new(5);
+        state.processed_ahead.insert(7);
+        state.processed_ahead.insert(8);
+        state
+            .gap_first_seen
+            .insert(6, obs_fenced(Instant::now(), 100));
+
+        let visible: BTreeSet<u64> = [7, 8].into_iter().collect();
+        let gap_timeout = Duration::from_secs(30);
+        let snap = TxidSnapshot {
+            xmin: 100,
+            xmax: 110,
+        };
+
+        let outcome = advance_contiguous_checkpoint(
+            &mut state,
+            &visible,
+            gap_timeout,
+            Some(snap),
+            FailureMode::FailOpen,
+        );
+
+        assert_eq!(
+            state.contiguous_checkpoint, 8,
+            "FenceCleared must advance FailOpen"
+        );
+        assert!(!state.gap_first_seen.contains_key(&6));
+        assert_eq!(outcome.skipped_gaps.len(), 1);
+        assert_eq!(outcome.skipped_gaps[0].reason, SkipReason::FenceCleared);
+        assert_eq!(
+            outcome.backstop_refused, None,
+            "FenceCleared path never sets backstop_refused"
+        );
+    }
+
+    // ---- Wedged predicate + shared-floor exclusion (spec 0028 P4b) -------
+
+    /// Builds a fail-closed subscriber wedged on a refused gap at `gap_seq`
+    /// (backstop refused, `halt_fired = true`).
+    fn wedged_gap(checkpoint: u64, gap_seq: u64) -> SubscriberState {
+        let mut s = SubscriberState::new(checkpoint);
+        s.failure_mode = FailureMode::FailClosed;
+        s.gap_first_seen.insert(
+            gap_seq,
+            GapObservation {
+                first_seen: Instant::now(),
+                fence_xmax: None,
+                halt_fired: true,
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn is_wedged_predicate_covers_both_halt_kinds() {
+        // Fail-open is never wedged, whatever it holds.
+        let mut fo = SubscriberState::new(5);
+        fo.held_event = Some(6);
+        assert!(!fo.is_wedged(), "fail-open subscribers are never wedged");
+
+        // Fail-closed deser/observer wedge: held_event set.
+        let mut fc_held = SubscriberState::new(5);
+        fc_held.failure_mode = FailureMode::FailClosed;
+        fc_held.held_event = Some(6);
+        assert!(
+            fc_held.is_wedged(),
+            "held_event wedges a fail-closed subscriber"
+        );
+
+        // Fail-closed refused-gap wedge.
+        assert!(
+            wedged_gap(5, 6).is_wedged(),
+            "a refused gap wedges fail-closed"
+        );
+
+        // Fail-closed with only a not-yet-refused (transient) gap is NOT wedged.
+        let mut fc_transient = SubscriberState::new(5);
+        fc_transient.failure_mode = FailureMode::FailClosed;
+        fc_transient.gap_first_seen.insert(6, obs(Instant::now())); // halt_fired = false
+        assert!(
+            !fc_transient.is_wedged(),
+            "a transient (not-yet-refused) gap must not count as wedged (R10 parity)"
+        );
+
+        // A clean fail-closed subscriber is not wedged.
+        let mut fc_clean = SubscriberState::new(5);
+        fc_clean.failure_mode = FailureMode::FailClosed;
+        assert!(!fc_clean.is_wedged());
+    }
+
+    #[test]
+    fn compute_shared_floor_all_wedged_skips_shared_fetch() {
+        // Two fail-closed subscribers, both wedged (one held_event, one refused
+        // gap): there is no healthy consumer, so the shared fetch is skipped.
+        let mut a = SubscriberState::new(5);
+        a.failure_mode = FailureMode::FailClosed;
+        a.held_event = Some(6);
+        let b = wedged_gap(9, 10);
+
+        let states = [a, b];
+        assert_eq!(
+            compute_shared_floor(states.iter()),
+            None,
+            "an all-wedged bus must skip the shared fetch (None)"
+        );
+    }
+
+    #[test]
+    fn compute_shared_floor_mixed_returns_healthy_floor() {
+        // Wedged fail-closed at 5 (excluded), healthy fail-open at 8, and a
+        // healthy fail-closed at 3 whose gap is only transient (not refused).
+        let mut wedged = SubscriberState::new(5);
+        wedged.failure_mode = FailureMode::FailClosed;
+        wedged.held_event = Some(6);
+
+        let healthy_fo = SubscriberState::new(8); // FailOpen default
+
+        let mut healthy_fc = SubscriberState::new(3);
+        healthy_fc.failure_mode = FailureMode::FailClosed;
+        healthy_fc.gap_first_seen.insert(4, obs(Instant::now())); // halt_fired = false
+
+        let states = [wedged, healthy_fo, healthy_fc];
+        // Floor is the min over non-wedged states only: min(8, 3) = 3, ignoring
+        // the wedge's lower checkpoint of 5.
+        assert_eq!(
+            compute_shared_floor(states.iter()),
+            Some(3),
+            "floor must be the min over non-wedged states, excluding the wedge"
+        );
+    }
+
+    #[test]
+    fn compute_shared_floor_no_subscribers_is_zero() {
+        let states: [SubscriberState; 0] = [];
+        assert_eq!(
+            compute_shared_floor(states.iter()),
+            Some(0),
+            "empty subscriber set preserves the legacy unwrap_or(0) floor"
+        );
+    }
+
+    #[test]
+    fn compute_shared_floor_no_wedge_is_plain_min() {
+        // With no wedge the floor is byte-identical to the former plain min.
+        let states = [
+            SubscriberState::new(5),
+            SubscriberState::new(2),
+            SubscriberState::new(9),
+        ];
+        assert_eq!(compute_shared_floor(states.iter()), Some(2));
+    }
+
+    #[test]
+    fn adopt_released_cursor_folds_processed_ahead_without_redelivery() {
+        // Wedged on a refused gap at 6, with events 7 and 8 already applied above
+        // it (processed_ahead) and a further one at 10.
+        let mut state = wedged_gap(5, 6);
+        state.processed_ahead.insert(7);
+        state.processed_ahead.insert(8);
+        state.processed_ahead.insert(10);
+
+        // Operator releases past 8: fold 7 and 8, retain 10 above the cursor.
+        state.adopt_released_cursor(8, Uuid::nil());
+
+        assert_eq!(state.contiguous_checkpoint, 8, "cursor adopted");
+        assert!(
+            !state.gap_first_seen.contains_key(&6),
+            "released gap below the cursor is cleared"
+        );
+        assert!(
+            !state.processed_ahead.contains(&7) && !state.processed_ahead.contains(&8),
+            "applied entries at or below the cursor are folded (not re-delivered)"
+        );
+        assert!(
+            state.processed_ahead.contains(&10),
+            "applied entries above the cursor are retained for exactly-once delivery"
+        );
+        assert!(
+            !state.is_wedged(),
+            "a released subscriber is no longer wedged"
+        );
+    }
+
+    #[test]
+    fn fail_open_backstop_unchanged() {
+        // Regression pin (R10): FailOpen backstop still advances and returns
+        // a SkippedGap entry — byte-identical to the pre-P4 behaviour.
+        let mut state = SubscriberState::new(5);
+        state.processed_ahead.insert(7);
+        state.processed_ahead.insert(8);
+        state
+            .gap_first_seen
+            .insert(6, obs(Instant::now() - Duration::from_secs(10)));
+
+        let visible: BTreeSet<u64> = [7, 8].into_iter().collect();
+        let gap_timeout = Duration::from_secs(5);
+
+        let outcome = advance_contiguous_checkpoint(
+            &mut state,
+            &visible,
+            gap_timeout,
+            None,
+            FailureMode::FailOpen,
+        );
+
+        assert_eq!(
+            state.contiguous_checkpoint, 8,
+            "FailOpen must advance past the gap"
+        );
+        assert_eq!(outcome.skipped_gaps.len(), 1);
+        assert_eq!(outcome.skipped_gaps[0].skipped_sequence, 6);
+        assert_eq!(outcome.skipped_gaps[0].reason, SkipReason::TimeoutBackstop);
+        assert_eq!(
+            outcome.backstop_refused, None,
+            "FailOpen never sets backstop_refused"
+        );
+        assert!(!state.gap_first_seen.contains_key(&6));
     }
 }

@@ -9,11 +9,13 @@ mod subscriber_state;
 pub(crate) use checkpoint::*;
 pub use config::{
     CheckpointMode, DispatchMode, DlqCallback, DlqInsertionInfo, GapTimeoutCallback,
-    GapTimeoutInfo, InstanceMode, ReliableDeliveryConfig,
+    GapTimeoutInfo, HaltCallback, HaltInfo, HaltReason, InstanceMode, ReliableDeliveryConfig,
 };
-pub(crate) use retry::{ProcessResult, process_event_with_retry};
+pub(crate) use retry::{
+    ProcessResult, invoke_observer_once, panic_payload_message, process_event_with_retry,
+};
 pub(crate) use subscriber_state::{
-    SkipReason, SubscriberState, TxidSnapshot, advance_contiguous_checkpoint,
+    SkipReason, SubscriberState, TxidSnapshot, advance_contiguous_checkpoint, compute_shared_floor,
 };
 
 #[cfg(test)]
@@ -21,7 +23,7 @@ pub use retry::calculate_retry_delay_no_jitter;
 
 use crate::event_store::PgDBEvent;
 use epoch_core::event::{Event, EventData};
-use epoch_core::event_store::{EventBus, SubscriptionMode};
+use epoch_core::event_store::{EventBus, FailureMode, SubscriptionMode};
 use epoch_core::prelude::EventObserver;
 use log::{error, info, warn};
 use serde::de::DeserializeOwned;
@@ -34,8 +36,10 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
+use futures::FutureExt;
 use futures::future::join_all;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 
 /// Minimal notification payload — identity/wake signal only.
 ///
@@ -218,6 +222,79 @@ async fn query_txid_snapshot(pool: &PgPool) -> Option<TxidSnapshot> {
     }
 }
 
+/// Writes (or refreshes) the fail-closed deserialize-halt DLQ row for one event
+/// (spec 0028 Q3). Unlike the observer-exhaustion DLQ row, this carries the
+/// `unrecoverable: deserialize:` prefix and does not fire `on_dlq_insertion` —
+/// the halt observability signal for the deser path is `on_halt` plus the row
+/// itself. Failure to write the row is logged, never fatal.
+async fn insert_deser_halt_dlq_row(
+    dlq_pool: &PgPool,
+    subscriber_id: &str,
+    event_id: Uuid,
+    global_sequence: u64,
+    error_message: &str,
+) {
+    if let Err(e) = sqlx::query(
+        r#"
+        INSERT INTO epoch_event_bus_dlq (subscriber_id, event_id, global_sequence, error_message, retry_count, last_retry_at)
+        VALUES ($1, $2, $3, $4, $5, NOW())
+        ON CONFLICT (subscriber_id, event_id) DO UPDATE SET
+            error_message = EXCLUDED.error_message,
+            retry_count = EXCLUDED.retry_count,
+            last_retry_at = NOW()
+        "#,
+    )
+    .bind(subscriber_id)
+    .bind(event_id)
+    .bind(global_sequence as i64)
+    .bind(error_message)
+    .bind(1i32)
+    .execute(dlq_pool)
+    .await
+    {
+        error!(
+            "Failed to insert deserialize-halt DLQ row for '{}' (event {}): {}",
+            subscriber_id, event_id, e
+        );
+    }
+}
+
+/// Fires the optional `on_halt` callback on halt entry (spec 0028 Q3). Fired
+/// once when a fail-closed subscriber enters a halt, never per re-attempt.
+///
+/// The invocation is panic-contained (spec 0028 §3.6, mirroring
+/// [`invoke_observer_once`]): a panicking `HaltCallback` is caught, logged as a
+/// WARN, and the halt proceeds — halt semantics are unaffected by the callback
+/// outcome. Call sites with a [`SubscriberState`] must commit the hold (e.g.
+/// `held_event`) *before* this fires, so a panicking callback can never lose
+/// the hold.
+async fn fire_on_halt(
+    config: &ReliableDeliveryConfig,
+    subscriber_id: &str,
+    held_below_sequence: u64,
+    reason: HaltReason,
+) {
+    if let Some(callback) = &config.on_halt {
+        let info = HaltInfo {
+            subscriber_id: subscriber_id.to_string(),
+            held_below_sequence,
+            reason,
+        };
+        if let Err(payload) = AssertUnwindSafe(callback.on_halt(info))
+            .catch_unwind()
+            .await
+        {
+            warn!(
+                "on_halt callback panicked for '{}' (reason: {:?}): {}. \
+                 The panic is contained; the halt proceeds.",
+                subscriber_id,
+                reason,
+                panic_payload_message(payload)
+            );
+        }
+    }
+}
+
 /// Processes one subscriber against the pre-fetched batch of events.
 /// All per-subscriber state is owned, making this safe to run concurrently.
 async fn process_subscriber_for_batch<D>(
@@ -246,8 +323,30 @@ where
     let replay_always =
         { projection.lock().await.subscription_mode() == SubscriptionMode::ReplayAlways };
     let contiguous_before = state.contiguous_checkpoint;
+    let failure_mode = state.failure_mode;
     let mut processed_any = false;
     let mut last_event_id = last_event_id_in;
+
+    // Bookkeeping for an event this subscriber applied (or, on a fail-open deser
+    // skip, advanced past): record it out-of-order and count it toward the
+    // `Batched` threshold, but never let an ahead-of-gap event become the
+    // published position (spec 0027 R1). The eager seed is born at the current
+    // contiguous prefix.
+    macro_rules! record_applied {
+        ($seq:expr, $id:expr) => {{
+            state.processed_ahead.insert($seq);
+            last_event_id = Some($id);
+            pending_checkpoint
+                .get_or_insert_with(|| {
+                    PendingCheckpoint::seeded(
+                        state.contiguous_checkpoint,
+                        state.contiguous_event_id,
+                    )
+                })
+                .record_processed();
+            processed_any = true;
+        }};
+    }
 
     for row in rows.iter() {
         let event_seq = row.global_sequence.unwrap_or(0) as u64;
@@ -262,6 +361,11 @@ where
             continue;
         }
 
+        // A fail-closed subscriber that halted on exactly this sequence in an
+        // earlier cycle re-attempts it with a SINGLE observer invocation and no
+        // retry ladder (spec 0028 §3.4).
+        let is_reattempt = state.held_event == Some(event_seq);
+
         let data = match row
             .data
             .clone()
@@ -269,30 +373,70 @@ where
             .transpose()
         {
             Ok(data) => data,
-            Err(e) => {
-                warn!(
-                    "Skipping event {} (type: '{}', global_seq: {}) \
-                     for '{}': failed to deserialize: {}. \
-                     This is expected when event variants have been \
-                     removed. Advancing checkpoint past this event.",
-                    event_id, row.event_type, event_seq, subscriber_id, e
-                );
-                state.processed_ahead.insert(event_seq);
-                last_event_id = Some(event_id);
-                // Count the event toward the `Batched` threshold, but never let
-                // an ahead-of-gap event become the published position (spec 0027
-                // R1). The eager seed is born at the current contiguous prefix.
-                pending_checkpoint
-                    .get_or_insert_with(|| {
-                        PendingCheckpoint::seeded(
-                            state.contiguous_checkpoint,
-                            state.contiguous_event_id,
+            Err(e) => match failure_mode {
+                FailureMode::FailClosed => {
+                    // Halt: hold the contiguous prefix below this sequence (no
+                    // processed_ahead insert, no record_processed), write a DLQ
+                    // row, and stop consuming this subscriber's batch. on_halt
+                    // fires only on halt ENTRY, never per re-attempt, to avoid
+                    // alert spam (spec 0028 §3.4). The DLQ row is likewise only
+                    // written on halt entry — a re-attempt must stay cheap, so
+                    // it re-holds with a debug log and no DB write (parity with
+                    // the observer re-attempt path).
+                    let error_message = format!("unrecoverable: deserialize: {}", e);
+                    if !is_reattempt {
+                        insert_deser_halt_dlq_row(
+                            &dlq_pool,
+                            &subscriber_id,
+                            event_id,
+                            event_seq,
+                            &error_message,
                         )
-                    })
-                    .record_processed();
-                processed_any = true;
-                continue;
-            }
+                        .await;
+                    }
+                    // Commit the hold BEFORE the on_halt callback fires so a
+                    // panicking callback cannot lose it (spec 0028 §3.6).
+                    state.held_event = Some(event_seq);
+                    if is_reattempt {
+                        log::debug!(
+                            "Fail-closed subscriber '{}' still cannot deserialize held \
+                             event {} (seq {}): {}. Holding.",
+                            subscriber_id,
+                            event_id,
+                            event_seq,
+                            e
+                        );
+                    } else {
+                        warn!(
+                            "Fail-closed halt for '{}': event {} (seq {}) is undeserializable: \
+                             {}. Holding the checkpoint below this sequence until the payload \
+                             is corrected or the subscriber is released.",
+                            subscriber_id, event_id, event_seq, e
+                        );
+                        fire_on_halt(
+                            &config,
+                            &subscriber_id,
+                            event_seq,
+                            HaltReason::DeserializeFailure,
+                        )
+                        .await;
+                    }
+                    break;
+                }
+                // Fail-open (and any future non-fail-closed mode): log, skip,
+                // and advance past the undeserializable event (unchanged).
+                _ => {
+                    warn!(
+                        "Skipping event {} (type: '{}', global_seq: {}) \
+                         for '{}': failed to deserialize: {}. \
+                         This is expected when event variants have been \
+                         removed. Advancing checkpoint past this event.",
+                        event_id, row.event_type, event_seq, subscriber_id, e
+                    );
+                    record_applied!(event_seq, event_id);
+                    continue;
+                }
+            },
         };
 
         let event = Arc::new(Event::<D> {
@@ -320,32 +464,103 @@ where
             subscriber_id
         );
 
-        process_event_with_retry(&projection, &event, &subscriber_id, &config, &dlq_pool).await;
-
-        state.processed_ahead.insert(event_seq);
-        last_event_id = Some(event_id);
-        // Count the event toward the `Batched` threshold, but never let an
-        // ahead-of-gap event become the published position (spec 0027 R1). The
-        // eager seed is born at the current contiguous prefix.
-        pending_checkpoint
-            .get_or_insert_with(|| {
-                PendingCheckpoint::seeded(state.contiguous_checkpoint, state.contiguous_event_id)
-            })
-            .record_processed();
-        processed_any = true;
+        match failure_mode {
+            // Fail-closed re-attempt of a held event: a single invocation, no
+            // retry ladder. Success clears the marker and resumes normal
+            // delivery from here; failure re-holds silently (spec 0028 §3.4).
+            FailureMode::FailClosed if is_reattempt => {
+                match invoke_observer_once(&projection, &event).await {
+                    Ok(()) => {
+                        state.held_event = None;
+                        record_applied!(event_seq, event_id);
+                    }
+                    Err(err) => {
+                        log::debug!(
+                            "Fail-closed re-attempt of held event {} (seq {}) for '{}' \
+                             failed: {}. Holding.",
+                            event_id,
+                            event_seq,
+                            subscriber_id,
+                            err
+                        );
+                        break;
+                    }
+                }
+            }
+            // Fail-closed first attempt: full retry ladder; on exhaustion, halt
+            // after the DLQ row / on_dlq_insertion already fired inside it.
+            FailureMode::FailClosed => {
+                match process_event_with_retry(
+                    &projection,
+                    &event,
+                    &subscriber_id,
+                    &config,
+                    &dlq_pool,
+                )
+                .await
+                {
+                    ProcessResult::Success => {
+                        record_applied!(event_seq, event_id);
+                    }
+                    ProcessResult::SentToDlq => {
+                        // Commit the hold BEFORE the on_halt callback fires so a
+                        // panicking callback cannot lose it (spec 0028 §3.6).
+                        state.held_event = Some(event_seq);
+                        fire_on_halt(
+                            &config,
+                            &subscriber_id,
+                            event_seq,
+                            HaltReason::ObserverFailure,
+                        )
+                        .await;
+                        break;
+                    }
+                }
+            }
+            // Fail-open (and any future non-fail-closed mode): retry then
+            // DLQ-and-continue, advancing past the event regardless of outcome
+            // (unchanged behaviour).
+            _ => {
+                process_event_with_retry(&projection, &event, &subscriber_id, &config, &dlq_pool)
+                    .await;
+                record_applied!(event_seq, event_id);
+            }
+        }
     }
 
     // CLOUD-180: thread the per-batch snapshot into the pure resolver. With
     // `None` (fencing disabled/unavailable) this is byte-for-byte the legacy
-    // timeout-only resolver.
-    let skipped_gaps =
-        advance_contiguous_checkpoint(&mut state, &visible_seqs, config.gap_timeout, snapshot);
+    // timeout-only resolver. Spec 0028 P4: pass the subscriber's failure_mode
+    // so a FailClosed subscriber refuses the backstop (gap refusal leg).
+    let failure_mode = state.failure_mode;
+    let outcome = advance_contiguous_checkpoint(
+        &mut state,
+        &visible_seqs,
+        config.gap_timeout,
+        snapshot,
+        failure_mode,
+    );
+
+    // Spec 0028 P4 gap refusal: fire on_halt(GapUnproven) on the first batch
+    // cycle where the backstop would have fired but was refused. Subsequent
+    // cycles for the same gap return None (halt_fired guards the entry-only
+    // contract, spec 0028 §3.4).
+    if let Some(refused_seq) = outcome.backstop_refused {
+        fire_on_halt(
+            &config,
+            &subscriber_id,
+            refused_seq,
+            HaltReason::GapUnproven,
+        )
+        .await;
+    }
 
     // Partition by reason: `FenceCleared` skips are expected, lossless rollbacks
     // (writer aborted / burned sequence) and are only debug-logged. Only
     // `TimeoutBackstop` skips carry potential data loss and are recorded via the
     // CLOUD-169 machinery.
-    let (fence_cleared, timeout_backstop): (Vec<_>, Vec<_>) = skipped_gaps
+    let (fence_cleared, timeout_backstop): (Vec<_>, Vec<_>) = outcome
+        .skipped_gaps
         .into_iter()
         .partition(|gap| gap.reason == SkipReason::FenceCleared);
 
@@ -571,6 +786,139 @@ where
     }
 }
 
+/// Runs one private-fetch cycle for a single wedged (halted) fail-closed
+/// `Checkpointed` subscriber (spec 0028 §3.5 / R13/R14).
+///
+/// A wedged subscriber is excluded from the shared `min_checkpoint` floor so a
+/// permanent hold on it never bounds the fetch window for healthy peers (R13).
+/// In exchange it fetches privately from its **own** persisted checkpoint, with
+/// its own `visible_seqs` and txid snapshot, so the shared window floating above
+/// the wedge is never mistaken for a gap. All wedge bookkeeping (contiguous
+/// position, `processed_ahead`, `gap_first_seen` including the first-captured
+/// `fence_xmax`, and `held_event`) is preserved across cycles: only the fetch
+/// cursor is re-seeded from the persisted row, and the sole reconciliation is
+/// the forward jump of an operator release (see
+/// [`SubscriberState::adopt_released_cursor`], R14).
+#[allow(clippy::too_many_arguments)]
+async fn private_fetch_for_wedged_subscriber<D>(
+    projection: Arc<Mutex<dyn EventObserver<D>>>,
+    subscriber_id: String,
+    mut state: SubscriberState,
+    pending_checkpoint: Option<PendingCheckpoint>,
+    last_event_id: Option<Uuid>,
+    config: &ReliableDeliveryConfig,
+    dlq_pool: &PgPool,
+    checkpoint_pool: &PgPool,
+    hwm: Arc<Mutex<HashMap<String, u64>>>,
+) -> SubscriberBatchOutcome
+where
+    D: EventData + Send + Sync + 'static,
+{
+    // Forward reconciliation (R14): re-read the persisted checkpoint each cycle.
+    // If an operator release moved it past the held position, adopt it — folding
+    // already-applied `processed_ahead` entries so nothing is re-delivered (R6).
+    match sqlx::query_as::<_, (i64, Option<Uuid>)>(
+        r#"
+        SELECT last_global_sequence, last_event_id
+        FROM epoch_event_bus_checkpoints
+        WHERE bus_name = $1 AND subscriber_id = $2
+        "#,
+    )
+    .bind(&config.events_table)
+    .bind(&subscriber_id)
+    .fetch_optional(checkpoint_pool)
+    .await
+    {
+        Ok(Some((seq, id))) => {
+            let cursor = seq as u64;
+            if cursor > state.contiguous_checkpoint {
+                state.adopt_released_cursor(cursor, id.unwrap_or_else(Uuid::nil));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                "Failed to re-read persisted checkpoint for wedged subscriber '{}': {}; \
+                 continuing from the in-memory position",
+                subscriber_id, e
+            );
+        }
+    }
+
+    // Private fetch: from this subscriber's own (possibly reconciled) contiguous
+    // position, capped at `catch_up_batch_size`, from its own query's rows.
+    let cursor = state.contiguous_checkpoint;
+    let query = format!(
+        "SELECT id, stream_id, stream_version, event_type, data, \
+         created_at, actor_id, purger_id, purged_at, \
+         global_sequence, causation_id, correlation_id, schema_version \
+         FROM {} WHERE global_sequence > $1 \
+         ORDER BY global_sequence ASC LIMIT $2",
+        config.events_table,
+    );
+    let rows: Vec<PgDBEvent> = match sqlx::query_as(&query)
+        .bind(cursor as i64)
+        .bind(config.catch_up_batch_size as i64)
+        .fetch_all(checkpoint_pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!(
+                "Private fetch for wedged subscriber '{}' failed: {}; state preserved",
+                subscriber_id, e
+            );
+            return SubscriberBatchOutcome {
+                subscriber_id,
+                state,
+                pending_checkpoint,
+                last_event_id,
+                cached_checkpoint: None,
+                processed_any: false,
+            };
+        }
+    };
+
+    let visible_seqs: BTreeSet<u64> = rows
+        .iter()
+        .filter_map(|r| r.global_sequence.map(|gs| gs as u64))
+        .collect();
+    let seq_to_id: HashMap<u64, Uuid> = rows
+        .iter()
+        .filter_map(|r| r.global_sequence.map(|gs| (gs as u64, r.id)))
+        .collect();
+
+    // Own txid snapshot, under the SAME gate the shared path uses
+    // (`snapshot_fencing` && a gap is active), so a gap-wedged subscriber's
+    // `FenceCleared` recovery can still fire from the private path.
+    let snapshot = if config.snapshot_fencing && !state.gap_first_seen.is_empty() {
+        query_txid_snapshot(checkpoint_pool).await
+    } else {
+        None
+    };
+
+    let ctx = BatchContext {
+        rows: Arc::new(rows),
+        visible_seqs: Arc::new(visible_seqs),
+        seq_to_id: Arc::new(seq_to_id),
+        config: config.clone(),
+        dlq_pool: dlq_pool.clone(),
+        checkpoint_pool: checkpoint_pool.clone(),
+        snapshot,
+        hwm,
+    };
+
+    process_subscriber_for_batch(
+        projection,
+        subscriber_id,
+        state,
+        pending_checkpoint,
+        last_event_id,
+        ctx,
+    )
+    .await
+}
+
 /// Represents an entry in the dead letter queue.
 ///
 /// DLQ entries are created when event processing fails after all retry attempts
@@ -668,6 +1016,24 @@ pub enum PgEventBusError {
          dispatched synchronously from publish() and no checkpoint or HWM position is tracked"
     )]
     InlineDispatchNotSupported,
+    /// A [`PgEventBus::release_halt`] call passed a `past_sequence` at or below
+    /// the subscriber's current persisted checkpoint. A release is a forward-only
+    /// skip past a sequence the subscriber never finished (spec 0028 R14), not a
+    /// rewind; rewinding is the job of `update_checkpoint` or, for a
+    /// `ReplayAlways` subscriber, a fresh `subscribe()`.
+    #[error(
+        "release_halt for subscriber '{subscriber_id}' rejected: past_sequence {past_sequence} \
+         is not beyond the current persisted checkpoint {current}; a release is a forward-only \
+         skip past a sequence the subscriber never finished (R14), not a rewind"
+    )]
+    BackwardRelease {
+        /// The subscriber the release targeted.
+        subscriber_id: String,
+        /// The rejected release position.
+        past_sequence: u64,
+        /// The subscriber's current persisted checkpoint.
+        current: u64,
+    },
 }
 
 /// Type alias for the projections collection to reduce type complexity.
@@ -1214,23 +1580,31 @@ where
             // is held across its `on_event`.
             let mut tagged = Vec::with_capacity(projections_snapshot.len());
             for projection in &projections_snapshot {
-                let (priority, subscriber_id, replay_always) = {
+                let (priority, subscriber_id, replay_always, failure_mode) = {
                     let obs = projection.lock().await;
                     (
                         obs.priority(),
                         obs.subscriber_id().to_string(),
                         obs.subscription_mode() == SubscriptionMode::ReplayAlways,
+                        obs.failure_mode(),
                     )
                 };
-                tagged.push((priority, subscriber_id, replay_always, projection));
+                tagged.push((
+                    priority,
+                    subscriber_id,
+                    replay_always,
+                    failure_mode,
+                    projection,
+                ));
             }
-            tagged.sort_by_key(|(priority, _, _, _)| *priority);
+            tagged.sort_by_key(|(priority, _, _, _, _)| *priority);
 
-            for (_, subscriber_id, replay_always, projection) in tagged {
+            for (_, subscriber_id, replay_always, failure_mode, projection) in tagged {
                 if let Err(e) = catch_up_from_checkpoint(
                     projection,
                     &subscriber_id,
                     replay_always,
+                    failure_mode,
                     &config,
                     &checkpoint_pool,
                     &hwm,
@@ -1424,14 +1798,24 @@ where
                 };
 
                 // Initialize per-subscriber state for any new subscribers.
+                //
+                // spec 0028 P4b: also record, per wake, an id -> projection map
+                // and which subscribers are `ReplayAlways`, so a wedged
+                // `Checkpointed` subscriber can be driven by a private fetch
+                // (below) without re-locking every observer a second time.
+                let mut sid_to_proj: Vec<(String, _)> = Vec::new();
+                let mut replay_always_by_sid: HashMap<String, bool> = HashMap::new();
                 for projection in projections_snapshot.iter() {
-                    let (subscriber_id, replay_always) = {
+                    let (subscriber_id, replay_always, failure_mode) = {
                         let guard = projection.lock().await;
                         (
                             guard.subscriber_id().to_string(),
                             guard.subscription_mode() == SubscriptionMode::ReplayAlways,
+                            guard.failure_mode(),
                         )
                     };
+                    replay_always_by_sid.insert(subscriber_id.clone(), replay_always);
+                    sid_to_proj.push((subscriber_id.clone(), projection.clone()));
                     if !subscriber_states.contains_key(&subscriber_id) {
                         // R5 (Correction 2): a ReplayAlways subscriber has no
                         // checkpoint row, so seeding from the checkpoint table would
@@ -1475,9 +1859,74 @@ where
                         };
                         subscriber_states.insert(
                             subscriber_id.clone(),
-                            SubscriberState::new_with_event_id(checkpoint, checkpoint_event_id),
+                            SubscriberState::new_with_event_id(
+                                checkpoint,
+                                checkpoint_event_id,
+                                failure_mode,
+                            ),
                         );
                     }
+                }
+
+                // === Private fetch pass for wedged subscribers (spec 0028 P4b) ===
+                //
+                // A wedged (halted) fail-closed `Checkpointed` subscriber is
+                // excluded from the shared `min_checkpoint` floor so it never
+                // starves healthy peers (R13). It is instead driven once per wake
+                // by a private fetch from its OWN persisted checkpoint, which also
+                // lets an operator release (R14) take effect on a running bus and
+                // lets a gap wedge self-heal via `FenceCleared` from the private
+                // path. The shared-row break conditions do not apply here: this is
+                // a single pass over every wedged subscriber, after which the
+                // cycle continues into the shared loop (or, when everyone is
+                // wedged, ends there and the timer tick re-enters).
+                //
+                // `ReplayAlways` wedges are out of P4b's scope (no persisted
+                // checkpoint row to re-seed from; the remedy is a fresh
+                // `subscribe()`, R9b) — the `ReplayAlways` floor-exclusion analogue
+                // lands in P5. This is the documented, bounded intra-pipeline gap.
+                let wedged_sids: Vec<String> = subscriber_states
+                    .iter()
+                    .filter(|(sid, s)| {
+                        s.is_wedged() && !replay_always_by_sid.get(*sid).copied().unwrap_or(false)
+                    })
+                    .map(|(sid, _)| sid.clone())
+                    .collect();
+                for sid in wedged_sids {
+                    let Some(projection) = sid_to_proj
+                        .iter()
+                        .find(|(s, _)| s == &sid)
+                        .map(|(_, p)| p.clone())
+                    else {
+                        continue;
+                    };
+                    let Some(state) = subscriber_states.remove(&sid) else {
+                        continue;
+                    };
+                    let pending = pending_checkpoints.remove(&sid);
+                    let last_id = last_event_ids.get(&sid).copied();
+                    let outcome = private_fetch_for_wedged_subscriber(
+                        projection,
+                        sid,
+                        state,
+                        pending,
+                        last_id,
+                        &config,
+                        &dlq_pool,
+                        &checkpoint_pool,
+                        hwm.clone(),
+                    )
+                    .await;
+                    if let Some(val) = outcome.cached_checkpoint {
+                        checkpoint_cache.insert(outcome.subscriber_id.clone(), val);
+                    }
+                    if let Some(id) = outcome.last_event_id {
+                        last_event_ids.insert(outcome.subscriber_id.clone(), id);
+                    }
+                    if let Some(p) = outcome.pending_checkpoint {
+                        pending_checkpoints.insert(outcome.subscriber_id.clone(), p);
+                    }
+                    subscriber_states.insert(outcome.subscriber_id, outcome.state);
                 }
 
                 // Shared batch loop: fetch events once from the minimum checkpoint,
@@ -1505,12 +1954,16 @@ where
                         break;
                     }
 
-                    // Find the minimum contiguous checkpoint across all subscribers.
-                    let min_checkpoint = subscriber_states
-                        .values()
-                        .map(|s| s.contiguous_checkpoint)
-                        .min()
-                        .unwrap_or(0);
+                    // Find the shared-fetch floor: the minimum contiguous
+                    // checkpoint across all NON-wedged subscribers (spec 0028 P4b
+                    // / R13). `None` means every subscriber is wedged and is
+                    // already being driven by its own private fetch (above), so
+                    // the shared fetch is skipped for this cycle. With no wedge
+                    // this is byte-identical to the former `min().unwrap_or(0)`.
+                    let min_checkpoint = match compute_shared_floor(subscriber_states.values()) {
+                        Some(floor) => floor,
+                        None => break,
+                    };
 
                     let catchup_query = format!(
                         "SELECT id, stream_id, stream_version, event_type, data, \
@@ -1551,6 +2004,19 @@ where
                         .collect();
 
                     let mut any_subscriber_processed = false;
+
+                    // Wedged subscribers are driven by the private pass, never the
+                    // shared batch (spec 0028 P4b): they are excluded here so they
+                    // see their own `visible_seqs` and never mistake the shared
+                    // window (floated above the wedge) for a gap. Materialized as
+                    // an owned set so the immutable read of `subscriber_states`
+                    // ends before the per-priority `remove`/`insert` below. Empty
+                    // when nothing is wedged, leaving the shared path unchanged.
+                    let wedged_now: std::collections::HashSet<String> = subscriber_states
+                        .iter()
+                        .filter(|(_, s)| s.is_wedged())
+                        .map(|(sid, _)| sid.clone())
+                        .collect();
 
                     // Process the shared batch with concurrent dispatch within each
                     // priority group. Projections (priority 0) must complete before
@@ -1603,7 +2069,11 @@ where
                         let mut seen_sids = std::collections::HashSet::<String>::new();
                         let task_inputs: Vec<_> = tagged
                             .iter()
-                            .filter(|(p, sid, _)| *p == priority && seen_sids.insert(sid.clone()))
+                            .filter(|(p, sid, _)| {
+                                *p == priority
+                                    && !wedged_now.contains(sid.as_str())
+                                    && seen_sids.insert(sid.clone())
+                            })
                             .map(|(_, sid, proj)| {
                                 let state = subscriber_states
                                     .remove(sid)
@@ -1788,6 +2258,100 @@ where
         Ok(())
     }
 
+    /// Releases a wedged (halted) fail-closed `Checkpointed` subscriber by
+    /// advancing its persisted checkpoint *past* a held sequence it never
+    /// finished (spec 0028 §3.4 / R14).
+    ///
+    /// This is the explicit, audited operator remedy for a halt that cannot
+    /// self-heal — most importantly a genuinely lost sequence (an
+    /// abandoned/prepared transaction pinning `xmin` past `fence_xmax`) that the
+    /// `gap_timeout` backstop would skip for a fail-open subscriber but a
+    /// fail-closed subscriber holds indefinitely. It is deliberately distinct
+    /// from [`PgEventBus::update_checkpoint`], whose contract is a contiguous
+    /// prefix the subscriber *has* finished: a release, by definition, accepts a
+    /// skip past a sequence the subscriber never processed.
+    ///
+    /// `past_sequence` is the sequence to advance beyond: on success the
+    /// subscriber resumes delivery from `past_sequence + 1`. Any events already
+    /// applied above the released position (`processed_ahead`) are still
+    /// delivered exactly once, never re-delivered (R6): the running listener's
+    /// private re-seeding fetch folds them in on its next cycle.
+    ///
+    /// The release takes effect on a running bus without a restart. On success
+    /// it writes the checkpoint row, logs a `WARN`, and fires the
+    /// [`HaltCallback`] with
+    /// [`HaltReason::Released`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PgEventBusError::BackwardRelease`] when `past_sequence` is at or
+    /// below the current persisted checkpoint: a release is forward-only, not a
+    /// rewind.
+    pub async fn release_halt(
+        &self,
+        subscriber_id: &str,
+        past_sequence: u64,
+    ) -> Result<(), PgEventBusError> {
+        let current = self.get_checkpoint(subscriber_id).await?.unwrap_or(0);
+        if past_sequence <= current {
+            return Err(PgEventBusError::BackwardRelease {
+                subscriber_id: subscriber_id.to_string(),
+                past_sequence,
+                current,
+            });
+        }
+
+        // Pair the released cursor with the event at `past_sequence` if one
+        // exists; a released sequence is often one that never committed, in
+        // which case `Uuid::nil()` is the honest (unpublishable) pairing.
+        let event_id: Uuid = sqlx::query_scalar(&format!(
+            "SELECT id FROM {} WHERE global_sequence = $1",
+            self.config.events_table,
+        ))
+        .bind(past_sequence as i64)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or_else(Uuid::nil);
+
+        sqlx::query(
+            r#"
+            INSERT INTO epoch_event_bus_checkpoints (bus_name, subscriber_id, last_global_sequence, last_event_id, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (bus_name, subscriber_id) DO UPDATE SET
+                last_global_sequence = EXCLUDED.last_global_sequence,
+                last_event_id = EXCLUDED.last_event_id,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(&self.config.events_table)
+        .bind(subscriber_id)
+        .bind(past_sequence as i64)
+        .bind(event_id)
+        .execute(&self.pool)
+        .await?;
+
+        warn!(
+            "Operator release: advanced subscriber '{}' past held sequence {} (was {}). \
+             Any sequence at or below {} the subscriber never finished is now skipped; \
+             delivery resumes from {}.",
+            subscriber_id,
+            past_sequence,
+            current,
+            past_sequence,
+            past_sequence + 1,
+        );
+
+        fire_on_halt(
+            &self.config,
+            subscriber_id,
+            past_sequence,
+            HaltReason::Released,
+        )
+        .await;
+
+        Ok(())
+    }
+
     // -------------------------------------------------------------------------
     // spec 0024 R1 — Subscriber lag / readiness
     // -------------------------------------------------------------------------
@@ -1897,7 +2461,7 @@ where
     ///
     /// Returns [`PgEventBusError::SubscriberNotFound`] if `subscriber_id` is
     /// not registered on this bus, or [`PgEventBusError::InlineDispatchNotSupported`]
-    /// if this bus is [`DispatchMode::Inline`](crate::DispatchMode::Inline) (Inline
+    /// if this bus is [`DispatchMode::Inline`] (Inline
     /// dispatch tracks no checkpoint or HWM position to measure lag against).
     ///
     /// # Hazard: one slow subscriber can hold up the rest
@@ -1994,7 +2558,7 @@ where
     ///
     /// Returns [`PgEventBusError::SubscriberNotFound`] if `subscriber_id` is
     /// not registered on this bus, or [`PgEventBusError::InlineDispatchNotSupported`]
-    /// if this bus is [`DispatchMode::Inline`](crate::DispatchMode::Inline).
+    /// if this bus is [`DispatchMode::Inline`].
     pub async fn wait_until_caught_up(
         &self,
         subscriber_id: &str,
@@ -2023,7 +2587,7 @@ where
     /// Returns `Ok(true)` only if **all** registered subscribers are caught up
     /// before the timeout, `Ok(false)` otherwise. Returns
     /// [`PgEventBusError::InlineDispatchNotSupported`] if this bus is
-    /// [`DispatchMode::Inline`](crate::DispatchMode::Inline).
+    /// [`DispatchMode::Inline`].
     ///
     /// # Hazard: an empty registry is trivially "caught up"
     /// If no subscribers are registered yet, this returns `Ok(true)`
@@ -2691,7 +3255,25 @@ where
 
                         for subscriber in sorted {
                             let guard = subscriber.lock().await;
-                            if let Err(e) = guard.on_event(entry.event.clone()).await {
+                            // Contain a panicking observer (spec 0028 §3.6/R11):
+                            // the inline path has no listener to survive, so a
+                            // caught panic routes through this same `Err` branch,
+                            // which runs the `inline_state` cleanup below
+                            // (in_progress reset, queue cleared, waiters notified)
+                            // — without it a swallowed panic would deadlock the bus.
+                            let outcome =
+                                match AssertUnwindSafe(guard.on_event(entry.event.clone()))
+                                    .catch_unwind()
+                                    .await
+                                {
+                                    Ok(result) => result,
+                                    Err(payload) => Err(format!(
+                                        "observer panicked: {}",
+                                        panic_payload_message(payload)
+                                    )
+                                    .into()),
+                                };
+                            if let Err(e) = outcome {
                                 // Notify waiters so they don't hang on error.
                                 entry.done.notify_one();
                                 let mut state = inline_state.lock().await;
@@ -2826,6 +3408,16 @@ async fn advance_catchup_prefix(
     checkpoint_cache: &mut HashMap<String, u64>,
 ) {
     if replay_always {
+        // CLOUD-227: apply the same contiguous-prefix guard as Checkpointed.
+        // Before this fix, the HWM was always the maximum sequence seen,
+        // meaning a hole in the catch-up window would cause the live listener
+        // to re-seed `contiguous_checkpoint` above the hole, permanently
+        // skipping the missing sequence. Now the HWM advances only across an
+        // unbroken prefix, matching the Checkpointed path exactly.
+        if event_global_seq != *contiguous + 1 {
+            return;
+        }
+        *contiguous = event_global_seq;
         hwm.lock()
             .await
             .insert(subscriber_id.to_string(), event_global_seq);
@@ -2901,6 +3493,7 @@ pub(crate) async fn catch_up_from_checkpoint<ED>(
     observer: &Arc<Mutex<dyn EventObserver<ED>>>,
     subscriber_id: &str,
     replay_always: bool,
+    failure_mode: FailureMode,
     config: &ReliableDeliveryConfig,
     pool: &PgPool,
     hwm: &Arc<Mutex<HashMap<String, u64>>>,
@@ -2954,6 +3547,12 @@ where
          ORDER BY global_sequence ASC LIMIT $2",
         config.events_table,
     );
+    // Fail-closed halt marker (spec 0028 R3). Set at the bad row, it breaks the
+    // inner row loop AND the outer pagination loop: without the outer break a
+    // full batch (batch_size == catch_up_batch_size) would re-fetch the same
+    // window from the unchanged `current_sequence`, re-hit the same row, and
+    // spin forever with no sleep, so `subscribe()` would never return.
+    let mut halted = false;
     loop {
         let rows: Vec<PgDBEvent> = sqlx::query_as(&subscriber_catchup_query)
             .bind(current_sequence as i64)
@@ -2979,33 +3578,67 @@ where
 
             let data: Option<ED> = match row.data.map(|d| serde_json::from_value(d)).transpose() {
                 Ok(d) => d,
-                Err(e) => {
-                    warn!(
-                        "Catch-up: skipping event {} (type: '{}', global_seq: {}) for '{}': \
-                             failed to deserialize: {}. This is expected when event variants have \
-                             been removed from the application enum. Advancing checkpoint past this event.",
-                        event_id, row.event_type, event_global_seq, subscriber_id, e
-                    );
-                    // Advance current_sequence and the contiguous prefix past
-                    // the undeserializable event to avoid an infinite retry loop;
-                    // a skipped-past event counts as processed for the prefix.
-                    current_sequence = event_global_seq;
-                    total_caught_up += 1;
-                    advance_catchup_prefix(
-                        replay_always,
-                        hwm,
-                        subscriber_id,
-                        event_global_seq,
-                        event_id,
-                        &mut contiguous,
-                        &mut pending_checkpoint,
-                        config,
-                        pool,
-                        &mut checkpoint_cache,
-                    )
-                    .await;
-                    continue;
-                }
+                Err(e) => match failure_mode {
+                    // Fail-closed halt (spec 0028 R3, catch-up leg): hold the
+                    // contiguous prefix below this sequence (skip the advance),
+                    // write the deser DLQ row, fire on_halt, and break out of
+                    // both loops via the halt marker. The final flush stays safe
+                    // by construction — `pending_checkpoint` never advanced past
+                    // the hole, so there is nothing above it to flush.
+                    FailureMode::FailClosed => {
+                        let error_message = format!("unrecoverable: deserialize: {}", e);
+                        warn!(
+                            "Catch-up: fail-closed halt for '{}': event {} (seq {}) is \
+                             undeserializable: {}. Holding the checkpoint below this sequence \
+                             until the payload is corrected or the subscriber is released.",
+                            subscriber_id, event_id, event_global_seq, e
+                        );
+                        insert_deser_halt_dlq_row(
+                            pool,
+                            subscriber_id,
+                            event_id,
+                            event_global_seq,
+                            &error_message,
+                        )
+                        .await;
+                        fire_on_halt(
+                            config,
+                            subscriber_id,
+                            event_global_seq,
+                            HaltReason::DeserializeFailure,
+                        )
+                        .await;
+                        halted = true;
+                        break;
+                    }
+                    // Fail-open (unchanged): log, skip, advance past the
+                    // undeserializable event to avoid an infinite retry loop; a
+                    // skipped-past event counts as processed for the prefix.
+                    _ => {
+                        warn!(
+                            "Catch-up: skipping event {} (type: '{}', global_seq: {}) for '{}': \
+                                 failed to deserialize: {}. This is expected when event variants have \
+                                 been removed from the application enum. Advancing checkpoint past this event.",
+                            event_id, row.event_type, event_global_seq, subscriber_id, e
+                        );
+                        current_sequence = event_global_seq;
+                        total_caught_up += 1;
+                        advance_catchup_prefix(
+                            replay_always,
+                            hwm,
+                            subscriber_id,
+                            event_global_seq,
+                            event_id,
+                            &mut contiguous,
+                            &mut pending_checkpoint,
+                            config,
+                            pool,
+                            &mut checkpoint_cache,
+                        )
+                        .await;
+                        continue;
+                    }
+                },
             };
 
             let event = Arc::new(Event {
@@ -3029,6 +3662,31 @@ where
             // Use the same retry/DLQ logic as real-time processing
             let result =
                 process_event_with_retry(observer, &event, subscriber_id, config, pool).await;
+
+            // Fail-closed observer-exhaustion halt (spec 0028 R3/R4, catch-up
+            // leg): the DLQ row + on_dlq_insertion already fired inside the
+            // retry ladder; add on_halt and hold below this sequence (skip the
+            // advance, do not bump the cursor), breaking both loops via the
+            // halt marker.
+            if let ProcessResult::SentToDlq = result
+                && failure_mode == FailureMode::FailClosed
+            {
+                warn!(
+                    "Catch-up: fail-closed halt for '{}': observer exhausted retries on event \
+                     {} (seq {}). Holding the checkpoint below this sequence until the observer \
+                     recovers or the subscriber is released.",
+                    subscriber_id, event_id, event_global_seq
+                );
+                fire_on_halt(
+                    config,
+                    subscriber_id,
+                    event_global_seq,
+                    HaltReason::ObserverFailure,
+                )
+                .await;
+                halted = true;
+                break;
+            }
 
             advance_catchup_prefix(
                 replay_always,
@@ -3054,6 +3712,13 @@ where
                     subscriber_id
                 );
             }
+        }
+
+        // A fail-closed halt exits the outer pagination loop too, or a full
+        // batch would re-fetch the same window and spin forever (spec 0028 P3
+        // P0 fix).
+        if halted {
+            break;
         }
 
         // If we got fewer events than the batch size, we've caught up
@@ -3149,9 +3814,13 @@ where
             // process never drives, burning its whole timeout every time (a
             // ReplayAlways position is a per-process HWM that would then never
             // advance here).
-            let (subscriber_id, mode) = {
+            let (subscriber_id, mode, failure_mode) = {
                 let o = observer.lock().await;
-                (o.subscriber_id().to_string(), o.subscription_mode())
+                (
+                    o.subscriber_id().to_string(),
+                    o.subscription_mode(),
+                    o.failure_mode(),
+                )
             };
             let replay_always = mode == SubscriptionMode::ReplayAlways;
 
@@ -3347,6 +4016,7 @@ where
                 &observer,
                 &subscriber_id,
                 replay_always,
+                failure_mode,
                 &config,
                 &pool,
                 &hwm,
@@ -3378,6 +4048,14 @@ where
             }
 
             let mut processed_from_buffer = 0u64;
+            // Fail-closed drain halt marker (spec 0028 R3, drain leg). Set at the
+            // bad row, it breaks both the inner row loop and the outer
+            // pagination loop (a full batch would otherwise re-fetch the same
+            // window and spin forever). It must NOT early-return out of
+            // subscribe(): registration (projections.push below) and the
+            // post-drain flush still run, so the subscriber is driven by the
+            // listener and can self-heal (R3, §3.3).
+            let mut halted = false;
 
             // Only query if at least one buffered event is newer than our checkpoint.
             // The `global_sequence > current_sequence` predicate also performs the
@@ -3427,15 +4105,53 @@ where
                             .transpose()
                         {
                             Ok(d) => Some(d),
-                            Err(e) => {
-                                warn!(
-                                    "Buffer processing: skipping event {} (type: '{}', \
-                                     global_seq: {}) for '{}': failed to deserialize: {}. \
-                                     Advancing checkpoint past this event.",
-                                    event_id, row.event_type, event_global_seq, subscriber_id, e
-                                );
-                                None
-                            }
+                            Err(e) => match failure_mode {
+                                // Fail-closed halt: hold below this sequence (skip
+                                // the shared advance), write the deser DLQ row,
+                                // fire on_halt, and break both loops.
+                                FailureMode::FailClosed => {
+                                    let error_message =
+                                        format!("unrecoverable: deserialize: {}", e);
+                                    warn!(
+                                        "Buffer processing: fail-closed halt for '{}': event {} \
+                                         (seq {}) is undeserializable: {}. Holding the checkpoint \
+                                         below this sequence until the payload is corrected or the \
+                                         subscriber is released.",
+                                        subscriber_id, event_id, event_global_seq, e
+                                    );
+                                    insert_deser_halt_dlq_row(
+                                        &pool,
+                                        &subscriber_id,
+                                        event_id,
+                                        event_global_seq,
+                                        &error_message,
+                                    )
+                                    .await;
+                                    fire_on_halt(
+                                        &config,
+                                        &subscriber_id,
+                                        event_global_seq,
+                                        HaltReason::DeserializeFailure,
+                                    )
+                                    .await;
+                                    halted = true;
+                                    break;
+                                }
+                                // Fail-open (unchanged): log, skip, advance past.
+                                _ => {
+                                    warn!(
+                                        "Buffer processing: skipping event {} (type: '{}', \
+                                         global_seq: {}) for '{}': failed to deserialize: {}. \
+                                         Advancing checkpoint past this event.",
+                                        event_id,
+                                        row.event_type,
+                                        event_global_seq,
+                                        subscriber_id,
+                                        e
+                                    );
+                                    None
+                                }
+                            },
                         };
 
                         if let Some(data) = maybe_data {
@@ -3468,6 +4184,31 @@ where
 
                             processed_from_buffer += 1;
 
+                            // Fail-closed observer-exhaustion halt (drain leg):
+                            // the DLQ row + on_dlq_insertion already fired inside
+                            // the retry ladder; add on_halt and hold below this
+                            // sequence by breaking before the shared advance.
+                            if let ProcessResult::SentToDlq = result
+                                && failure_mode == FailureMode::FailClosed
+                            {
+                                warn!(
+                                    "Buffer processing: fail-closed halt for '{}': observer \
+                                     exhausted retries on event {} (seq {}). Holding the \
+                                     checkpoint below this sequence until the observer recovers \
+                                     or the subscriber is released.",
+                                    subscriber_id, event_id, event_global_seq
+                                );
+                                fire_on_halt(
+                                    &config,
+                                    &subscriber_id,
+                                    event_global_seq,
+                                    HaltReason::ObserverFailure,
+                                )
+                                .await;
+                                halted = true;
+                                break;
+                            }
+
                             if let ProcessResult::Success = result {
                                 log::debug!(
                                     "Processed buffered event {} for '{}'",
@@ -3496,6 +4237,13 @@ where
                         .await;
 
                         current_sequence = event_global_seq;
+                    }
+
+                    // A fail-closed halt exits the outer pagination loop too
+                    // (spec 0028 P3 P0 fix), through normal control flow so
+                    // registration and the final flush below still run.
+                    if halted {
+                        break;
                     }
 
                     if batch_size < config.catch_up_batch_size as usize {
@@ -3917,10 +4665,17 @@ mod tests {
         let (_, s4) = cu_insert(&pool, &table, stream_id, 4).await;
         let (_, s5) = cu_insert(&pool, &table, stream_id, 5).await;
 
-        let (cursor, contiguous) =
-            catch_up_from_checkpoint(&observer, &sub_id, false, &config, &pool, &hwm)
-                .await
-                .expect("catch_up_from_checkpoint");
+        let (cursor, contiguous) = catch_up_from_checkpoint(
+            &observer,
+            &sub_id,
+            false,
+            FailureMode::FailOpen,
+            &config,
+            &pool,
+            &hwm,
+        )
+        .await
+        .expect("catch_up_from_checkpoint");
 
         // Prefix must stop before the hole. This table is exclusive to this
         // test, so no concurrent process can extend the contiguous run; the
@@ -3986,10 +4741,17 @@ mod tests {
         let (_, s4) = cu_insert(&pool, &table, stream_id, 4).await;
         let (_, s5) = cu_insert(&pool, &table, stream_id, 5).await;
 
-        let (cursor, contiguous) =
-            catch_up_from_checkpoint(&observer, &sub_id, false, &config, &pool, &hwm)
-                .await
-                .expect("catch_up_from_checkpoint");
+        let (cursor, contiguous) = catch_up_from_checkpoint(
+            &observer,
+            &sub_id,
+            false,
+            FailureMode::FailOpen,
+            &config,
+            &pool,
+            &hwm,
+        )
+        .await
+        .expect("catch_up_from_checkpoint");
 
         assert!(
             contiguous < s3 as u64,
@@ -4040,10 +4802,17 @@ mod tests {
         let (_, _s2) = cu_insert(&pool, table, stream_id, 2).await;
         let (_, s3) = cu_insert(&pool, table, stream_id, 3).await;
 
-        let (cursor, contiguous) =
-            catch_up_from_checkpoint(&observer, &sub_id, false, &config, &pool, &hwm)
-                .await
-                .expect("catch_up_from_checkpoint");
+        let (cursor, contiguous) = catch_up_from_checkpoint(
+            &observer,
+            &sub_id,
+            false,
+            FailureMode::FailOpen,
+            &config,
+            &pool,
+            &hwm,
+        )
+        .await
+        .expect("catch_up_from_checkpoint");
 
         // The cursor scans to the head regardless of gaps, so it must reach s3
         // whether or not the range is contiguous.
@@ -4106,10 +4875,17 @@ mod tests {
         // cu_set_checkpoint for Checkpointed subscribers).
         hwm.lock().await.insert(sub_id.clone(), s3 as u64 - 3);
 
-        let (cursor, _contiguous) =
-            catch_up_from_checkpoint(&observer, &sub_id, true, &config, &pool, &hwm)
-                .await
-                .expect("catch_up_from_checkpoint");
+        let (cursor, _contiguous) = catch_up_from_checkpoint(
+            &observer,
+            &sub_id,
+            true,
+            FailureMode::FailOpen,
+            &config,
+            &pool,
+            &hwm,
+        )
+        .await
+        .expect("catch_up_from_checkpoint");
 
         // Cursor must reach at least s3.
         assert!(cursor >= s3 as u64, "cursor must reach at least s3");

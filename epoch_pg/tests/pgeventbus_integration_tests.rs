@@ -66,6 +66,7 @@ struct TestProjection {
     state_store: InMemoryStateStore<TestState>,
     subscriber_id: String,
     subscription_mode: SubscriptionMode,
+    failure_mode: FailureMode,
 }
 
 impl TestProjection {
@@ -78,6 +79,7 @@ impl TestProjection {
             state_store: InMemoryStateStore::new(),
             subscriber_id,
             subscription_mode: SubscriptionMode::Checkpointed,
+            failure_mode: FailureMode::FailOpen,
         }
     }
 
@@ -88,7 +90,15 @@ impl TestProjection {
             state_store: InMemoryStateStore::new(),
             subscriber_id,
             subscription_mode: SubscriptionMode::ReplayAlways,
+            failure_mode: FailureMode::FailOpen,
         }
+    }
+
+    /// Marks this projection [`FailureMode::FailClosed`] (spec 0028): it halts
+    /// rather than skipping an event it cannot apply in order.
+    pub fn fail_closed(mut self) -> Self {
+        self.failure_mode = FailureMode::FailClosed;
+        self
     }
 }
 
@@ -127,6 +137,10 @@ impl EventApplicator<TestEventData> for TestProjection {
 impl Projection<TestEventData> for TestProjection {
     fn subscription_mode(&self) -> SubscriptionMode {
         self.subscription_mode
+    }
+
+    fn failure_mode(&self) -> FailureMode {
+        self.failure_mode
     }
 }
 
@@ -7017,4 +7031,2467 @@ async fn test_live_replay_always_writes_no_checkpoint() {
         checkpoint, None,
         "a ReplayAlways subscriber must write no checkpoint from the live path (R6)"
     );
+}
+
+// ============================================================================
+// Spec 0028 (CLOUD-216) — fail-closed live-path delivery, observability, and
+// panic containment (phase P2).
+//
+// Every test here runs on an `isolated_events_table` under `#[serial]`, per the
+// standing isolation rule: a fail-closed subscriber starting at checkpoint 0
+// would otherwise wedge on any malformed row a sibling binary left on the
+// shared `epoch_events` table.
+// ============================================================================
+
+use epoch_pg::event_bus::{DlqCallback, DlqInsertionInfo, HaltCallback, HaltInfo, HaltReason};
+use std::collections::HashMap as StdHashMap;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+/// Inserts a committed row whose `data` cannot be deserialized as
+/// `TestEventData`, returning its id and assigned `global_sequence`.
+async fn insert_corrupt_event(
+    pool: &PgPool,
+    table: &str,
+    stream_id: Uuid,
+    version: i64,
+) -> (Uuid, i64) {
+    let id = Uuid::new_v4();
+    let data = serde_json::json!({ "garbage": true, "not_a_variant": 123 });
+    let seq: i64 = sqlx::query_scalar(&format!(
+        r#"INSERT INTO {table} (id, stream_id, stream_version, event_type, data, created_at)
+           VALUES ($1, $2, $3, 'MyEvent', $4, NOW())
+           RETURNING global_sequence"#
+    ))
+    .bind(id)
+    .bind(stream_id)
+    .bind(version)
+    .bind(&data)
+    .fetch_one(pool)
+    .await
+    .expect("insert corrupt event");
+    (id, seq)
+}
+
+/// Raw `SELECT` against `epoch_event_bus_dlq` for one subscriber. There is no
+/// bus-level DLQ-read API (`list_dlq_entries` does not exist), so tests read the
+/// table directly. Returns `(event_id, global_sequence, error_message)` rows.
+async fn read_dlq_rows(pool: &PgPool, subscriber_id: &str) -> Vec<(Uuid, i64, String)> {
+    sqlx::query_as::<_, (Uuid, i64, String)>(
+        r#"SELECT event_id, global_sequence, error_message
+           FROM epoch_event_bus_dlq
+           WHERE subscriber_id = $1
+           ORDER BY global_sequence ASC"#,
+    )
+    .bind(subscriber_id)
+    .fetch_all(pool)
+    .await
+    .expect("read dlq rows")
+}
+
+/// Rewrites a row's `data` payload so a previously-undeserializable event now
+/// deserializes (drives the self-healing recovery path, spec 0028 §3.4).
+async fn fix_event_payload(pool: &PgPool, table: &str, global_sequence: i64, value: &str) {
+    let data = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: value.to_string(),
+    }))
+    .unwrap();
+    sqlx::query(&format!(
+        "UPDATE {table} SET data = $1 WHERE global_sequence = $2"
+    ))
+    .bind(&data)
+    .bind(global_sequence)
+    .execute(pool)
+    .await
+    .expect("fix event payload");
+}
+
+/// Builds and starts a `PgEventBus` on `table` with `config`, using a fresh
+/// per-test NOTIFY channel. The caller is responsible for setting
+/// `config.events_table` to `table`.
+async fn start_isolated_bus(
+    pool: &PgPool,
+    config: epoch_pg::event_bus::ReliableDeliveryConfig,
+) -> PgEventBus<TestEventData> {
+    let channel_name = format!("test_fc_{}", Uuid::new_v4().simple());
+    let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+    event_bus
+        .start_listener()
+        .await
+        .expect("Failed to start listener");
+    event_bus
+}
+
+/// Captures every `HaltInfo` the bus fires, for assertions on halt entry.
+struct CapturingHaltCallback {
+    halts: Arc<StdMutex<Vec<HaltInfo>>>,
+}
+
+#[async_trait]
+impl HaltCallback for CapturingHaltCallback {
+    async fn on_halt(&self, info: HaltInfo) {
+        self.halts.lock().unwrap().push(info);
+    }
+}
+
+/// A `HaltCallback` that panics on its **first** `on_halt` invocation and
+/// records every later one, so a test can prove (a) a panicking callback does
+/// not kill the listener task, (b) the hold engages anyway, and (c) the panic
+/// did not poison future halt entries (the second halt is recorded).
+struct PanicOnceHaltCallback {
+    calls: AtomicU32,
+    halts: Arc<StdMutex<Vec<HaltInfo>>>,
+}
+
+#[async_trait]
+impl HaltCallback for PanicOnceHaltCallback {
+    async fn on_halt(&self, info: HaltInfo) {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("deterministic halt-callback panic");
+        }
+        self.halts.lock().unwrap().push(info);
+    }
+}
+
+/// Captures every `DlqInsertionInfo` the bus fires (observer-exhaustion path).
+struct CapturingDlqCallback {
+    inserts: Arc<StdMutex<Vec<DlqInsertionInfo>>>,
+}
+
+#[async_trait]
+impl DlqCallback for CapturingDlqCallback {
+    async fn on_dlq_insertion(&self, info: DlqInsertionInfo) {
+        self.inserts.lock().unwrap().push(info);
+    }
+}
+
+/// An `EventObserver` whose `on_event` fails while `healthy` is `false` and
+/// succeeds once flipped `true`, counting invocations per sequence so a test can
+/// poll the retry/re-attempt cadence (spec 0028 R4).
+struct CountingFailingObserver {
+    subscriber_id: String,
+    failure_mode: FailureMode,
+    healthy: Arc<AtomicBool>,
+    invocations: Arc<StdMutex<StdHashMap<u64, u32>>>,
+    applied: Arc<StdMutex<Vec<u64>>>,
+}
+
+impl epoch_core::SubscriberId for CountingFailingObserver {
+    fn subscriber_id(&self) -> &str {
+        &self.subscriber_id
+    }
+}
+
+#[async_trait]
+impl EventObserver<TestEventData> for CountingFailingObserver {
+    async fn on_event(
+        &self,
+        event: Arc<Event<TestEventData>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let seq = event.global_sequence.unwrap_or(0);
+        *self.invocations.lock().unwrap().entry(seq).or_insert(0) += 1;
+        if self.healthy.load(Ordering::SeqCst) {
+            self.applied.lock().unwrap().push(seq);
+            Ok(())
+        } else {
+            Err(format!("counting-failing observer down for seq {seq}").into())
+        }
+    }
+
+    fn failure_mode(&self) -> FailureMode {
+        self.failure_mode
+    }
+}
+
+/// An `EventObserver` whose `on_event` always panics with a deterministic
+/// message (spec 0028 §3.6 panic containment).
+struct PanickingObserver {
+    subscriber_id: String,
+    failure_mode: FailureMode,
+    invocations: Arc<AtomicU32>,
+}
+
+impl epoch_core::SubscriberId for PanickingObserver {
+    fn subscriber_id(&self) -> &str {
+        &self.subscriber_id
+    }
+}
+
+#[async_trait]
+impl EventObserver<TestEventData> for PanickingObserver {
+    async fn on_event(
+        &self,
+        _event: Arc<Event<TestEventData>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        panic!("panicking observer: deterministic boom");
+    }
+
+    fn failure_mode(&self) -> FailureMode {
+        self.failure_mode
+    }
+}
+
+fn seq_invocations(invocations: &Arc<StdMutex<StdHashMap<u64, u32>>>, seq: u64) -> u32 {
+    invocations.lock().unwrap().get(&seq).copied().unwrap_or(0)
+}
+
+/// Polls until the DLQ has at least one row for `subscriber_id`, returning them.
+async fn poll_dlq_rows(pool: &PgPool, subscriber_id: &str) -> Vec<(Uuid, i64, String)> {
+    for _ in 0..80 {
+        let rows = read_dlq_rows(pool, subscriber_id).await;
+        if !rows.is_empty() {
+            return rows;
+        }
+        tokio::time::sleep(GapDuration::from_millis(50)).await;
+    }
+    read_dlq_rows(pool, subscriber_id).await
+}
+
+/// Polls until `subscriber_id`'s persisted checkpoint equals `expected`.
+async fn poll_checkpoint_eq(
+    event_bus: &PgEventBus<TestEventData>,
+    subscriber_id: &str,
+    expected: Option<u64>,
+) -> bool {
+    for _ in 0..80 {
+        if event_bus
+            .get_checkpoint(subscriber_id)
+            .await
+            .expect("get checkpoint")
+            == expected
+        {
+            return true;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    false
+}
+
+/// T1 (R2, R7, R8): a fail-closed live deserialize failure holds the contiguous
+/// checkpoint below the bad sequence, writes a DLQ row, fires `on_halt`, blocks
+/// readiness, and leaves a healthy fail-open peer unaffected.
+#[tokio::test]
+#[serial]
+async fn test_live_deser_halt_holds_checkpoint_fail_closed() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let fc_id = format!("projection:fc-deser:{}", Uuid::new_v4());
+    let fc = TestProjection::with_subscriber_id(fc_id.clone()).fail_closed();
+    let fc_store = fc.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(fc))
+        .await
+        .expect("subscribe fc");
+
+    let peer_id = format!("projection:peer:{}", Uuid::new_v4());
+    let peer = TestProjection::with_subscriber_id(peer_id.clone());
+    let peer_store = peer.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(peer))
+        .await
+        .expect("subscribe peer");
+
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (valid1_id, seq1) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (corrupt_id, seq2) = insert_corrupt_event(&pool, &table, stream, 2).await;
+    let (valid3_id, seq3) = insert_committed_event(&pool, &table, stream, 3, "v3").await;
+
+    // The healthy peer skips the corrupt row and advances to the tail.
+    assert!(
+        poll_checkpoint_eq(&event_bus, &peer_id, Some(seq3 as u64)).await,
+        "healthy fail-open peer must advance past the corrupt row to seq {seq3}"
+    );
+
+    // The fail-closed subscriber holds at the last good sequence.
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(seq1 as u64)).await,
+        "fail-closed subscriber must hold its checkpoint at seq {seq1} (below the corrupt row)"
+    );
+
+    let fc_state = fc_store.get_state(stream).await.unwrap().unwrap();
+    let fc_ids: Vec<Uuid> = fc_state.0.iter().map(|e| e.id).collect();
+    assert_eq!(
+        fc_ids,
+        vec![valid1_id],
+        "fail-closed applied only the pre-halt event"
+    );
+
+    let peer_state = peer_store.get_state(stream).await.unwrap().unwrap();
+    let peer_ids: Vec<Uuid> = peer_state.0.iter().map(|e| e.id).collect();
+    assert!(peer_ids.contains(&valid1_id) && peer_ids.contains(&valid3_id));
+    assert!(!peer_ids.contains(&corrupt_id));
+
+    // R8: a held wedge blocks readiness.
+    let ready = event_bus
+        .wait_until_caught_up(&fc_id, GapDuration::from_secs(2))
+        .await
+        .expect("wait_until_caught_up");
+    assert!(
+        !ready,
+        "a held fail-closed subscriber must not certify as caught up"
+    );
+
+    // R7: deser DLQ row.
+    let dlq = poll_dlq_rows(&pool, &fc_id).await;
+    assert_eq!(
+        dlq.len(),
+        1,
+        "exactly one deser DLQ row for the corrupt event"
+    );
+    assert_eq!(dlq[0].0, corrupt_id);
+    assert_eq!(dlq[0].1, seq2);
+    assert!(
+        dlq[0].2.starts_with("unrecoverable: deserialize:"),
+        "unexpected DLQ error_message: {}",
+        dlq[0].2
+    );
+
+    // R7: on_halt fired exactly once, on entry.
+    {
+        let halts = halts.lock().unwrap();
+        assert_eq!(
+            halts.len(),
+            1,
+            "on_halt fires once on entry, not per re-attempt"
+        );
+        assert_eq!(halts[0].subscriber_id, fc_id);
+        assert_eq!(halts[0].held_below_sequence, seq2 as u64);
+        assert_eq!(halts[0].reason, HaltReason::DeserializeFailure);
+    }
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T2 (R6): after T1's deser halt, correcting the payload lets the next batch
+/// apply the held event and everything after it exactly once, in order, with no
+/// manual replay.
+#[tokio::test]
+#[serial]
+async fn test_live_deser_halt_self_heals_after_fix() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let fc_id = format!("projection:fc-heal:{}", Uuid::new_v4());
+    let fc = TestProjection::with_subscriber_id(fc_id.clone()).fail_closed();
+    let fc_store = fc.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(fc))
+        .await
+        .expect("subscribe fc");
+
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_valid1_id, seq1) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (_corrupt_id, seq2) = insert_corrupt_event(&pool, &table, stream, 2).await;
+    let (_valid3_id, seq3) = insert_committed_event(&pool, &table, stream, 3, "v3").await;
+
+    // Confirm the halt landed at seq1.
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(seq1 as u64)).await,
+        "fail-closed subscriber must first halt at seq {seq1}"
+    );
+
+    // Fix the corrupt payload; the next batch self-heals.
+    fix_event_payload(&pool, &table, seq2, "recovered").await;
+
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(seq3 as u64)).await,
+        "after the fix the checkpoint must advance to the tail seq {seq3}"
+    );
+
+    let fc_state = fc_store.get_state(stream).await.unwrap().unwrap();
+    let seqs: Vec<u64> = fc_state
+        .0
+        .iter()
+        .map(|e| e.global_sequence.unwrap())
+        .collect();
+    assert_eq!(
+        seqs,
+        vec![seq1 as u64, seq2 as u64, seq3 as u64],
+        "recovery applies the held event and everything after it exactly once, in order"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T2b (spec 0028 §3.6 panic containment, halt-callback leg): a `HaltCallback`
+/// whose `on_halt` panics on a live-path deserialize halt must not kill the
+/// listener task or lose the hold. The panic is contained and logged, the
+/// checkpoint stays held below the bad sequence, the held event is
+/// re-attempted (never skipped) once the payload is fixed, and a later halt
+/// entry still fires — this callback panics only on its first invocation, so
+/// the second halt is recorded.
+#[tokio::test]
+#[serial]
+async fn test_live_deser_halt_survives_panicking_halt_callback() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let callback = Arc::new(PanicOnceHaltCallback {
+        calls: AtomicU32::new(0),
+        halts: halts.clone(),
+    });
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        on_halt: Some(callback.clone()),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let fc_id = format!("projection:fc-panic-halt:{}", Uuid::new_v4());
+    let fc = TestProjection::with_subscriber_id(fc_id.clone()).fail_closed();
+    let fc_store = fc.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(fc))
+        .await
+        .expect("subscribe fc");
+
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_valid1_id, seq1) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (_corrupt_id, seq2) = insert_corrupt_event(&pool, &table, stream, 2).await;
+    let (_valid3_id, seq3) = insert_committed_event(&pool, &table, stream, 3, "v3").await;
+
+    // (b) The hold engages even though the callback panicked on halt entry:
+    // the checkpoint stays at the last good sequence.
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(seq1 as u64)).await,
+        "checkpoint must hold at seq {seq1} despite the panicking halt callback"
+    );
+
+    // (a) The listener task survives the panic: fix the payload and the wedged
+    // subscriber re-attempts the held event on its next batch and self-heals.
+    fix_event_payload(&pool, &table, seq2, "recovered-after-panic").await;
+    let (_valid4_id, seq4) = insert_committed_event(&pool, &table, stream, 4, "v4").await;
+
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(seq4 as u64)).await,
+        "listener task must survive the panicking halt callback: after the payload \
+         fix the checkpoint must advance to the tail seq {seq4}"
+    );
+
+    // (b) The held event was re-attempted, not skipped: recovery applies
+    // seq1..seq4 exactly once, in order.
+    let fc_state = fc_store.get_state(stream).await.unwrap().unwrap();
+    let seqs: Vec<u64> = fc_state
+        .0
+        .iter()
+        .map(|e| e.global_sequence.unwrap())
+        .collect();
+    assert_eq!(
+        seqs,
+        vec![seq1 as u64, seq2 as u64, seq3 as u64, seq4 as u64],
+        "the previously-held event must be re-attempted (not skipped), in order"
+    );
+
+    // (c) The panic did not poison future halts: a second corrupt event halts
+    // again; this time the callback (past its first invocation) records the
+    // halt instead of panicking.
+    let (_corrupt2_id, seq5) = insert_corrupt_event(&pool, &table, stream, 5).await;
+
+    let mut recorded: Vec<HaltInfo> = Vec::new();
+    for _ in 0..80 {
+        recorded = halts.lock().unwrap().clone();
+        if !recorded.is_empty() {
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the second halt entry must fire and be recorded: {recorded:?}"
+    );
+    assert_eq!(recorded[0].subscriber_id, fc_id);
+    assert_eq!(recorded[0].held_below_sequence, seq5 as u64);
+    assert_eq!(recorded[0].reason, HaltReason::DeserializeFailure);
+
+    // The second halt holds the checkpoint below its bad sequence again.
+    assert_eq!(
+        event_bus
+            .get_checkpoint(&fc_id)
+            .await
+            .expect("get checkpoint"),
+        Some(seq4 as u64),
+        "the second halt must hold the checkpoint at seq {seq4}"
+    );
+
+    // Entry-only contract intact: exactly two on_halt invocations (the panicking
+    // first and the recorded second) — re-attempts of the held event never
+    // re-fire the callback.
+    assert_eq!(
+        callback.calls.load(Ordering::SeqCst),
+        2,
+        "on_halt must fire once per halt entry, never per re-attempt"
+    );
+
+    assert!(
+        event_bus.is_running().await,
+        "listener task must stay alive"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T3 (R4, R6, R7): a fail-closed observer that exhausts its retries halts after
+/// a DLQ row + `on_dlq_insertion` + `on_halt`; during the halt it is re-invoked
+/// at most about once per batch cycle (never the full retry ladder), a healthy
+/// peer is unaffected, and fixing the observer self-heals.
+#[tokio::test]
+#[serial]
+async fn test_live_observer_failure_halt_fail_closed() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let dlq_inserts = Arc::new(StdMutex::new(Vec::new()));
+    let max_retries = 3u32;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        max_retries,
+        initial_retry_delay: GapDuration::from_millis(50),
+        max_retry_delay: GapDuration::from_millis(200),
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        on_dlq_insertion: Some(Arc::new(CapturingDlqCallback {
+            inserts: dlq_inserts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let healthy = Arc::new(AtomicBool::new(false));
+    let invocations = Arc::new(StdMutex::new(StdHashMap::new()));
+    let applied = Arc::new(StdMutex::new(Vec::new()));
+    let fc_id = format!("observer:fc-fail:{}", Uuid::new_v4());
+    event_bus
+        .subscribe(CountingFailingObserver {
+            subscriber_id: fc_id.clone(),
+            failure_mode: FailureMode::FailClosed,
+            healthy: healthy.clone(),
+            invocations: invocations.clone(),
+            applied: applied.clone(),
+        })
+        .await
+        .expect("subscribe failing observer");
+
+    let peer_id = format!("projection:peer:{}", Uuid::new_v4());
+    let peer = TestProjection::with_subscriber_id(peer_id.clone());
+    event_bus
+        .subscribe(ProjectionHandler::new(peer))
+        .await
+        .expect("subscribe peer");
+
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_e1, seq1) = insert_committed_event(&pool, &table, stream, 1, "e1").await;
+    let (_e2, seq2) = insert_committed_event(&pool, &table, stream, 2, "e2").await;
+    let (_e3, seq3) = insert_committed_event(&pool, &table, stream, 3, "e3").await;
+
+    // The observer fails on the first event: DLQ row + callbacks + halt below seq1.
+    let dlq = poll_dlq_rows(&pool, &fc_id).await;
+    assert_eq!(dlq.len(), 1, "observer failure DLQs the failed event");
+    assert_eq!(dlq[0].1, seq1);
+
+    // Healthy peer is unaffected.
+    assert!(
+        poll_checkpoint_eq(&event_bus, &peer_id, Some(seq3 as u64)).await,
+        "healthy peer advances to the tail while the observer is wedged"
+    );
+
+    // Fail-closed subscriber holds below the failing sequence (no checkpoint row).
+    assert_eq!(
+        event_bus
+            .get_checkpoint(&fc_id)
+            .await
+            .expect("get checkpoint"),
+        None,
+        "the wedged fail-closed observer must not persist any checkpoint"
+    );
+
+    // on_dlq_insertion + on_halt both fired.
+    assert!(
+        dlq_inserts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|i| i.subscriber_id == fc_id && i.retry_count == max_retries + 1),
+        "on_dlq_insertion fires with retry_count == max_retries + 1"
+    );
+    {
+        let h = halts.lock().unwrap();
+        assert_eq!(h.len(), 1, "on_halt fires once on entry");
+        assert_eq!(h[0].subscriber_id, fc_id);
+        assert_eq!(h[0].reason, HaltReason::ObserverFailure);
+        assert_eq!(h[0].held_below_sequence, seq1 as u64);
+    }
+
+    // R4: the ladder ran once; during the hold the observer is re-invoked ~once
+    // per batch cycle, never re-running the full ladder each cycle.
+    let first_failure_count = seq_invocations(&invocations, seq1 as u64);
+    assert!(
+        first_failure_count > max_retries,
+        "the first failure must run the full ladder ({} invocations), saw {first_failure_count}",
+        max_retries + 1
+    );
+    let wait_secs = 3u32;
+    tokio::time::sleep(GapDuration::from_secs(wait_secs as u64)).await;
+    let held_count = seq_invocations(&invocations, seq1 as u64);
+    assert!(
+        held_count <= first_failure_count + wait_secs + 3,
+        "held re-attempts must be ~1 per cycle: {held_count} > {first_failure_count} + {wait_secs} + slack"
+    );
+    assert!(
+        held_count < first_failure_count * max_retries,
+        "the retry ladder must not re-run every cycle: {held_count} >= {first_failure_count} * {max_retries}"
+    );
+
+    // R6: fixing the observer self-heals — the held event and everything after
+    // it are applied exactly once, in order.
+    healthy.store(true, Ordering::SeqCst);
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(seq3 as u64)).await,
+        "after the observer recovers the checkpoint advances to the tail"
+    );
+    let applied = applied.lock().unwrap().clone();
+    assert_eq!(
+        applied,
+        vec![seq1 as u64, seq2 as u64, seq3 as u64],
+        "recovery applies every held-and-after event exactly once, in order"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T8-live (R11): a panicking observer no longer kills the listener task. Under
+/// fail-closed it halts (DLQ + `on_halt`); the listener stays alive and a
+/// healthy peer keeps advancing.
+#[tokio::test]
+#[serial]
+async fn test_live_panicking_observer_fail_closed_halts() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        max_retries: 2,
+        initial_retry_delay: GapDuration::from_millis(50),
+        max_retry_delay: GapDuration::from_millis(100),
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let invocations = Arc::new(AtomicU32::new(0));
+    let panic_id = format!("observer:panic-fc:{}", Uuid::new_v4());
+    event_bus
+        .subscribe(PanickingObserver {
+            subscriber_id: panic_id.clone(),
+            failure_mode: FailureMode::FailClosed,
+            invocations: invocations.clone(),
+        })
+        .await
+        .expect("subscribe panicking observer");
+
+    let peer_id = format!("projection:peer:{}", Uuid::new_v4());
+    let peer = TestProjection::with_subscriber_id(peer_id.clone());
+    event_bus
+        .subscribe(ProjectionHandler::new(peer))
+        .await
+        .expect("subscribe peer");
+
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_e1, seq1) = insert_committed_event(&pool, &table, stream, 1, "e1").await;
+
+    // Panic is contained → DLQ + halt, not listener death.
+    let dlq = poll_dlq_rows(&pool, &panic_id).await;
+    assert_eq!(dlq[0].1, seq1);
+    assert!(
+        poll_checkpoint_eq(&event_bus, &peer_id, Some(seq1 as u64)).await,
+        "listener survives the panic and keeps serving the healthy peer"
+    );
+    assert!(
+        event_bus.is_running().await,
+        "listener task must still be alive"
+    );
+    assert!(invocations.load(Ordering::SeqCst) >= 1);
+    {
+        let h = halts.lock().unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].reason, HaltReason::ObserverFailure);
+    }
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T8-live (R10/R11): under fail-open a panicking observer is contained and the
+/// checkpoint advances past the event (documented behaviour change — the
+/// listener survives where today it would die).
+#[tokio::test]
+#[serial]
+async fn test_live_panicking_observer_fail_open_continues() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        max_retries: 2,
+        initial_retry_delay: GapDuration::from_millis(50),
+        max_retry_delay: GapDuration::from_millis(100),
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let invocations = Arc::new(AtomicU32::new(0));
+    let panic_id = format!("observer:panic-fo:{}", Uuid::new_v4());
+    event_bus
+        .subscribe(PanickingObserver {
+            subscriber_id: panic_id.clone(),
+            failure_mode: FailureMode::FailOpen,
+            invocations: invocations.clone(),
+        })
+        .await
+        .expect("subscribe panicking observer");
+
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_e1, seq1) = insert_committed_event(&pool, &table, stream, 1, "e1").await;
+
+    // DLQ + continue: the fail-open observer advances past the panicking event.
+    let dlq = poll_dlq_rows(&pool, &panic_id).await;
+    assert_eq!(dlq[0].1, seq1);
+    assert!(
+        poll_checkpoint_eq(&event_bus, &panic_id, Some(seq1 as u64)).await,
+        "fail-open contains the panic and advances past the event"
+    );
+    assert!(
+        event_bus.is_running().await,
+        "listener task must still be alive"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T6 (Batched interplay): in `Batched` mode a fail-closed wedge must not let the
+/// periodic `max_delay_ms` flush publish above the held sequence; after the fix,
+/// flushes resume.
+#[tokio::test]
+#[serial]
+async fn test_live_batched_fail_closed_wedge_holds_then_resumes() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        checkpoint_mode: epoch_pg::event_bus::CheckpointMode::Batched {
+            batch_size: 1000,
+            max_delay_ms: 200,
+        },
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let fc_id = format!("projection:fc-batched:{}", Uuid::new_v4());
+    let fc = TestProjection::with_subscriber_id(fc_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(fc))
+        .await
+        .expect("subscribe fc");
+
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_valid1_id, seq1) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (_corrupt_id, seq2) = insert_corrupt_event(&pool, &table, stream, 2).await;
+    let (_valid3_id, seq3) = insert_committed_event(&pool, &table, stream, 3, "v3").await;
+
+    // Halt lands at seq1.
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(seq1 as u64)).await,
+        "batched fail-closed subscriber must hold at seq {seq1}"
+    );
+
+    // Across several max_delay periods the periodic flush must not publish above
+    // the wedge.
+    for _ in 0..8 {
+        tokio::time::sleep(GapDuration::from_millis(200)).await;
+        assert_eq!(
+            event_bus
+                .get_checkpoint(&fc_id)
+                .await
+                .expect("get checkpoint"),
+            Some(seq1 as u64),
+            "the batched timer flush must never publish above the held wedge"
+        );
+    }
+
+    // After the fix the wedge clears and flushes resume.
+    fix_event_payload(&pool, &table, seq2, "recovered").await;
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(seq3 as u64)).await,
+        "after the fix the batched flush resumes and reaches seq {seq3}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+// ============================================================================
+// P3 (spec 0028): catch-up + drain fail-closed halt, inline panic containment.
+//
+// T4 (R3, R7, R8): a fail-closed subscriber halts at the bad sequence during
+// the catch-up pass and the subscribe() buffer drain, without advancing, and a
+// drain halt still completes registration so the subscriber self-heals under
+// the live listener. Two catch-up variants exercise both the short-batch case
+// and the FULL-batch case (which proves the P0 infinite-loop hazard is fixed:
+// a spinning bus would hang the bounded subscribe() timeout below).
+//
+// T8 remainder (R11): a panic during catch-up is contained (halt + DLQ, no
+// crash of subscribe()); a panic in the inline drain routes through publish()'s
+// Err branch with inline_state cleaned up (no deadlock).
+// ============================================================================
+
+/// Builds a bus on an isolated `table` WITHOUT starting the live listener, so
+/// the only path that can halt is the one under test (catch-up inside
+/// `subscribe()`), giving clean single-halt `on_halt` assertions.
+async fn build_isolated_bus_no_listener(
+    pool: &PgPool,
+    config: epoch_pg::event_bus::ReliableDeliveryConfig,
+) -> PgEventBus<TestEventData> {
+    let channel_name = format!("test_fc_nl_{}", Uuid::new_v4().simple());
+    let event_bus = PgEventBus::<TestEventData>::with_config(pool.clone(), channel_name, config);
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("Failed to setup trigger");
+    event_bus
+}
+
+/// Pre-plants a persisted checkpoint row for `subscriber_id` on `table`'s bus,
+/// so catch-up resumes from `seq` rather than replaying the whole table.
+async fn plant_checkpoint(
+    pool: &PgPool,
+    table: &str,
+    subscriber_id: &str,
+    seq: i64,
+    event_id: Uuid,
+) {
+    sqlx::query(
+        r#"INSERT INTO epoch_event_bus_checkpoints
+               (bus_name, subscriber_id, last_global_sequence, last_event_id, updated_at)
+           VALUES ($1, $2, $3, $4, NOW())
+           ON CONFLICT (bus_name, subscriber_id) DO UPDATE SET
+               last_global_sequence = EXCLUDED.last_global_sequence,
+               last_event_id = EXCLUDED.last_event_id,
+               updated_at = NOW()"#,
+    )
+    .bind(table)
+    .bind(subscriber_id)
+    .bind(seq)
+    .bind(event_id)
+    .execute(pool)
+    .await
+    .expect("plant checkpoint");
+}
+
+/// T4 catch-up variant 1 (short-batch, R3/R7/R8): with a pre-planted checkpoint
+/// and a corrupt row just above it, catch-up inside `subscribe()` halts at the
+/// bad sequence — no advance, DLQ row, `on_halt`, readiness blocked. The batch
+/// containing the corrupt row is short (< catch_up_batch_size), so this variant
+/// would pass even with the P0 hazard present; the full-batch variant below is
+/// what proves the fix.
+#[tokio::test]
+#[serial]
+async fn test_catchup_deser_halt_short_batch_fail_closed() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = build_isolated_bus_no_listener(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (valid1_id, seq1) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (corrupt_id, seq2) = insert_corrupt_event(&pool, &table, stream, 2).await;
+    let (_valid3_id, _seq3) = insert_committed_event(&pool, &table, stream, 3, "v3").await;
+
+    let fc_id = format!("projection:fc-catchup-short:{}", Uuid::new_v4());
+    // Pre-plant the checkpoint at seq1 so catch-up resumes just below the corrupt row.
+    plant_checkpoint(&pool, &table, &fc_id, seq1, valid1_id).await;
+
+    let fc = TestProjection::with_subscriber_id(fc_id.clone()).fail_closed();
+    let fc_store = fc.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(fc))
+        .await
+        .expect("subscribe fc (catch-up halt must not error out)");
+
+    // No advance past the corrupt row: checkpoint held at seq1.
+    assert_eq!(
+        event_bus
+            .get_checkpoint(&fc_id)
+            .await
+            .expect("get checkpoint"),
+        Some(seq1 as u64),
+        "catch-up must hold the checkpoint at seq {seq1}, below the corrupt row"
+    );
+
+    // The corrupt row and everything after it stayed unapplied.
+    assert!(
+        fc_store.get_state(stream).await.unwrap().is_none(),
+        "catch-up applied nothing above the pre-planted checkpoint"
+    );
+
+    // R8: readiness blocked.
+    assert!(
+        !event_bus
+            .wait_until_caught_up(&fc_id, GapDuration::from_secs(2))
+            .await
+            .expect("wait_until_caught_up"),
+        "a held fail-closed subscriber must not certify as caught up"
+    );
+
+    // R7: deser DLQ row + on_halt on entry.
+    let dlq = read_dlq_rows(&pool, &fc_id).await;
+    assert_eq!(
+        dlq.len(),
+        1,
+        "exactly one deser DLQ row for the corrupt event"
+    );
+    assert_eq!(dlq[0].0, corrupt_id);
+    assert_eq!(dlq[0].1, seq2);
+    assert!(dlq[0].2.starts_with("unrecoverable: deserialize:"));
+    {
+        let h = halts.lock().unwrap();
+        assert_eq!(h.len(), 1, "on_halt fires once, on entry");
+        assert_eq!(h[0].subscriber_id, fc_id);
+        assert_eq!(h[0].held_below_sequence, seq2 as u64);
+        assert_eq!(h[0].reason, HaltReason::DeserializeFailure);
+    }
+
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T4 catch-up variant 2 (FULL-batch, R3/R7/R8 + P0 hazard): more than
+/// `catch_up_batch_size` (100) rows sit below the corrupt one, so the batch that
+/// contains the corrupt row is full. Before the P0 fix, halting only the inner
+/// row loop on a full batch re-fetches the identical window forever and
+/// `subscribe()` never returns; the bounded timeout below turns that spin into a
+/// clear test failure instead of a hang.
+#[tokio::test]
+#[serial]
+async fn test_catchup_deser_halt_full_batch_fail_closed() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        // Default catch_up_batch_size is 100; keep it so the "full batch" is 100.
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let batch = config.catch_up_batch_size;
+    let event_bus = build_isolated_bus_no_listener(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    // valid(seq1), corrupt(seq2), then > catch_up_batch_size valid rows below it,
+    // so the first LIMIT `batch` page is full and contains the corrupt row.
+    let (_valid1_id, seq1) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (corrupt_id, seq2) = insert_corrupt_event(&pool, &table, stream, 2).await;
+    for i in 0..(batch as i64 + 5) {
+        insert_committed_event(&pool, &table, stream, 3 + i, "tail").await;
+    }
+
+    let fc_id = format!("projection:fc-catchup-full:{}", Uuid::new_v4());
+    let fc = TestProjection::with_subscriber_id(fc_id.clone()).fail_closed();
+
+    // A spinning catch-up would never let subscribe() return; bound it.
+    let subscribe_fut = event_bus.subscribe(ProjectionHandler::new(fc));
+    tokio::time::timeout(GapDuration::from_secs(30), subscribe_fut)
+        .await
+        .expect(
+            "subscribe() did not return within 30s — the catch-up pagination loop is spinning on a \
+             full batch (P0 infinite-loop hazard is not fixed)",
+        )
+        .expect("subscribe fc (catch-up halt must not error out)");
+
+    // Held at seq1 despite 100+ rows below the corrupt one.
+    assert_eq!(
+        event_bus
+            .get_checkpoint(&fc_id)
+            .await
+            .expect("get checkpoint"),
+        Some(seq1 as u64),
+        "full-batch catch-up must still hold at seq {seq1}, below the corrupt row"
+    );
+
+    assert!(
+        !event_bus
+            .wait_until_caught_up(&fc_id, GapDuration::from_secs(2))
+            .await
+            .expect("wait_until_caught_up"),
+        "a held fail-closed subscriber must not certify as caught up"
+    );
+
+    let dlq = read_dlq_rows(&pool, &fc_id).await;
+    assert_eq!(
+        dlq.len(),
+        1,
+        "exactly one deser DLQ row for the corrupt event"
+    );
+    assert_eq!(dlq[0].0, corrupt_id);
+    assert_eq!(dlq[0].1, seq2);
+    {
+        let h = halts.lock().unwrap();
+        assert_eq!(h.len(), 1, "on_halt fires once, on entry");
+        assert_eq!(h[0].reason, HaltReason::DeserializeFailure);
+        assert_eq!(h[0].held_below_sequence, seq2 as u64);
+    }
+
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T4 drain leg (R3): a fail-closed halt during the subscribe() catch-up/buffer
+/// drain phase must NOT early-return out of subscribe() — registration
+/// completes, so the live listener drives the subscriber afterward and it
+/// self-heals once the payload is fixed. A small `catch_up_batch_size` plus
+/// events committed concurrently during catch-up pushes the corrupt row through
+/// the buffer drain; whichever path (catch-up or drain) catches it, fail-closed
+/// holds below it and never advances past it.
+#[tokio::test]
+#[serial]
+async fn test_drain_halt_registers_and_self_heals_fail_closed() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        catch_up_batch_size: 2,
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // Pre-existing rows so catch-up takes several DB round-trips at batch_size=2,
+    // widening the window for the during-task's rows to land in the buffer drain.
+    let stream = Uuid::new_v4();
+    let mut last_pre_seq = 0i64;
+    for i in 1i64..=20 {
+        let (_id, s) = insert_committed_event(&pool, &table, stream, i, "pre").await;
+        last_pre_seq = s;
+    }
+
+    // Concurrently commit valid → corrupt → valid while catch-up runs.
+    let pool2 = pool.clone();
+    let table2 = table.clone();
+    let during = tokio::spawn(async move {
+        tokio::time::sleep(GapDuration::from_millis(5)).await;
+        let (_v1, s1) = insert_committed_event(&pool2, &table2, stream, 21, "d1").await;
+        let (corrupt_id, sc) = insert_corrupt_event(&pool2, &table2, stream, 22).await;
+        let (_v2, s2) = insert_committed_event(&pool2, &table2, stream, 23, "d2").await;
+        (s1, corrupt_id, sc, s2)
+    });
+
+    let fc_id = format!("projection:fc-drain:{}", Uuid::new_v4());
+    let fc = TestProjection::with_subscriber_id(fc_id.clone()).fail_closed();
+    // R3: a drain halt must not turn subscribe() into an Err / early return.
+    event_bus
+        .subscribe(ProjectionHandler::new(fc))
+        .await
+        .expect("subscribe fc (drain halt must still complete registration)");
+
+    let (s1, corrupt_id, sc, s2) = during.await.expect("during task");
+    assert!(
+        sc > last_pre_seq,
+        "corrupt row must sit above the pre-existing rows"
+    );
+
+    // Fail-closed never advances past the corrupt row on any path — the
+    // checkpoint holds at the last good sequence below it.
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(s1 as u64)).await,
+        "fail-closed must hold the checkpoint at seq {s1}, below the corrupt row {sc}"
+    );
+
+    // R7: DLQ row for the corrupt event + on_halt fired (at least once — a halt
+    // can be re-entered by the live listener after a catch-up/drain halt).
+    let dlq = poll_dlq_rows(&pool, &fc_id).await;
+    assert!(
+        dlq.iter().any(|(id, seq, msg)| *id == corrupt_id
+            && *seq == sc
+            && msg.starts_with("unrecoverable: deserialize:")),
+        "a deser DLQ row must exist for the corrupt event, got {dlq:?}"
+    );
+    assert!(
+        halts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|h| h.subscriber_id == fc_id
+                && h.reason == HaltReason::DeserializeFailure
+                && h.held_below_sequence == sc as u64),
+        "on_halt must fire for the drain/catch-up deser halt"
+    );
+
+    // R8: readiness blocked while held.
+    assert!(
+        !event_bus
+            .wait_until_caught_up(&fc_id, GapDuration::from_secs(2))
+            .await
+            .expect("wait_until_caught_up"),
+        "a held fail-closed subscriber must not certify as caught up"
+    );
+
+    // R3 + R6: because registration completed, the live listener drives the
+    // subscriber, so fixing the payload self-heals it up to the tail.
+    fix_event_payload(&pool, &table, sc, "recovered").await;
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(s2 as u64)).await,
+        "after the fix the registered subscriber self-heals to seq {s2}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T8 catch-up leg (R11): a panicking observer during the catch-up pass is
+/// contained (classified as an observer failure → DLQ → fail-closed halt);
+/// `subscribe()` returns normally rather than unwinding the panic to the caller.
+#[tokio::test]
+#[serial]
+async fn test_catchup_panicking_observer_contained_fail_closed() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        max_retries: 1,
+        initial_retry_delay: GapDuration::from_millis(20),
+        max_retry_delay: GapDuration::from_millis(40),
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = build_isolated_bus_no_listener(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (_e1, seq1) = insert_committed_event(&pool, &table, stream, 1, "e1").await;
+
+    let invocations = Arc::new(AtomicU32::new(0));
+    let panic_id = format!("observer:catchup-panic-fc:{}", Uuid::new_v4());
+    // A panic in catch-up must not unwind through subscribe(): it returns Ok,
+    // with the halt surfaced via the DLQ + on_halt.
+    event_bus
+        .subscribe(PanickingObserver {
+            subscriber_id: panic_id.clone(),
+            failure_mode: FailureMode::FailClosed,
+            invocations: invocations.clone(),
+        })
+        .await
+        .expect("subscribe panicking observer (catch-up panic must be contained)");
+
+    assert!(
+        invocations.load(Ordering::SeqCst) >= 1,
+        "the observer was invoked during catch-up"
+    );
+    // Held below seq1: no checkpoint persisted.
+    assert_eq!(
+        event_bus
+            .get_checkpoint(&panic_id)
+            .await
+            .expect("get checkpoint"),
+        None,
+        "the wedged fail-closed observer must not persist a checkpoint"
+    );
+    let dlq = read_dlq_rows(&pool, &panic_id).await;
+    assert_eq!(dlq.len(), 1, "the panicking event is DLQ'd");
+    assert_eq!(dlq[0].1, seq1);
+    {
+        let h = halts.lock().unwrap();
+        assert_eq!(h.len(), 1, "on_halt fires once on entry");
+        assert_eq!(h[0].reason, HaltReason::ObserverFailure);
+        assert_eq!(h[0].held_below_sequence, seq1 as u64);
+    }
+
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T8 inline leg (R11): a panic in the inline drain is caught and routed through
+/// `publish()`'s existing `Err` branch, with `inline_state` cleaned up — a
+/// subsequent `publish()` must not deadlock on stuck `in_progress`/unnotified
+/// waiters.
+#[tokio::test]
+#[serial]
+async fn test_inline_drain_panic_returns_err_no_deadlock() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let channel_name = format!("inline_panic_{}", Uuid::new_v4().simple());
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        dispatch_mode: epoch_pg::event_bus::DispatchMode::Inline,
+        ..Default::default()
+    };
+    let event_bus: PgEventBus<TestEventData> =
+        PgEventBus::with_config(pool.clone(), channel_name, config);
+
+    let invocations = Arc::new(AtomicU32::new(0));
+    let panic_id = format!("observer:inline-panic:{}", Uuid::new_v4());
+    event_bus
+        .subscribe(PanickingObserver {
+            subscriber_id: panic_id.clone(),
+            failure_mode: FailureMode::FailClosed,
+            invocations: invocations.clone(),
+        })
+        .await
+        .expect("subscribe panicking observer");
+
+    let stream = Uuid::new_v4();
+    let first = event_bus
+        .publish(Arc::new(new_event(stream, 1, "boom1")))
+        .await;
+    assert!(
+        first.is_err(),
+        "a panic in the inline drain must surface as Err from publish(), got {first:?}"
+    );
+
+    // inline_state must be cleaned up (in_progress reset, queue cleared, waiters
+    // notified): a second publish returns promptly instead of deadlocking.
+    let second = tokio::time::timeout(
+        GapDuration::from_secs(5),
+        event_bus.publish(Arc::new(new_event(stream, 2, "boom2"))),
+    )
+    .await
+    .expect("second publish() deadlocked — inline_state was not cleaned up after the panic");
+    assert!(
+        second.is_err(),
+        "the observer still panics on the second event, so publish() is Err again, got {second:?}"
+    );
+    assert!(
+        invocations.load(Ordering::SeqCst) >= 2,
+        "both publishes reached the observer"
+    );
+}
+
+/// T5 (R5, R7, spec 0028 P4): a fail-closed subscriber refuses the gap-timeout
+/// backstop — no checkpoint advance, no `epoch_event_bus_gap_timeouts` row, no
+/// `on_gap_timeout`, `on_halt(GapUnproven)` fires exactly once.
+///
+/// Recovery leg: rolling back the held transaction (so the sequence provably
+/// never existed) clears the snapshot fence, and the subscriber's checkpoint
+/// then advances past the gap via `FenceCleared` (not the backstop).
+///
+/// Uses an isolated table + sequence (`snapshot_fencing: true`, `gap_timeout:
+/// 500ms`) so the hole is deterministic and does not stall sibling test binaries.
+/// A generous recovery-poll timeout (30 s) accommodates xmin advancement on a
+/// shared test instance.
+#[tokio::test]
+#[serial]
+async fn test_fail_closed_gap_refusal_and_fence_cleared_recovery() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: true,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // Subscribe a fail-closed observer. Subscribe after start_listener so it
+    // takes the live path (no catch-up) — the checkpoint is pre-planted just
+    // below the hole to isolate from shared-table history.
+    let fc_id = format!("projection:fc-gap:{}", Uuid::new_v4());
+    let fc = TestProjection::with_subscriber_id(fc_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(fc))
+        .await
+        .expect("subscribe fail-closed observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    // Commit a below-hole event; wait until the subscriber's checkpoint lands on
+    // it before opening the hole.  This proves the write path is alive and gives
+    // us the exact contiguous position the gap refusal must hold.
+    let stream = Uuid::new_v4();
+    let (_, seq_below) = insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(seq_below as u64)).await,
+        "fail-closed subscriber must reach seq {seq_below} before the hole is opened"
+    );
+
+    // Open the hole: claim an uncommitted sequence on the isolated table.
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_hole_id, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(
+        seq_hole > seq_below,
+        "hole must sit above the below-hole event"
+    );
+
+    // Commit two events above the hole so the bus sees a gap at seq_hole.
+    let (_, seq_above1) = insert_committed_event(&pool, &table, hole_stream, 2, "above1").await;
+    let (_, seq_above2) = insert_committed_event(&pool, &table, hole_stream, 3, "above2").await;
+    assert!(seq_above1 > seq_hole && seq_above2 > seq_above1);
+
+    // Wait for gap_timeout (500ms) + several bus cycles (1s flush_interval +
+    // buffer) so fail-open would have advanced past the hole by now.
+    tokio::time::sleep(GapDuration::from_millis(2500)).await;
+
+    // --- Assert the gap was REFUSED (fail-closed) ---------------------------
+
+    // Checkpoint must be held at seq_below (not advanced past seq_hole).
+    let checkpoint_held = event_bus
+        .get_checkpoint(&fc_id)
+        .await
+        .expect("get checkpoint");
+    assert_eq!(
+        checkpoint_held,
+        Some(seq_below as u64),
+        "fail-closed subscriber must hold checkpoint at seq {seq_below}, not advance past \
+         hole at {seq_hole}; got {checkpoint_held:?}"
+    );
+
+    // No gap-timeout row must have been inserted (the backstop was refused).
+    let gap_rows = event_bus
+        .list_gap_timeouts(Some(&fc_id), false, 0, 50)
+        .await
+        .expect("list_gap_timeouts");
+    assert!(
+        gap_rows.is_empty(),
+        "FailClosed must not insert a gap-timeout row; found: {gap_rows:?}"
+    );
+
+    // on_halt(GapUnproven) must have fired exactly once (halt entry only).
+    {
+        let halts_guard = halts.lock().unwrap();
+        assert_eq!(
+            halts_guard.len(),
+            1,
+            "on_halt must fire exactly once on halt entry, got: {halts_guard:?}"
+        );
+        assert_eq!(halts_guard[0].subscriber_id, fc_id);
+        assert_eq!(halts_guard[0].held_below_sequence, seq_hole as u64);
+        assert_eq!(halts_guard[0].reason, HaltReason::GapUnproven);
+    }
+
+    // --- Recovery: roll back the hole → FenceCleared → advance ---------------
+
+    // Rolling back aborts the writer: the sequence seq_hole provably never
+    // existed. On the next bus cycle the snapshot fence clears (xmin catches up
+    // past fence_xmax), and the FenceCleared branch advances the checkpoint.
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    // Poll until the checkpoint advances past seq_hole (up to 30 s to allow
+    // xmin to advance on a loaded instance).
+    let mut recovered = false;
+    for _ in 0..120 {
+        let cp = event_bus
+            .get_checkpoint(&fc_id)
+            .await
+            .expect("get checkpoint after rollback");
+        if matches!(cp, Some(s) if s >= seq_above2 as u64) {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(250)).await;
+    }
+    assert!(
+        recovered,
+        "after rolling back the hole, the fail-closed subscriber must recover via \
+         FenceCleared and advance to seq {seq_above2}"
+    );
+
+    // Still no gap-timeout row after recovery (FenceCleared is lossless and
+    // never recorded).
+    let gap_rows_after = event_bus
+        .list_gap_timeouts(Some(&fc_id), false, 0, 50)
+        .await
+        .expect("list_gap_timeouts after recovery");
+    assert!(
+        gap_rows_after.is_empty(),
+        "FenceCleared recovery must not insert a gap-timeout row; found: {gap_rows_after:?}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// Fail-open gap regression pin (R10): with `snapshot_fencing: false` and
+/// `gap_timeout: 500ms`, a fail-open subscriber's backstop DOES advance past
+/// the gap, inserts a `epoch_event_bus_gap_timeouts` row, and invokes
+/// `on_gap_timeout`. Byte-identical to pre-P4 behaviour.
+///
+/// This pin is complementary to the existing `test_gap_timeout_inserts_record`
+/// and `test_gap_timeout_callback_is_invoked` suites; it runs on an isolated
+/// table to avoid leaving holes on the shared sequence.
+#[tokio::test]
+#[serial]
+async fn test_fail_open_gap_backstop_still_advances_pin() {
+    use epoch_pg::event_bus::{GapTimeoutCallback, GapTimeoutInfo};
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+
+    struct CapturingGapCallback {
+        fired: Arc<StdMutex<Vec<u64>>>,
+    }
+    #[async_trait]
+    impl GapTimeoutCallback for CapturingGapCallback {
+        async fn on_gap_timeout(&self, info: GapTimeoutInfo) {
+            self.fired.lock().unwrap().push(info.skipped_sequence);
+        }
+    }
+
+    let fired = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_gap_timeout: Some(Arc::new(CapturingGapCallback {
+            fired: fired.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let fo_id = format!("projection:fo-gap-pin:{}", Uuid::new_v4());
+    let fo = TestProjection::with_subscriber_id(fo_id.clone()); // FailOpen default
+    event_bus
+        .subscribe(ProjectionHandler::new(fo))
+        .await
+        .expect("subscribe fail-open observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_, seq_below) = insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fo_id, Some(seq_below as u64)).await,
+        "fail-open subscriber must reach seq {seq_below} before the hole"
+    );
+
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    let (_, seq_above) = insert_committed_event(&pool, &table, hole_stream, 2, "above").await;
+    assert!(seq_above > seq_hole);
+
+    // Wait for the backstop to fire (gap_timeout 500ms + bus cycles).
+    let mut advanced = false;
+    for _ in 0..60 {
+        let cp = event_bus
+            .get_checkpoint(&fo_id)
+            .await
+            .expect("get checkpoint");
+        if matches!(cp, Some(s) if s >= seq_above as u64) {
+            advanced = true;
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    // Release the hole before asserting so a failing test doesn't leave it open.
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    assert!(
+        advanced,
+        "fail-open subscriber must advance past the gap at {seq_hole} via backstop"
+    );
+
+    // A gap-timeout row must exist.
+    let rows = event_bus
+        .list_gap_timeouts(Some(&fo_id), false, 0, 50)
+        .await
+        .expect("list_gap_timeouts");
+    assert!(
+        rows.iter().any(|r| r.skipped_sequence == seq_hole as u64),
+        "fail-open backstop must insert a gap-timeout row for seq {seq_hole}; got {rows:?}"
+    );
+
+    // on_gap_timeout callback must have fired.
+    assert!(
+        fired.lock().unwrap().contains(&(seq_hole as u64)),
+        "fail-open on_gap_timeout must fire for seq {seq_hole}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// Polls until `subscriber_id`'s persisted checkpoint is at least `expected`.
+async fn poll_checkpoint_at_least(
+    event_bus: &PgEventBus<TestEventData>,
+    subscriber_id: &str,
+    expected: u64,
+    attempts: usize,
+) -> bool {
+    for _ in 0..attempts {
+        if matches!(
+            event_bus.get_checkpoint(subscriber_id).await.expect("get checkpoint"),
+            Some(s) if s >= expected
+        ) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Collects the distinct event ids a subscriber applied to `stream`.
+async fn applied_ids(store: &InMemoryStateStore<TestState>, stream: Uuid) -> Vec<Uuid> {
+    store
+        .get_state(stream)
+        .await
+        .unwrap()
+        .map(|s| s.0.iter().map(|e| e.id).collect())
+        .unwrap_or_default()
+}
+
+/// T9 variant (a) — refused-gap wedge (R13/R14/R6): a fail-closed `Checkpointed`
+/// subscriber wedged on a refused gap does NOT starve a healthy peer on the same
+/// bus (the peer advances well past `wedge + catch_up_batch_size`), and an
+/// operator `release_halt` past the gap resumes it in-process without a restart,
+/// with no duplicate delivery of the events it applied above the gap while
+/// wedged.
+///
+/// Isolated table + `snapshot_fencing: false` so the permanent (rolled-back)
+/// hole cannot self-heal via `FenceCleared` and race the release; small
+/// `catch_up_batch_size` (5) keeps the "beyond the batch cap" event count low.
+#[tokio::test]
+#[serial]
+async fn test_wedged_gap_does_not_starve_peer_and_release_resumes() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    const CAP: u32 = 5;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        catch_up_batch_size: CAP,
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // Fail-closed subscriber + healthy fail-open peer on the SAME bus.
+    let fc_id = format!("projection:fc-gap-wedge:{}", Uuid::new_v4());
+    let fc = TestProjection::with_subscriber_id(fc_id.clone()).fail_closed();
+    let fc_store = fc.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(fc))
+        .await
+        .expect("subscribe fail-closed");
+
+    let peer_id = format!("projection:peer-gap:{}", Uuid::new_v4());
+    let peer = TestProjection::with_subscriber_id(peer_id.clone());
+    let peer_store = peer.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(peer))
+        .await
+        .expect("subscribe peer");
+
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    // A below-hole event both subscribers reach before the hole is opened.
+    let below_stream = Uuid::new_v4();
+    let (below_id, seq_below) =
+        insert_committed_event(&pool, &table, below_stream, 1, "below").await;
+    assert!(poll_checkpoint_eq(&event_bus, &fc_id, Some(seq_below as u64)).await);
+    assert!(poll_checkpoint_eq(&event_bus, &peer_id, Some(seq_below as u64)).await);
+
+    // Open a hole, commit many events above it (well beyond CAP), then roll the
+    // hole back so the gap is permanent.
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_hole_id, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(seq_hole > seq_below);
+
+    let mut above_ids = Vec::new();
+    let mut above_seqs = Vec::new();
+    for i in 0..12 {
+        let (id, seq) =
+            insert_committed_event(&pool, &table, hole_stream, i + 2, &format!("above{i}")).await;
+        above_ids.push(id);
+        above_seqs.push(seq as u64);
+    }
+    tx_hole.rollback().await.expect("rollback hole tx");
+    let top_seq = *above_seqs.iter().max().unwrap();
+    assert!(
+        top_seq > seq_hole as u64 + CAP as u64,
+        "must commit beyond the wedge + batch cap to prove the exclusion"
+    );
+
+    // R13: the peer advances to the tail while the FC subscriber is wedged. Note
+    // that without the wedged-floor exclusion the peer would be pinned at
+    // seq_hole + CAP by the FC's held floor.
+    assert!(
+        poll_checkpoint_at_least(&event_bus, &peer_id, top_seq, 80).await,
+        "healthy peer must advance to the tail ({top_seq}) despite the wedge"
+    );
+
+    // The FC subscriber is held at the below-hole sequence.
+    let fc_cp = event_bus
+        .get_checkpoint(&fc_id)
+        .await
+        .expect("get checkpoint");
+    assert_eq!(
+        fc_cp,
+        Some(seq_below as u64),
+        "fail-closed subscriber must hold at seq {seq_below} while wedged"
+    );
+    // on_halt(GapUnproven) fired for the gap.
+    {
+        let halts = halts.lock().unwrap();
+        assert!(
+            halts.iter().any(|h| h.subscriber_id == fc_id
+                && h.reason == HaltReason::GapUnproven
+                && h.held_below_sequence == seq_hole as u64),
+            "on_halt(GapUnproven) must fire for the wedged FC subscriber: {halts:?}"
+        );
+    }
+
+    // R14: operator release past the gap. The FC subscriber resumes in-process.
+    event_bus
+        .release_halt(&fc_id, seq_hole as u64)
+        .await
+        .expect("release_halt past the gap");
+
+    assert!(
+        poll_checkpoint_at_least(&event_bus, &fc_id, top_seq, 120).await,
+        "released FC subscriber must resume without a restart and reach the tail ({top_seq})"
+    );
+
+    // R6: no duplicate delivery. The events applied above the gap while wedged
+    // are delivered exactly once across the whole lifecycle.
+    let fc_above = applied_ids(&fc_store, hole_stream).await;
+    let mut fc_above_sorted = fc_above.clone();
+    fc_above_sorted.sort();
+    fc_above_sorted.dedup();
+    assert_eq!(
+        fc_above_sorted.len(),
+        fc_above.len(),
+        "FC must not double-deliver any above-gap event (R6): {fc_above:?}"
+    );
+    let mut expected_above = above_ids.clone();
+    expected_above.sort();
+    assert_eq!(
+        fc_above_sorted, expected_above,
+        "FC must deliver every above-gap event exactly once after release"
+    );
+    // The below-hole event is applied exactly once, the hole never.
+    assert_eq!(applied_ids(&fc_store, below_stream).await, vec![below_id]);
+
+    // Peer applied the same above set exactly once (skipping the hole).
+    let peer_above = applied_ids(&peer_store, hole_stream).await;
+    assert_eq!(peer_above.len(), above_ids.len());
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T9 variant (b) — deserialize wedge (R13/R14/R6): a fail-closed `Checkpointed`
+/// subscriber wedged on a corrupt (undeserializable) row does NOT starve a
+/// healthy peer, and `release_halt` past the corrupt row resumes it in-process
+/// with no duplicate delivery. Relies on P2's `held_event` marker being set on
+/// the deserialize halt path, so the wedged predicate sees it exactly like a
+/// gap wedge.
+#[tokio::test]
+#[serial]
+async fn test_wedged_deser_does_not_starve_peer_and_release_resumes() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    const CAP: u32 = 5;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        catch_up_batch_size: CAP,
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let fc_id = format!("projection:fc-deser-wedge:{}", Uuid::new_v4());
+    let fc = TestProjection::with_subscriber_id(fc_id.clone()).fail_closed();
+    let fc_store = fc.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(fc))
+        .await
+        .expect("subscribe fail-closed");
+
+    let peer_id = format!("projection:peer-deser:{}", Uuid::new_v4());
+    let peer = TestProjection::with_subscriber_id(peer_id.clone());
+    let peer_store = peer.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(peer))
+        .await
+        .expect("subscribe peer");
+
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    // valid(seq1) -> corrupt(seq2) -> many valid rows above (well beyond CAP).
+    let stream = Uuid::new_v4();
+    let (valid1_id, seq1) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (corrupt_id, seq2) = insert_corrupt_event(&pool, &table, stream, 2).await;
+    let mut above_ids = Vec::new();
+    let mut above_seqs = Vec::new();
+    for i in 0..12 {
+        let (id, seq) =
+            insert_committed_event(&pool, &table, stream, i + 3, &format!("v{}", i + 3)).await;
+        above_ids.push(id);
+        above_seqs.push(seq as u64);
+    }
+    let top_seq = *above_seqs.iter().max().unwrap();
+    assert!(top_seq > seq2 as u64 + CAP as u64);
+
+    // R13: peer skips the corrupt row (fail-open) and advances to the tail while
+    // the FC subscriber is wedged at the corrupt row.
+    assert!(
+        poll_checkpoint_at_least(&event_bus, &peer_id, top_seq, 80).await,
+        "healthy peer must advance to the tail ({top_seq}) despite the deser wedge"
+    );
+    assert!(!applied_ids(&peer_store, stream).await.contains(&corrupt_id));
+
+    // FC held at the last good sequence below the corrupt row.
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(seq1 as u64)).await,
+        "fail-closed subscriber must hold at seq {seq1} (below the corrupt row)"
+    );
+    {
+        let halts = halts.lock().unwrap();
+        assert!(
+            halts.iter().any(|h| h.subscriber_id == fc_id
+                && h.reason == HaltReason::DeserializeFailure
+                && h.held_below_sequence == seq2 as u64),
+            "on_halt(DeserializeFailure) must fire for the wedged FC subscriber: {halts:?}"
+        );
+    }
+
+    // Backward release is rejected with an R14-explaining error.
+    let backward = event_bus.release_halt(&fc_id, seq1 as u64).await;
+    assert!(
+        matches!(
+            backward,
+            Err(epoch_pg::event_bus::PgEventBusError::BackwardRelease { .. })
+        ),
+        "a backward release must be rejected: {backward:?}"
+    );
+
+    // R14: operator release past the corrupt row resumes the FC subscriber.
+    event_bus
+        .release_halt(&fc_id, seq2 as u64)
+        .await
+        .expect("release_halt past the corrupt row");
+
+    assert!(
+        poll_checkpoint_at_least(&event_bus, &fc_id, top_seq, 120).await,
+        "released FC subscriber must resume without a restart and reach the tail ({top_seq})"
+    );
+
+    // R6: exactly-once, no corrupt row, no duplicates.
+    let fc_applied = applied_ids(&fc_store, stream).await;
+    let mut fc_sorted = fc_applied.clone();
+    fc_sorted.sort();
+    fc_sorted.dedup();
+    assert_eq!(
+        fc_sorted.len(),
+        fc_applied.len(),
+        "no duplicate delivery (R6)"
+    );
+    assert!(
+        !fc_applied.contains(&corrupt_id),
+        "the corrupt row is skipped by the release, never applied"
+    );
+    let mut expected: Vec<Uuid> = std::iter::once(valid1_id)
+        .chain(above_ids.clone())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        fc_sorted, expected,
+        "FC applies the good rows exactly once, skipping only the corrupt row"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+// ==================== P5: ReplayAlways contiguous HWM (CLOUD-227, T7/T7b/T10) ====================
+
+/// Polls until `on_halt` has been fired at least `min_count` times.
+async fn poll_halt_count_at_least(
+    halts: &Arc<StdMutex<Vec<HaltInfo>>>,
+    subscriber_id: &str,
+    min_count: usize,
+) -> bool {
+    for _ in 0..100 {
+        if halts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|h| h.subscriber_id == subscriber_id)
+            .count()
+            >= min_count
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// T7 (R9a): a fail-closed `ReplayAlways` subscriber whose catch-up halts at a
+/// corrupt event survives a listener restart with its HWM held at the last
+/// contiguous position — the restart's catch-up re-seeds from that HWM rather
+/// than from 0, so the good event below the corrupt one is NOT re-delivered to
+/// the observer, and the corrupt event is re-attempted (on_halt fires again).
+///
+/// This verifies the CLOUD-227 / P5 fix: before the fix `advance_catchup_prefix`
+/// set `hwm = event_global_seq` unconditionally, so the HWM could advance past a
+/// hole; after the fix it applies the same contiguous-prefix guard as the
+/// Checkpointed path and holds the HWM at the unbroken prefix before the failure.
+#[tokio::test]
+#[serial]
+async fn test_replay_always_fc_hold_survives_restart() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let ra_id = format!("projection:ra-fc-restart:{}", Uuid::new_v4());
+    let stream = Uuid::new_v4();
+
+    // Insert events before subscribing so the halt happens in the catch-up path.
+    let (valid1_id, _seq1) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (_corrupt_id, seq2) = insert_corrupt_event(&pool, &table, stream, 2).await;
+    let (_valid3_id, _seq3) = insert_committed_event(&pool, &table, stream, 3, "v3").await;
+
+    let ra = TestProjection::replay_always(ra_id.clone()).fail_closed();
+    let ra_store = ra.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(ra))
+        .await
+        .expect("subscribe fail-closed ReplayAlways");
+
+    // Wait for at least 2 on_halt firings: one from the catch-up inside
+    // subscribe() and one from the first live batch (subscriber_states seeded
+    // fresh, held_event=None, seq2 re-encountered).
+    assert!(
+        poll_halt_count_at_least(&halts, &ra_id, 2).await,
+        "on_halt must fire at least twice before restart (catch-up + first live batch)"
+    );
+
+    // Verify observer applied only seq1 and nothing above the halt point.
+    let ids_before = applied_ids(&ra_store, stream).await;
+    assert_eq!(
+        ids_before,
+        vec![valid1_id],
+        "only seq1 applied before restart"
+    );
+
+    let halt_count_before_restart = halts.lock().unwrap().len();
+
+    // Restart listener (no fresh subscribe — the in-memory HWM must survive).
+    event_bus.shutdown().await.expect("shutdown");
+    event_bus.start_listener().await.expect("restart listener");
+
+    // Wait for on_halt to fire again (restart catch-up re-attempts seq2).
+    assert!(
+        poll_halt_count_at_least(&halts, &ra_id, halt_count_before_restart + 1).await,
+        "on_halt must fire again after restart, proving seq2 was re-attempted"
+    );
+
+    // The HWM held at seq1: the restart catch-up starts from seq1, not 0, so
+    // seq1 is NOT applied again. Observer state must still show seq1 exactly once.
+    let ids_after = applied_ids(&ra_store, stream).await;
+    assert_eq!(
+        ids_after,
+        vec![valid1_id],
+        "seq1 must appear exactly once (HWM survived restart at seq1, no replay from 0)"
+    );
+
+    // Every on_halt must point at seq2 as the held sequence.
+    {
+        let hs = halts.lock().unwrap();
+        let ra_halts: Vec<_> = hs.iter().filter(|h| h.subscriber_id == ra_id).collect();
+        assert!(
+            ra_halts.iter().all(|h| h.held_below_sequence == seq2 as u64
+                && h.reason == HaltReason::DeserializeFailure),
+            "all on_halt entries must point at seq2 with DeserializeFailure: {ra_halts:?}"
+        );
+    }
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T7b (R9b): a fresh `subscribe()` call resets the in-memory HWM to 0 and
+/// triggers a full replay that re-holds at the same corrupt event, with no
+/// events above the bad row applied.
+#[tokio::test]
+#[serial]
+async fn test_replay_always_fc_fresh_subscribe_resets_hwm_and_reholds() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let ra_id = format!("projection:ra-fc-resubscribe:{}", Uuid::new_v4());
+    let stream = Uuid::new_v4();
+
+    // Pre-insert: valid, corrupt, valid (the last must never be applied).
+    let (valid1_id, seq2) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (_corrupt_id, seq_corrupt) = insert_corrupt_event(&pool, &table, stream, 2).await;
+    let (above_id, _seq_above) = insert_committed_event(&pool, &table, stream, 3, "v3").await;
+
+    // First subscribe: catch-up halts at the corrupt row.
+    let ra1 = TestProjection::replay_always(ra_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(ra1))
+        .await
+        .expect("first subscribe");
+
+    // Wait for the initial halt to be recorded.
+    assert!(
+        poll_halt_count_at_least(&halts, &ra_id, 1).await,
+        "on_halt must fire after first subscribe"
+    );
+
+    let halts_after_first = halts.lock().unwrap().len();
+
+    // Fresh subscribe(): resets HWM to 0, full replay from scratch.
+    let ra2 = TestProjection::replay_always(ra_id.clone()).fail_closed();
+    let store2 = ra2.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(ra2))
+        .await
+        .expect("fresh subscribe");
+
+    // Wait for on_halt to fire again from the fresh subscribe's catch-up.
+    assert!(
+        poll_halt_count_at_least(&halts, &ra_id, halts_after_first + 1).await,
+        "on_halt must fire again after fresh subscribe (full replay re-holds at corrupt row)"
+    );
+
+    // Full replay reached seq1 (applied to store2).
+    let ids2 = applied_ids(&store2, stream).await;
+    assert!(
+        ids2.contains(&valid1_id),
+        "fresh-subscribe full replay must apply seq1 (seq {seq2}): {ids2:?}"
+    );
+
+    // Nothing above the corrupt row must have been applied.
+    assert!(
+        !ids2.contains(&above_id),
+        "event above the corrupt row must NOT be applied after full replay halt: {ids2:?}"
+    );
+
+    // The halt must reference the corrupt sequence.
+    {
+        let hs = halts.lock().unwrap();
+        let last_halt = hs
+            .iter()
+            .filter(|h| h.subscriber_id == ra_id)
+            .next_back()
+            .unwrap();
+        assert_eq!(
+            last_halt.held_below_sequence, seq_corrupt as u64,
+            "fresh-subscribe halt must hold below the corrupt sequence"
+        );
+        assert_eq!(last_halt.reason, HaltReason::DeserializeFailure);
+    }
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T10 (R13 extended to ReplayAlways): a wedged fail-closed `ReplayAlways`
+/// subscriber does not starve a healthy `Checkpointed` peer on the same bus.
+/// The shared `min_checkpoint` floor excludes the wedged subscriber via
+/// `is_wedged()` / `compute_shared_floor`, so the healthy peer can advance well
+/// past `wedge_seq + catch_up_batch_size` while the wedge holds.
+#[tokio::test]
+#[serial]
+async fn test_wedged_replay_always_does_not_starve_peer() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    // Small batch cap so "beyond wedge + cap" is easy to prove.
+    const CAP: u32 = 5;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        gap_timeout: GapDuration::from_secs(30),
+        catch_up_batch_size: CAP,
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let ra_id = format!("projection:ra-fc-starve:{}", Uuid::new_v4());
+    let peer_id = format!("projection:peer-starve:{}", Uuid::new_v4());
+    let stream = Uuid::new_v4();
+
+    // valid(seq1) -> corrupt(seq2) pre-inserted so both subscribers encounter
+    // them in catch-up.
+    let (_valid1_id, _seq1) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (_corrupt_id, seq2) = insert_corrupt_event(&pool, &table, stream, 2).await;
+
+    // Fail-closed ReplayAlways subscriber (will wedge at seq2).
+    let ra = TestProjection::replay_always(ra_id.clone()).fail_closed();
+    let ra_store = ra.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(ra))
+        .await
+        .expect("subscribe fail-closed ReplayAlways");
+
+    // Healthy fail-open Checkpointed peer.
+    let peer = TestProjection::with_subscriber_id(peer_id.clone());
+    let peer_store = peer.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(peer))
+        .await
+        .expect("subscribe healthy peer");
+
+    // Commit many valid events well beyond seq2 + CAP to prove liveness.
+    let mut above_ids = Vec::new();
+    let mut above_seqs = Vec::new();
+    for i in 0..12 {
+        let (id, seq) =
+            insert_committed_event(&pool, &table, stream, i + 3, &format!("v{}", i + 3)).await;
+        above_ids.push(id);
+        above_seqs.push(seq as u64);
+    }
+    let top_seq = *above_seqs.iter().max().unwrap();
+    assert!(
+        top_seq > seq2 as u64 + CAP as u64,
+        "must commit beyond wedge + batch cap to prove floor exclusion"
+    );
+
+    // Wait for the RA subscriber to halt (proving it's wedged).
+    assert!(
+        poll_halt_count_at_least(&halts, &ra_id, 1).await,
+        "on_halt must fire for the wedged ReplayAlways subscriber"
+    );
+
+    // R13: the healthy peer must advance to the tail despite the wedged RA subscriber.
+    assert!(
+        poll_checkpoint_at_least(&event_bus, &peer_id, top_seq, 120).await,
+        "healthy Checkpointed peer must advance to tail ({top_seq}) while RA subscriber is wedged"
+    );
+
+    // The RA subscriber must remain held: only seq1 should have been applied.
+    // (seq2 = corrupt, seqs above = not applied due to the hold.)
+    let ra_applied = applied_ids(&ra_store, stream).await;
+    assert!(
+        !ra_applied.iter().any(|id| above_ids.contains(id)),
+        "fail-closed ReplayAlways must not apply events above its hold point: {ra_applied:?}"
+    );
+
+    // The healthy peer (fail-open) applied all above-seq2 events.
+    let peer_applied = applied_ids(&peer_store, stream).await;
+    assert_eq!(
+        peer_applied.len(),
+        above_ids.len() + 1, // +1 for seq1
+        "fail-open peer must apply all valid events (seq1 + {} above): {peer_applied:?}",
+        above_ids.len()
+    );
+
+    // on_halt reason must be DeserializeFailure for the RA subscriber.
+    {
+        let hs = halts.lock().unwrap();
+        assert!(
+            hs.iter()
+                .filter(|h| h.subscriber_id == ra_id)
+                .any(|h| h.held_below_sequence == seq2 as u64
+                    && h.reason == HaltReason::DeserializeFailure),
+            "on_halt(DeserializeFailure) at seq2 must fire for wedged RA subscriber: {hs:?}"
+        );
+    }
+
+    // The RA subscriber must NOT have been assigned a contiguous checkpoint row
+    // (ReplayAlways never writes to the checkpoints table).
+    let ra_checkpoint = event_bus
+        .get_checkpoint(&ra_id)
+        .await
+        .expect("get_checkpoint");
+    assert!(
+        ra_checkpoint.is_none(),
+        "ReplayAlways subscriber must have no persisted checkpoint: {ra_checkpoint:?}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// Regression pin (R10): a fail-open observer that exhausts its retry ladder
+/// has the event sent to the DLQ and continues advancing — no halt, no
+/// checkpoint hold, listener task alive. Uses `CountingFailingObserver` with
+/// `FailureMode::FailOpen` (regular error return, not a panic) to guard the
+/// non-panic FO observer failure path independently of the panic-containment
+/// path tested by `test_live_panicking_observer_fail_open_continues`.
+#[tokio::test]
+#[serial]
+async fn test_fail_open_observer_failure_dlq_continue_advance_pin() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::<HaltInfo>::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        max_retries: 2,
+        initial_retry_delay: GapDuration::from_millis(50),
+        max_retry_delay: GapDuration::from_millis(100),
+        gap_timeout: GapDuration::from_secs(30),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // Observer permanently unhealthy (never flipped true).
+    let healthy = Arc::new(AtomicBool::new(false));
+    let invocations = Arc::new(StdMutex::new(StdHashMap::new()));
+    let applied = Arc::new(StdMutex::new(Vec::<u64>::new()));
+    let fo_id = format!("observer:fo-fail-pin:{}", Uuid::new_v4());
+    event_bus
+        .subscribe(CountingFailingObserver {
+            subscriber_id: fo_id.clone(),
+            failure_mode: FailureMode::FailOpen,
+            healthy: healthy.clone(),
+            invocations: invocations.clone(),
+            applied: applied.clone(),
+        })
+        .await
+        .expect("subscribe fail-open failing observer");
+
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_e1, seq1) = insert_committed_event(&pool, &table, stream, 1, "e1").await;
+    let (_e2, seq2) = insert_committed_event(&pool, &table, stream, 2, "e2").await;
+
+    // DLQ: the failed event must be sent to the dead-letter queue.
+    let dlq = poll_dlq_rows(&pool, &fo_id).await;
+    assert!(
+        dlq.iter().any(|r| r.1 == seq1),
+        "fail-open observer must DLQ the failed event at seq {seq1}: {dlq:?}"
+    );
+
+    // Continue + advance: checkpoint reaches seq2 (past the DLQ'd event).
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fo_id, Some(seq2 as u64)).await,
+        "fail-open observer must advance past the DLQ'd event to seq {seq2}"
+    );
+
+    // No halt: fail-open mode never fires on_halt.
+    assert!(
+        halts.lock().unwrap().is_empty(),
+        "fail-open mode must not fire on_halt; got: {:?}",
+        halts.lock().unwrap()
+    );
+
+    assert!(
+        event_bus.is_running().await,
+        "listener task must stay alive"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// Regression pin: `update_checkpoint` writes to the same checkpoint upsert as
+/// `release_halt` (spec 0028 P4b). This pin proves that `update_checkpoint`'s
+/// public contract is intact after P4b landed: write, read-back, release, and
+/// write-again all succeed and do not interfere.
+#[tokio::test]
+#[serial]
+async fn test_update_checkpoint_contract_unchanged_pin() {
+    common::init_test_logger();
+    let Some((_pool, event_bus, _store)) = setup().await else {
+        return;
+    };
+
+    let sid = format!("projection:cp-pin:{}", Uuid::new_v4());
+    let eid1 = Uuid::new_v4();
+    let eid2 = Uuid::new_v4();
+
+    // Write seq=10 via update_checkpoint.
+    event_bus
+        .update_checkpoint(&sid, 10, eid1)
+        .await
+        .expect("update_checkpoint seq=10");
+    assert_eq!(
+        event_bus.get_checkpoint(&sid).await.expect("read"),
+        Some(10),
+        "update_checkpoint must persist seq=10"
+    );
+
+    // release_halt writes the same upsert internally; advance to seq=15.
+    event_bus
+        .release_halt(&sid, 15)
+        .await
+        .expect("release_halt seq=15");
+    assert_eq!(
+        event_bus
+            .get_checkpoint(&sid)
+            .await
+            .expect("read after release"),
+        Some(15),
+        "release_halt must advance the checkpoint to 15"
+    );
+
+    // update_checkpoint again after release_halt must still work.
+    event_bus
+        .update_checkpoint(&sid, 20, eid2)
+        .await
+        .expect("update_checkpoint seq=20 after release_halt");
+    assert_eq!(
+        event_bus.get_checkpoint(&sid).await.expect("read final"),
+        Some(20),
+        "update_checkpoint after release_halt must persist seq=20"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
 }

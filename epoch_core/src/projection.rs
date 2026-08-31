@@ -11,7 +11,7 @@
 //! be subscribed to the event bus for their own events. This would cause
 //! duplicate writes and race conditions.
 //!
-//! The type system enforces this: `Aggregate` extends [`EventApplicator`](crate::event_applicator::EventApplicator),
+//! The type system enforces this: `Aggregate` extends [`EventApplicator`],
 //! NOT `Projection`, so aggregates cannot be wrapped in `ProjectionHandler`.
 
 use std::sync::Arc;
@@ -174,11 +174,20 @@ where
 
     /// How this projection relates to persisted checkpoints.
     ///
-    /// Defaults to [`SubscriptionMode::Checkpointed`]. Override and return
-    /// [`SubscriptionMode::ReplayAlways`] for in-memory projections that must
+    /// Defaults to [`crate::event_store::SubscriptionMode::Checkpointed`]. Override and return
+    /// [`crate::event_store::SubscriptionMode::ReplayAlways`] for in-memory projections that must
     /// replay from sequence 0 on every process start.
     fn subscription_mode(&self) -> crate::event_store::SubscriptionMode {
         crate::event_store::SubscriptionMode::Checkpointed
+    }
+
+    /// How the bus reacts when this projection cannot apply an event.
+    ///
+    /// Defaults to [`crate::event_store::FailureMode::FailOpen`]: log, skip, and advance past the
+    /// failed event. Override and return [`crate::event_store::FailureMode::FailClosed`] for
+    /// projections that must never silently diverge from the event log.
+    fn failure_mode(&self) -> crate::event_store::FailureMode {
+        crate::event_store::FailureMode::FailOpen
     }
 }
 
@@ -259,6 +268,10 @@ where
 
     fn subscription_mode(&self) -> crate::event_store::SubscriptionMode {
         self.0.subscription_mode()
+    }
+
+    fn failure_mode(&self) -> crate::event_store::FailureMode {
+        self.0.failure_mode()
     }
 }
 
