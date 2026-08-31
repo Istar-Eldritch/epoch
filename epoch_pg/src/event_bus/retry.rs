@@ -21,7 +21,7 @@ pub(crate) enum ProcessResult {
 }
 
 /// Renders a caught panic payload into a human-readable string.
-fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+pub(crate) fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -159,15 +159,18 @@ where
         // instead of killing the listener task.
         match invoke_observer_once(observer, event).await {
             Ok(()) => {
+                // `match` (not an inline `if/else` in the log args) to avoid a
+                // rust-analyzer inference false-positive inside this fn; both
+                // forms are behaviourally identical.
+                let retry_suffix = match attempt {
+                    0 => String::new(),
+                    n => format!(" (after {} retries)", n),
+                };
                 log::debug!(
                     "Successfully applied event to '{}': {:?}{}",
                     subscriber_id,
                     event_id,
-                    if attempt > 0 {
-                        format!(" (after {} retries)", attempt)
-                    } else {
-                        String::new()
-                    }
+                    retry_suffix
                 );
                 return ProcessResult::Success;
             }

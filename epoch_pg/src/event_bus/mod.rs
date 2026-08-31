@@ -11,7 +11,9 @@ pub use config::{
     CheckpointMode, DispatchMode, DlqCallback, DlqInsertionInfo, GapTimeoutCallback,
     GapTimeoutInfo, HaltCallback, HaltInfo, HaltReason, InstanceMode, ReliableDeliveryConfig,
 };
-pub(crate) use retry::{ProcessResult, invoke_observer_once, process_event_with_retry};
+pub(crate) use retry::{
+    ProcessResult, invoke_observer_once, panic_payload_message, process_event_with_retry,
+};
 pub(crate) use subscriber_state::{
     SkipReason, SubscriberState, TxidSnapshot, advance_contiguous_checkpoint,
 };
@@ -34,8 +36,10 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
+use futures::FutureExt;
 use futures::future::join_all;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 
 /// Minimal notification payload — identity/wake signal only.
 ///
@@ -1382,23 +1386,31 @@ where
             // is held across its `on_event`.
             let mut tagged = Vec::with_capacity(projections_snapshot.len());
             for projection in &projections_snapshot {
-                let (priority, subscriber_id, replay_always) = {
+                let (priority, subscriber_id, replay_always, failure_mode) = {
                     let obs = projection.lock().await;
                     (
                         obs.priority(),
                         obs.subscriber_id().to_string(),
                         obs.subscription_mode() == SubscriptionMode::ReplayAlways,
+                        obs.failure_mode(),
                     )
                 };
-                tagged.push((priority, subscriber_id, replay_always, projection));
+                tagged.push((
+                    priority,
+                    subscriber_id,
+                    replay_always,
+                    failure_mode,
+                    projection,
+                ));
             }
-            tagged.sort_by_key(|(priority, _, _, _)| *priority);
+            tagged.sort_by_key(|(priority, _, _, _, _)| *priority);
 
-            for (_, subscriber_id, replay_always, projection) in tagged {
+            for (_, subscriber_id, replay_always, failure_mode, projection) in tagged {
                 if let Err(e) = catch_up_from_checkpoint(
                     projection,
                     &subscriber_id,
                     replay_always,
+                    failure_mode,
                     &config,
                     &checkpoint_pool,
                     &hwm,
@@ -2864,7 +2876,25 @@ where
 
                         for subscriber in sorted {
                             let guard = subscriber.lock().await;
-                            if let Err(e) = guard.on_event(entry.event.clone()).await {
+                            // Contain a panicking observer (spec 0028 §3.6/R11):
+                            // the inline path has no listener to survive, so a
+                            // caught panic routes through this same `Err` branch,
+                            // which runs the `inline_state` cleanup below
+                            // (in_progress reset, queue cleared, waiters notified)
+                            // — without it a swallowed panic would deadlock the bus.
+                            let outcome =
+                                match AssertUnwindSafe(guard.on_event(entry.event.clone()))
+                                    .catch_unwind()
+                                    .await
+                                {
+                                    Ok(result) => result,
+                                    Err(payload) => Err(format!(
+                                        "observer panicked: {}",
+                                        panic_payload_message(payload)
+                                    )
+                                    .into()),
+                                };
+                            if let Err(e) = outcome {
                                 // Notify waiters so they don't hang on error.
                                 entry.done.notify_one();
                                 let mut state = inline_state.lock().await;
@@ -3074,6 +3104,7 @@ pub(crate) async fn catch_up_from_checkpoint<ED>(
     observer: &Arc<Mutex<dyn EventObserver<ED>>>,
     subscriber_id: &str,
     replay_always: bool,
+    failure_mode: FailureMode,
     config: &ReliableDeliveryConfig,
     pool: &PgPool,
     hwm: &Arc<Mutex<HashMap<String, u64>>>,
@@ -3127,6 +3158,12 @@ where
          ORDER BY global_sequence ASC LIMIT $2",
         config.events_table,
     );
+    // Fail-closed halt marker (spec 0028 R3). Set at the bad row, it breaks the
+    // inner row loop AND the outer pagination loop: without the outer break a
+    // full batch (batch_size == catch_up_batch_size) would re-fetch the same
+    // window from the unchanged `current_sequence`, re-hit the same row, and
+    // spin forever with no sleep, so `subscribe()` would never return.
+    let mut halted = false;
     loop {
         let rows: Vec<PgDBEvent> = sqlx::query_as(&subscriber_catchup_query)
             .bind(current_sequence as i64)
@@ -3152,33 +3189,67 @@ where
 
             let data: Option<ED> = match row.data.map(|d| serde_json::from_value(d)).transpose() {
                 Ok(d) => d,
-                Err(e) => {
-                    warn!(
-                        "Catch-up: skipping event {} (type: '{}', global_seq: {}) for '{}': \
-                             failed to deserialize: {}. This is expected when event variants have \
-                             been removed from the application enum. Advancing checkpoint past this event.",
-                        event_id, row.event_type, event_global_seq, subscriber_id, e
-                    );
-                    // Advance current_sequence and the contiguous prefix past
-                    // the undeserializable event to avoid an infinite retry loop;
-                    // a skipped-past event counts as processed for the prefix.
-                    current_sequence = event_global_seq;
-                    total_caught_up += 1;
-                    advance_catchup_prefix(
-                        replay_always,
-                        hwm,
-                        subscriber_id,
-                        event_global_seq,
-                        event_id,
-                        &mut contiguous,
-                        &mut pending_checkpoint,
-                        config,
-                        pool,
-                        &mut checkpoint_cache,
-                    )
-                    .await;
-                    continue;
-                }
+                Err(e) => match failure_mode {
+                    // Fail-closed halt (spec 0028 R3, catch-up leg): hold the
+                    // contiguous prefix below this sequence (skip the advance),
+                    // write the deser DLQ row, fire on_halt, and break out of
+                    // both loops via the halt marker. The final flush stays safe
+                    // by construction — `pending_checkpoint` never advanced past
+                    // the hole, so there is nothing above it to flush.
+                    FailureMode::FailClosed => {
+                        let error_message = format!("unrecoverable: deserialize: {}", e);
+                        warn!(
+                            "Catch-up: fail-closed halt for '{}': event {} (seq {}) is \
+                             undeserializable: {}. Holding the checkpoint below this sequence \
+                             until the payload is corrected or the subscriber is released.",
+                            subscriber_id, event_id, event_global_seq, e
+                        );
+                        insert_deser_halt_dlq_row(
+                            pool,
+                            subscriber_id,
+                            event_id,
+                            event_global_seq,
+                            &error_message,
+                        )
+                        .await;
+                        fire_on_halt(
+                            config,
+                            subscriber_id,
+                            event_global_seq,
+                            HaltReason::DeserializeFailure,
+                        )
+                        .await;
+                        halted = true;
+                        break;
+                    }
+                    // Fail-open (unchanged): log, skip, advance past the
+                    // undeserializable event to avoid an infinite retry loop; a
+                    // skipped-past event counts as processed for the prefix.
+                    _ => {
+                        warn!(
+                            "Catch-up: skipping event {} (type: '{}', global_seq: {}) for '{}': \
+                                 failed to deserialize: {}. This is expected when event variants have \
+                                 been removed from the application enum. Advancing checkpoint past this event.",
+                            event_id, row.event_type, event_global_seq, subscriber_id, e
+                        );
+                        current_sequence = event_global_seq;
+                        total_caught_up += 1;
+                        advance_catchup_prefix(
+                            replay_always,
+                            hwm,
+                            subscriber_id,
+                            event_global_seq,
+                            event_id,
+                            &mut contiguous,
+                            &mut pending_checkpoint,
+                            config,
+                            pool,
+                            &mut checkpoint_cache,
+                        )
+                        .await;
+                        continue;
+                    }
+                },
             };
 
             let event = Arc::new(Event {
@@ -3202,6 +3273,31 @@ where
             // Use the same retry/DLQ logic as real-time processing
             let result =
                 process_event_with_retry(observer, &event, subscriber_id, config, pool).await;
+
+            // Fail-closed observer-exhaustion halt (spec 0028 R3/R4, catch-up
+            // leg): the DLQ row + on_dlq_insertion already fired inside the
+            // retry ladder; add on_halt and hold below this sequence (skip the
+            // advance, do not bump the cursor), breaking both loops via the
+            // halt marker.
+            if let ProcessResult::SentToDlq = result
+                && failure_mode == FailureMode::FailClosed
+            {
+                warn!(
+                    "Catch-up: fail-closed halt for '{}': observer exhausted retries on event \
+                     {} (seq {}). Holding the checkpoint below this sequence until the observer \
+                     recovers or the subscriber is released.",
+                    subscriber_id, event_id, event_global_seq
+                );
+                fire_on_halt(
+                    config,
+                    subscriber_id,
+                    event_global_seq,
+                    HaltReason::ObserverFailure,
+                )
+                .await;
+                halted = true;
+                break;
+            }
 
             advance_catchup_prefix(
                 replay_always,
@@ -3227,6 +3323,13 @@ where
                     subscriber_id
                 );
             }
+        }
+
+        // A fail-closed halt exits the outer pagination loop too, or a full
+        // batch would re-fetch the same window and spin forever (spec 0028 P3
+        // P0 fix).
+        if halted {
+            break;
         }
 
         // If we got fewer events than the batch size, we've caught up
@@ -3322,9 +3425,13 @@ where
             // process never drives, burning its whole timeout every time (a
             // ReplayAlways position is a per-process HWM that would then never
             // advance here).
-            let (subscriber_id, mode) = {
+            let (subscriber_id, mode, failure_mode) = {
                 let o = observer.lock().await;
-                (o.subscriber_id().to_string(), o.subscription_mode())
+                (
+                    o.subscriber_id().to_string(),
+                    o.subscription_mode(),
+                    o.failure_mode(),
+                )
             };
             let replay_always = mode == SubscriptionMode::ReplayAlways;
 
@@ -3520,6 +3627,7 @@ where
                 &observer,
                 &subscriber_id,
                 replay_always,
+                failure_mode,
                 &config,
                 &pool,
                 &hwm,
@@ -3551,6 +3659,14 @@ where
             }
 
             let mut processed_from_buffer = 0u64;
+            // Fail-closed drain halt marker (spec 0028 R3, drain leg). Set at the
+            // bad row, it breaks both the inner row loop and the outer
+            // pagination loop (a full batch would otherwise re-fetch the same
+            // window and spin forever). It must NOT early-return out of
+            // subscribe(): registration (projections.push below) and the
+            // post-drain flush still run, so the subscriber is driven by the
+            // listener and can self-heal (R3, §3.3).
+            let mut halted = false;
 
             // Only query if at least one buffered event is newer than our checkpoint.
             // The `global_sequence > current_sequence` predicate also performs the
@@ -3600,15 +3716,53 @@ where
                             .transpose()
                         {
                             Ok(d) => Some(d),
-                            Err(e) => {
-                                warn!(
-                                    "Buffer processing: skipping event {} (type: '{}', \
-                                     global_seq: {}) for '{}': failed to deserialize: {}. \
-                                     Advancing checkpoint past this event.",
-                                    event_id, row.event_type, event_global_seq, subscriber_id, e
-                                );
-                                None
-                            }
+                            Err(e) => match failure_mode {
+                                // Fail-closed halt: hold below this sequence (skip
+                                // the shared advance), write the deser DLQ row,
+                                // fire on_halt, and break both loops.
+                                FailureMode::FailClosed => {
+                                    let error_message =
+                                        format!("unrecoverable: deserialize: {}", e);
+                                    warn!(
+                                        "Buffer processing: fail-closed halt for '{}': event {} \
+                                         (seq {}) is undeserializable: {}. Holding the checkpoint \
+                                         below this sequence until the payload is corrected or the \
+                                         subscriber is released.",
+                                        subscriber_id, event_id, event_global_seq, e
+                                    );
+                                    insert_deser_halt_dlq_row(
+                                        &pool,
+                                        &subscriber_id,
+                                        event_id,
+                                        event_global_seq,
+                                        &error_message,
+                                    )
+                                    .await;
+                                    fire_on_halt(
+                                        &config,
+                                        &subscriber_id,
+                                        event_global_seq,
+                                        HaltReason::DeserializeFailure,
+                                    )
+                                    .await;
+                                    halted = true;
+                                    break;
+                                }
+                                // Fail-open (unchanged): log, skip, advance past.
+                                _ => {
+                                    warn!(
+                                        "Buffer processing: skipping event {} (type: '{}', \
+                                         global_seq: {}) for '{}': failed to deserialize: {}. \
+                                         Advancing checkpoint past this event.",
+                                        event_id,
+                                        row.event_type,
+                                        event_global_seq,
+                                        subscriber_id,
+                                        e
+                                    );
+                                    None
+                                }
+                            },
                         };
 
                         if let Some(data) = maybe_data {
@@ -3641,6 +3795,31 @@ where
 
                             processed_from_buffer += 1;
 
+                            // Fail-closed observer-exhaustion halt (drain leg):
+                            // the DLQ row + on_dlq_insertion already fired inside
+                            // the retry ladder; add on_halt and hold below this
+                            // sequence by breaking before the shared advance.
+                            if let ProcessResult::SentToDlq = result
+                                && failure_mode == FailureMode::FailClosed
+                            {
+                                warn!(
+                                    "Buffer processing: fail-closed halt for '{}': observer \
+                                     exhausted retries on event {} (seq {}). Holding the \
+                                     checkpoint below this sequence until the observer recovers \
+                                     or the subscriber is released.",
+                                    subscriber_id, event_id, event_global_seq
+                                );
+                                fire_on_halt(
+                                    &config,
+                                    &subscriber_id,
+                                    event_global_seq,
+                                    HaltReason::ObserverFailure,
+                                )
+                                .await;
+                                halted = true;
+                                break;
+                            }
+
                             if let ProcessResult::Success = result {
                                 log::debug!(
                                     "Processed buffered event {} for '{}'",
@@ -3669,6 +3848,13 @@ where
                         .await;
 
                         current_sequence = event_global_seq;
+                    }
+
+                    // A fail-closed halt exits the outer pagination loop too
+                    // (spec 0028 P3 P0 fix), through normal control flow so
+                    // registration and the final flush below still run.
+                    if halted {
+                        break;
                     }
 
                     if batch_size < config.catch_up_batch_size as usize {
@@ -4090,10 +4276,17 @@ mod tests {
         let (_, s4) = cu_insert(&pool, &table, stream_id, 4).await;
         let (_, s5) = cu_insert(&pool, &table, stream_id, 5).await;
 
-        let (cursor, contiguous) =
-            catch_up_from_checkpoint(&observer, &sub_id, false, &config, &pool, &hwm)
-                .await
-                .expect("catch_up_from_checkpoint");
+        let (cursor, contiguous) = catch_up_from_checkpoint(
+            &observer,
+            &sub_id,
+            false,
+            FailureMode::FailOpen,
+            &config,
+            &pool,
+            &hwm,
+        )
+        .await
+        .expect("catch_up_from_checkpoint");
 
         // Prefix must stop before the hole. This table is exclusive to this
         // test, so no concurrent process can extend the contiguous run; the
@@ -4159,10 +4352,17 @@ mod tests {
         let (_, s4) = cu_insert(&pool, &table, stream_id, 4).await;
         let (_, s5) = cu_insert(&pool, &table, stream_id, 5).await;
 
-        let (cursor, contiguous) =
-            catch_up_from_checkpoint(&observer, &sub_id, false, &config, &pool, &hwm)
-                .await
-                .expect("catch_up_from_checkpoint");
+        let (cursor, contiguous) = catch_up_from_checkpoint(
+            &observer,
+            &sub_id,
+            false,
+            FailureMode::FailOpen,
+            &config,
+            &pool,
+            &hwm,
+        )
+        .await
+        .expect("catch_up_from_checkpoint");
 
         assert!(
             contiguous < s3 as u64,
@@ -4213,10 +4413,17 @@ mod tests {
         let (_, _s2) = cu_insert(&pool, table, stream_id, 2).await;
         let (_, s3) = cu_insert(&pool, table, stream_id, 3).await;
 
-        let (cursor, contiguous) =
-            catch_up_from_checkpoint(&observer, &sub_id, false, &config, &pool, &hwm)
-                .await
-                .expect("catch_up_from_checkpoint");
+        let (cursor, contiguous) = catch_up_from_checkpoint(
+            &observer,
+            &sub_id,
+            false,
+            FailureMode::FailOpen,
+            &config,
+            &pool,
+            &hwm,
+        )
+        .await
+        .expect("catch_up_from_checkpoint");
 
         // The cursor scans to the head regardless of gaps, so it must reach s3
         // whether or not the range is contiguous.
@@ -4279,10 +4486,17 @@ mod tests {
         // cu_set_checkpoint for Checkpointed subscribers).
         hwm.lock().await.insert(sub_id.clone(), s3 as u64 - 3);
 
-        let (cursor, _contiguous) =
-            catch_up_from_checkpoint(&observer, &sub_id, true, &config, &pool, &hwm)
-                .await
-                .expect("catch_up_from_checkpoint");
+        let (cursor, _contiguous) = catch_up_from_checkpoint(
+            &observer,
+            &sub_id,
+            true,
+            FailureMode::FailOpen,
+            &config,
+            &pool,
+            &hwm,
+        )
+        .await
+        .expect("catch_up_from_checkpoint");
 
         // Cursor must reach at least s3.
         assert!(cursor >= s3 as u64, "cursor must reach at least s3");
