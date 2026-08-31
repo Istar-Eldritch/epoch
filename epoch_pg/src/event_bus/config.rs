@@ -51,6 +51,77 @@ pub trait DlqCallback: Send + Sync {
     async fn on_dlq_insertion(&self, info: DlqInsertionInfo);
 }
 
+/// Why a fail-closed subscriber's delivery halted.
+///
+/// Passed inside a [`HaltInfo`] to the [`HaltCallback`]. The enum is
+/// `#[non_exhaustive]`: later delivery paths (gap refusal, operator release)
+/// contribute further reasons without breaking downstream `match` arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HaltReason {
+    /// An event's stored payload could not be deserialized into the
+    /// subscriber's event type, and the subscriber is [`FailClosed`]. The
+    /// checkpoint is held below the bad sequence and a DLQ row
+    /// (`unrecoverable: deserialize: …`) is written.
+    ///
+    /// [`FailClosed`]: epoch_core::FailureMode::FailClosed
+    DeserializeFailure,
+    /// An observer exhausted its retry ladder on an event, and the subscriber
+    /// is [`FailClosed`]. The existing DLQ row and `on_dlq_insertion` callback
+    /// still fire; the checkpoint is then held below the failed sequence.
+    ///
+    /// [`FailClosed`]: epoch_core::FailureMode::FailClosed
+    ObserverFailure,
+}
+
+/// Information about a fail-closed delivery halt, passed to the [`HaltCallback`].
+///
+/// A halt fires once on entry (and, in later phases, on operator release), not
+/// on every re-attempt of a held event, so callbacks can drive alerting without
+/// per-batch spam.
+#[derive(Debug, Clone)]
+pub struct HaltInfo {
+    /// The subscriber whose delivery halted.
+    pub subscriber_id: String,
+    /// The sequence the subscriber is held below: its contiguous checkpoint
+    /// stays under this value until the cause is resolved or the subscriber is
+    /// released.
+    pub held_below_sequence: u64,
+    /// Why the halt occurred.
+    pub reason: HaltReason,
+}
+
+/// Callback invoked when a fail-closed subscriber halts delivery.
+///
+/// Implementations should be lightweight and avoid blocking for extended
+/// periods. Errors or panics inside the callback do not affect the halt itself
+/// (the checkpoint is held regardless of callback outcome). Use this to alert
+/// operators that a subscriber has stopped and needs the underlying cause
+/// (missing upcaster, broken observer, unproven gap) resolved.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use epoch_pg::event_bus::{HaltCallback, HaltInfo};
+/// use async_trait::async_trait;
+///
+/// struct AlertCallback;
+///
+/// #[async_trait]
+/// impl HaltCallback for AlertCallback {
+///     async fn on_halt(&self, info: HaltInfo) {
+///         log::error!("subscriber '{}' halted below seq {}: {:?}",
+///             info.subscriber_id, info.held_below_sequence, info.reason);
+///     }
+/// }
+/// ```
+#[async_trait]
+pub trait HaltCallback: Send + Sync {
+    /// Called when a fail-closed subscriber halts delivery below
+    /// `info.held_below_sequence`.
+    async fn on_halt(&self, info: HaltInfo);
+}
+
 /// Information about a gap that was advanced past due to timeout.
 ///
 /// Passed to the [`GapTimeoutCallback`] after the gap-timeout record has been
@@ -221,6 +292,19 @@ pub struct ReliableDeliveryConfig {
     /// Default: `None` (no callback)
     pub on_gap_timeout: Option<Arc<dyn GapTimeoutCallback>>,
 
+    /// Optional callback invoked when a fail-closed subscriber halts delivery.
+    ///
+    /// Fires once on halt entry (deserialize failure, observer-retry
+    /// exhaustion, and in later phases an unproven gap or an operator release),
+    /// not on every re-attempt of a held event. Use this to alert operators
+    /// that a subscriber has stopped and needs its underlying cause resolved.
+    ///
+    /// Errors from the callback are logged but do not affect the halt — the
+    /// checkpoint is held regardless of callback outcome.
+    ///
+    /// Default: `None` (no callback)
+    pub on_halt: Option<Arc<dyn HaltCallback>>,
+
     /// How events flow from publishers to subscribers. See [`DispatchMode`].
     pub dispatch_mode: DispatchMode,
 
@@ -263,6 +347,7 @@ impl Default for ReliableDeliveryConfig {
             gap_timeout: Duration::from_secs(5),
             on_dlq_insertion: None,
             on_gap_timeout: None,
+            on_halt: None,
             dispatch_mode: DispatchMode::default(),
             events_table: "epoch_events".to_string(),
             snapshot_fencing: true,
@@ -288,6 +373,10 @@ impl std::fmt::Debug for ReliableDeliveryConfig {
             .field(
                 "on_gap_timeout",
                 &self.on_gap_timeout.as_ref().map(|_| "Some(<callback>)"),
+            )
+            .field(
+                "on_halt",
+                &self.on_halt.as_ref().map(|_| "Some(<callback>)"),
             )
             .field("dispatch_mode", &self.dispatch_mode)
             .field("events_table", &self.events_table)
@@ -449,6 +538,7 @@ mod tests {
             gap_timeout: Duration::from_secs(10),
             on_dlq_insertion: None,
             on_gap_timeout: None,
+            on_halt: None,
             dispatch_mode: DispatchMode::default(),
             events_table: "custom_events".to_string(),
             snapshot_fencing: false,

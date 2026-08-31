@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-subscriber fail-closed delivery semantics** (`epoch_core`, `epoch_pg`, CLOUD-216) —
+  an opt-in `FailureMode { FailOpen (default), FailClosed }` letting a subscriber halt
+  rather than silently skip an event it cannot apply in order:
+  - **`epoch_core`** — `FailureMode` enum (`#[non_exhaustive]`, re-exported from the
+    prelude); defaulted `failure_mode()` on `EventObserver`, `Projection`, and `Saga`,
+    forwarded by `ProjectionHandler`, `SagaHandler`, `SagaAdapter`, and the
+    `impl Saga for Arc<S>` blanket. Existing implementors are unchanged (default `FailOpen`).
+  - **`epoch_pg`** — on the live batch path a `FailClosed` subscriber that hits a
+    deserialize failure or an observer-retry exhaustion now holds its contiguous
+    checkpoint below the bad sequence (writing a `unrecoverable: deserialize: …` DLQ row
+    for the deserialize case), fires the new `on_halt` callback once on entry, and
+    self-heals on the next batch once the cause is fixed. A panicking observer is now
+    contained (caught in `process_event_with_retry`) instead of killing the listener
+    task — a deliberate fail-open behaviour change: the panic routes through the existing
+    retry/DLQ machinery. New `HaltCallback` / `HaltInfo` / `HaltReason` public API in
+    `epoch_pg::event_bus`. No schema migration.
+
 - **Subscriber readiness + startup safety** (`epoch_core`, `epoch_pg`, CLOUD-221) —
   first-class lag/readiness API on `PgEventBus`, a `ReplayAlways` subscription mode for
   in-memory projections that replay from zero every boot, and startup catch-up so a
@@ -248,6 +265,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `on_gap_timeout: Option<Arc<dyn GapTimeoutCallback>>` field (defaults to `None`).
   Code that constructs `ReliableDeliveryConfig` using struct-literal syntax (rather than
   `..Default::default()`) must add `on_gap_timeout: None` to the literal.
+- **Source-compat note** (`epoch_pg`, CLOUD-216, `feat(pg)!`): `ReliableDeliveryConfig`
+  gains the new `on_halt: Option<Arc<dyn HaltCallback>>` field (defaults to `None`),
+  fired when a fail-closed subscriber halts delivery. Code that constructs
+  `ReliableDeliveryConfig` using struct-literal syntax (rather than
+  `..Default::default()`) must add `on_halt: None` to the literal.
 - **Source-compat note**: `ReliableDeliveryConfig` (`epoch_pg`) gains the new
   `snapshot_fencing: bool` field (defaults to `true`). Code that constructs
   `ReliableDeliveryConfig` using struct-literal syntax (rather than
