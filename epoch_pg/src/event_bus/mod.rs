@@ -509,15 +509,37 @@ where
 
     // CLOUD-180: thread the per-batch snapshot into the pure resolver. With
     // `None` (fencing disabled/unavailable) this is byte-for-byte the legacy
-    // timeout-only resolver.
-    let skipped_gaps =
-        advance_contiguous_checkpoint(&mut state, &visible_seqs, config.gap_timeout, snapshot);
+    // timeout-only resolver. Spec 0028 P4: pass the subscriber's failure_mode
+    // so a FailClosed subscriber refuses the backstop (gap refusal leg).
+    let failure_mode = state.failure_mode;
+    let outcome = advance_contiguous_checkpoint(
+        &mut state,
+        &visible_seqs,
+        config.gap_timeout,
+        snapshot,
+        failure_mode,
+    );
+
+    // Spec 0028 P4 gap refusal: fire on_halt(GapUnproven) on the first batch
+    // cycle where the backstop would have fired but was refused. Subsequent
+    // cycles for the same gap return None (halt_fired guards the entry-only
+    // contract, spec 0028 §3.4).
+    if let Some(refused_seq) = outcome.backstop_refused {
+        fire_on_halt(
+            &config,
+            &subscriber_id,
+            refused_seq,
+            HaltReason::GapUnproven,
+        )
+        .await;
+    }
 
     // Partition by reason: `FenceCleared` skips are expected, lossless rollbacks
     // (writer aborted / burned sequence) and are only debug-logged. Only
     // `TimeoutBackstop` skips carry potential data loss and are recorded via the
     // CLOUD-169 machinery.
-    let (fence_cleared, timeout_backstop): (Vec<_>, Vec<_>) = skipped_gaps
+    let (fence_cleared, timeout_backstop): (Vec<_>, Vec<_>) = outcome
+        .skipped_gaps
         .into_iter()
         .partition(|gap| gap.reason == SkipReason::FenceCleared);
 

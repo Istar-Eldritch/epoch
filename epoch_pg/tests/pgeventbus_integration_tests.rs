@@ -8271,3 +8271,269 @@ async fn test_inline_drain_panic_returns_err_no_deadlock() {
         "both publishes reached the observer"
     );
 }
+
+/// T5 (R5, R7, spec 0028 P4): a fail-closed subscriber refuses the gap-timeout
+/// backstop — no checkpoint advance, no `epoch_event_bus_gap_timeouts` row, no
+/// `on_gap_timeout`, `on_halt(GapUnproven)` fires exactly once.
+///
+/// Recovery leg: rolling back the held transaction (so the sequence provably
+/// never existed) clears the snapshot fence, and the subscriber's checkpoint
+/// then advances past the gap via `FenceCleared` (not the backstop).
+///
+/// Uses an isolated table + sequence (`snapshot_fencing: true`, `gap_timeout:
+/// 500ms`) so the hole is deterministic and does not stall sibling test binaries.
+/// A generous recovery-poll timeout (30 s) accommodates xmin advancement on a
+/// shared test instance.
+#[tokio::test]
+#[serial]
+async fn test_fail_closed_gap_refusal_and_fence_cleared_recovery() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: true,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // Subscribe a fail-closed observer. Subscribe after start_listener so it
+    // takes the live path (no catch-up) — the checkpoint is pre-planted just
+    // below the hole to isolate from shared-table history.
+    let fc_id = format!("projection:fc-gap:{}", Uuid::new_v4());
+    let fc = TestProjection::with_subscriber_id(fc_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(fc))
+        .await
+        .expect("subscribe fail-closed observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    // Commit a below-hole event; wait until the subscriber's checkpoint lands on
+    // it before opening the hole.  This proves the write path is alive and gives
+    // us the exact contiguous position the gap refusal must hold.
+    let stream = Uuid::new_v4();
+    let (_, seq_below) = insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fc_id, Some(seq_below as u64)).await,
+        "fail-closed subscriber must reach seq {seq_below} before the hole is opened"
+    );
+
+    // Open the hole: claim an uncommitted sequence on the isolated table.
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_hole_id, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(
+        seq_hole > seq_below,
+        "hole must sit above the below-hole event"
+    );
+
+    // Commit two events above the hole so the bus sees a gap at seq_hole.
+    let (_, seq_above1) = insert_committed_event(&pool, &table, hole_stream, 2, "above1").await;
+    let (_, seq_above2) = insert_committed_event(&pool, &table, hole_stream, 3, "above2").await;
+    assert!(seq_above1 > seq_hole && seq_above2 > seq_above1);
+
+    // Wait for gap_timeout (500ms) + several bus cycles (1s flush_interval +
+    // buffer) so fail-open would have advanced past the hole by now.
+    tokio::time::sleep(GapDuration::from_millis(2500)).await;
+
+    // --- Assert the gap was REFUSED (fail-closed) ---------------------------
+
+    // Checkpoint must be held at seq_below (not advanced past seq_hole).
+    let checkpoint_held = event_bus
+        .get_checkpoint(&fc_id)
+        .await
+        .expect("get checkpoint");
+    assert_eq!(
+        checkpoint_held,
+        Some(seq_below as u64),
+        "fail-closed subscriber must hold checkpoint at seq {seq_below}, not advance past \
+         hole at {seq_hole}; got {checkpoint_held:?}"
+    );
+
+    // No gap-timeout row must have been inserted (the backstop was refused).
+    let gap_rows = event_bus
+        .list_gap_timeouts(Some(&fc_id), false, 0, 50)
+        .await
+        .expect("list_gap_timeouts");
+    assert!(
+        gap_rows.is_empty(),
+        "FailClosed must not insert a gap-timeout row; found: {gap_rows:?}"
+    );
+
+    // on_halt(GapUnproven) must have fired exactly once (halt entry only).
+    {
+        let halts_guard = halts.lock().unwrap();
+        assert_eq!(
+            halts_guard.len(),
+            1,
+            "on_halt must fire exactly once on halt entry, got: {halts_guard:?}"
+        );
+        assert_eq!(halts_guard[0].subscriber_id, fc_id);
+        assert_eq!(halts_guard[0].held_below_sequence, seq_hole as u64);
+        assert_eq!(halts_guard[0].reason, HaltReason::GapUnproven);
+    }
+
+    // --- Recovery: roll back the hole → FenceCleared → advance ---------------
+
+    // Rolling back aborts the writer: the sequence seq_hole provably never
+    // existed. On the next bus cycle the snapshot fence clears (xmin catches up
+    // past fence_xmax), and the FenceCleared branch advances the checkpoint.
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    // Poll until the checkpoint advances past seq_hole (up to 30 s to allow
+    // xmin to advance on a loaded instance).
+    let mut recovered = false;
+    for _ in 0..120 {
+        let cp = event_bus
+            .get_checkpoint(&fc_id)
+            .await
+            .expect("get checkpoint after rollback");
+        if matches!(cp, Some(s) if s >= seq_above2 as u64) {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(250)).await;
+    }
+    assert!(
+        recovered,
+        "after rolling back the hole, the fail-closed subscriber must recover via \
+         FenceCleared and advance to seq {seq_above2}"
+    );
+
+    // Still no gap-timeout row after recovery (FenceCleared is lossless and
+    // never recorded).
+    let gap_rows_after = event_bus
+        .list_gap_timeouts(Some(&fc_id), false, 0, 50)
+        .await
+        .expect("list_gap_timeouts after recovery");
+    assert!(
+        gap_rows_after.is_empty(),
+        "FenceCleared recovery must not insert a gap-timeout row; found: {gap_rows_after:?}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// Fail-open gap regression pin (R10): with `snapshot_fencing: false` and
+/// `gap_timeout: 500ms`, a fail-open subscriber's backstop DOES advance past
+/// the gap, inserts a `epoch_event_bus_gap_timeouts` row, and invokes
+/// `on_gap_timeout`. Byte-identical to pre-P4 behaviour.
+///
+/// This pin is complementary to the existing `test_gap_timeout_inserts_record`
+/// and `test_gap_timeout_callback_is_invoked` suites; it runs on an isolated
+/// table to avoid leaving holes on the shared sequence.
+#[tokio::test]
+#[serial]
+async fn test_fail_open_gap_backstop_still_advances_pin() {
+    use epoch_pg::event_bus::{GapTimeoutCallback, GapTimeoutInfo};
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+
+    struct CapturingGapCallback {
+        fired: Arc<StdMutex<Vec<u64>>>,
+    }
+    #[async_trait]
+    impl GapTimeoutCallback for CapturingGapCallback {
+        async fn on_gap_timeout(&self, info: GapTimeoutInfo) {
+            self.fired.lock().unwrap().push(info.skipped_sequence);
+        }
+    }
+
+    let fired = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_gap_timeout: Some(Arc::new(CapturingGapCallback {
+            fired: fired.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let fo_id = format!("projection:fo-gap-pin:{}", Uuid::new_v4());
+    let fo = TestProjection::with_subscriber_id(fo_id.clone()); // FailOpen default
+    event_bus
+        .subscribe(ProjectionHandler::new(fo))
+        .await
+        .expect("subscribe fail-open observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_, seq_below) = insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    assert!(
+        poll_checkpoint_eq(&event_bus, &fo_id, Some(seq_below as u64)).await,
+        "fail-open subscriber must reach seq {seq_below} before the hole"
+    );
+
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    let (_, seq_above) = insert_committed_event(&pool, &table, hole_stream, 2, "above").await;
+    assert!(seq_above > seq_hole);
+
+    // Wait for the backstop to fire (gap_timeout 500ms + bus cycles).
+    let mut advanced = false;
+    for _ in 0..60 {
+        let cp = event_bus
+            .get_checkpoint(&fo_id)
+            .await
+            .expect("get checkpoint");
+        if matches!(cp, Some(s) if s >= seq_above as u64) {
+            advanced = true;
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    // Release the hole before asserting so a failing test doesn't leave it open.
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    assert!(
+        advanced,
+        "fail-open subscriber must advance past the gap at {seq_hole} via backstop"
+    );
+
+    // A gap-timeout row must exist.
+    let rows = event_bus
+        .list_gap_timeouts(Some(&fo_id), false, 0, 50)
+        .await
+        .expect("list_gap_timeouts");
+    assert!(
+        rows.iter().any(|r| r.skipped_sequence == seq_hole as u64),
+        "fail-open backstop must insert a gap-timeout row for seq {seq_hole}; got {rows:?}"
+    );
+
+    // on_gap_timeout callback must have fired.
+    assert!(
+        fired.lock().unwrap().contains(&(seq_hole as u64)),
+        "fail-open on_gap_timeout must fire for seq {seq_hole}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}

@@ -72,6 +72,17 @@ pub enum HaltReason {
     ///
     /// [`FailClosed`]: epoch_core::FailureMode::FailClosed
     ObserverFailure,
+    /// The gap-timeout backstop would have advanced past a missing sequence,
+    /// but the subscriber is [`FailClosed`]. The checkpoint is held below the
+    /// gap until the writer's transaction is proven absent (fence clears
+    /// because the writer aborted) or an operator releases the subscriber.
+    ///
+    /// Unlike the fail-open backstop advance (which records a
+    /// `epoch_event_bus_gap_timeouts` row and moves on), this halt leaves the
+    /// subscriber permanently held until the cause is resolved.
+    ///
+    /// [`FailClosed`]: epoch_core::FailureMode::FailClosed
+    GapUnproven,
 }
 
 /// Information about a fail-closed delivery halt, passed to the [`HaltCallback`].
