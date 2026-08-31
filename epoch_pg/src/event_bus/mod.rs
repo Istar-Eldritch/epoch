@@ -9,9 +9,9 @@ mod subscriber_state;
 pub(crate) use checkpoint::*;
 pub use config::{
     CheckpointMode, DispatchMode, DlqCallback, DlqInsertionInfo, GapTimeoutCallback,
-    GapTimeoutInfo, InstanceMode, ReliableDeliveryConfig,
+    GapTimeoutInfo, HaltCallback, HaltInfo, HaltReason, InstanceMode, ReliableDeliveryConfig,
 };
-pub(crate) use retry::{ProcessResult, process_event_with_retry};
+pub(crate) use retry::{ProcessResult, invoke_observer_once, process_event_with_retry};
 pub(crate) use subscriber_state::{
     SkipReason, SubscriberState, TxidSnapshot, advance_contiguous_checkpoint,
 };
@@ -21,7 +21,7 @@ pub use retry::calculate_retry_delay_no_jitter;
 
 use crate::event_store::PgDBEvent;
 use epoch_core::event::{Event, EventData};
-use epoch_core::event_store::{EventBus, SubscriptionMode};
+use epoch_core::event_store::{EventBus, FailureMode, SubscriptionMode};
 use epoch_core::prelude::EventObserver;
 use log::{error, info, warn};
 use serde::de::DeserializeOwned;
@@ -218,6 +218,62 @@ async fn query_txid_snapshot(pool: &PgPool) -> Option<TxidSnapshot> {
     }
 }
 
+/// Writes (or refreshes) the fail-closed deserialize-halt DLQ row for one event
+/// (spec 0028 Q3). Unlike the observer-exhaustion DLQ row, this carries the
+/// `unrecoverable: deserialize:` prefix and does not fire `on_dlq_insertion` —
+/// the halt observability signal for the deser path is `on_halt` plus the row
+/// itself. Failure to write the row is logged, never fatal.
+async fn insert_deser_halt_dlq_row(
+    dlq_pool: &PgPool,
+    subscriber_id: &str,
+    event_id: Uuid,
+    global_sequence: u64,
+    error_message: &str,
+) {
+    if let Err(e) = sqlx::query(
+        r#"
+        INSERT INTO epoch_event_bus_dlq (subscriber_id, event_id, global_sequence, error_message, retry_count, last_retry_at)
+        VALUES ($1, $2, $3, $4, $5, NOW())
+        ON CONFLICT (subscriber_id, event_id) DO UPDATE SET
+            error_message = EXCLUDED.error_message,
+            retry_count = EXCLUDED.retry_count,
+            last_retry_at = NOW()
+        "#,
+    )
+    .bind(subscriber_id)
+    .bind(event_id)
+    .bind(global_sequence as i64)
+    .bind(error_message)
+    .bind(1i32)
+    .execute(dlq_pool)
+    .await
+    {
+        error!(
+            "Failed to insert deserialize-halt DLQ row for '{}' (event {}): {}",
+            subscriber_id, event_id, e
+        );
+    }
+}
+
+/// Fires the optional `on_halt` callback on halt entry (spec 0028 Q3). Fired
+/// once when a fail-closed subscriber enters a halt, never per re-attempt.
+async fn fire_on_halt(
+    config: &ReliableDeliveryConfig,
+    subscriber_id: &str,
+    held_below_sequence: u64,
+    reason: HaltReason,
+) {
+    if let Some(callback) = &config.on_halt {
+        callback
+            .on_halt(HaltInfo {
+                subscriber_id: subscriber_id.to_string(),
+                held_below_sequence,
+                reason,
+            })
+            .await;
+    }
+}
+
 /// Processes one subscriber against the pre-fetched batch of events.
 /// All per-subscriber state is owned, making this safe to run concurrently.
 async fn process_subscriber_for_batch<D>(
@@ -246,8 +302,30 @@ where
     let replay_always =
         { projection.lock().await.subscription_mode() == SubscriptionMode::ReplayAlways };
     let contiguous_before = state.contiguous_checkpoint;
+    let failure_mode = state.failure_mode;
     let mut processed_any = false;
     let mut last_event_id = last_event_id_in;
+
+    // Bookkeeping for an event this subscriber applied (or, on a fail-open deser
+    // skip, advanced past): record it out-of-order and count it toward the
+    // `Batched` threshold, but never let an ahead-of-gap event become the
+    // published position (spec 0027 R1). The eager seed is born at the current
+    // contiguous prefix.
+    macro_rules! record_applied {
+        ($seq:expr, $id:expr) => {{
+            state.processed_ahead.insert($seq);
+            last_event_id = Some($id);
+            pending_checkpoint
+                .get_or_insert_with(|| {
+                    PendingCheckpoint::seeded(
+                        state.contiguous_checkpoint,
+                        state.contiguous_event_id,
+                    )
+                })
+                .record_processed();
+            processed_any = true;
+        }};
+    }
 
     for row in rows.iter() {
         let event_seq = row.global_sequence.unwrap_or(0) as u64;
@@ -262,6 +340,11 @@ where
             continue;
         }
 
+        // A fail-closed subscriber that halted on exactly this sequence in an
+        // earlier cycle re-attempts it with a SINGLE observer invocation and no
+        // retry ladder (spec 0028 §3.4).
+        let is_reattempt = state.held_event == Some(event_seq);
+
         let data = match row
             .data
             .clone()
@@ -269,30 +352,68 @@ where
             .transpose()
         {
             Ok(data) => data,
-            Err(e) => {
-                warn!(
-                    "Skipping event {} (type: '{}', global_seq: {}) \
-                     for '{}': failed to deserialize: {}. \
-                     This is expected when event variants have been \
-                     removed. Advancing checkpoint past this event.",
-                    event_id, row.event_type, event_seq, subscriber_id, e
-                );
-                state.processed_ahead.insert(event_seq);
-                last_event_id = Some(event_id);
-                // Count the event toward the `Batched` threshold, but never let
-                // an ahead-of-gap event become the published position (spec 0027
-                // R1). The eager seed is born at the current contiguous prefix.
-                pending_checkpoint
-                    .get_or_insert_with(|| {
-                        PendingCheckpoint::seeded(
-                            state.contiguous_checkpoint,
-                            state.contiguous_event_id,
+            Err(e) => match failure_mode {
+                FailureMode::FailClosed => {
+                    // Halt: hold the contiguous prefix below this sequence (no
+                    // processed_ahead insert, no record_processed), write a DLQ
+                    // row, and stop consuming this subscriber's batch. on_halt
+                    // fires only on halt ENTRY, never per re-attempt, to avoid
+                    // alert spam (spec 0028 §3.4). The DLQ row is likewise only
+                    // written on halt entry — a re-attempt must stay cheap, so
+                    // it re-holds with a debug log and no DB write (parity with
+                    // the observer re-attempt path).
+                    let error_message = format!("unrecoverable: deserialize: {}", e);
+                    if !is_reattempt {
+                        insert_deser_halt_dlq_row(
+                            &dlq_pool,
+                            &subscriber_id,
+                            event_id,
+                            event_seq,
+                            &error_message,
                         )
-                    })
-                    .record_processed();
-                processed_any = true;
-                continue;
-            }
+                        .await;
+                    }
+                    if is_reattempt {
+                        log::debug!(
+                            "Fail-closed subscriber '{}' still cannot deserialize held \
+                             event {} (seq {}): {}. Holding.",
+                            subscriber_id,
+                            event_id,
+                            event_seq,
+                            e
+                        );
+                    } else {
+                        warn!(
+                            "Fail-closed halt for '{}': event {} (seq {}) is undeserializable: \
+                             {}. Holding the checkpoint below this sequence until the payload \
+                             is corrected or the subscriber is released.",
+                            subscriber_id, event_id, event_seq, e
+                        );
+                        fire_on_halt(
+                            &config,
+                            &subscriber_id,
+                            event_seq,
+                            HaltReason::DeserializeFailure,
+                        )
+                        .await;
+                    }
+                    state.held_event = Some(event_seq);
+                    break;
+                }
+                // Fail-open (and any future non-fail-closed mode): log, skip,
+                // and advance past the undeserializable event (unchanged).
+                _ => {
+                    warn!(
+                        "Skipping event {} (type: '{}', global_seq: {}) \
+                         for '{}': failed to deserialize: {}. \
+                         This is expected when event variants have been \
+                         removed. Advancing checkpoint past this event.",
+                        event_id, row.event_type, event_seq, subscriber_id, e
+                    );
+                    record_applied!(event_seq, event_id);
+                    continue;
+                }
+            },
         };
 
         let event = Arc::new(Event::<D> {
@@ -320,19 +441,66 @@ where
             subscriber_id
         );
 
-        process_event_with_retry(&projection, &event, &subscriber_id, &config, &dlq_pool).await;
-
-        state.processed_ahead.insert(event_seq);
-        last_event_id = Some(event_id);
-        // Count the event toward the `Batched` threshold, but never let an
-        // ahead-of-gap event become the published position (spec 0027 R1). The
-        // eager seed is born at the current contiguous prefix.
-        pending_checkpoint
-            .get_or_insert_with(|| {
-                PendingCheckpoint::seeded(state.contiguous_checkpoint, state.contiguous_event_id)
-            })
-            .record_processed();
-        processed_any = true;
+        match failure_mode {
+            // Fail-closed re-attempt of a held event: a single invocation, no
+            // retry ladder. Success clears the marker and resumes normal
+            // delivery from here; failure re-holds silently (spec 0028 §3.4).
+            FailureMode::FailClosed if is_reattempt => {
+                match invoke_observer_once(&projection, &event).await {
+                    Ok(()) => {
+                        state.held_event = None;
+                        record_applied!(event_seq, event_id);
+                    }
+                    Err(err) => {
+                        log::debug!(
+                            "Fail-closed re-attempt of held event {} (seq {}) for '{}' \
+                             failed: {}. Holding.",
+                            event_id,
+                            event_seq,
+                            subscriber_id,
+                            err
+                        );
+                        break;
+                    }
+                }
+            }
+            // Fail-closed first attempt: full retry ladder; on exhaustion, halt
+            // after the DLQ row / on_dlq_insertion already fired inside it.
+            FailureMode::FailClosed => {
+                match process_event_with_retry(
+                    &projection,
+                    &event,
+                    &subscriber_id,
+                    &config,
+                    &dlq_pool,
+                )
+                .await
+                {
+                    ProcessResult::Success => {
+                        record_applied!(event_seq, event_id);
+                    }
+                    ProcessResult::SentToDlq => {
+                        fire_on_halt(
+                            &config,
+                            &subscriber_id,
+                            event_seq,
+                            HaltReason::ObserverFailure,
+                        )
+                        .await;
+                        state.held_event = Some(event_seq);
+                        break;
+                    }
+                }
+            }
+            // Fail-open (and any future non-fail-closed mode): retry then
+            // DLQ-and-continue, advancing past the event regardless of outcome
+            // (unchanged behaviour).
+            _ => {
+                process_event_with_retry(&projection, &event, &subscriber_id, &config, &dlq_pool)
+                    .await;
+                record_applied!(event_seq, event_id);
+            }
+        }
     }
 
     // CLOUD-180: thread the per-batch snapshot into the pure resolver. With
@@ -1425,11 +1593,12 @@ where
 
                 // Initialize per-subscriber state for any new subscribers.
                 for projection in projections_snapshot.iter() {
-                    let (subscriber_id, replay_always) = {
+                    let (subscriber_id, replay_always, failure_mode) = {
                         let guard = projection.lock().await;
                         (
                             guard.subscriber_id().to_string(),
                             guard.subscription_mode() == SubscriptionMode::ReplayAlways,
+                            guard.failure_mode(),
                         )
                     };
                     if !subscriber_states.contains_key(&subscriber_id) {
@@ -1475,7 +1644,11 @@ where
                         };
                         subscriber_states.insert(
                             subscriber_id.clone(),
-                            SubscriberState::new_with_event_id(checkpoint, checkpoint_event_id),
+                            SubscriberState::new_with_event_id(
+                                checkpoint,
+                                checkpoint_event_id,
+                                failure_mode,
+                            ),
                         );
                     }
                 }

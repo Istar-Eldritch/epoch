@@ -3,8 +3,10 @@
 use super::config::ReliableDeliveryConfig;
 use epoch_core::event::{Event, EventData};
 use epoch_core::prelude::EventObserver;
+use futures::FutureExt;
 use log::{error, info, warn};
 use sqlx::PgPool;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
@@ -16,6 +18,47 @@ pub(crate) enum ProcessResult {
     Success,
     /// Event failed after all retries and was sent to DLQ
     SentToDlq,
+}
+
+/// Renders a caught panic payload into a human-readable string.
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+/// Invokes an observer's `on_event` exactly once, containing any panic.
+///
+/// The observer future is wrapped in [`AssertUnwindSafe`] and `catch_unwind`
+/// (spec 0028 §3.6): a panic in `on_event` is caught and classified as an
+/// observer failure (`Err`) instead of unwinding through `join_all` and killing
+/// the whole listener task. `tokio::sync::Mutex` does not poison, so the
+/// observer lock is released cleanly on unwind. Used both by the retry ladder
+/// below and by the fail-closed single re-attempt of a held event (which must
+/// not re-run the full ladder).
+pub(crate) async fn invoke_observer_once<ED>(
+    observer: &Arc<Mutex<dyn EventObserver<ED>>>,
+    event: &Arc<Event<ED>>,
+) -> Result<(), String>
+where
+    ED: EventData + Send + Sync,
+{
+    let observer_guard = observer.lock().await;
+    match AssertUnwindSafe(observer_guard.on_event(Arc::clone(event)))
+        .catch_unwind()
+        .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("{:?}", e)),
+        Err(payload) => Err(format!(
+            "observer panicked: {}",
+            panic_payload_message(payload)
+        )),
+    }
 }
 
 /// Calculates the retry delay using exponential backoff with jitter.
@@ -111,9 +154,11 @@ where
     let mut last_error: Option<String> = None;
 
     for attempt in 0..=config.max_retries {
-        let observer_guard = observer.lock().await;
-        match observer_guard.on_event(Arc::clone(event)).await {
-            Ok(_) => {
+        // A panic in `on_event` is contained here (spec 0028 §3.6) and treated
+        // as an observer failure, so it flows through this same retry/DLQ ladder
+        // instead of killing the listener task.
+        match invoke_observer_once(observer, event).await {
+            Ok(()) => {
                 log::debug!(
                     "Successfully applied event to '{}': {:?}{}",
                     subscriber_id,
@@ -127,11 +172,10 @@ where
                 return ProcessResult::Success;
             }
             Err(e) => {
-                last_error = Some(format!("{:?}", e));
                 if attempt < config.max_retries {
                     let delay = calculate_retry_delay(config, attempt);
                     warn!(
-                        "Failed applying event {} to '{}' (attempt {}/{}): {:?}. Retrying in {:?}",
+                        "Failed applying event {} to '{}' (attempt {}/{}): {}. Retrying in {:?}",
                         event_id,
                         subscriber_id,
                         attempt + 1,
@@ -139,16 +183,17 @@ where
                         e,
                         delay
                     );
-                    drop(observer_guard);
+                    last_error = Some(e);
                     sleep(delay).await;
                 } else {
                     error!(
-                        "Failed applying event {} to '{}' after {} attempts: {:?}. Sending to DLQ.",
+                        "Failed applying event {} to '{}' after {} attempts: {}. Sending to DLQ.",
                         event_id,
                         subscriber_id,
                         config.max_retries + 1,
                         e
                     );
+                    last_error = Some(e);
                 }
             }
         }

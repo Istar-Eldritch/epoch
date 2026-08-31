@@ -5,6 +5,7 @@
 //! correct checkpoint advancement even when events are delivered or become visible
 //! out of order (e.g., due to PostgreSQL's non-transactional `nextval()` behavior).
 
+use epoch_core::event_store::FailureMode;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -108,6 +109,20 @@ pub(crate) struct SubscriberState {
     /// Key: the missing global_sequence. Value: the [`GapObservation`] captured
     /// when the gap was first noticed.
     pub gap_first_seen: HashMap<u64, GapObservation>,
+
+    /// This subscriber's fail-closed/fail-open policy, resolved once from the
+    /// observer at state-init (spec 0028). Read by the live batch path to decide
+    /// whether a failure holds the checkpoint (`FailClosed`) or advances past it
+    /// (`FailOpen`).
+    pub failure_mode: FailureMode,
+
+    /// The sequence a fail-closed subscriber has halted at, if any. Set on the
+    /// deserialize-failure and observer-exhaustion halt paths; the general
+    /// "halted-at" marker. While set, the next batch cycle re-attempts exactly
+    /// this sequence with a single observer invocation (no retry ladder, spec
+    /// 0028 §3.4); a successful re-attempt clears it. Always `None` for a
+    /// fail-open subscriber.
+    pub held_event: Option<u64>,
 }
 
 impl SubscriberState {
@@ -123,6 +138,8 @@ impl SubscriberState {
             contiguous_event_id: Uuid::nil(),
             processed_ahead: HashSet::new(),
             gap_first_seen: HashMap::new(),
+            failure_mode: FailureMode::FailOpen,
+            held_event: None,
         }
     }
 
@@ -133,12 +150,14 @@ impl SubscriberState {
     /// `last_global_sequence` and `last_event_id` from the checkpoints table so
     /// an eager [`PendingCheckpoint`](super::checkpoint::PendingCheckpoint) can
     /// be seeded with a correctly paired id.
-    pub fn new_with_event_id(checkpoint: u64, event_id: Uuid) -> Self {
+    pub fn new_with_event_id(checkpoint: u64, event_id: Uuid, failure_mode: FailureMode) -> Self {
         Self {
             contiguous_checkpoint: checkpoint,
             contiguous_event_id: event_id,
             processed_ahead: HashSet::new(),
             gap_first_seen: HashMap::new(),
+            failure_mode,
+            held_event: None,
         }
     }
 }
