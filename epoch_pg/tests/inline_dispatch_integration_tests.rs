@@ -816,3 +816,225 @@ async fn inline_mode_cross_bus_cascade_sees_persisted_state_of_same_stream_comma
         .await
         .ok();
 }
+
+// =============================================================================
+// CLOUD-242 P1 (red): top-level same-bus reentrant regression tests.
+//
+// Unlike the cross-bus cascade test above, there is no trigger bus / cross-bus
+// hop here: the outer `handle(Create)` call IS the top-level dispatch, and
+// `IncrementOnCreatedSaga` is subscribed directly on the counter's own bus.
+// Per spec 0029 this synchronous same-bus reentrant path is NOT deferred (only
+// cross-bus dispatch is), so today's publish-before-persist ordering in
+// `Aggregate::handle()` makes the nested `Increment` observe no state row and
+// fail with `CounterError::NotFound` — these tests are expected to fail until
+// P2-P4 land the persist-before-publish reorder.
+// =============================================================================
+
+async fn setup_top_level_reentrant_counter(
+    pool: &PgPool,
+    dispatch_mode: DispatchMode,
+) -> Arc<CounterAggregate> {
+    Migrator::new(pool.clone()).run().await.expect("migrate");
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS inline_counter_states (
+            id UUID PRIMARY KEY,
+            value BIGINT NOT NULL,
+            version BIGINT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await
+    .expect("create inline_counter_states");
+
+    let counter_channel = format!("inline_counter_{}", Uuid::new_v4().simple());
+    let counter_bus = PgEventBus::<CounterEvent>::with_config(
+        pool.clone(),
+        counter_channel,
+        ReliableDeliveryConfig {
+            dispatch_mode,
+            ..Default::default()
+        },
+    );
+    counter_bus.start_listener().await.expect("start_listener");
+    let counter_event_store = PgEventStore::new(pool.clone(), counter_bus.clone());
+    let counter = Arc::new(CounterAggregate::new(pool.clone(), counter_event_store));
+
+    counter_bus
+        .subscribe(IncrementOnCreatedSaga {
+            counter: counter.clone(),
+        })
+        .await
+        .expect("subscribe increment saga");
+
+    counter
+}
+
+#[tokio::test]
+#[serial]
+async fn top_level_same_bus_reentrant_sees_persisted_state() {
+    // T1: a TOP-LEVEL handle(Create) (no trigger bus, no cross-bus hop) whose
+    // own bus carries a saga that reacts to Created by calling
+    // handle(Increment) on the SAME aggregate. Expected today: NotFound.
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    let _ = env_logger::builder().is_test(true).try_init();
+    let counter = setup_top_level_reentrant_counter(&pool, DispatchMode::Inline).await;
+
+    let counter_id = Uuid::new_v4();
+    let result = counter
+        .handle(Command::new(
+            counter_id,
+            CounterCommand::Create {
+                id: counter_id,
+                value: 0,
+            },
+            Some(()),
+            None,
+        ))
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "top-level Create must succeed even though its own bus carries a \
+         same-stream reentrant saga: {result:?}"
+    );
+
+    let state: CounterState =
+        sqlx::query_as("SELECT id, value, version FROM inline_counter_states WHERE id = $1")
+            .bind(counter_id)
+            .fetch_one(&pool)
+            .await
+            .expect("counter state must exist and reflect both Create and Increment");
+    assert_eq!(state.value, 1, "0 (Created) + 1 (Incremented) = 1");
+    assert_eq!(
+        state.version, 2,
+        "stream_version starts at 1: Created=1, Incremented=2"
+    );
+
+    sqlx::query("DROP TABLE IF EXISTS inline_counter_states CASCADE")
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+#[serial]
+async fn top_level_same_bus_reentrant_has_no_event_state_store_split() {
+    // T2: same setup as T1. Assert the committed Created + Incremented events
+    // both exist durably, and the final state row's version reconciles with
+    // both applied events — i.e. no durable event lacking a state row.
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    let _ = env_logger::builder().is_test(true).try_init();
+    let counter = setup_top_level_reentrant_counter(&pool, DispatchMode::Inline).await;
+
+    let counter_id = Uuid::new_v4();
+    counter
+        .handle(Command::new(
+            counter_id,
+            CounterCommand::Create {
+                id: counter_id,
+                value: 0,
+            },
+            Some(()),
+            None,
+        ))
+        .await
+        .expect("top-level Create must succeed");
+
+    let event_types: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT event_type, stream_version FROM epoch_events WHERE stream_id = $1 \
+         ORDER BY stream_version ASC",
+    )
+    .bind(counter_id)
+    .fetch_all(&pool)
+    .await
+    .expect("query epoch_events");
+    assert_eq!(
+        event_types,
+        vec![("Created".to_string(), 1), ("Incremented".to_string(), 2)],
+        "both Created and Incremented must be durably committed"
+    );
+
+    let state: CounterState =
+        sqlx::query_as("SELECT id, value, version FROM inline_counter_states WHERE id = $1")
+            .bind(counter_id)
+            .fetch_one(&pool)
+            .await
+            .expect(
+                "a state row must exist for a stream with durably committed events \
+                 (no event-store/state-store split)",
+            );
+    assert_eq!(
+        state.version, 2,
+        "state version must reconcile with both applied events (Created=1, Incremented=2)"
+    );
+
+    sqlx::query("DROP TABLE IF EXISTS inline_counter_states CASCADE")
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+#[serial]
+async fn async_mode_same_bus_reentrant_still_delivers() {
+    // T5: Async-mode variant of T1's shape. Regression pin, not a new-behaviour
+    // test — Async delivery is already decoupled from the publish-before-
+    // persist ordering (pg's listener wakes off the commit-time NOTIFY
+    // trigger, not off publish()), so this is expected to pass today.
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    let _ = env_logger::builder().is_test(true).try_init();
+    let counter = setup_top_level_reentrant_counter(&pool, DispatchMode::Async).await;
+
+    let counter_id = Uuid::new_v4();
+    let result = counter
+        .handle(Command::new(
+            counter_id,
+            CounterCommand::Create {
+                id: counter_id,
+                value: 0,
+            },
+            Some(()),
+            None,
+        ))
+        .await;
+    assert!(
+        result.is_ok(),
+        "top-level Create must not fail synchronously under Async dispatch: {result:?}"
+    );
+
+    // Async delivery is out-of-band (LISTEN/NOTIFY); poll for the reentrant
+    // increment to land instead of asserting immediately.
+    let mut state: Option<CounterState> = None;
+    for _ in 0..50 {
+        state =
+            sqlx::query_as("SELECT id, value, version FROM inline_counter_states WHERE id = $1")
+                .bind(counter_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("query state");
+        if let Some(s) = &state {
+            if s.version == 2 {
+                break;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    let state = state.expect("counter state must eventually exist");
+    assert_eq!(state.value, 1, "0 (Created) + 1 (Incremented) = 1");
+    assert_eq!(
+        state.version, 2,
+        "reentrant increment must eventually be applied under Async dispatch"
+    );
+
+    sqlx::query("DROP TABLE IF EXISTS inline_counter_states CASCADE")
+        .execute(&pool)
+        .await
+        .ok();
+}
