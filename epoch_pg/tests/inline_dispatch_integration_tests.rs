@@ -699,10 +699,11 @@ impl EventObserver<TriggerEvent> for CreateOnFireSaga {
 /// produced, issuing a second command against that same aggregate.
 struct IncrementOnCreatedSaga {
     counter: Arc<CounterAggregate>,
+    subscriber_id: String,
 }
 impl epoch_core::SubscriberId for IncrementOnCreatedSaga {
     fn subscriber_id(&self) -> &str {
-        "inline:regression:increment_on_created"
+        &self.subscriber_id
     }
 }
 #[async_trait]
@@ -759,6 +760,7 @@ async fn inline_mode_cross_bus_cascade_sees_persisted_state_of_same_stream_comma
     counter_bus
         .subscribe(IncrementOnCreatedSaga {
             counter: counter.clone(),
+            subscriber_id: "inline:regression:increment_on_created".to_string(),
         })
         .await
         .expect("subscribe increment saga");
@@ -859,9 +861,45 @@ async fn setup_top_level_reentrant_counter(
     let counter_event_store = PgEventStore::new(pool.clone(), counter_bus.clone());
     let counter = Arc::new(CounterAggregate::new(pool.clone(), counter_event_store));
 
+    // Unique per-invocation subscriber id: this subscriber's checkpoint is
+    // persisted keyed by subscriber_id (not by the random counter_channel
+    // above), so a fixed id here would let repeated test runs against the
+    // same dev DB inherit a prior run's checkpoint/backlog state.
+    //
+    // A fresh subscriber_id has no checkpoint row, which means position 0 —
+    // `subscribe()` resolves that position and runs its own catch-up pass
+    // SYNCHRONOUSLY, inside the awaited `subscribe()` call, before it returns.
+    // Without seeding a checkpoint first, an Async-mode subscriber (T5) would
+    // therefore replay the ENTIRE historical `Created` backlog in the shared
+    // `epoch_events` table from sequence 0 on every run — inside this very
+    // call — burning a full retry ladder into the DLQ for each stale event
+    // (its target counter_id's state row is long gone). Seeding the
+    // checkpoint at the bus's current head via `update_checkpoint()` BEFORE
+    // `subscribe()` (fast_forward_all_subscribers() runs AFTER subscribe()
+    // returns, too late to prevent the in-subscribe replay) gives both
+    // properties: a collision-free identity per run AND no backlog replay
+    // (CLAUDE.md §8 repeatability).
+    let subscriber_id = format!(
+        "inline:regression:increment_on_created:{}",
+        Uuid::new_v4().simple()
+    );
+    let head: Option<(i64, Uuid)> = sqlx::query_as(&format!(
+        "SELECT global_sequence, id FROM {} ORDER BY global_sequence DESC LIMIT 1",
+        counter_bus.events_table(),
+    ))
+    .fetch_optional(pool)
+    .await
+    .expect("query bus head");
+    if let Some((max_seq, last_event_id)) = head {
+        counter_bus
+            .update_checkpoint(&subscriber_id, max_seq as u64, last_event_id)
+            .await
+            .expect("seed fresh subscriber checkpoint at head");
+    }
     counter_bus
         .subscribe(IncrementOnCreatedSaga {
             counter: counter.clone(),
+            subscriber_id,
         })
         .await
         .expect("subscribe increment saga");
@@ -981,10 +1019,13 @@ async fn top_level_same_bus_reentrant_has_no_event_state_store_split() {
 #[tokio::test]
 #[serial]
 async fn async_mode_same_bus_reentrant_still_delivers() {
-    // T5: Async-mode variant of T1's shape. Regression pin, not a new-behaviour
-    // test — Async delivery is already decoupled from the publish-before-
-    // persist ordering (pg's listener wakes off the commit-time NOTIFY
-    // trigger, not off publish()), so this is expected to pass today.
+    // T5: Async-mode variant of T1's shape. This test DOES carry real signal —
+    // reverting the P4 persist-before-publish reorder in aggregate.rs makes it
+    // fail: Async delivery also races persist_state (pg's listener can wake off
+    // the commit-time NOTIFY before persist_state() runs), so the nested
+    // Increment's retry ladder can exhaust with Command(NotFound) before state
+    // lands. The reorder fixes that race for Async the same way it fixes it for
+    // Inline; this pins that it stays fixed.
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
     };
@@ -1011,7 +1052,7 @@ async fn async_mode_same_bus_reentrant_still_delivers() {
     // Async delivery is out-of-band (LISTEN/NOTIFY); poll for the reentrant
     // increment to land instead of asserting immediately.
     let mut state: Option<CounterState> = None;
-    for _ in 0..50 {
+    for _ in 0..150 {
         state =
             sqlx::query_as("SELECT id, value, version FROM inline_counter_states WHERE id = $1")
                 .bind(counter_id)

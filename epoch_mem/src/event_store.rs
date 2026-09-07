@@ -63,6 +63,84 @@ pub enum InMemoryEventStoreBackendError {
     PublishEvent,
 }
 
+impl<B> InMemoryEventStore<B>
+where
+    B: EventBus + Send + Sync + Clone,
+{
+    /// Shared persist step for `store_events` and `store_events_without_publish`:
+    /// validates per-stream version continuity across the whole batch (Phase 1),
+    /// then inserts and indexes every event (Phase 2). Returns the stored events
+    /// as `Arc` so `store_events` can hand them straight to `bus.publish` without
+    /// an extra clone; `store_events_without_publish` pays one clone per event to
+    /// satisfy its owned-`Vec<Event<_>>` return type.
+    async fn store_events_validated(
+        &self,
+        events: Vec<Event<B::EventType>>,
+    ) -> Result<Vec<Arc<Event<B::EventType>>>, InMemoryEventStoreBackendError> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let data = self.data.clone();
+        let mut data = data.lock().await;
+
+        // Phase 1: Validate all versions first (atomic check)
+        // Group events by stream_id to validate versions correctly
+        let mut stream_versions: std::collections::HashMap<Uuid, u64> =
+            std::collections::HashMap::new();
+        for event in &events {
+            let expected_version = stream_versions
+                .get(&event.stream_id)
+                .copied()
+                .unwrap_or_else(|| *data.stream_version.get(&event.stream_id).unwrap_or(&1));
+
+            if event.stream_version != expected_version {
+                log::debug!(
+                    "Event version mismatch for stream_id: {}. Expected: {}, Got: {}",
+                    event.stream_id,
+                    expected_version,
+                    event.stream_version
+                );
+                return Err(InMemoryEventStoreBackendError::VersionMismatch(
+                    event.stream_version,
+                    expected_version,
+                ));
+            }
+
+            // Track what the next version should be for this stream
+            stream_versions.insert(event.stream_id, expected_version + 1);
+        }
+
+        // Phase 2: Store all events (all validations passed)
+        let mut stored_events = Vec::with_capacity(events.len());
+        for event in events {
+            let stream_id = event.stream_id;
+            let new_version = event.stream_version + 1;
+
+            data.stream_version.insert(stream_id, new_version);
+
+            let event_id = event.id;
+            // Maintain correlation index
+            if let Some(correlation_id) = event.correlation_id {
+                data.correlation_events
+                    .entry(correlation_id)
+                    .or_default()
+                    .push(event_id);
+            }
+            let event = Arc::new(event);
+            data.events.insert(event_id, Arc::clone(&event));
+            data.stream_events
+                .entry(stream_id)
+                .or_default()
+                .push(event_id);
+
+            stored_events.push(event);
+        }
+
+        Ok(stored_events)
+    }
+}
+
 #[async_trait]
 impl<B> EventStoreBackend for InMemoryEventStore<B>
 where
@@ -155,71 +233,9 @@ where
     }
 
     async fn store_events(&self, events: Vec<Event<Self::EventType>>) -> Result<(), Self::Error> {
-        if events.is_empty() {
-            return Ok(());
-        }
-
-        let data = self.data.clone();
         let bus = self.bus.clone();
-        let mut data = data.lock().await;
+        let stored_events = self.store_events_validated(events).await?;
 
-        // Phase 1: Validate all versions first (atomic check)
-        // Group events by stream_id to validate versions correctly
-        let mut stream_versions: std::collections::HashMap<Uuid, u64> =
-            std::collections::HashMap::new();
-        for event in &events {
-            let expected_version = stream_versions
-                .get(&event.stream_id)
-                .copied()
-                .unwrap_or_else(|| *data.stream_version.get(&event.stream_id).unwrap_or(&1));
-
-            if event.stream_version != expected_version {
-                log::debug!(
-                    "Event version mismatch for stream_id: {}. Expected: {}, Got: {}",
-                    event.stream_id,
-                    expected_version,
-                    event.stream_version
-                );
-                return Err(InMemoryEventStoreBackendError::VersionMismatch(
-                    event.stream_version,
-                    expected_version,
-                ));
-            }
-
-            // Track what the next version should be for this stream
-            stream_versions.insert(event.stream_id, expected_version + 1);
-        }
-
-        // Phase 2: Store all events (all validations passed)
-        let mut stored_events = Vec::with_capacity(events.len());
-        for event in events {
-            let stream_id = event.stream_id;
-            let new_version = event.stream_version + 1;
-
-            data.stream_version.insert(stream_id, new_version);
-
-            let event_id = event.id;
-            // Maintain correlation index
-            if let Some(correlation_id) = event.correlation_id {
-                data.correlation_events
-                    .entry(correlation_id)
-                    .or_default()
-                    .push(event_id);
-            }
-            let event = Arc::new(event);
-            data.events.insert(event_id, Arc::clone(&event));
-            data.stream_events
-                .entry(stream_id)
-                .or_default()
-                .push(event_id);
-
-            stored_events.push(event);
-        }
-
-        // Release lock before publishing
-        drop(data);
-
-        // Phase 3: Publish all events
         // Note: If publishing fails partway through, events are stored but not all published.
         // This is acceptable for event sourcing - events are durable and projections can
         // catch up by replaying from the event store.
@@ -236,67 +252,8 @@ where
         &self,
         events: Vec<Event<Self::EventType>>,
     ) -> Result<Vec<Event<Self::EventType>>, Self::Error> {
-        if events.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let data = self.data.clone();
-        let mut data = data.lock().await;
-
-        // Phase 1: Validate all versions first (atomic check)
-        let mut stream_versions: std::collections::HashMap<Uuid, u64> =
-            std::collections::HashMap::new();
-        for event in &events {
-            let expected_version = stream_versions
-                .get(&event.stream_id)
-                .copied()
-                .unwrap_or_else(|| *data.stream_version.get(&event.stream_id).unwrap_or(&1));
-
-            if event.stream_version != expected_version {
-                log::debug!(
-                    "Event version mismatch for stream_id: {}. Expected: {}, Got: {}",
-                    event.stream_id,
-                    expected_version,
-                    event.stream_version
-                );
-                return Err(InMemoryEventStoreBackendError::VersionMismatch(
-                    event.stream_version,
-                    expected_version,
-                ));
-            }
-
-            stream_versions.insert(event.stream_id, expected_version + 1);
-        }
-
-        // Phase 2: Store all events (all validations passed)
-        let mut stored_events = Vec::with_capacity(events.len());
-        for event in events {
-            let stream_id = event.stream_id;
-            let new_version = event.stream_version + 1;
-
-            data.stream_version.insert(stream_id, new_version);
-
-            let event_id = event.id;
-            if let Some(correlation_id) = event.correlation_id {
-                data.correlation_events
-                    .entry(correlation_id)
-                    .or_default()
-                    .push(event_id);
-            }
-            let event = Arc::new(event);
-            data.events.insert(event_id, Arc::clone(&event));
-            data.stream_events
-                .entry(stream_id)
-                .or_default()
-                .push(event_id);
-
-            stored_events.push((*event).clone());
-        }
-
-        // Release lock before returning
-        drop(data);
-
-        Ok(stored_events)
+        let stored_events = self.store_events_validated(events).await?;
+        Ok(stored_events.into_iter().map(|e| (*e).clone()).collect())
     }
 
     async fn publish_stored_events(

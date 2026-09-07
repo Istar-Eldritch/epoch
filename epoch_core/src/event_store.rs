@@ -115,6 +115,24 @@ pub trait EventStoreBackend: Send + Sync {
     /// this keep today's publish-before-persist ordering (acceptable: they are not
     /// on the reentrant Inline write path). Production backends override it to
     /// genuinely split persist from publish.
+    ///
+    /// # Override both or neither
+    ///
+    /// This method and [`publish_stored_events`](Self::publish_stored_events) are
+    /// only behaviourally correct as a pair — their defaults are each written
+    /// assuming the other is also at its default. Overriding exactly one:
+    ///
+    /// - Overriding **only this method** (to genuinely skip publishing) while
+    ///   leaving [`publish_stored_events`](Self::publish_stored_events) at its
+    ///   no-op default causes a **silent no-publish**: events are persisted but
+    ///   never delivered to the bus, and nothing surfaces an error.
+    /// - Leaving this method at its default (which already publishes via
+    ///   [`store_events`](Self::store_events)) while overriding only
+    ///   [`publish_stored_events`](Self::publish_stored_events) causes a
+    ///   **double-publish**: every event is delivered to the bus twice.
+    ///
+    /// A backend that wants a genuine persist/publish split must override both
+    /// methods together.
     async fn store_events_without_publish(
         &self,
         events: Vec<Event<Self::EventType>>,
@@ -131,6 +149,14 @@ pub trait EventStoreBackend: Send + Sync {
     /// No-op (`Ok(())`). Combined with the [`store_events_without_publish`](Self::store_events_without_publish)
     /// default — which already published inside [`store_events`](Self::store_events) —
     /// this keeps non-overriding backends byte-identical.
+    ///
+    /// # Override both or neither
+    ///
+    /// This method and [`store_events_without_publish`](Self::store_events_without_publish)
+    /// are only behaviourally correct as a pair — see the "Override both or
+    /// neither" note on [`store_events_without_publish`](Self::store_events_without_publish)
+    /// for the concrete double-publish / silent-no-publish failure modes of a
+    /// partial override.
     async fn publish_stored_events(
         &self,
         _events: Vec<Event<Self::EventType>>,

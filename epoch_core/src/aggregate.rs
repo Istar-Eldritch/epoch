@@ -371,7 +371,8 @@ where
     /// 4. Calls `handle_command` to generate events
     /// 5. Applies events to update state
     /// 6. Persists events to the event store (without publishing)
-    /// 7. Persists state to the state store
+    /// 7. Persists state to the state store, or deletes it if the command
+    ///    produced no new state
     /// 8. Publishes the stored events to the event bus
     ///
     /// Events are persisted (step 6) and state is persisted (step 7) **before**
@@ -565,6 +566,15 @@ where
     /// capture/prune logic. It returns `()` deliberately: a snapshot failure must never fail an
     /// already-committed command (events are durable; a snapshot is a rebuildable
     /// cache), so implementors log and swallow errors.
+    ///
+    /// # Ordering relative to publish
+    ///
+    /// This hook now runs **before** [`handle()`](Self::handle) publishes the
+    /// command's events (it runs right after `persist_state`, and publish is
+    /// deferred until after it returns). Previously events were published as
+    /// part of the persist step, so publish had already happened by the time
+    /// this hook ran. An implementor relying on publish-then-`after_persist`
+    /// ordering will observe the opposite ordering now.
     ///
     /// Because the default body is empty, aggregates that do not override it perform
     /// no I/O and no observable behaviour change (the empty async-trait future still incurs one boxed-future allocation per command).
