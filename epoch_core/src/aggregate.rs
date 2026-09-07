@@ -370,8 +370,24 @@ where
     /// 3. Re-hydrates from event store to catch up on any missed events
     /// 4. Calls `handle_command` to generate events
     /// 5. Applies events to update state
-    /// 6. Persists events to the event store
+    /// 6. Persists events to the event store (without publishing)
     /// 7. Persists state to the state store
+    /// 8. Publishes the stored events to the event bus
+    ///
+    /// Events are persisted (step 6) and state is persisted (step 7) **before**
+    /// publishing (step 8). This ordering exists so that a synchronous,
+    /// same-stream reentrant subscriber (e.g. an Inline-bus saga reacting to a
+    /// published event by issuing a new command against the same aggregate)
+    /// observes durable state rather than racing the outer command's own
+    /// persistence.
+    ///
+    /// If publishing fails after this reordering, the events and state are
+    /// already durable; only the publish failed, and it is recoverable by
+    /// replay. This mirrors `AggregateTransaction::commit`'s
+    /// `CommitError::Publish` contract ("transaction is committed" but publish
+    /// failed) and `EventStoreBackend::store_events`'s best-effort-publish
+    /// contract: a publish failure surfaces as `HandleCommandError::Event`
+    /// without rolling back the persisted events or state.
     ///
     /// # Arguments
     ///
@@ -501,8 +517,9 @@ where
                 events_applied,
                 std::any::type_name::<ED>()
             );
-            self.get_event_store()
-                .store_events(events)
+            let stored = self
+                .get_event_store()
+                .store_events_without_publish(events)
                 .await
                 .map_err(HandleCommandError::Event)?;
 
@@ -517,6 +534,10 @@ where
                     .map_err(HandleCommandError::State)?;
                 self.after_persist(state_id, new_state_version, events_applied, &state)
                     .await;
+                self.get_event_store()
+                    .publish_stored_events(stored)
+                    .await
+                    .map_err(HandleCommandError::Event)?;
                 Ok(Some(state))
             } else {
                 debug!("Deleting state for command. State ID: {:?}", state_id);
@@ -524,6 +545,10 @@ where
                     .delete_state(state_id)
                     .await
                     .map_err(HandleCommandError::State)?;
+                self.get_event_store()
+                    .publish_stored_events(stored)
+                    .await
+                    .map_err(HandleCommandError::Event)?;
                 Ok(None)
             }
         } else {
