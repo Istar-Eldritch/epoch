@@ -99,6 +99,45 @@ pub trait EventStoreBackend: Send + Sync {
     /// [`read_events`]: Self::read_events
     async fn store_events(&self, events: Vec<Event<Self::EventType>>) -> Result<(), Self::Error>;
 
+    /// Durably persists `events` WITHOUT publishing them to the bus, returning the
+    /// stored events (backends that assign identifiers such as `global_sequence`
+    /// return the enriched copies) for a later [`publish_stored_events`](Self::publish_stored_events) call.
+    ///
+    /// This is the persist half of the fused [`store_events`](Self::store_events).
+    /// `Aggregate::handle()` uses it to persist state before publishing, so a
+    /// synchronous Inline subscriber that reenters the same aggregate observes
+    /// durable state.
+    ///
+    /// # Default
+    ///
+    /// Delegates to [`store_events`](Self::store_events) (which persists AND
+    /// publishes) and echoes the input events back. Backends that do not override
+    /// this keep today's publish-before-persist ordering (acceptable: they are not
+    /// on the reentrant Inline write path). Production backends override it to
+    /// genuinely split persist from publish.
+    async fn store_events_without_publish(
+        &self,
+        events: Vec<Event<Self::EventType>>,
+    ) -> Result<Vec<Event<Self::EventType>>, Self::Error> {
+        self.store_events(events.clone()).await?;
+        Ok(events)
+    }
+
+    /// Publishes already-durable `events` to the bus. Pairs with
+    /// [`store_events_without_publish`](Self::store_events_without_publish).
+    ///
+    /// # Default
+    ///
+    /// No-op (`Ok(())`). Combined with the [`store_events_without_publish`](Self::store_events_without_publish)
+    /// default — which already published inside [`store_events`](Self::store_events) —
+    /// this keeps non-overriding backends byte-identical.
+    async fn publish_stored_events(
+        &self,
+        _events: Vec<Event<Self::EventType>>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Returns the most recent event in the given stream, or `None` if the stream is empty.
     ///
     /// "Most recent" is defined as the event with the highest `stream_version` — i.e. the
