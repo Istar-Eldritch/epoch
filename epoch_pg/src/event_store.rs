@@ -530,6 +530,37 @@ where
         self.publish_events(stored_events).await
     }
 
+    /// Persists `events` in a single transaction and returns the enriched
+    /// (`global_sequence`-stamped) events WITHOUT publishing them.
+    ///
+    /// This is the persist half of the fused [`store_events`](Self::store_events),
+    /// sharing the same [`store_events_in_tx`](Self::store_events_in_tx) +
+    /// `tx.commit()` sequence. Pair with
+    /// [`publish_stored_events`](Self::publish_stored_events) to publish afterward.
+    async fn store_events_without_publish(
+        &self,
+        events: Vec<Event<Self::EventType>>,
+    ) -> Result<Vec<Event<Self::EventType>>, Self::Error> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut tx = self.postgres.begin().await?;
+        let stored_events = self.store_events_in_tx(&mut tx, events).await?;
+        tx.commit().await?;
+
+        Ok(stored_events)
+    }
+
+    /// Publishes already-durable `events` to the bus. Pairs with
+    /// [`store_events_without_publish`](Self::store_events_without_publish).
+    async fn publish_stored_events(
+        &self,
+        events: Vec<Event<Self::EventType>>,
+    ) -> Result<(), Self::Error> {
+        self.publish_events(events).await
+    }
+
     /// Returns the most recent event of the given stream via a single indexed query.
     ///
     /// Overrides the default O(N) trait implementation with an

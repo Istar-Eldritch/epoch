@@ -232,6 +232,86 @@ where
         Ok(())
     }
 
+    async fn store_events_without_publish(
+        &self,
+        events: Vec<Event<Self::EventType>>,
+    ) -> Result<Vec<Event<Self::EventType>>, Self::Error> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let data = self.data.clone();
+        let mut data = data.lock().await;
+
+        // Phase 1: Validate all versions first (atomic check)
+        let mut stream_versions: std::collections::HashMap<Uuid, u64> =
+            std::collections::HashMap::new();
+        for event in &events {
+            let expected_version = stream_versions
+                .get(&event.stream_id)
+                .copied()
+                .unwrap_or_else(|| *data.stream_version.get(&event.stream_id).unwrap_or(&1));
+
+            if event.stream_version != expected_version {
+                log::debug!(
+                    "Event version mismatch for stream_id: {}. Expected: {}, Got: {}",
+                    event.stream_id,
+                    expected_version,
+                    event.stream_version
+                );
+                return Err(InMemoryEventStoreBackendError::VersionMismatch(
+                    event.stream_version,
+                    expected_version,
+                ));
+            }
+
+            stream_versions.insert(event.stream_id, expected_version + 1);
+        }
+
+        // Phase 2: Store all events (all validations passed)
+        let mut stored_events = Vec::with_capacity(events.len());
+        for event in events {
+            let stream_id = event.stream_id;
+            let new_version = event.stream_version + 1;
+
+            data.stream_version.insert(stream_id, new_version);
+
+            let event_id = event.id;
+            if let Some(correlation_id) = event.correlation_id {
+                data.correlation_events
+                    .entry(correlation_id)
+                    .or_default()
+                    .push(event_id);
+            }
+            let event = Arc::new(event);
+            data.events.insert(event_id, Arc::clone(&event));
+            data.stream_events
+                .entry(stream_id)
+                .or_default()
+                .push(event_id);
+
+            stored_events.push((*event).clone());
+        }
+
+        // Release lock before returning
+        drop(data);
+
+        Ok(stored_events)
+    }
+
+    async fn publish_stored_events(
+        &self,
+        events: Vec<Event<Self::EventType>>,
+    ) -> Result<(), Self::Error> {
+        let bus = self.bus.clone();
+        for event in events {
+            if bus.publish(Arc::new(event)).await.is_err() {
+                return Err(InMemoryEventStoreBackendError::PublishEvent);
+            }
+        }
+        Ok(())
+    }
+
     async fn read_events_by_correlation_id(
         &self,
         correlation_id: Uuid,
