@@ -1018,10 +1018,10 @@ async fn async_mode_same_bus_reentrant_still_delivers() {
                 .fetch_optional(&pool)
                 .await
                 .expect("query state");
-        if let Some(s) = &state {
-            if s.version == 2 {
-                break;
-            }
+        if let Some(s) = &state
+            && s.version == 2
+        {
+            break;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
