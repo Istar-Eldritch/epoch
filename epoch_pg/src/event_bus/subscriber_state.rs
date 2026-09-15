@@ -5,7 +5,7 @@
 //! correct checkpoint advancement even when events are delivered or become visible
 //! out of order (e.g., due to PostgreSQL's non-transactional `nextval()` behavior).
 
-use epoch_core::event_store::FailureMode;
+use epoch_core::event_store::{FailureMode, GapPolicy};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -120,6 +120,17 @@ pub(crate) struct SubscriberState {
     /// (`FailOpen`).
     pub failure_mode: FailureMode,
 
+    /// This subscriber's gap policy, resolved once from the observer at
+    /// state-init (spec 0030 R2). Read by the gap resolver to decide what an
+    /// unproven gap does after the timeout backstop: hold below the hole
+    /// ([`GapPolicy::Halt`]) or take the audited skip
+    /// ([`GapPolicy::SkipAfterBackstop`]).
+    ///
+    /// The resolver arm that reads this field lands in spec 0030 P3; until
+    /// then the resolved policy is only carried on the state, never consulted.
+    #[allow(dead_code)]
+    pub gap_policy: GapPolicy,
+
     /// The sequence a fail-closed subscriber has halted at, if any. Set on the
     /// deserialize-failure and observer-exhaustion halt paths; the general
     /// "halted-at" marker. While set, the next batch cycle re-attempts exactly
@@ -143,6 +154,7 @@ impl SubscriberState {
             processed_ahead: HashSet::new(),
             gap_first_seen: HashMap::new(),
             failure_mode: FailureMode::FailOpen,
+            gap_policy: GapPolicy::Halt,
             held_event: None,
         }
     }
@@ -154,13 +166,19 @@ impl SubscriberState {
     /// `last_global_sequence` and `last_event_id` from the checkpoints table so
     /// an eager [`PendingCheckpoint`](super::checkpoint::PendingCheckpoint) can
     /// be seeded with a correctly paired id.
-    pub fn new_with_event_id(checkpoint: u64, event_id: Uuid, failure_mode: FailureMode) -> Self {
+    pub fn new_with_event_id(
+        checkpoint: u64,
+        event_id: Uuid,
+        failure_mode: FailureMode,
+        gap_policy: GapPolicy,
+    ) -> Self {
         Self {
             contiguous_checkpoint: checkpoint,
             contiguous_event_id: event_id,
             processed_ahead: HashSet::new(),
             gap_first_seen: HashMap::new(),
             failure_mode,
+            gap_policy,
             held_event: None,
         }
     }

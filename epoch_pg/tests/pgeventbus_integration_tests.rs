@@ -67,6 +67,7 @@ struct TestProjection {
     subscriber_id: String,
     subscription_mode: SubscriptionMode,
     failure_mode: FailureMode,
+    gap_policy: GapPolicy,
 }
 
 impl TestProjection {
@@ -80,6 +81,7 @@ impl TestProjection {
             subscriber_id,
             subscription_mode: SubscriptionMode::Checkpointed,
             failure_mode: FailureMode::FailOpen,
+            gap_policy: GapPolicy::Halt,
         }
     }
 
@@ -91,6 +93,7 @@ impl TestProjection {
             subscriber_id,
             subscription_mode: SubscriptionMode::ReplayAlways,
             failure_mode: FailureMode::FailOpen,
+            gap_policy: GapPolicy::Halt,
         }
     }
 
@@ -98,6 +101,13 @@ impl TestProjection {
     /// rather than skipping an event it cannot apply in order.
     pub fn fail_closed(mut self) -> Self {
         self.failure_mode = FailureMode::FailClosed;
+        self
+    }
+
+    /// Opts this projection into [`GapPolicy::SkipAfterBackstop`] (spec 0030):
+    /// an unproven gap past the backstop is skipped instead of wedging.
+    pub fn skip_after_backstop(mut self) -> Self {
+        self.gap_policy = GapPolicy::SkipAfterBackstop;
         self
     }
 }
@@ -141,6 +151,10 @@ impl Projection<TestEventData> for TestProjection {
 
     fn failure_mode(&self) -> FailureMode {
         self.failure_mode
+    }
+
+    fn gap_policy(&self) -> GapPolicy {
+        self.gap_policy
     }
 }
 
@@ -9494,4 +9508,61 @@ async fn test_update_checkpoint_contract_unchanged_pin() {
     );
 
     event_bus.shutdown().await.expect("shutdown");
+}
+
+// ==================== spec 0030 P2: gap-policy guardrail at subscribe (T1) ====================
+
+// T1 (spec 0030 R2): the subscribe-time gap-policy guardrail.
+//
+// `GapPolicy::SkipAfterBackstop` is valid only for `ReplayAlways` subscribers
+// (spec 0030 §3.1): a `Checkpointed` subscriber that skips an unproven gap
+// would advance a *persisted* checkpoint past the hole, letting it lead the
+// contiguous prefix in violation of spec 0027 §3.3. `subscribe()` must reject
+// that combination as a registration-time error
+// (`PgEventBusError::InvalidSubscriptionConfig`) and accept the
+// `SkipAfterBackstop` + `ReplayAlways` combination unchanged.
+#[tokio::test]
+#[serial]
+async fn test_subscribe_gap_policy_guardrail_skip_after_backstop_replay_always_only() {
+    use epoch_pg::PgEventBusError;
+
+    let Some((_pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+
+    // (a) SkipAfterBackstop + Checkpointed: registration-time error.
+    let checkpointed = TestProjection::new().skip_after_backstop();
+    let rejected = event_bus
+        .subscribe(ProjectionHandler::new(checkpointed))
+        .await;
+    assert!(
+        matches!(
+            &rejected,
+            Err(PgEventBusError::InvalidSubscriptionConfig { .. })
+        ),
+        "SkipAfterBackstop + Checkpointed must be rejected with \
+         InvalidSubscriptionConfig at subscribe: {rejected:?}"
+    );
+    if let Err(PgEventBusError::InvalidSubscriptionConfig {
+        subscriber_id,
+        reason,
+    }) = rejected
+    {
+        assert!(
+            subscriber_id.starts_with("projection:test:"),
+            "the error must identify the rejected subscriber: {subscriber_id}"
+        );
+        assert!(
+            reason.contains("ReplayAlways"),
+            "the error must explain the ReplayAlways-only rule: {reason}"
+        );
+    }
+
+    // (b) SkipAfterBackstop + ReplayAlways: accepted.
+    let replay = TestProjection::replay_always(format!("projection:gap-ra:{}", Uuid::new_v4()))
+        .skip_after_backstop();
+    event_bus
+        .subscribe(ProjectionHandler::new(replay))
+        .await
+        .expect("SkipAfterBackstop + ReplayAlways must be accepted at subscribe");
 }

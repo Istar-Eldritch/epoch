@@ -23,7 +23,7 @@ pub use retry::calculate_retry_delay_no_jitter;
 
 use crate::event_store::PgDBEvent;
 use epoch_core::event::{Event, EventData};
-use epoch_core::event_store::{EventBus, FailureMode, SubscriptionMode};
+use epoch_core::event_store::{EventBus, FailureMode, GapPolicy, SubscriptionMode};
 use epoch_core::prelude::EventObserver;
 use log::{error, info, warn};
 use serde::de::DeserializeOwned;
@@ -1034,6 +1034,22 @@ pub enum PgEventBusError {
         /// The subscriber's current persisted checkpoint.
         current: u64,
     },
+    /// A [`PgEventBus::subscribe`] call presented a subscriber configuration
+    /// the bus cannot honour (spec 0030 R2). The only invalid combination is
+    /// [`GapPolicy::SkipAfterBackstop`](epoch_core::GapPolicy) on a
+    /// [`SubscriptionMode::Checkpointed`] subscriber: skipping an unproven gap
+    /// would advance a *persisted* checkpoint past the hole, letting it lead
+    /// the contiguous prefix (spec 0027 §3.3). `SkipAfterBackstop` is accepted
+    /// only for `ReplayAlways` subscribers, whose position is in-memory and
+    /// never persisted. This variant is a minor breaking change for downstream
+    /// exhaustive matches: the enum is deliberately not `#[non_exhaustive]`.
+    #[error("invalid subscription config for subscriber '{subscriber_id}': {reason}")]
+    InvalidSubscriptionConfig {
+        /// The subscriber whose configuration was rejected.
+        subscriber_id: String,
+        /// Why the configuration was rejected.
+        reason: String,
+    },
 }
 
 /// Type alias for the projections collection to reduce type complexity.
@@ -1806,12 +1822,13 @@ where
                 let mut sid_to_proj: Vec<(String, _)> = Vec::new();
                 let mut replay_always_by_sid: HashMap<String, bool> = HashMap::new();
                 for projection in projections_snapshot.iter() {
-                    let (subscriber_id, replay_always, failure_mode) = {
+                    let (subscriber_id, replay_always, failure_mode, gap_policy) = {
                         let guard = projection.lock().await;
                         (
                             guard.subscriber_id().to_string(),
                             guard.subscription_mode() == SubscriptionMode::ReplayAlways,
                             guard.failure_mode(),
+                            guard.gap_policy(),
                         )
                     };
                     replay_always_by_sid.insert(subscriber_id.clone(), replay_always);
@@ -1863,6 +1880,7 @@ where
                                 checkpoint,
                                 checkpoint_event_id,
                                 failure_mode,
+                                gap_policy,
                             ),
                         );
                     }
@@ -3814,15 +3832,39 @@ where
             // process never drives, burning its whole timeout every time (a
             // ReplayAlways position is a per-process HWM that would then never
             // advance here).
-            let (subscriber_id, mode, failure_mode) = {
+            let (subscriber_id, mode, failure_mode, gap_policy) = {
                 let o = observer.lock().await;
                 (
                     o.subscriber_id().to_string(),
                     o.subscription_mode(),
                     o.failure_mode(),
+                    o.gap_policy(),
                 )
             };
             let replay_always = mode == SubscriptionMode::ReplayAlways;
+
+            // Spec 0030 R2 guardrail: `SkipAfterBackstop` is valid only for a
+            // `ReplayAlways` subscriber. A `Checkpointed` subscriber that skips
+            // an unproven gap would advance its *persisted* checkpoint past the
+            // hole, letting it lead the contiguous prefix (spec 0027 §3.3) —
+            // reject that combination at registration time rather than
+            // downgrading silently. `Halt` (the default) and
+            // `SkipAfterBackstop` + `ReplayAlways` both pass through unchanged.
+            // Sits before any side effect of subscribe() (inline registration,
+            // trigger probe, advisory lock, catch-up) so an invalid config
+            // fails fast and touches nothing.
+            if gap_policy == GapPolicy::SkipAfterBackstop && mode == SubscriptionMode::Checkpointed
+            {
+                return Err(PgEventBusError::InvalidSubscriptionConfig {
+                    subscriber_id,
+                    reason:
+                        "GapPolicy::SkipAfterBackstop requires SubscriptionMode::ReplayAlways: \
+                         a Checkpointed subscriber must never advance its persisted checkpoint \
+                         past an unproven gap, or the checkpoint would lead the contiguous \
+                         prefix (spec 0027 §3.3)"
+                            .to_string(),
+                });
+            }
 
             // Inline dispatch: no LISTEN task, no NOTIFY channel, no catch-up.
             // Just register the subscriber and return. Any events published
