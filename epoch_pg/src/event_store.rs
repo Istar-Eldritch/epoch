@@ -68,6 +68,36 @@ async fn reseed_sequence_counter(postgres: &PgPool, events_table: &str) -> Resul
     Ok(())
 }
 
+/// Draws `k` `global_sequence` values for `events_table` from the counter row,
+/// inside the caller's transaction, returning the **first** value of the block
+/// (the block is `first ..= first + k - 1`).
+///
+/// The draw is an ordinary row UPDATE, so it takes the counter row's lock for
+/// the remainder of the transaction: concurrent writers serialize here, and a
+/// rollback or crash rewinds the draw (zero burn).
+///
+/// # Failure
+///
+/// If the counter row for `events_table` is absent (the table was dropped, or
+/// migration m014 never ran) the UPDATE matches no row and this returns
+/// [`sqlx::Error::RowNotFound`], failing the insert. There is deliberately no
+/// fallback to `nextval`: a silent fallback would hand out values the counter
+/// has already promised.
+async fn draw_sequence_block(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    events_table: &str,
+    k: i64,
+) -> Result<i64, sqlx::Error> {
+    let last: i64 = sqlx::query_scalar(
+        "UPDATE epoch_events_sequence_counter SET val = val + $2 WHERE name = $1 RETURNING val",
+    )
+    .bind(events_table)
+    .bind(k)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(last - k + 1)
+}
+
 /// How `global_sequence` values are allocated on the insert path.
 ///
 /// Selected once at [`PgEventStore`] construction: this is a deployment-wide
@@ -257,6 +287,27 @@ impl<B: EventBus + Clone> PgEventStore<B> {
         events_table: impl Into<String>,
         allocation_mode: AllocationMode,
     ) -> Result<Self, PgEventStoreError<B::Error>> {
+        Self::with_allocation_mode_and_upcasters(
+            postgres,
+            bus,
+            events_table,
+            allocation_mode,
+            Arc::new(UpcasterRegistry::new()),
+        )
+        .await
+    }
+
+    /// Like [`with_allocation_mode`](Self::with_allocation_mode), but also
+    /// installs an [`UpcasterRegistry`] — the two options are independent, so a
+    /// `PerTxnCounter` store can still upcast on read (see
+    /// [`with_upcasters`](Self::with_upcasters) for the registry's role).
+    pub async fn with_allocation_mode_and_upcasters(
+        postgres: PgPool,
+        bus: B,
+        events_table: impl Into<String>,
+        allocation_mode: AllocationMode,
+        upcasters: Arc<UpcasterRegistry>,
+    ) -> Result<Self, PgEventStoreError<B::Error>> {
         let events_table = events_table.into();
         log::debug!(
             "Creating a new PgEventStore targeting table '{events_table}' with {allocation_mode:?} allocation"
@@ -282,7 +333,7 @@ impl<B: EventBus + Clone> PgEventStore<B> {
             postgres,
             bus,
             events_table,
-            upcasters: Arc::new(UpcasterRegistry::new()),
+            upcasters,
             allocation_mode,
         })
     }
@@ -317,6 +368,19 @@ impl<B: EventBus + Clone> PgEventStore<B> {
     ///
     /// Returns events with `global_sequence` populated.
     ///
+    /// # Allocation
+    ///
+    /// Under the default [`AllocationMode::Nextval`] the INSERT omits
+    /// `global_sequence`, the column DEFAULT `nextval(...)` assigns it, and a
+    /// rollback or crash permanently burns the values drawn.
+    ///
+    /// Under [`AllocationMode::PerTxnCounter`] the whole batch draws `+K` once
+    /// from this table's counter row inside `tx` (serializing writers on that
+    /// row) and the values are supplied explicitly, so a rollback or crash
+    /// burns nothing. If the counter row is missing the insert fails with
+    /// [`sqlx::Error::RowNotFound`] — there is no fallback to `nextval`.
+    /// Either way `RETURNING global_sequence` remains the read-back contract.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -339,16 +403,35 @@ impl<B: EventBus + Clone> PgEventStore<B> {
     {
         let mut stored_events = Vec::with_capacity(events.len());
 
-        let insert_sql = format!(
-            "INSERT INTO {} (id, stream_id, stream_version, event_type, data, \
-             created_at, actor_id, purger_id, purged_at, causation_id, correlation_id, \
-             schema_version) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-             RETURNING global_sequence",
-            self.events_table,
-        );
+        // PerTxnCounter draws the whole block once, inside the caller's txn.
+        let mut next_sequence = match self.allocation_mode {
+            AllocationMode::Nextval => None,
+            AllocationMode::PerTxnCounter if events.is_empty() => None,
+            AllocationMode::PerTxnCounter => {
+                Some(draw_sequence_block(tx, &self.events_table, events.len() as i64).await?)
+            }
+        };
+
+        let insert_sql = match self.allocation_mode {
+            AllocationMode::Nextval => format!(
+                "INSERT INTO {} (id, stream_id, stream_version, event_type, data, \
+                 created_at, actor_id, purger_id, purged_at, causation_id, correlation_id, \
+                 schema_version) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                 RETURNING global_sequence",
+                self.events_table,
+            ),
+            AllocationMode::PerTxnCounter => format!(
+                "INSERT INTO {} (id, stream_id, stream_version, event_type, data, \
+                 created_at, actor_id, purger_id, purged_at, causation_id, correlation_id, \
+                 schema_version, global_sequence) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                 RETURNING global_sequence",
+                self.events_table,
+            ),
+        };
         for event in events {
-            let row: (i64,) = sqlx::query_as(&insert_sql)
+            let mut query = sqlx::query_as(&insert_sql)
                 .bind(event.id)
                 .bind(event.stream_id)
                 .bind(TryInto::<i64>::try_into(event.stream_version).map_err(|e| {
@@ -367,9 +450,12 @@ impl<B: EventBus + Clone> PgEventStore<B> {
                 .bind(event.purged_at)
                 .bind(event.causation_id)
                 .bind(event.correlation_id)
-                .bind(event.schema_version as i32)
-                .fetch_one(&mut **tx)
-                .await?;
+                .bind(event.schema_version as i32);
+            if let Some(sequence) = next_sequence {
+                query = query.bind(sequence);
+                next_sequence = Some(sequence + 1);
+            }
+            let row: (i64,) = query.fetch_one(&mut **tx).await?;
 
             stored_events.push(Event {
                 id: event.id,
@@ -648,7 +734,28 @@ where
         Ok(event_stream)
     }
 
+    /// Stores a single event and publishes it.
+    ///
+    /// # Allocation
+    ///
+    /// Under the default [`AllocationMode::Nextval`] the INSERT omits
+    /// `global_sequence` and runs directly on the pool: the column DEFAULT
+    /// assigns the value and a failed insert burns it.
+    ///
+    /// Under [`AllocationMode::PerTxnCounter`] the insert runs in its own
+    /// transaction that first draws `+1` from this table's counter row and then
+    /// supplies the value explicitly, so a rollback or crash burns nothing;
+    /// writers serialize on the counter row. A missing counter row fails the
+    /// insert with [`sqlx::Error::RowNotFound`] — never a fallback to `nextval`.
+    /// `RETURNING global_sequence` remains the read-back contract in both modes.
     async fn store_event(&self, event: Event<Self::EventType>) -> Result<(), Self::Error> {
+        if self.allocation_mode == AllocationMode::PerTxnCounter {
+            let mut tx = self.postgres.begin().await?;
+            let stored = self.store_events_in_tx(&mut tx, vec![event]).await?;
+            tx.commit().await?;
+            return self.publish_events(stored).await;
+        }
+
         // Insert the event and get back the assigned global_sequence
         let store_sql = format!(
             "INSERT INTO {} (id, stream_id, stream_version, event_type, data, \

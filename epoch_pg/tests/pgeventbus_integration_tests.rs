@@ -10801,3 +10801,501 @@ async fn test_nextval_allocation_mode_touches_no_counter_row() {
 
     drop_isolated_events_table(&pool, &table).await;
 }
+
+// ==================== Part B: PerTxnCounter write path (spec 0030 P7) ====================
+
+/// Builds a `PerTxnCounter` store over `table` with a Uuid-unique bus channel.
+async fn per_txn_counter_store(
+    pool: &PgPool,
+    table: &str,
+) -> PgEventStore<PgEventBus<TestEventData>> {
+    PgEventStore::with_allocation_mode(
+        pool.clone(),
+        PgEventBus::<TestEventData>::new(
+            pool.clone(),
+            format!("alloc_ch_{}", Uuid::new_v4().simple()),
+        ),
+        table.to_string(),
+        epoch_pg::AllocationMode::PerTxnCounter,
+    )
+    .await
+    .expect("construction under PerTxnCounter must succeed")
+}
+
+/// Reads the committed `global_sequence` of the event `id` on `table`.
+async fn committed_sequence(pool: &PgPool, table: &str, id: Uuid) -> i64 {
+    sqlx::query_scalar(&format!(
+        "SELECT global_sequence FROM {table} WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("read the committed global_sequence")
+}
+
+/// Drops the isolated table and its counter row.
+async fn cleanup_counter_table(pool: &PgPool, table: &str) {
+    drop_isolated_events_table(pool, table).await;
+    sqlx::query("DELETE FROM epoch_events_sequence_counter WHERE name = $1")
+        .bind(table)
+        .execute(pool)
+        .await
+        .expect("clean up the counter row");
+}
+
+// T9 (spec 0030 R13): under `PerTxnCounter` a rolled-back transaction burns
+// zero — the counter draw is an uncommitted MVCC version, so it rewinds and the
+// next committed writer takes the value the rolled-back txn had drawn.
+#[tokio::test]
+#[serial]
+async fn test_per_txn_counter_rollback_burns_nothing() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let store = per_txn_counter_store(&pool, &table).await;
+
+    let anchor = new_event(Uuid::new_v4(), 1, "anchor");
+    let anchor_id = anchor.id;
+    store.store_event(anchor).await.expect("store the anchor");
+    let anchor_seq = committed_sequence(&pool, &table, anchor_id).await;
+
+    // A K-row insert that draws +K and then rolls back.
+    let mut tx = pool.begin().await.expect("begin the doomed txn");
+    let doomed_stream = Uuid::new_v4();
+    let doomed: Vec<_> = (1..=3u64)
+        .map(|v| new_event(doomed_stream, v, "doomed"))
+        .collect();
+    let drawn = store
+        .store_events_in_tx(&mut tx, doomed)
+        .await
+        .expect("the doomed insert itself succeeds");
+    assert_eq!(drawn.len(), 3);
+    tx.rollback().await.expect("roll the doomed txn back");
+
+    let after = new_event(Uuid::new_v4(), 1, "after_rollback");
+    let after_id = after.id;
+    store
+        .store_event(after)
+        .await
+        .expect("store after rollback");
+
+    assert_eq!(
+        committed_sequence(&pool, &table, after_id).await,
+        anchor_seq + 1,
+        "a rolled-back PerTxnCounter txn must burn zero: the next committed \
+         writer takes the very next value"
+    );
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        Some(anchor_seq + 1),
+        "the counter rewound with the rollback"
+    );
+
+    cleanup_counter_table(&pool, &table).await;
+}
+
+// T10 (spec 0030 R13): under `PerTxnCounter` a *crashed* writer burns zero. A
+// dedicated `PgConnection` draws +K and is then terminated mid-transaction via
+// `pg_terminate_backend(pg_backend_pid())`; the abort discards the draw.
+#[tokio::test]
+#[serial]
+async fn test_per_txn_counter_crash_burns_nothing() {
+    use sqlx::Connection;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let store = per_txn_counter_store(&pool, &table).await;
+
+    let anchor = new_event(Uuid::new_v4(), 1, "anchor");
+    let anchor_id = anchor.id;
+    store.store_event(anchor).await.expect("store the anchor");
+    let anchor_seq = committed_sequence(&pool, &table, anchor_id).await;
+    let before = sequence_counter_val(&pool, &table)
+        .await
+        .expect("counter row exists");
+
+    // Dedicated connection: draw +3 inside a transaction, then kill the backend
+    // holding it. The terminate statement kills its own session, so the query
+    // itself errors — that IS the crash.
+    let mut victim = sqlx::PgConnection::connect(&common::database_url())
+        .await
+        .expect("dedicated victim connection");
+    let mut victim_tx = victim.begin().await.expect("begin on the victim");
+    let drawn: i64 = sqlx::query_scalar(
+        "UPDATE epoch_events_sequence_counter SET val = val + 3 WHERE name = $1 RETURNING val",
+    )
+    .bind(&table)
+    .fetch_one(&mut *victim_tx)
+    .await
+    .expect("the victim draws +3");
+    assert_eq!(drawn, before + 3, "the victim drew a block of 3");
+    let terminated = sqlx::query("SELECT pg_terminate_backend(pg_backend_pid())")
+        .execute(&mut *victim_tx)
+        .await;
+    assert!(
+        terminated.is_err(),
+        "terminating our own backend must break the connection: {terminated:?}"
+    );
+    drop(victim_tx);
+    drop(victim);
+
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        Some(before),
+        "the aborted transaction leaves the counter unchanged — zero burn"
+    );
+
+    let after = new_event(Uuid::new_v4(), 1, "after_crash");
+    let after_id = after.id;
+    store
+        .store_event(after)
+        .await
+        .expect("store after the crash");
+    assert_eq!(
+        committed_sequence(&pool, &table, after_id).await,
+        anchor_seq + 1,
+        "the fresh writer gets the same relative value the aborted txn drew — \
+         no committed value was reused or skipped"
+    );
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        Some(before + 1),
+        "the fresh writer's value came from the counter (one draw past the \
+         pre-crash value), not from nextval"
+    );
+
+    cleanup_counter_table(&pool, &table).await;
+}
+
+// T11 (spec 0030 R10) — P7's MERGE GATE: the default `Nextval` write path is
+// unchanged. A rolled-back K-row insert burns K (a relative gap of K), exactly
+// as today, and no counter row is created or touched.
+#[tokio::test]
+#[serial]
+async fn test_nextval_rollback_still_burns_and_touches_no_counter() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    for explicit_mode in [false, true] {
+        let table = isolated_events_table(&pool).await;
+        let bus = PgEventBus::<TestEventData>::new(
+            pool.clone(),
+            format!("alloc_ch_{}", Uuid::new_v4().simple()),
+        );
+        let store = if explicit_mode {
+            PgEventStore::with_allocation_mode(
+                pool.clone(),
+                bus,
+                table.clone(),
+                epoch_pg::AllocationMode::Nextval,
+            )
+            .await
+            .expect("construction under Nextval must succeed")
+        } else {
+            PgEventStore::with_table(pool.clone(), bus, table.clone()).await
+        };
+
+        let anchor = new_event(Uuid::new_v4(), 1, "anchor");
+        let anchor_id = anchor.id;
+        store.store_event(anchor).await.expect("store the anchor");
+        let anchor_seq = committed_sequence(&pool, &table, anchor_id).await;
+
+        let mut tx = pool.begin().await.expect("begin the doomed txn");
+        let doomed_stream = Uuid::new_v4();
+        let doomed: Vec<_> = (1..=3u64)
+            .map(|v| new_event(doomed_stream, v, "doomed"))
+            .collect();
+        store
+            .store_events_in_tx(&mut tx, doomed)
+            .await
+            .expect("the doomed insert itself succeeds");
+        tx.rollback().await.expect("roll the doomed txn back");
+
+        let after = new_event(Uuid::new_v4(), 1, "after_rollback");
+        let after_id = after.id;
+        store
+            .store_event(after)
+            .await
+            .expect("store after rollback");
+
+        assert_eq!(
+            committed_sequence(&pool, &table, after_id).await,
+            anchor_seq + 4,
+            "the default path must keep burning K=3 on rollback (mode set \
+             explicitly: {explicit_mode})"
+        );
+        assert_eq!(
+            sequence_counter_val(&pool, &table).await,
+            None,
+            "the default path must never touch a counter row (mode set \
+             explicitly: {explicit_mode})"
+        );
+
+        drop_isolated_events_table(&pool, &table).await;
+    }
+}
+
+// T12 (spec 0030 R12): a multi-event transaction allocates +K exactly once and
+// the K events get a contiguous range, all of it returned by
+// `RETURNING global_sequence`.
+#[tokio::test]
+#[serial]
+async fn test_per_txn_counter_allocates_once_per_transaction() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let store = per_txn_counter_store(&pool, &table).await;
+    let before = sequence_counter_val(&pool, &table)
+        .await
+        .expect("counter row exists");
+
+    let stream_id = Uuid::new_v4();
+    let batch: Vec<_> = (1..=4u64)
+        .map(|v| new_event(stream_id, v, "batched"))
+        .collect();
+    let mut tx = pool.begin().await.expect("begin the batch txn");
+    let stored = store
+        .store_events_in_tx(&mut tx, batch)
+        .await
+        .expect("store the batch");
+    tx.commit().await.expect("commit the batch");
+
+    let seqs: Vec<u64> = stored
+        .iter()
+        .map(|e| e.global_sequence.expect("RETURNING must yield a sequence"))
+        .collect();
+    assert_eq!(seqs.len(), 4, "RETURNING yields all K values");
+    for pair in seqs.windows(2) {
+        assert_eq!(
+            pair[1],
+            pair[0] + 1,
+            "the K events must occupy a contiguous range: {seqs:?}"
+        );
+    }
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        Some(before + 4),
+        "the counter advanced by exactly K — one draw for the whole txn"
+    );
+    assert_eq!(
+        seqs[0] as i64,
+        before + 1,
+        "the block starts immediately above the pre-txn counter value"
+    );
+
+    cleanup_counter_table(&pool, &table).await;
+}
+
+// T14 (spec 0030 R11/R13): the end-to-end opt-in transition is collision-free —
+// after `Nextval` writers have advanced the sequence past any earlier seed, a
+// quiesced switch to `PerTxnCounter` assigns sequences above every previously
+// assigned value.
+#[tokio::test]
+#[serial]
+async fn test_opt_in_transition_assigns_above_every_previous_value() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let seq = format!("{table}_seq");
+
+    // Seed the counter early, then keep running Nextval past it — the case the
+    // construction-time re-seed exists for.
+    let _early = per_txn_counter_store(&pool, &table).await;
+
+    let nextval_store = PgEventStore::with_table(
+        pool.clone(),
+        PgEventBus::<TestEventData>::new(
+            pool.clone(),
+            format!("alloc_ch_{}", Uuid::new_v4().simple()),
+        ),
+        table.clone(),
+    )
+    .await;
+    let stream_id = Uuid::new_v4();
+    for v in 1..=3u64 {
+        nextval_store
+            .store_event(new_event(stream_id, v, "nextval"))
+            .await
+            .expect("store under Nextval");
+    }
+    for _ in 0..2 {
+        sqlx::query(&format!("SELECT nextval('{seq}')"))
+            .execute(&pool)
+            .await
+            .expect("burn a sequence value");
+    }
+    let sequence_high_water: i64 = sqlx::query_scalar(&format!("SELECT last_value FROM {seq}"))
+        .fetch_one(&pool)
+        .await
+        .expect("read the sequence high-water");
+
+    // Writers quiesced; construct under PerTxnCounter and commit.
+    let counter_store = per_txn_counter_store(&pool, &table).await;
+    let switched = new_event(Uuid::new_v4(), 1, "after_switch");
+    let switched_id = switched.id;
+    counter_store
+        .store_event(switched)
+        .await
+        .expect("store under PerTxnCounter");
+
+    assert_eq!(
+        committed_sequence(&pool, &table, switched_id).await,
+        sequence_high_water + 1,
+        "the first counter-assigned value exceeds every value the sequence \
+         ever assigned — no collision"
+    );
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        Some(sequence_high_water + 1),
+        "the post-switch value was drawn from the counter, not the sequence"
+    );
+
+    cleanup_counter_table(&pool, &table).await;
+}
+
+// T15 (spec 0030 R14): concurrent `PerTxnCounter` writers commit a gapless
+// contiguous block — the counter row serializes them, so no hole ever forms and
+// the gap/fence machinery never engages.
+#[tokio::test]
+#[serial]
+async fn test_per_txn_counter_concurrent_writers_are_contiguous() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let store = Arc::new(per_txn_counter_store(&pool, &table).await);
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let store = Arc::clone(&store);
+        handles.push(tokio::spawn(async move {
+            let stream_id = Uuid::new_v4();
+            for v in 1..=3u64 {
+                store
+                    .store_event(new_event(stream_id, v, "concurrent"))
+                    .await
+                    .expect("concurrent store");
+            }
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("writer task panicked");
+    }
+
+    let seqs: Vec<i64> = sqlx::query_scalar(&format!(
+        "SELECT global_sequence FROM {table} ORDER BY global_sequence"
+    ))
+    .fetch_all(&pool)
+    .await
+    .expect("read the committed sequences");
+
+    assert_eq!(seqs.len(), 24, "every concurrent write committed");
+    for pair in seqs.windows(2) {
+        assert_eq!(
+            pair[1],
+            pair[0] + 1,
+            "concurrent PerTxnCounter writers must leave no hole: {seqs:?}"
+        );
+    }
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        seqs.last().copied(),
+        "every concurrent value was drawn from the counter row that serialized \
+         the writers"
+    );
+
+    cleanup_counter_table(&pool, &table).await;
+}
+
+// T7b-pin (spec 0030 R12 review finding): under `PerTxnCounter` a missing
+// counter row makes the insert FAIL — there is no silent fallback to the
+// column DEFAULT `nextval`, which would reintroduce exactly the collision
+// hazard the opt-in exists to remove. This pins the documented failure mode.
+#[tokio::test]
+#[serial]
+async fn test_per_txn_counter_missing_counter_row_fails_the_insert() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let store = per_txn_counter_store(&pool, &table).await;
+
+    // Remove the per-table counter row the constructor seeded.
+    sqlx::query("DELETE FROM epoch_events_sequence_counter WHERE name = $1")
+        .bind(&table)
+        .execute(&pool)
+        .await
+        .expect("delete the counter row");
+
+    let stream_id = Uuid::new_v4();
+    let event = new_event(stream_id, 1, "no_counter_row");
+    let result = store.store_event(event).await;
+
+    let err = result.expect_err("missing counter row must fail the insert");
+    assert!(
+        matches!(
+            err,
+            epoch_pg::PgEventStoreError::DBError(sqlx::error::Error::RowNotFound)
+        ),
+        "expected RowNotFound from the missing counter draw, got: {err:?}"
+    );
+
+    // Nothing was written: the events table has no row for this stream.
+    let written: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM {table} WHERE stream_id = $1"
+    ))
+    .bind(stream_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count the (absent) rows");
+    assert_eq!(written, 0, "a failed counter draw must not write the event");
+
+    cleanup_counter_table(&pool, &table).await;
+}
