@@ -68,6 +68,25 @@ async fn reseed_sequence_counter(postgres: &PgPool, events_table: &str) -> Resul
     Ok(())
 }
 
+/// Ensures the optional per-table columns a custom events table needs.
+///
+/// Both are best-effort: a failure is logged and construction continues with
+/// the documented degradation, which is why this returns nothing.
+async fn ensure_custom_table_columns(postgres: &PgPool, events_table: &str) {
+    if let Err(e) = crate::event_bus::ensure_txid_column(postgres, events_table).await {
+        log::warn!(
+            "Failed to ensure txid column on custom events table '{events_table}'; \
+             snapshot fencing degrades to timeout-only for this table: {e}"
+        );
+    }
+    if let Err(e) = crate::event_bus::ensure_schema_version_column(postgres, events_table).await {
+        log::warn!(
+            "Failed to ensure schema_version column on custom events table '{events_table}'; \
+             schema version will be read as NULL (treated as v1) for this table: {e}"
+        );
+    }
+}
+
 /// Draws `k` `global_sequence` values for `events_table` from the counter row,
 /// inside the caller's transaction, returning the **first** value of the block
 /// (the block is `first ..= first + k - 1`).
@@ -147,9 +166,11 @@ pub enum AllocationMode {
     /// Each insert transaction draws its `global_sequence` values from the
     /// per-events-table counter row **inside that same transaction** — zero burn.
     ///
-    /// Because the draw is an ordinary row UPDATE, a rollback rewinds the
-    /// counter and a crash aborts it: neither burns a value, so the committed
-    /// sequence is contiguous.
+    /// Because the draw is an ordinary row UPDATE, both zero-burn legs are just
+    /// MVCC: a rollback rewinds the counter's uncommitted new version and a
+    /// crash aborts that version's xid, so the pre-draw value is what any other
+    /// writer sees. Neither burns a value, so the committed sequence is
+    /// contiguous.
     ///
     /// # Write-tax trade-off
     ///
@@ -160,14 +181,31 @@ pub enum AllocationMode {
     /// remains the default: pay this tax only if contiguous sequences are worth
     /// more to you than write throughput.
     ///
+    /// Read those figures as a floor, not a budget. They were measured on bare
+    /// inserts, and the draw happens at the *top* of `store_events_in_tx`, so
+    /// the counter row's lock is held for the remainder of the caller's
+    /// transaction — including any aggregate state-upsert and the commit
+    /// round-trip that follow. A fat aggregate transaction therefore serializes
+    /// other writers for longer than the bare number implies; keep the work
+    /// after the insert short. The single-event `store_event`
+    /// additionally pays an explicit `BEGIN`/`COMMIT` round-trip under this
+    /// mode that the `Nextval` path does not need.
+    ///
     /// # Fence-safe by construction
     ///
     /// That same serialization is what keeps the gap/fence machinery valid with
-    /// no change: the counter lock makes sequence order equal commit order, so
-    /// a committed event can never appear above a hole, and a missing
-    /// sequence's writer (if any) necessarily holds an xid inside the
-    /// transaction that drew the value — precisely the premise the snapshot
-    /// fence already assumes under `nextval`.
+    /// no change (spec 0030 §3.6, §5.2): the counter lock makes sequence order
+    /// equal commit order, so a committed event can never appear above a hole,
+    /// and a missing sequence's writer (if any) necessarily holds an xid inside
+    /// the transaction that drew the value — precisely the premise the snapshot
+    /// fence already assumes under `nextval`. No gap or fence machinery changes
+    /// for this mode.
+    ///
+    /// This is the decisive contrast with the rejected cached-block allocator
+    /// (§5.2): a block cached outside the insert transaction breaks both halves
+    /// — sequence order stops tracking commit order, and a missing sequence's
+    /// writer need hold no xid at detection — which would have forced a fence
+    /// rework. Exact per-transaction allocation buys fence validity for free.
     ///
     /// # Opting in
     ///
@@ -243,20 +281,7 @@ impl<B: EventBus + Clone> PgEventStore<B> {
     pub async fn with_table(postgres: PgPool, bus: B, events_table: impl Into<String>) -> Self {
         let events_table = events_table.into();
         log::debug!("Creating a new PgEventStore targeting table '{events_table}'");
-        if let Err(e) = crate::event_bus::ensure_txid_column(&postgres, &events_table).await {
-            log::warn!(
-                "Failed to ensure txid column on custom events table '{events_table}'; \
-                 snapshot fencing degrades to timeout-only for this table: {e}"
-            );
-        }
-        if let Err(e) =
-            crate::event_bus::ensure_schema_version_column(&postgres, &events_table).await
-        {
-            log::warn!(
-                "Failed to ensure schema_version column on custom events table '{events_table}'; \
-                 schema version will be read as NULL (treated as v1) for this table: {e}"
-            );
-        }
+        ensure_custom_table_columns(&postgres, &events_table).await;
         Self {
             postgres,
             bus,
@@ -312,20 +337,7 @@ impl<B: EventBus + Clone> PgEventStore<B> {
         log::debug!(
             "Creating a new PgEventStore targeting table '{events_table}' with {allocation_mode:?} allocation"
         );
-        if let Err(e) = crate::event_bus::ensure_txid_column(&postgres, &events_table).await {
-            log::warn!(
-                "Failed to ensure txid column on custom events table '{events_table}'; \
-                 snapshot fencing degrades to timeout-only for this table: {e}"
-            );
-        }
-        if let Err(e) =
-            crate::event_bus::ensure_schema_version_column(&postgres, &events_table).await
-        {
-            log::warn!(
-                "Failed to ensure schema_version column on custom events table '{events_table}'; \
-                 schema version will be read as NULL (treated as v1) for this table: {e}"
-            );
-        }
+        ensure_custom_table_columns(&postgres, &events_table).await;
         if allocation_mode == AllocationMode::PerTxnCounter {
             reseed_sequence_counter(&postgres, &events_table).await?;
         }

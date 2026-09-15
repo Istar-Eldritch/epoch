@@ -55,6 +55,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     wording are unchanged; no `ReplayAlways` recovery path was added.
   - No schema migration (reuses the m009 gap-timeout ledger) and no write-path change.
 
+- **Sequence-burn resilience: opt-in `AllocationMode` that never burns**
+  (`epoch_pg`, CLOUD-261, spec 0030 Part B) — Part A recovers from a burned
+  `global_sequence`; Part B lets a deployment stop forming the hole in the first place.
+  Entirely additive: no breaking change.
+  - **Migration m014** adds `epoch_events_sequence_counter`, a counter table keyed by
+    events-table name (the events table is configurable, so two stores on two tables get
+    two independent counters). The migration is additive and creates the table only; it
+    is **inert until a store opts in** — nothing reads or writes the table under the
+    default allocator.
+  - **`AllocationMode { Nextval (default), PerTxnCounter }`** (`#[non_exhaustive]`) —
+    **`Nextval` is the default and is byte-for-byte unchanged**: the INSERT still omits
+    `global_sequence`, the column `DEFAULT nextval(...)` assigns it, `RETURNING
+    global_sequence` reads it back, and no counter row is touched. The mere existence of
+    the mode costs a default-mode writer nothing.
+  - **`PerTxnCounter`** draws a transaction's whole `+K` block from the counter row with a
+    single `UPDATE ... RETURNING` **inside the caller's insert transaction** and supplies
+    the values explicitly, so a rollback rewinds the draw and a crash aborts it —
+    **zero burn** on both legs. A missing counter row fails the insert
+    (`sqlx::Error::RowNotFound`); there is deliberately no fallback to `nextval`.
+    **Write tax:** writers serialize on the counter row, measured at **3.5–4.4× slower
+    than `nextval` at K=1** (per transaction, not per event, so multi-event aggregate
+    transactions amortize it) — which is why `Nextval` stays the default. Fence-safe by
+    construction: the counter lock makes sequence order equal commit order, so the gap,
+    fence, and snapshot machinery are unchanged.
+  - **`PgEventStore::with_allocation_mode` / `with_allocation_mode_and_upcasters`** — new
+    **fallible** async constructors. Under `PerTxnCounter` they re-seed the per-table
+    counter row to `GREATEST(counter, sequence last-assigned, MAX(global_sequence))`,
+    creating it if absent, and a re-seed failure **fails construction** rather than
+    letting the allocator hand out colliding values. `allocation_mode()` exposes the
+    resolved mode.
+  - **Opting in is a one-way, deployment-lifetime choice** for this release: quiesce all
+    `Nextval` writers, then construct under `PerTxnCounter`. Switching back is not a built
+    path — it is a documented operator procedure (quiesce, `setval` the events table's
+    sequence past the counter row's `val`, restart under `Nextval`).
+
 - **Per-subscriber fail-closed delivery semantics** (`epoch_core`, `epoch_pg`, CLOUD-216) —
   an opt-in `FailureMode { FailOpen (default), FailClosed }` letting a subscriber halt
   rather than silently skip an event it cannot apply in order:
