@@ -9489,6 +9489,224 @@ async fn test_skip_after_backstop_ledger_failure_withholds_skip_then_retries() {
     drop_isolated_events_table(&pool, &table).await;
 }
 
+// T5 (spec 0030 R6): `GapPolicy::Halt` (the default) is byte-for-byte
+// unchanged. This is pinned by the two shipped fail-closed tests, which run in
+// this suite unchanged and must stay green:
+//   - `test_fail_closed_gap_refusal_and_fence_cleared_recovery` (fence-cleared
+//     recovery + backstop refusal + `on_halt(GapUnproven)` fires once), and
+//   - `test_wedged_gap_does_not_starve_peer_and_release_resumes` (`Checkpointed`
+//     release + peer non-starvation).
+// T6 below also exercises the default `Halt` wedge for a `ReplayAlways`
+// subscriber. No new test is added for T5 on purpose: duplicating those two
+// would pin the same behaviour twice.
+
+/// T6 (spec 0030 R8): `release_halt`'s success WARN no longer over-promises for
+/// a `ReplayAlways` subscriber. Such a subscriber routes advancement through its
+/// in-memory high-water mark and never reads the checkpoint row the call writes,
+/// so the WARN must NOT claim delivery resumes — it must say plainly that the
+/// subscriber is not resumed. No recovery path is added to `release_halt` (spec
+/// 0030 OQ-3); the `Checkpointed` wording stays pinned by
+/// `test_wedged_gap_does_not_starve_peer_and_release_resumes`.
+///
+/// Setup mirrors T2 minus the opt-in, so the subscriber takes the default
+/// `Halt` path and genuinely wedges on the unproven hole before the release.
+#[tokio::test]
+#[serial]
+async fn test_release_halt_warn_does_not_promise_resume_for_replay_always() {
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // ReplayAlways + FailClosed, default GapPolicy::Halt: this one wedges.
+    let sub_id = format!("projection:release-warn:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe fail-closed ReplayAlways observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_below_id, seq_below) =
+        insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up"),
+        "subscriber must reach the below-hole event before the hole is opened"
+    );
+
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(
+        seq_hole > seq_below,
+        "hole must sit above the below-hole event"
+    );
+
+    let (_, seq_above1) = insert_committed_event(&pool, &table, hole_stream, 2, "above1").await;
+    assert!(seq_above1 > seq_hole);
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    // Wait for the default-Halt wedge: on_halt(GapUnproven) after gap_timeout.
+    let mut wedged = false;
+    for _ in 0..60 {
+        if !halts.lock().unwrap().is_empty() {
+            wedged = true;
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    assert!(
+        wedged,
+        "default GapPolicy::Halt must still wedge the ReplayAlways subscriber with \
+         on_halt(GapUnproven) (spec 0030 R6)"
+    );
+
+    let log_start = common::captured_logs_len();
+    event_bus
+        .release_halt(&sub_id, seq_hole as u64)
+        .await
+        .expect("release_halt writes the checkpoint row");
+
+    assert!(
+        !common::captured_logs_contain_since(log_start, "delivery resumes from"),
+        "release_halt must not claim delivery resumes for a ReplayAlways subscriber"
+    );
+    assert!(
+        common::captured_logs_contain_since(log_start, "delivery does NOT resume"),
+        "release_halt's WARN must state plainly that a ReplayAlways subscriber is not \
+         resumed by the release"
+    );
+    assert!(
+        common::captured_logs_contain_since(log_start, &sub_id),
+        "the WARN must name the released subscriber"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T8 (spec 0030 R9): readiness across a skipped hole. A
+/// `GapPolicy::SkipAfterBackstop` + `ReplayAlways` subscriber that has skipped a
+/// hole reports caught-up *while the skip is still unresolved in the ledger* —
+/// the amended spec 0026 R5 contract (§3.7): for this class no checkpoint is
+/// held below the hole, so caught-up is the honest report, and the residual
+/// divergence is healed by late-materialization detection driving a rebuild.
+#[tokio::test]
+#[serial]
+async fn test_readiness_reports_caught_up_across_skipped_hole() {
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let sub_id = format!("projection:readiness-skip:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone())
+        .fail_closed()
+        .skip_after_backstop();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe SkipAfterBackstop observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_, seq_below) = insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up"),
+        "subscriber must reach the below-hole event before the hole is opened"
+    );
+
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(
+        seq_hole > seq_below,
+        "hole must sit above the below-hole event"
+    );
+
+    let (_, seq_above1) = insert_committed_event(&pool, &table, hole_stream, 2, "above1").await;
+    assert!(seq_above1 > seq_hole);
+    // Let the backstop fire and the skip land, then release the hole tx so a
+    // failing test does not leave it open.
+    tokio::time::sleep(GapDuration::from_millis(1500)).await;
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    // Readiness reports caught-up even though the hole at `seq_hole` was never
+    // proven — the position advanced past it under the opt-in policy.
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(10))
+            .await
+            .expect("wait_until_caught_up across the skipped hole"),
+        "readiness must report caught-up across a skipped hole for the opt-in class"
+    );
+    assert_eq!(
+        event_bus
+            .subscriber_lag(&sub_id)
+            .await
+            .expect("subscriber_lag"),
+        0,
+        "lag must be zero across the skipped hole for the opt-in class"
+    );
+
+    // And the hole really is still an unresolved skip in the ledger: readiness
+    // is reporting caught-up over an unhealed divergence, by design.
+    let unresolved = event_bus
+        .list_gap_timeouts(Some(&sub_id), true, 0, 50)
+        .await
+        .expect("list unresolved gap timeouts");
+    assert_eq!(
+        unresolved.len(),
+        1,
+        "the skipped hole must still be an unresolved ledger row; got {unresolved:?}"
+    );
+    assert_eq!(unresolved[0].skipped_sequence, seq_hole as u64);
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
 /// Polls until `subscriber_id`'s persisted checkpoint is at least `expected`.
 async fn poll_checkpoint_at_least(
     event_bus: &PgEventBus<TestEventData>,

@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sequence-burn resilience: opt-in `GapPolicy` for `ReplayAlways` subscribers**
+  (`epoch_core`, `epoch_pg`, CLOUD-261, spec 0030 Part A) — a burned `global_sequence`
+  (a value allocated by `nextval` and lost to a rolled-back insert) can leave a hole
+  that the snapshot fence never proves, wedging the sole fail-closed `ReplayAlways`
+  subscriber indefinitely. Subscribers may now opt into a recovery contract:
+  - **`epoch_core`** — `GapPolicy { Halt (default), SkipAfterBackstop }` enum
+    (`#[non_exhaustive]`, re-exported from the prelude), with a defaulted
+    `gap_policy()` on `EventObserver`, `Projection`, and `Saga`, forwarded by the
+    handlers/adapters. **`Halt` is the default and is byte-for-byte unchanged**: a
+    subscriber that does not opt in behaves exactly as before.
+  - **`SkipAfterBackstop`** — for fold-style `ReplayAlways` projections whose state is
+    a pure function of currently-present rows. Once the `gap_timeout` backstop would
+    fire and the fence is still unproven, the skip is **recorded** in the existing
+    `epoch_event_bus_gap_timeouts` ledger (firing `on_gap_timeout`) and only then does
+    the in-memory high-water mark advance past the hole. A ledger-write failure
+    withholds the skip: the subscriber holds below the gap and retries.
+  - **Late-materialization detection** — `PgEventBus::check_skipped_gaps()` joins
+    unresolved ledger rows against the bus's events table; when a row has since
+    committed at a skipped sequence it fires the new rebuild-needed callback
+    (`(subscriber_id, skipped_sequence)`) and marks that ledger row resolved, so the
+    signal fires once per (subscriber, skipped sequence). An optional
+    `gap_scan_interval` runs the scan automatically; it is **off by default**.
+  - **Registration guardrail** —
+    `subscribe()` rejects `GapPolicy::SkipAfterBackstop` combined with
+    `SubscriptionMode::Checkpointed` with the new
+    **`PgEventBusError::InvalidSubscriptionConfig { subscriber_id, reason }`** variant.
+    The enum is not `#[non_exhaustive]`, so this is a **minor breaking change for
+    downstream code that matches `PgEventBusError` exhaustively**. The guardrail is
+    what keeps spec 0027 §3.3 ("a persisted checkpoint MUST NEVER lead the in-memory
+    one") intact: it is **clarified, not amended** — the opt-in class persists no
+    checkpoint at all, and the one configuration that could violate the invariant is
+    refused at registration.
+  - **Readiness: spec 0026 R5 is amended for the opt-in class only** — "readiness MUST
+    NOT report caught-up while a checkpoint is legitimately held below a hole" no
+    longer holds for `SkipAfterBackstop` + `ReplayAlways` subscribers:
+    `subscriber_lag` / `wait_until_caught_up` **will** report caught-up across a
+    skipped hole. For that class this is the honest report (the position is not
+    persisted and nothing is held below the hole); the residual divergence is healed
+    by the detection-then-rebuild loop above. Every other class is unchanged.
+  - **`release_halt` WARN honesty** — the success `WARN` no longer claims "delivery
+    resumes from N" for a `ReplayAlways` subscriber, which never reads the checkpoint
+    row the call writes; it now states plainly that such a subscriber is not resumed
+    and that the remedy is a fresh `subscribe()`. Behaviour and the `Checkpointed`
+    wording are unchanged; no `ReplayAlways` recovery path was added.
+  - No schema migration (reuses the m009 gap-timeout ledger) and no write-path change.
+
 - **Per-subscriber fail-closed delivery semantics** (`epoch_core`, `epoch_pg`, CLOUD-216) —
   an opt-in `FailureMode { FailOpen (default), FailClosed }` letting a subscriber halt
   rather than silently skip an event it cannot apply in order:

@@ -344,15 +344,15 @@ pub enum SubscriptionMode {
 #[non_exhaustive]
 pub enum GapPolicy {
     /// Default. A fail-closed subscriber holds below an unproven gap (today's
-    /// `GapUnproven` wedge). No behaviour change.
+    /// fail-closed gap wedge). No behaviour change.
     #[default]
     Halt,
     /// Opt-in for fold-style [`SubscriptionMode::ReplayAlways`] projections
     /// whose state is a pure function of currently-present rows. After the
-    /// backstop would fire and the fence is still unproven, the subscriber's
-    /// high-water mark advances past the hole, the skip is recorded, and
-    /// late-materialization detection (a later phase) triggers a rebuild when
-    /// a row materializes at a skipped sequence.
+    /// backstop would fire and the fence is still unproven, the skip is
+    /// recorded, then the subscriber's high-water mark advances past the hole;
+    /// if a row later materializes at a skipped sequence, late-materialization
+    /// detection finds it and triggers a rebuild.
     ///
     /// # In-flight-writer safety contract
     ///
@@ -367,6 +367,17 @@ pub enum GapPolicy {
     /// position is persisted, or whose state is not a pure fold over
     /// currently-present rows, skipping an unproven gap risks permanently
     /// missing an event that later commits.
+    ///
+    /// # Readiness reports caught-up across a skipped hole
+    ///
+    /// Because the position advances past the hole, backend readiness checks
+    /// (lag / wait-until-caught-up) will report this subscriber caught-up
+    /// across a sequence that may still commit. For this class that is the
+    /// honest report: nothing is held below the hole and no checkpoint is
+    /// persisted, and the residual divergence is what late-materialization
+    /// detection and the rebuild it triggers exist to heal. Subscribers that
+    /// need readiness to mean "no sequence unaccounted for" must stay on
+    /// [`GapPolicy::Halt`].
     SkipAfterBackstop,
 }
 

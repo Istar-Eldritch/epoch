@@ -716,6 +716,12 @@ where
             break;
         }
         if !confirm_gap_timeout_record(&checkpoint_pool, &config, &subscriber_id, &pending).await {
+            // Visibility gap (known, deliberate): a persistently failing ledger
+            // write withholds the skip silently as far as the callback surface
+            // is concerned — neither `on_halt` nor `on_gap_timeout` fires, so a
+            // subscriber can sit indefinitely in the refused-backstop posture
+            // with only the per-tick `error!` from `confirm_gap_timeout_record`
+            // to show for it. Operators must alert on that log line.
             break;
         }
         state.gap_first_seen.remove(&pending.skipped_sequence);
@@ -2547,6 +2553,19 @@ where
     /// [`HaltCallback`] with
     /// [`HaltReason::Released`].
     ///
+    /// # A `ReplayAlways` subscriber is NOT resumed by a release (spec 0030 R8)
+    ///
+    /// This call only writes the persisted checkpoint row, and a
+    /// [`SubscriptionMode::ReplayAlways`] subscriber never reads that row — it
+    /// routes advancement through its in-memory high-water mark. Calling
+    /// `release_halt` for one writes the row and fires
+    /// [`HaltReason::Released`], but the live subscriber stays wedged; the
+    /// success `WARN` says so rather than claiming delivery resumes. The
+    /// remedy for a wedged `ReplayAlways` subscriber is a fresh `subscribe()`
+    /// with a fresh model, or opting into
+    /// [`GapPolicy::SkipAfterBackstop`](epoch_core::event_store::GapPolicy::SkipAfterBackstop)
+    /// so the wedge never forms.
+    ///
     /// # Errors
     ///
     /// Returns [`PgEventBusError::BackwardRelease`] when `past_sequence` is at or
@@ -2595,16 +2614,35 @@ where
         .execute(&self.pool)
         .await?;
 
-        warn!(
-            "Operator release: advanced subscriber '{}' past held sequence {} (was {}). \
-             Any sequence at or below {} the subscriber never finished is now skipped; \
-             delivery resumes from {}.",
-            subscriber_id,
-            past_sequence,
-            current,
-            past_sequence,
-            past_sequence + 1,
+        // Spec 0030 R8: only a `Checkpointed` subscriber reads the row this
+        // call writes, so only for that class may the WARN promise resumption.
+        // An unregistered subscriber_id (operator releasing ahead of
+        // registration) takes the `Checkpointed` wording — the default mode,
+        // and the one the written row serves.
+        let is_replay_always = matches!(
+            self.subscriber_modes.lock().await.get(subscriber_id),
+            Some(SubscriptionMode::ReplayAlways)
         );
+        if is_replay_always {
+            warn!(
+                "Operator release: advanced subscriber '{}' past held sequence {} (was {}) in the \
+                 checkpoint table. This subscriber is ReplayAlways: it never reads that \
+                 checkpoint row, so delivery does NOT resume — it stays wedged below {}. The \
+                 remedy is a fresh subscribe() with a fresh model.",
+                subscriber_id, past_sequence, current, past_sequence,
+            );
+        } else {
+            warn!(
+                "Operator release: advanced subscriber '{}' past held sequence {} (was {}). \
+                 Any sequence at or below {} the subscriber never finished is now skipped; \
+                 delivery resumes from {}.",
+                subscriber_id,
+                past_sequence,
+                current,
+                past_sequence,
+                past_sequence + 1,
+            );
+        }
 
         fire_on_halt(
             &self.config,
@@ -2820,6 +2858,19 @@ where
     /// covers — pins `position` at the hole's location until it resolves, so
     /// this call can stay pending even though every event visible so far has
     /// actually been processed. See spec 0026 R5.
+    ///
+    /// # Amendment for `SkipAfterBackstop` subscribers (spec 0030 R9)
+    /// Spec 0026 R5 ("readiness MUST NOT report caught-up while a checkpoint is
+    /// legitimately held below a hole") is amended for the opt-in
+    /// [`GapPolicy::SkipAfterBackstop`](epoch_core::event_store::GapPolicy::SkipAfterBackstop)
+    /// plus [`SubscriptionMode::ReplayAlways`] class only: that subscriber's
+    /// position advances past an unproven hole once the backstop fires, so this
+    /// call **will** report caught-up across a sequence that may still commit.
+    /// For that class this is the honest report — no checkpoint is persisted at
+    /// all, and the residual divergence across the skipped sequence is healed by
+    /// [`check_skipped_gaps`](Self::check_skipped_gaps) driving a rebuild. Spec
+    /// 0027 §3.3 (a persisted checkpoint never leads the in-memory one) is NOT
+    /// amended: it holds untouched for every class.
     ///
     /// Returns [`PgEventBusError::SubscriberNotFound`] if `subscriber_id` is
     /// not registered on this bus, or [`PgEventBusError::InlineDispatchNotSupported`]
