@@ -9,7 +9,8 @@ mod subscriber_state;
 pub(crate) use checkpoint::*;
 pub use config::{
     CheckpointMode, DispatchMode, DlqCallback, DlqInsertionInfo, GapTimeoutCallback,
-    GapTimeoutInfo, HaltCallback, HaltInfo, HaltReason, InstanceMode, ReliableDeliveryConfig,
+    GapTimeoutInfo, HaltCallback, HaltInfo, HaltReason, InstanceMode, RebuildNeededCallback,
+    RebuildNeededInfo, ReliableDeliveryConfig,
 };
 pub(crate) use retry::{
     ProcessResult, invoke_observer_once, panic_payload_message, process_event_with_retry,
@@ -356,6 +357,96 @@ async fn confirm_gap_timeout_record(
             true
         }
     }
+}
+
+/// Detection core for late-materialized skipped sequences (spec 0030 §3.3).
+///
+/// Joins this bus's unresolved `epoch_event_bus_gap_timeouts` rows against the
+/// bus's configured events table; for every hit it fires
+/// [`RebuildNeededCallback::on_rebuild_needed`] and then marks that row
+/// resolved (`resolved_by = 'gap_detection'`) on the full
+/// `(bus_name, subscriber_id, skipped_sequence)` unique key, so the callback
+/// fires at least once per skipped sequence per subscriber rather than every
+/// scan (a crash or a concurrent scan can re-fire it; the rebuild remedy is
+/// idempotent).
+///
+/// Shared by the on-demand entry point and the periodic scan.
+async fn scan_late_materialized_gaps(
+    pool: &PgPool,
+    config: &ReliableDeliveryConfig,
+) -> Result<Vec<GapTimeoutEntry>, SqlxError> {
+    use sqlx::Row;
+
+    let bus_name = &config.events_table;
+    let rows = sqlx::query(&format!(
+        r#"
+        SELECT g.id, g.bus_name, g.subscriber_id, g.skipped_sequence, g.gap_duration_ms,
+               g.timed_out_at, g.resolved_at, g.resolved_by, g.resolution_notes
+        FROM epoch_event_bus_gap_timeouts g
+        JOIN {bus_name} e ON e.global_sequence = g.skipped_sequence
+        WHERE g.bus_name = $1 AND g.resolved_at IS NULL
+        ORDER BY g.skipped_sequence ASC
+        "#
+    ))
+    .bind(bus_name)
+    .fetch_all(pool)
+    .await?;
+
+    let mut detected = Vec::with_capacity(rows.len());
+    for row in rows {
+        let entry = GapTimeoutEntry {
+            id: row.get("id"),
+            bus_name: row.get("bus_name"),
+            subscriber_id: row.get("subscriber_id"),
+            skipped_sequence: row.get::<i64, _>("skipped_sequence") as u64,
+            gap_duration_ms: row.get("gap_duration_ms"),
+            timed_out_at: row.get("timed_out_at"),
+            resolved_at: row.get("resolved_at"),
+            resolved_by: row.get("resolved_by"),
+            resolution_notes: row.get("resolution_notes"),
+        };
+
+        warn!(
+            "Late materialization on bus '{}': seq {} committed after '{}' advanced past it \
+             — that subscriber's model is missing this event and must be rebuilt (drop the \
+             model and re-subscribe)",
+            entry.bus_name, entry.skipped_sequence, entry.subscriber_id
+        );
+
+        if let Some(callback) = &config.on_rebuild_needed {
+            callback
+                .on_rebuild_needed(RebuildNeededInfo {
+                    bus_name: entry.bus_name.clone(),
+                    subscriber_id: entry.subscriber_id.clone(),
+                    skipped_sequence: entry.skipped_sequence,
+                })
+                .await;
+        }
+
+        // Keyed on the FULL unique key: resolving on (bus_name, skipped_sequence)
+        // alone would swallow another subscriber's pending callback for the same
+        // sequence.
+        sqlx::query(
+            r#"
+            UPDATE epoch_event_bus_gap_timeouts
+            SET resolved_at = NOW(),
+                resolved_by = 'gap_detection'
+            WHERE bus_name = $1
+              AND subscriber_id = $2
+              AND skipped_sequence = $3
+              AND resolved_at IS NULL
+            "#,
+        )
+        .bind(&entry.bus_name)
+        .bind(&entry.subscriber_id)
+        .bind(entry.skipped_sequence as i64)
+        .execute(pool)
+        .await?;
+
+        detected.push(entry);
+    }
+
+    Ok(detected)
 }
 
 /// Processes one subscriber against the pre-fetched batch of events.
@@ -1275,7 +1366,10 @@ where
 struct ListenerState {
     /// Handle to the spawned listener task.
     handle: tokio::task::JoinHandle<()>,
-    /// Signal to trigger shutdown.
+    /// Handle to the periodic late-materialization scan task, when
+    /// [`ReliableDeliveryConfig::gap_scan_interval`] enables it.
+    scan_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Signal to trigger shutdown. Shared by both tasks.
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
@@ -2264,11 +2358,45 @@ where
             }
         });
 
-        // Store the handle and shutdown sender
+        // Periodic late-materialization scan (spec 0030 §3.3). A dedicated task
+        // rather than a fold into the listener tick: the tick's cadence is the
+        // 1 s checkpoint-flush interval and its body is the delivery hot path,
+        // whereas this scan is independently configurable, off by default, and
+        // its callback is awaited inline — it has no business delaying delivery.
+        let scan_handle = self.config.gap_scan_interval.map(|interval| {
+            let scan_pool = self.pool.clone();
+            let scan_config = self.config.clone();
+            let mut scan_shutdown_rx = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = sleep(interval) => {
+                            if let Err(e) = scan_late_materialized_gaps(&scan_pool, &scan_config).await {
+                                warn!(
+                                    "Late-materialization scan on bus '{}' failed: {}; retrying on the next interval",
+                                    scan_config.events_table, e
+                                );
+                            }
+                        }
+                        res = scan_shutdown_rx.changed() => {
+                            // Sender dropped means the bus was dropped without
+                            // shutdown(); exit as documented rather than
+                            // spinning on an always-ready branch.
+                            if res.is_err() || *scan_shutdown_rx.borrow() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+        });
+
+        // Store the handles and shutdown sender
         {
             let mut state = self.listener_state.lock().await;
             *state = Some(ListenerState {
                 handle,
+                scan_handle,
                 shutdown_tx,
             });
         }
@@ -2308,6 +2436,7 @@ where
         match state {
             Some(ListenerState {
                 handle,
+                scan_handle,
                 shutdown_tx,
             }) => {
                 // Signal shutdown
@@ -2317,6 +2446,12 @@ where
                 handle
                     .await
                     .map_err(|e| format!("Listener task panicked: {}", e))?;
+
+                if let Some(scan_handle) = scan_handle {
+                    scan_handle
+                        .await
+                        .map_err(|e| format!("Gap-scan task panicked: {}", e))?;
+                }
 
                 info!("Event bus listener shut down gracefully");
                 Ok(())
@@ -3153,6 +3288,70 @@ where
                 resolution_notes: row.get("resolution_notes"),
             })
             .collect())
+    }
+
+    /// Detects rows that have committed at a `global_sequence` a subscriber on
+    /// this bus already advanced past, and fires the rebuild-needed signal
+    /// (spec 0030 §3.3, R5).
+    ///
+    /// Every bus fetch is `WHERE global_sequence > position`, so a row that
+    /// commits *below* a subscriber's position is otherwise invisible forever.
+    /// This runs the join that finds them: this bus's unresolved
+    /// `epoch_event_bus_gap_timeouts` rows against this bus's configured
+    /// `events_table`. For each hit it invokes
+    /// [`ReliableDeliveryConfig::on_rebuild_needed`] with
+    /// `(subscriber_id, skipped_sequence)` and then marks that row resolved.
+    ///
+    /// The signal is delivered **at least once** per
+    /// `(subscriber, skipped sequence)`. The callback is awaited *before* the
+    /// resolving `UPDATE`, so a crash or panic in that window leaves the row
+    /// unresolved and the next scan re-fires it; likewise two scans running
+    /// concurrently on the same bus (an on-demand call racing the timer, or two
+    /// processes sharing a `bus_name` — detection is a plain `SELECT`, not a
+    /// claiming `UPDATE`) can both see the same row and both fire. That is safe
+    /// by the same argument as the orphan rows below: the remedy is a
+    /// `ReplayAlways` rebuild from 0, which is idempotent, so a repeated signal
+    /// costs work, never correctness.
+    ///
+    /// Callable on demand at any time. When
+    /// [`ReliableDeliveryConfig::gap_scan_interval`] is `Some`, the listener
+    /// also calls it on that cadence; both paths share this code.
+    ///
+    /// # The three subscriber classes
+    ///
+    /// - **[`GapPolicy::SkipAfterBackstop`]
+    ///   subscribers.** This is the loop the policy's safety contract depends
+    ///   on: the position advanced past an unproven hole under an audited skip,
+    ///   and this entry point is what turns a late commit at that hole into a
+    ///   rebuild.
+    /// - **Fail-open `TimeoutBackstop` `ReplayAlways` subscribers.** The same
+    ///   remedy applies, and they need no opt-in to get it: the gap recorder
+    ///   writes ledger rows for every timeout-backstop skip regardless of
+    ///   failure mode, so their position also advanced past a hole and a
+    ///   detected late row fires the same callback.
+    /// - **Default [`GapPolicy::Halt`] subscribers.** A
+    ///   fail-closed wedge records no ledger row, so for a `Halt`-only
+    ///   deployment this finds nothing and is a harmless read-only diagnostic.
+    ///   It is **not** a general recovery API: it cannot unwedge a halted
+    ///   subscriber, and the remedy there remains a fresh `subscribe()`.
+    ///
+    /// # Candidates, not proofs
+    ///
+    /// A ledger row records that a skip was *offered and audited*, not that it
+    /// was necessarily taken. Under record-then-advance the row is committed
+    /// before the position moves, so a crash in that window leaves an orphan
+    /// row for a sequence that was never actually skipped. This method reports
+    /// candidates and may therefore fire the callback for such a row. That is
+    /// accepted by design: the remedy is a `ReplayAlways` rebuild from 0, which
+    /// is always safe, so a spurious rebuild costs work, never correctness.
+    ///
+    /// # Returns
+    ///
+    /// The entries detected and resolved by this invocation (empty when there
+    /// is nothing to detect). The returned entries carry their pre-resolution
+    /// column values.
+    pub async fn check_skipped_gaps(&self) -> Result<Vec<GapTimeoutEntry>, SqlxError> {
+        scan_late_materialized_gaps(&self.pool, &self.config).await
     }
 
     /// Marks a gap-timeout record as resolved.

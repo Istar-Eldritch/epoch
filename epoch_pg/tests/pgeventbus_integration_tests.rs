@@ -9010,6 +9010,291 @@ async fn test_skip_after_backstop_audited_row_precedes_hwm_advance() {
     drop_isolated_events_table(&pool, &table).await;
 }
 
+/// Captures every `RebuildNeededInfo` the late-materialization detection fires
+/// (T4, spec 0030 R5).
+struct CapturingRebuildCallback {
+    fired: Arc<StdMutex<Vec<epoch_pg::event_bus::RebuildNeededInfo>>>,
+}
+
+#[async_trait]
+impl epoch_pg::event_bus::RebuildNeededCallback for CapturingRebuildCallback {
+    async fn on_rebuild_needed(&self, info: epoch_pg::event_bus::RebuildNeededInfo) {
+        self.fired.lock().unwrap().push(info);
+    }
+}
+
+/// Inserts an event with an EXPLICIT `global_sequence`, simulating a row that
+/// commits at a sequence a subscriber already advanced past (late
+/// materialization, T4).
+async fn insert_event_at_sequence(
+    pool: &PgPool,
+    table: &str,
+    stream_id: Uuid,
+    version: i64,
+    global_sequence: i64,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let data = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: "late_materialized".to_string(),
+    }))
+    .unwrap();
+    sqlx::query(&format!(
+        r#"INSERT INTO {table} (id, stream_id, stream_version, event_type, data, created_at, global_sequence)
+           VALUES ($1, $2, $3, 'MyEvent', $4, NOW(), $5)"#
+    ))
+    .bind(id)
+    .bind(stream_id)
+    .bind(version)
+    .bind(&data)
+    .bind(global_sequence)
+    .execute(pool)
+    .await
+    .expect("insert event at skipped sequence");
+    id
+}
+
+/// T4 (spec 0030 R5): a row that commits at a skipped `global_sequence` is
+/// detected and fires the rebuild-needed callback exactly once.
+///
+/// Four assertions, in order:
+/// (a) the detection core, invoked directly (cadence-independent), detects the
+///     late row and fires `on_rebuild_needed` with the skipped sequence;
+/// (b) the row is marked resolved — a SECOND invocation fires nothing;
+/// (c) with `gap_scan_interval` set, the periodic scan fires the callback with
+///     no manual invocation;
+/// (d) a `Halt`-only deployment records no ledger rows, so the entry point is a
+///     harmless no-op there.
+#[tokio::test]
+#[serial]
+async fn test_late_materialization_detected_fires_rebuild_once() {
+    use epoch_pg::event_bus::RebuildNeededInfo;
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // --- (a)/(b): a real SkipAfterBackstop skip, then a late row at the hole --
+    let table = isolated_events_table(&pool).await;
+    let rebuilds = Arc::new(StdMutex::new(Vec::<RebuildNeededInfo>::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_rebuild_needed: Some(Arc::new(CapturingRebuildCallback {
+            fired: rebuilds.clone(),
+        })),
+        // Scan OFF: (a)/(b) must observe the on-demand entry point alone.
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let sub_id = format!("projection:late-mat:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone())
+        .fail_closed()
+        .skip_after_backstop();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe SkipAfterBackstop observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_, seq_below) = insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up"),
+        "subscriber must reach the below-hole event before the hole is opened"
+    );
+
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(seq_hole > seq_below);
+    let (_, seq_above) = insert_committed_event(&pool, &table, hole_stream, 2, "above").await;
+    assert!(seq_above > seq_hole);
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    tokio::time::sleep(GapDuration::from_millis(1500)).await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(10))
+            .await
+            .expect("wait_until_caught_up after backstop"),
+        "the SkipAfterBackstop subscriber must advance past the hole at {seq_hole}"
+    );
+
+    // Nothing to detect yet: the skipped sequence has no committed row.
+    let none_yet = event_bus
+        .check_skipped_gaps()
+        .await
+        .expect("check_skipped_gaps before the late row");
+    assert!(
+        none_yet.is_empty(),
+        "an unresolved skip with no committed row must not be detected; got {none_yet:?}"
+    );
+    assert!(rebuilds.lock().unwrap().is_empty());
+
+    // The late row materializes at the skipped sequence.
+    insert_event_at_sequence(&pool, &table, hole_stream, 3, seq_hole).await;
+
+    // (a) detected on demand, callback carries the skipped sequence.
+    let detected = event_bus
+        .check_skipped_gaps()
+        .await
+        .expect("check_skipped_gaps after the late row");
+    assert_eq!(
+        detected.len(),
+        1,
+        "the late-materialized skip must be detected exactly once; got {detected:?}"
+    );
+    assert_eq!(detected[0].skipped_sequence, seq_hole as u64);
+    assert_eq!(detected[0].subscriber_id, sub_id);
+    {
+        let fired = rebuilds.lock().unwrap();
+        assert_eq!(
+            fired.len(),
+            1,
+            "on_rebuild_needed must fire once for the late row; got {fired:?}"
+        );
+        assert_eq!(fired[0].skipped_sequence, seq_hole as u64);
+        assert_eq!(fired[0].subscriber_id, sub_id);
+        assert_eq!(fired[0].bus_name, table);
+    }
+
+    // (b) the row is marked resolved, so a second invocation fires nothing.
+    let rows = event_bus
+        .list_gap_timeouts(Some(&sub_id), false, 0, 50)
+        .await
+        .expect("list_gap_timeouts");
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].resolved_at.is_some(),
+        "the detected row must be marked resolved"
+    );
+    assert_eq!(rows[0].resolved_by.as_deref(), Some("gap_detection"));
+    let second = event_bus
+        .check_skipped_gaps()
+        .await
+        .expect("second check_skipped_gaps");
+    assert!(
+        second.is_empty(),
+        "a resolved row must not be re-detected; got {second:?}"
+    );
+    assert_eq!(
+        rebuilds.lock().unwrap().len(),
+        1,
+        "on_rebuild_needed must fire exactly once per (subscriber, skipped sequence)"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+
+    // --- (c): the automatic scan drives the same core, no manual call --------
+    let scan_table = isolated_events_table(&pool).await;
+    let scan_rebuilds = Arc::new(StdMutex::new(Vec::<RebuildNeededInfo>::new()));
+    let scan_bus = start_isolated_bus(
+        &pool,
+        epoch_pg::event_bus::ReliableDeliveryConfig {
+            events_table: scan_table.clone(),
+            gap_scan_interval: Some(GapDuration::from_millis(200)),
+            on_rebuild_needed: Some(Arc::new(CapturingRebuildCallback {
+                fired: scan_rebuilds.clone(),
+            })),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // A committed row plus an unresolved ledger row naming its sequence is the
+    // exact state the scan looks for; planting it directly keeps this leg
+    // independent of the (slow) wedge machinery already exercised above.
+    let scan_sub = format!("projection:scan:{}", Uuid::new_v4());
+    let (_, scan_seq) = insert_committed_event(&pool, &scan_table, Uuid::new_v4(), 1, "late").await;
+    sqlx::query(
+        "INSERT INTO epoch_event_bus_gap_timeouts \
+         (bus_name, subscriber_id, skipped_sequence, gap_duration_ms) VALUES ($1, $2, $3, 500)",
+    )
+    .bind(&scan_table)
+    .bind(&scan_sub)
+    .bind(scan_seq)
+    .execute(&pool)
+    .await
+    .expect("plant unresolved ledger row");
+
+    let mut scan_fired = false;
+    for _ in 0..50 {
+        if !scan_rebuilds.lock().unwrap().is_empty() {
+            scan_fired = true;
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    assert!(
+        scan_fired,
+        "the periodic scan must fire on_rebuild_needed without a manual invocation"
+    );
+    {
+        let fired = scan_rebuilds.lock().unwrap();
+        assert_eq!(fired[0].skipped_sequence, scan_seq as u64);
+        assert_eq!(fired[0].subscriber_id, scan_sub);
+    }
+
+    scan_bus.shutdown().await.expect("shutdown scan bus");
+    drop_isolated_events_table(&pool, &scan_table).await;
+
+    // --- (d): a Halt-only deployment records nothing, so detection is a no-op -
+    let halt_table = isolated_events_table(&pool).await;
+    let halt_rebuilds = Arc::new(StdMutex::new(Vec::<RebuildNeededInfo>::new()));
+    let halt_bus = start_isolated_bus(
+        &pool,
+        epoch_pg::event_bus::ReliableDeliveryConfig {
+            events_table: halt_table.clone(),
+            on_rebuild_needed: Some(Arc::new(CapturingRebuildCallback {
+                fired: halt_rebuilds.clone(),
+            })),
+            ..Default::default()
+        },
+    )
+    .await;
+    let halt_sub = format!("projection:halt-only:{}", Uuid::new_v4());
+    halt_bus
+        .subscribe(ProjectionHandler::new(
+            TestProjection::replay_always(halt_sub.clone()).fail_closed(),
+        ))
+        .await
+        .expect("subscribe default-Halt observer");
+    insert_committed_event(&pool, &halt_table, Uuid::new_v4(), 1, "plain").await;
+    assert!(
+        halt_bus
+            .wait_until_caught_up(&halt_sub, GapDuration::from_secs(10))
+            .await
+            .expect("wait_until_caught_up on the Halt-only bus")
+    );
+    let halt_detected = halt_bus
+        .check_skipped_gaps()
+        .await
+        .expect("check_skipped_gaps on a Halt-only deployment");
+    assert!(
+        halt_detected.is_empty(),
+        "a Halt-only deployment records no skips, so detection must find nothing; got {halt_detected:?}"
+    );
+    assert!(
+        halt_rebuilds.lock().unwrap().is_empty(),
+        "no rebuild signal may fire for a Halt-only deployment"
+    );
+
+    halt_bus.shutdown().await.expect("shutdown halt bus");
+    drop_isolated_events_table(&pool, &halt_table).await;
+}
+
 /// T7 (spec 0030 R4): a ledger-write failure BLOCKS the skip — the subscriber
 /// stays in the refused-backstop posture (HWM below the hole, no audit row, no
 /// callback) — and once the failure is lifted the skip lands on a later tick,

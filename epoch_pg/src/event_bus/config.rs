@@ -209,6 +209,82 @@ pub trait GapTimeoutCallback: Send + Sync {
     async fn on_gap_timeout(&self, info: GapTimeoutInfo);
 }
 
+/// Information about a skipped sequence that has since materialized.
+///
+/// Passed to the [`RebuildNeededCallback`] when late-materialization detection
+/// finds a committed row at a sequence a subscriber's position advanced past.
+#[derive(Debug, Clone)]
+pub struct RebuildNeededInfo {
+    /// The bus on which the skip was recorded (the configured `events_table`).
+    pub bus_name: String,
+    /// The subscriber whose position advanced past the sequence.
+    pub subscriber_id: String,
+    /// The `global_sequence` that was skipped and has now committed.
+    pub skipped_sequence: u64,
+}
+
+/// Callback invoked when a row commits at a sequence a subscriber already
+/// skipped, i.e. the subscriber's model is missing an event that now exists
+/// (spec 0030 §3.3).
+///
+/// # What the consumer MUST do
+///
+/// Drop the affected model and re-`subscribe()` it. A fresh `subscribe()` of a
+/// [`SubscriptionMode::ReplayAlways`](epoch_core::SubscriptionMode::ReplayAlways)
+/// subscriber replays from 0 against a fresh model, so it picks up the
+/// late-committed row. Epoch provides the *trigger*, not the rebuild: it cannot
+/// reconstruct a consumer's in-memory state for it.
+///
+/// # Who receives it
+///
+/// The signal is driven by [`PgEventBus::check_skipped_gaps`], which is scoped
+/// to rows this bus recorded. See that method for the three subscriber classes
+/// and for the orphan-row caveat.
+///
+/// [`PgEventBus::check_skipped_gaps`]: crate::event_bus::PgEventBus::check_skipped_gaps
+///
+/// # Blocking contract
+///
+/// The callback is awaited inline on the scanning task (the on-demand caller's
+/// task, or the periodic scan task). A slow implementation delays the rest of
+/// that scan; it never delays event delivery. Panics are not caught — keep the
+/// implementation lightweight and infallible, or catch inside it.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use epoch_pg::{RebuildNeededCallback, RebuildNeededInfo};
+/// use async_trait::async_trait;
+///
+/// struct RebuildSignal;
+///
+/// #[async_trait]
+/// impl RebuildNeededCallback for RebuildSignal {
+///     async fn on_rebuild_needed(&self, info: RebuildNeededInfo) {
+///         log::warn!(
+///             "Subscriber '{}' missed seq {} which has now committed: rebuild required",
+///             info.subscriber_id, info.skipped_sequence
+///         );
+///     }
+/// }
+/// ```
+#[async_trait]
+pub trait RebuildNeededCallback: Send + Sync {
+    /// Called when a row is detected at a sequence that subscriber skipped.
+    ///
+    /// Delivery is **at least once** per `(subscriber_id, skipped_sequence)`,
+    /// not exactly once: the callback is awaited *before* the ledger row is
+    /// marked resolved, so a crash in that window, or two scans racing on the
+    /// same bus (an on-demand [`PgEventBus::check_skipped_gaps`] against the
+    /// timer, or two processes sharing a `bus_name` — the detection query is a
+    /// plain `SELECT`, not a claiming `UPDATE`), can re-fire it. That is
+    /// accepted by design: the remedy is a `ReplayAlways` rebuild from 0, which
+    /// is idempotent, so a repeated signal costs work, never correctness.
+    ///
+    /// [`PgEventBus::check_skipped_gaps`]: crate::event_bus::PgEventBus::check_skipped_gaps
+    async fn on_rebuild_needed(&self, info: RebuildNeededInfo);
+}
+
 /// How events are dispatched from the bus to subscribers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -255,6 +331,8 @@ pub enum DispatchMode {
 /// | `on_gap_timeout` | `None` |
 /// | `on_halt` | `None` |
 /// | `snapshot_fencing` | `true` |
+/// | `on_rebuild_needed` | `None` |
+/// | `gap_scan_interval` | `None` (scan disabled) |
 ///
 /// Using `..Default::default()` avoids this churn for all optional fields.
 #[derive(Clone)]
@@ -391,6 +469,42 @@ pub struct ReliableDeliveryConfig {
     ///
     /// [`gap_timeout`]: Self::gap_timeout
     pub snapshot_fencing: bool,
+
+    /// Optional callback invoked when a row is found at a `global_sequence` a
+    /// subscriber already skipped (late materialization, spec 0030 §3.3).
+    ///
+    /// Fires at least once per `(subscriber_id, skipped_sequence)` (a crash
+    /// between callback and resolve, or concurrent scans, can re-fire it —
+    /// safe, because the remedy is an idempotent rebuild from 0; see
+    /// [`RebuildNeededCallback::on_rebuild_needed`] for the full contract),
+    /// driven by [`PgEventBus::check_skipped_gaps`] — either on demand or from the
+    /// periodic scan enabled by [`gap_scan_interval`]. The consumer must drop
+    /// the affected model and re-`subscribe()`. See [`RebuildNeededCallback`].
+    ///
+    /// [`PgEventBus::check_skipped_gaps`]: crate::event_bus::PgEventBus::check_skipped_gaps
+    /// [`gap_scan_interval`]: Self::gap_scan_interval
+    ///
+    /// Default: `None` (no callback)
+    pub on_rebuild_needed: Option<Arc<dyn RebuildNeededCallback>>,
+
+    /// How often the background listener scans for late-materialized skipped
+    /// sequences (spec 0030 §3.3).
+    ///
+    /// When `Some(interval)`, [`start_listener`] spawns a dedicated timer task
+    /// that calls [`PgEventBus::check_skipped_gaps`] every `interval` and
+    /// stops with the listener. The first scan runs one full `interval` after
+    /// the listener starts, not immediately. When `None` the scan never runs —
+    /// the entry point remains available on demand.
+    ///
+    /// Default: `None` (disabled). Detection is only meaningful once a
+    /// subscriber has skipped a sequence, so leaving the scan off costs a
+    /// default deployment nothing and preserves its behaviour exactly. Enable
+    /// it alongside `GapPolicy::SkipAfterBackstop` (or fail-open
+    /// `ReplayAlways`) subscribers, where a detected late row is actionable.
+    ///
+    /// [`start_listener`]: crate::event_bus::PgEventBus::start_listener
+    /// [`PgEventBus::check_skipped_gaps`]: crate::event_bus::PgEventBus::check_skipped_gaps
+    pub gap_scan_interval: Option<Duration>,
 }
 
 impl Default for ReliableDeliveryConfig {
@@ -410,6 +524,8 @@ impl Default for ReliableDeliveryConfig {
             dispatch_mode: DispatchMode::default(),
             events_table: "epoch_events".to_string(),
             snapshot_fencing: true,
+            on_rebuild_needed: None,
+            gap_scan_interval: None,
         }
     }
 }
@@ -440,6 +556,11 @@ impl std::fmt::Debug for ReliableDeliveryConfig {
             .field("dispatch_mode", &self.dispatch_mode)
             .field("events_table", &self.events_table)
             .field("snapshot_fencing", &self.snapshot_fencing)
+            .field(
+                "on_rebuild_needed",
+                &self.on_rebuild_needed.as_ref().map(|_| "Some(<callback>)"),
+            )
+            .field("gap_scan_interval", &self.gap_scan_interval)
             .finish()
     }
 }
@@ -601,6 +722,8 @@ mod tests {
             dispatch_mode: DispatchMode::default(),
             events_table: "custom_events".to_string(),
             snapshot_fencing: false,
+            on_rebuild_needed: None,
+            gap_scan_interval: None,
         };
 
         assert_eq!(config.max_retries, 5);
