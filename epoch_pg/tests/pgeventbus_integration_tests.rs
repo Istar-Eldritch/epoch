@@ -10600,3 +10600,204 @@ async fn test_subscribe_gap_policy_guardrail_skip_after_backstop_replay_always_o
          same InvalidSubscriptionConfig variant: {rejected_inline:?}"
     );
 }
+
+// ==================== Part B: AllocationMode surface (spec 0030 P6) ====================
+
+/// Reads the `epoch_events_sequence_counter` row for `table`.
+async fn sequence_counter_val(pool: &PgPool, table: &str) -> Option<i64> {
+    sqlx::query_scalar("SELECT val FROM epoch_events_sequence_counter WHERE name = $1")
+        .bind(table)
+        .fetch_optional(pool)
+        .await
+        .expect("query the per-table counter row")
+}
+
+// T13 (spec 0030 R11): constructing under `PerTxnCounter` creates and seeds the
+// per-events-table counter row above the table's high-water mark, including
+// sequence values that were assigned but never committed (burn). Observed via
+// direct SQL on the counter row only — no allocator behaviour is exercised here
+// (that is P7). Also pins idempotency (a second construction never lowers the
+// counter) and that the default `Nextval` path touches no counter row.
+#[tokio::test]
+#[serial]
+async fn test_per_txn_counter_construction_reseeds_counter_row() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let seq = format!("{table}_seq");
+    let bus = || {
+        PgEventBus::<TestEventData>::new(
+            pool.clone(),
+            format!("alloc_ch_{}", Uuid::new_v4().simple()),
+        )
+    };
+
+    // A virgin sequence (is_called = false) has assigned nothing, and an empty
+    // table has no MAX: the seed floor is 0, and the row is created regardless.
+    let empty_store = PgEventStore::with_allocation_mode(
+        pool.clone(),
+        bus(),
+        table.clone(),
+        epoch_pg::AllocationMode::PerTxnCounter,
+    )
+    .await
+    .expect("construction under PerTxnCounter must succeed");
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        Some(0),
+        "a virgin sequence over an empty table seeds the counter at 0"
+    );
+    assert_eq!(
+        empty_store.allocation_mode(),
+        epoch_pg::AllocationMode::PerTxnCounter
+    );
+
+    // Commit rows under the default Nextval path, then burn sequence values
+    // without committing rows, so the sequence's last-assigned value leads
+    // MAX(global_sequence) — the case a MAX-only seed would get wrong.
+    let nextval_store = PgEventStore::with_table(pool.clone(), bus(), table.clone()).await;
+    let stream_id = Uuid::new_v4();
+    nextval_store
+        .store_event(new_event(stream_id, 1, "seeded"))
+        .await
+        .expect("store under Nextval");
+    nextval_store
+        .store_event(new_event(stream_id, 2, "seeded"))
+        .await
+        .expect("store under Nextval");
+    for _ in 0..3 {
+        sqlx::query(&format!("SELECT nextval('{seq}')"))
+            .execute(&pool)
+            .await
+            .expect("burn a sequence value");
+    }
+
+    let max_committed: i64 =
+        sqlx::query_scalar(&format!("SELECT MAX(global_sequence) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .expect("read MAX(global_sequence)");
+    let sequence_high_water: i64 = sqlx::query_scalar(&format!("SELECT last_value FROM {seq}"))
+        .fetch_one(&pool)
+        .await
+        .expect("read the sequence high-water");
+    assert!(
+        sequence_high_water > max_committed,
+        "setup: the burned sequence must lead the committed rows"
+    );
+
+    PgEventStore::with_allocation_mode(
+        pool.clone(),
+        bus(),
+        table.clone(),
+        epoch_pg::AllocationMode::PerTxnCounter,
+    )
+    .await
+    .expect("re-seeding construction must succeed");
+
+    let seeded = sequence_counter_val(&pool, &table)
+        .await
+        .expect("the counter row must exist after PerTxnCounter construction");
+    assert_eq!(
+        seeded, sequence_high_water,
+        "the counter is raised to the sequence's last-assigned value, \
+         which is above every value the sequence has handed out"
+    );
+    assert!(
+        seeded > max_committed,
+        "the counter must lead every committed global_sequence, so the first \
+         counter-drawn value cannot collide"
+    );
+
+    // Idempotency: re-seeding never lowers an already-higher counter.
+    sqlx::query("UPDATE epoch_events_sequence_counter SET val = val + 100 WHERE name = $1")
+        .bind(&table)
+        .execute(&pool)
+        .await
+        .expect("raise the counter above the sequence");
+    PgEventStore::with_allocation_mode(
+        pool.clone(),
+        bus(),
+        table.clone(),
+        epoch_pg::AllocationMode::PerTxnCounter,
+    )
+    .await
+    .expect("repeat construction must succeed");
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        Some(seeded + 100),
+        "re-seeding must never lower an already-higher counter"
+    );
+
+    drop_isolated_events_table(&pool, &table).await;
+    sqlx::query("DELETE FROM epoch_events_sequence_counter WHERE name = $1")
+        .bind(&table)
+        .execute(&pool)
+        .await
+        .expect("clean up the counter row");
+}
+
+// R10: the default `Nextval` mode allocates exactly as it does today and creates
+// no counter row — neither via the new constructor nor via the pre-existing
+// infallible ones.
+#[tokio::test]
+#[serial]
+async fn test_nextval_allocation_mode_touches_no_counter_row() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let bus = PgEventBus::<TestEventData>::new(
+        pool.clone(),
+        format!("alloc_ch_{}", Uuid::new_v4().simple()),
+    );
+
+    let store = PgEventStore::with_allocation_mode(
+        pool.clone(),
+        bus,
+        table.clone(),
+        epoch_pg::AllocationMode::Nextval,
+    )
+    .await
+    .expect("construction under Nextval must succeed");
+    assert_eq!(store.allocation_mode(), epoch_pg::AllocationMode::Nextval);
+
+    // The pre-existing infallible constructors are unchanged and default to Nextval.
+    let default_store = PgEventStore::new(
+        pool.clone(),
+        PgEventBus::<TestEventData>::new(
+            pool.clone(),
+            format!("alloc_ch_{}", Uuid::new_v4().simple()),
+        ),
+    );
+    assert_eq!(
+        default_store.allocation_mode(),
+        epoch_pg::AllocationMode::Nextval
+    );
+
+    store
+        .store_event(new_event(Uuid::new_v4(), 1, "nextval"))
+        .await
+        .expect("store under Nextval");
+
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        None,
+        "the default mode must not create a counter row"
+    );
+
+    drop_isolated_events_table(&pool, &table).await;
+}

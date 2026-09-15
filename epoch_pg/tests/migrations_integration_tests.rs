@@ -28,6 +28,10 @@ async fn teardown(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("Failed to drop snapshots table");
+    sqlx::query("DROP TABLE IF EXISTS epoch_events_sequence_counter CASCADE")
+        .execute(pool)
+        .await
+        .expect("Failed to drop sequence counter table");
     sqlx::query("DROP TABLE IF EXISTS epoch_event_bus_dlq CASCADE")
         .execute(pool)
         .await
