@@ -168,9 +168,23 @@ pub struct GapTimeoutInfo {
 ///
 /// Use this to increment metrics counters or trigger alerts. Implementations
 /// should be lightweight. The callback fires after the gap-timeout record has
-/// been persisted; errors or panics inside the callback are isolated in a
-/// detached task and do **not** affect checkpoint advancement — the gap is
-/// always skipped regardless of callback outcome.
+/// been persisted.
+///
+/// # Blocking contract
+///
+/// The invocation shape depends on the subscriber's
+/// [`GapPolicy`](crate::GapPolicy):
+///
+/// - Fail-open (timeout-skip) subscribers: fire-and-forget. The callback is
+///   dispatched in a detached task, so errors or panics inside it are isolated
+///   and do **not** affect checkpoint advancement — the gap is skipped
+///   regardless of callback outcome.
+/// - `GapPolicy::SkipAfterBackstop` subscribers: the callback is **awaited
+///   inline** on the listener's per-subscriber task, because record-then-advance
+///   ordering requires the audit row (and its notification) to be confirmed
+///   before the position moves past the gap. Implementations therefore MUST NOT
+///   block for long: a slow callback stalls that listener cycle, including the
+///   other subscribers dispatched in it.
 ///
 /// # Example
 ///
@@ -324,8 +338,12 @@ pub struct ReliableDeliveryConfig {
     /// `epoch_event_bus_gap_timeouts`. Use this to increment metrics counters,
     /// trigger alerts, or drive recovery workflows.
     ///
-    /// Errors from the callback are logged but do not affect checkpoint
-    /// advancement — the gap is always skipped regardless of callback outcome.
+    /// For fail-open subscribers the callback is fire-and-forget: errors are
+    /// logged but do not affect checkpoint advancement — the gap is skipped
+    /// regardless of callback outcome. For `GapPolicy::SkipAfterBackstop`
+    /// subscribers it is awaited inline on the listener's per-subscriber task
+    /// so record-then-advance ordering holds, so the implementation must not
+    /// block for long. See [`GapTimeoutCallback`].
     ///
     /// Default: `None` (no callback)
     pub on_gap_timeout: Option<Arc<dyn GapTimeoutCallback>>,

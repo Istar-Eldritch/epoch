@@ -8701,6 +8701,509 @@ async fn test_fail_open_gap_backstop_still_advances_pin() {
     drop_isolated_events_table(&pool, &table).await;
 }
 
+// ---- Spec 0030 P3: SkipAfterBackstop resolver arm + audited skip ----------
+
+/// T2 (spec 0030 R3): a `ReplayAlways` + `FailClosed` subscriber that opts into
+/// `GapPolicy::SkipAfterBackstop` advances its HWM past an unproven gap once
+/// the `gap_timeout` backstop fires, instead of wedging: no `GapUnproven`
+/// halt, and the post-hole events are delivered (they were applied above the
+/// hole while the gap was held).
+///
+/// Isolated table + `snapshot_fencing: false` so the burned hole can never
+/// self-heal via `FenceCleared` — the only way past it is the new skip arm.
+#[tokio::test]
+#[serial]
+async fn test_skip_after_backstop_advances_hwm_past_unproven_gap() {
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // ReplayAlways + FailClosed + SkipAfterBackstop, subscribed after
+    // start_listener so it takes the live path on an empty history.
+    let sub_id = format!("projection:skip-backstop:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone())
+        .fail_closed()
+        .skip_after_backstop();
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe SkipAfterBackstop observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    // Commit a below-hole event and wait until the subscriber's HWM reaches it
+    // (readiness for a ReplayAlways subscriber reads the in-memory HWM), which
+    // proves the write path is alive and pins the exact posture the gap must
+    // hold below.
+    let stream = Uuid::new_v4();
+    let (_below_id, seq_below) =
+        insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up"),
+        "subscriber must reach the below-hole event before the hole is opened"
+    );
+
+    // Burn a hole: claim the next sequence inside a transaction that is rolled
+    // back, so the value is permanently consumed and never commits.
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(
+        seq_hole > seq_below,
+        "hole must sit above the below-hole event"
+    );
+
+    // Commit two events above the hole so the bus sees a gap at seq_hole.
+    let (above1_id, seq_above1) =
+        insert_committed_event(&pool, &table, hole_stream, 2, "above1").await;
+    let (above2_id, seq_above2) =
+        insert_committed_event(&pool, &table, hole_stream, 3, "above2").await;
+    assert!(seq_above1 > seq_hole && seq_above2 > seq_above1);
+
+    // The post-hole events are delivered while the gap is still held (they go
+    // to processed_ahead above the hole). Release the hole tx before waiting so
+    // a failing test does not leave it open.
+    let mut above_delivered = false;
+    for _ in 0..50 {
+        let ids = applied_ids(&store, hole_stream).await;
+        if ids.contains(&above1_id) && ids.contains(&above2_id) {
+            above_delivered = true;
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    tx_hole.rollback().await.expect("rollback hole tx");
+    assert!(
+        above_delivered,
+        "post-hole events must be delivered while the gap is held"
+    );
+
+    // Wait out gap_timeout (500ms) plus several bus cycles, then require the
+    // HWM to advance past the hole to the head.
+    tokio::time::sleep(GapDuration::from_millis(1500)).await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(10))
+            .await
+            .expect("wait_until_caught_up after backstop"),
+        "SkipAfterBackstop subscriber must advance its HWM past the unproven hole \
+         at {seq_hole} once the backstop fires"
+    );
+
+    // No halt of any kind: the skip arm replaces the refusal, so
+    // on_halt(GapUnproven) must never fire for this subscriber.
+    {
+        let halts_guard = halts.lock().unwrap();
+        assert!(
+            halts_guard.is_empty(),
+            "SkipAfterBackstop must never fire on_halt(GapUnproven); got: {halts_guard:?}"
+        );
+    }
+
+    // No post-hole event was delivered twice: the skip does not re-deliver what
+    // was already applied above the hole while it was held.
+    let ids = applied_ids(&store, hole_stream).await;
+    let mut sorted = ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), ids.len(), "no duplicate delivery");
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// A `GapTimeoutCallback` that records every invocation and, on the first one,
+/// signals the test and then BLOCKS until released. Blocking the callback
+/// blocks the listener task between the synchronous ledger confirm and the HWM
+/// routing, giving the test a deterministic observation window for the
+/// record-then-advance ordering (T3, spec 0030 R4).
+struct BlockingGapCallback {
+    fired: Arc<StdMutex<Vec<epoch_pg::event_bus::GapTimeoutInfo>>>,
+    entered_tx: tokio::sync::mpsc::Sender<()>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl epoch_pg::event_bus::GapTimeoutCallback for BlockingGapCallback {
+    async fn on_gap_timeout(&self, info: epoch_pg::event_bus::GapTimeoutInfo) {
+        self.fired.lock().unwrap().push(info);
+        let _ = self.entered_tx.send(()).await;
+        // Bounded wait so a broken test fails rather than hangs the suite.
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(20), self.release.notified()).await;
+    }
+}
+
+/// T3 (spec 0030 R4): the skip is audited — exactly one
+/// `epoch_event_bus_gap_timeouts` row for the skipped sequence, and
+/// `on_gap_timeout` fires exactly once — and the record lands BEFORE the HWM
+/// advances (record-then-advance, spec 0030 §3.1).
+///
+/// The ordering is proven by parking the test inside the `on_gap_timeout`
+/// callback: the bus confirms the ledger row and fires the callback before it
+/// routes the advance to the HWM, so while the callback is parked the test can
+/// observe (a) the row already present in the ledger and (b) the HWM still
+/// below the hole. Releasing the callback then lets the advance complete.
+#[tokio::test]
+#[serial]
+async fn test_skip_after_backstop_audited_row_precedes_hwm_advance() {
+    use epoch_pg::event_bus::GapTimeoutInfo;
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let fired = Arc::new(StdMutex::new(Vec::<GapTimeoutInfo>::new()));
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        on_gap_timeout: Some(Arc::new(BlockingGapCallback {
+            fired: fired.clone(),
+            entered_tx,
+            release: release.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // Identical posture to T2: ReplayAlways + FailClosed + SkipAfterBackstop.
+    let sub_id = format!("projection:skip-audit:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone())
+        .fail_closed()
+        .skip_after_backstop();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe SkipAfterBackstop observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_, seq_below) = insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up"),
+        "subscriber must reach the below-hole event before the hole is opened"
+    );
+
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(seq_hole > seq_below);
+
+    let (_, seq_above1) = insert_committed_event(&pool, &table, hole_stream, 2, "above1").await;
+    let (_, seq_above2) = insert_committed_event(&pool, &table, hole_stream, 3, "above2").await;
+    assert!(seq_above1 > seq_hole && seq_above2 > seq_above1);
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    // Park inside on_gap_timeout once the backstop fires.
+    tokio::time::timeout(GapDuration::from_secs(15), entered_rx.recv())
+        .await
+        .expect("callback entry wait must not time out")
+        .expect("callback entry signal");
+
+    // --- Inside the record-then-advance window -----------------------------
+    // The bus is parked between the synchronous ledger confirm and the HWM
+    // routing: the audit row must already be present, and the HWM must NOT
+    // have moved past the hole yet.
+    let (row_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM epoch_event_bus_gap_timeouts \
+         WHERE bus_name = $1 AND subscriber_id = $2 AND skipped_sequence = $3",
+    )
+    .bind(&table)
+    .bind(&sub_id)
+    .bind(seq_hole)
+    .fetch_one(&pool)
+    .await
+    .expect("query gap-timeouts row inside the ordering window");
+    assert_eq!(
+        row_count, 1,
+        "the audit row must exist BEFORE the HWM advances (record-then-advance)"
+    );
+    let lag_in_window = event_bus
+        .subscriber_lag(&sub_id)
+        .await
+        .expect("subscriber_lag inside the ordering window");
+    assert_eq!(
+        lag_in_window,
+        (seq_above2 - seq_below) as u64,
+        "while the callback is parked the HWM must still sit at the below-hole \
+         position (seq {seq_below}), not past the hole (seq {seq_hole})"
+    );
+
+    // Release the callback: the advance completes.
+    release.notify_waiters();
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(10))
+            .await
+            .expect("wait_until_caught_up after release"),
+        "after the callback is released the HWM must advance past the hole"
+    );
+
+    // Exactly one audit row for the skipped sequence, and exactly one
+    // on_gap_timeout invocation.
+    let rows = event_bus
+        .list_gap_timeouts(Some(&sub_id), false, 0, 50)
+        .await
+        .expect("list_gap_timeouts");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one gap-timeout row must be recorded; got {rows:?}"
+    );
+    assert_eq!(rows[0].skipped_sequence, seq_hole as u64);
+    {
+        let fired_guard = fired.lock().unwrap();
+        assert_eq!(
+            fired_guard.len(),
+            1,
+            "on_gap_timeout must fire exactly once; got {fired_guard:?}"
+        );
+        assert_eq!(fired_guard[0].skipped_sequence, seq_hole as u64);
+        assert_eq!(fired_guard[0].subscriber_id, sub_id);
+    }
+    assert!(
+        halts.lock().unwrap().is_empty(),
+        "the audited skip must not fire on_halt(GapUnproven)"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T7 (spec 0030 R4): a ledger-write failure BLOCKS the skip — the subscriber
+/// stays in the refused-backstop posture (HWM below the hole, no audit row, no
+/// callback) — and once the failure is lifted the skip lands on a later tick,
+/// proving the record-then-advance retry.
+///
+/// Injection mechanism: the bus runs on a dedicated pool whose connections set
+/// `lock_timeout = '250ms'`, and the test holds `ACCESS EXCLUSIVE` on
+/// `epoch_event_bus_gap_timeouts` in an open transaction. The synchronous
+/// ledger INSERT then fails fast with a lock timeout on every backstop
+/// attempt; committing the lock transaction lifts the injection hermetically
+/// (no DDL, no privilege changes on shared objects).
+#[tokio::test]
+#[serial]
+async fn test_skip_after_backstop_ledger_failure_withholds_skip_then_retries() {
+    use epoch_pg::event_bus::{GapTimeoutCallback, GapTimeoutInfo};
+    use std::time::Duration as GapDuration;
+
+    struct CapturingGapCb {
+        fired: Arc<StdMutex<Vec<u64>>>,
+    }
+    #[async_trait]
+    impl GapTimeoutCallback for CapturingGapCb {
+        async fn on_gap_timeout(&self, info: GapTimeoutInfo) {
+            self.fired.lock().unwrap().push(info.skipped_sequence);
+        }
+    }
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+
+    // Dedicated bus pool: every bus statement gives up on a lock wait after
+    // 250ms, so the ledger INSERT fails fast while the test holds the table
+    // lock. The test's own pool (30s lock_timeout) is unaffected.
+    let bus_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(GapDuration::from_secs(5))
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SET lock_timeout = '250ms'")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&common::database_url())
+        .await
+        .expect("connect dedicated bus pool");
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let fired = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        on_gap_timeout: Some(Arc::new(CapturingGapCb {
+            fired: fired.clone(),
+        })),
+        ..Default::default()
+    };
+    let channel_name = format!("test_t7_{}", Uuid::new_v4().simple());
+    let event_bus = {
+        let bus = PgEventBus::<TestEventData>::with_config(bus_pool.clone(), channel_name, config);
+        bus.setup_trigger().await.expect("Failed to setup trigger");
+        bus.start_listener()
+            .await
+            .expect("Failed to start listener");
+        bus
+    };
+
+    let sub_id = format!("projection:skip-t7:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone())
+        .fail_closed()
+        .skip_after_backstop();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe SkipAfterBackstop observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_, seq_below) = insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up"),
+        "subscriber must reach the below-hole event before the hole is opened"
+    );
+
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(seq_hole > seq_below);
+
+    // Inject the ledger-write failure BEFORE any backstop attempt can fire:
+    // hold ACCESS EXCLUSIVE on the gap-timeouts ledger for the whole
+    // gap_timeout window (~2.7s).
+    //
+    // Assumption: `epoch_event_bus_gap_timeouts` is shared across this binary's
+    // tests, but no other test binary in the workspace contends on it in
+    // `epoch_pg_test` (the migration suite runs against
+    // `epoch_pg_test_migrations`), and a lock wait blocks rather than corrupts.
+    // Revisit this hold if another suite starts touching the ledger.
+    let mut tx_lock = pool.begin().await.expect("begin ledger-lock tx");
+    sqlx::query("LOCK TABLE epoch_event_bus_gap_timeouts IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *tx_lock)
+        .await
+        .expect("lock ledger table");
+
+    // Commit above the hole; delivery works under the lock (it touches no
+    // ledger table), and the gap arms with the injection already active.
+    let (_, seq_above1) = insert_committed_event(&pool, &table, hole_stream, 2, "above1").await;
+    let (_, seq_above2) = insert_committed_event(&pool, &table, hole_stream, 3, "above2").await;
+    assert!(seq_above1 > seq_hole && seq_above2 > seq_above1);
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    // --- Failure window: the backstop fires but the skip is withheld --------
+    // Wait past gap_timeout and then require the posture to be unchanged
+    // across a further full gap_timeout, spanning several retry ticks: HWM
+    // below the hole, no callback, no halt. (The ledger row count is not
+    // sampled here — a read would block on the held ACCESS EXCLUSIVE lock; a
+    // successful confirm would have fired the callback, so an empty callback
+    // log plus the unadvanced HWM pins the no-record/no-skip posture.)
+    tokio::time::sleep(GapDuration::from_millis(1200)).await;
+    let expected_lag = (seq_above2 - seq_below) as u64;
+    for i in 0..10 {
+        let lag = event_bus
+            .subscriber_lag(&sub_id)
+            .await
+            .expect("subscriber_lag in failure window");
+        assert_eq!(
+            lag, expected_lag,
+            "iteration {i}: ledger failure must withhold the skip — the HWM must \
+             stay at the below-hole position (seq {seq_below}), not advance past \
+             the hole (seq {seq_hole})"
+        );
+        assert!(
+            halts.lock().unwrap().is_empty(),
+            "the withheld skip must not degrade into on_halt(GapUnproven)"
+        );
+        tokio::time::sleep(GapDuration::from_millis(150)).await;
+    }
+    assert!(
+        fired.lock().unwrap().is_empty(),
+        "no on_gap_timeout may fire while the ledger write fails"
+    );
+
+    // Lift the injection: the skip lands on a later tick.
+    tx_lock
+        .commit()
+        .await
+        .expect("commit ledger-lock tx (lift)");
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(10))
+            .await
+            .expect("wait_until_caught_up after lift"),
+        "once the ledger write succeeds the withheld skip must land on a later \
+         tick and advance the HWM past the hole (seq {seq_hole})"
+    );
+
+    // The eventual skip is audited exactly once.
+    let rows = event_bus
+        .list_gap_timeouts(Some(&sub_id), false, 0, 50)
+        .await
+        .expect("list_gap_timeouts after lift");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one gap-timeout row after the retried skip lands; got {rows:?}"
+    );
+    assert_eq!(rows[0].skipped_sequence, seq_hole as u64);
+    assert_eq!(
+        *fired.lock().unwrap(),
+        vec![seq_hole as u64],
+        "on_gap_timeout fires exactly once for the retried skip"
+    );
+    assert!(halts.lock().unwrap().is_empty());
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
 /// Polls until `subscriber_id`'s persisted checkpoint is at least `expected`.
 async fn poll_checkpoint_at_least(
     event_bus: &PgEventBus<TestEventData>,
@@ -9525,8 +10028,9 @@ async fn test_update_checkpoint_contract_unchanged_pin() {
 #[serial]
 async fn test_subscribe_gap_policy_guardrail_skip_after_backstop_replay_always_only() {
     use epoch_pg::PgEventBusError;
+    use epoch_pg::event_bus::DispatchMode;
 
-    let Some((_pool, event_bus)) = setup_without_listener().await else {
+    let Some((pool, event_bus)) = setup_without_listener().await else {
         return;
     };
 
@@ -9565,4 +10069,31 @@ async fn test_subscribe_gap_policy_guardrail_skip_after_backstop_replay_always_o
         .subscribe(ProjectionHandler::new(replay))
         .await
         .expect("SkipAfterBackstop + ReplayAlways must be accepted at subscribe");
+
+    // (c) Inline dispatch (spec 0030 R2 review note): the guardrail sits before
+    // the inline registration branch in subscribe(), so an Inline bus rejects
+    // the forbidden combination with the same variant — inline delivery would
+    // otherwise have no registration-time protection at all.
+    let inline_config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        dispatch_mode: DispatchMode::Inline,
+        ..Default::default()
+    };
+    let inline_bus: PgEventBus<TestEventData> = PgEventBus::with_config(
+        pool.clone(),
+        format!("test_inline_gap_{}", Uuid::new_v4().simple()),
+        inline_config,
+    );
+    let rejected_inline = inline_bus
+        .subscribe(ProjectionHandler::new(
+            TestProjection::new().skip_after_backstop(),
+        ))
+        .await;
+    assert!(
+        matches!(
+            &rejected_inline,
+            Err(PgEventBusError::InvalidSubscriptionConfig { .. })
+        ),
+        "Inline dispatch must reject SkipAfterBackstop + Checkpointed with the \
+         same InvalidSubscriptionConfig variant: {rejected_inline:?}"
+    );
 }
