@@ -29,7 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     unresolved ledger rows against the bus's events table; when a row has since
     committed at a skipped sequence it fires the new rebuild-needed callback
     (`(subscriber_id, skipped_sequence)`) and marks that ledger row resolved, so the
-    signal fires once per (subscriber, skipped sequence). An optional
+    signal is **at-least-once** per (subscriber, skipped sequence) rather than exactly
+    once: the callback is awaited before the resolving UPDATE and detection is a plain
+    `SELECT`, so a crash in that window or a concurrent scan can re-fire it. A spurious
+    rebuild costs work, never correctness. A panicking gap-timeout callback on the
+    `SkipAfterBackstop` arm is caught and logged (a WARN), so it cannot kill the
+    listener task; the audit row is already durable at that point, so the panic
+    still takes the skip. An optional
     `gap_scan_interval` runs the scan automatically; it is **off by default**.
   - **Registration guardrail** —
     `subscribe()` rejects `GapPolicy::SkipAfterBackstop` combined with
@@ -379,6 +385,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fired when a fail-closed subscriber halts delivery. Code that constructs
   `ReliableDeliveryConfig` using struct-literal syntax (rather than
   `..Default::default()`) must add `on_halt: None` to the literal.
+- **Source-compat note** (`epoch_pg`, CLOUD-261, `feat(pg)!`): `ReliableDeliveryConfig`
+  gains the new `on_rebuild_needed: Option<Arc<dyn RebuildNeededCallback>>` (defaults to
+  `None`) and `gap_scan_interval: Option<Duration>` (defaults to `None`) fields. The
+  struct is not `#[non_exhaustive]`, so code that constructs `ReliableDeliveryConfig`
+  using struct-literal syntax (rather than `..Default::default()`) must add
+  `on_rebuild_needed: None` and `gap_scan_interval: None` to the literal.
 - **Source-compat note**: `ReliableDeliveryConfig` (`epoch_pg`) gains the new
   `snapshot_fencing: bool` field (defaults to `true`). Code that constructs
   `ReliableDeliveryConfig` using struct-literal syntax (rather than

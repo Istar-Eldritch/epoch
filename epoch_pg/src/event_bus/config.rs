@@ -186,6 +186,18 @@ pub struct GapTimeoutInfo {
 ///   block for long: a slow callback stalls that listener cycle, including the
 ///   other subscribers dispatched in it.
 ///
+/// # Panic isolation
+///
+/// A panicking callback never unwinds the listener task. On the
+/// `GapPolicy::SkipAfterBackstop` arm the panic is caught here and logged as a
+/// WARN; on the fail-open arm the callback runs in a detached task, so the
+/// panic is isolated at that task boundary and reported by the process panic
+/// hook rather than caught by this crate. On the `SkipAfterBackstop` arm the
+/// callback is consulted only after the gap-timeout audit row is confirmed
+/// persisted, so a caught panic still **takes the skip** (the position advances
+/// past the gap) — the record detection relies on is already durable. Only a
+/// failed ledger *write* withholds a skip; a failed callback does not.
+///
 /// # Example
 ///
 /// ```rust,ignore

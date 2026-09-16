@@ -25,6 +25,12 @@ use uuid::Uuid;
 /// `GREATEST`-on-conflict keeps the row monotone even if a straggler
 /// `nextval` writer interleaves — a higher value drawn after the read still
 /// wins on conflict, so this never regresses.
+///
+/// The floor is **degraded** for a custom events table whose `global_sequence`
+/// is not owned by a sequence (`pg_get_serial_sequence` returns `NULL`): the
+/// sequence term drops out and only `MAX(global_sequence)` is used. That is
+/// safe for a table with no `nextval` DEFAULT, but it is logged as a WARN
+/// because a table that draws from an unowned sequence could still collide.
 async fn reseed_sequence_counter(postgres: &PgPool, events_table: &str) -> Result<(), sqlx::Error> {
     let sequence: Option<String> =
         sqlx::query_scalar("SELECT pg_get_serial_sequence($1, 'global_sequence')")
@@ -45,7 +51,15 @@ async fn reseed_sequence_counter(postgres: &PgPool, events_table: &str) -> Resul
                 last_value - 1
             }
         }
-        None => 0,
+        None => {
+            log::warn!(
+                "No owned sequence for '{events_table}'.global_sequence \
+                 (pg_get_serial_sequence returned NULL): seeding the PerTxnCounter floor from \
+                 MAX(global_sequence) alone. If that column draws from an unowned sequence, \
+                 counter-drawn values may collide with values it already handed out."
+            );
+            0
+        }
     };
 
     let max_global_sequence: Option<i64> =
@@ -119,7 +133,7 @@ async fn draw_sequence_block(
 
 /// How `global_sequence` values are allocated on the insert path.
 ///
-/// Selected once at [`PgEventStore`] construction: this is a deployment-wide
+/// Selected once at [`PgEventStore`] construction: this is a store-wide
 /// choice, not a per-writer or per-subscriber one. The default
 /// ([`AllocationMode::Nextval`]) is today's path, unchanged; the mere existence
 /// of this enum costs a default-mode writer nothing.

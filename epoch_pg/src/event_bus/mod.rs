@@ -311,6 +311,13 @@ async fn fire_on_halt(
 /// Returns `false` on a write failure, which withholds the skip: an unrecorded
 /// skip is one late-materialization detection can never see, so the position
 /// must not move past it.
+///
+/// The callback invocation is panic-contained (mirroring [`fire_on_halt`]).
+/// This function runs inline on the listener's per-subscriber task, so an
+/// uncontained panic would unwind the whole listener for every subscriber. The
+/// callback is consulted only *after* the ledger row is confirmed present, so a
+/// caught panic still returns `true`: the audit row detection depends on is
+/// already durable, and withholding the skip would not un-write it.
 async fn confirm_gap_timeout_record(
     pool: &PgPool,
     config: &ReliableDeliveryConfig,
@@ -352,7 +359,20 @@ async fn confirm_gap_timeout_record(
                     skipped_sequence: gap.skipped_sequence,
                     gap_duration: gap.gap_duration,
                 };
-                callback.on_gap_timeout(info).await;
+                if let Err(payload) = AssertUnwindSafe(callback.on_gap_timeout(info))
+                    .catch_unwind()
+                    .await
+                {
+                    warn!(
+                        "on_gap_timeout callback panicked for '{}' on bus '{}' seq {}: {}. \
+                         The panic is contained; the ledger row is already durable, so the \
+                         SkipAfterBackstop skip proceeds.",
+                        subscriber_id,
+                        bus_name,
+                        gap.skipped_sequence,
+                        panic_payload_message(payload)
+                    );
+                }
             }
             true
         }
@@ -2563,7 +2583,7 @@ where
     /// success `WARN` says so rather than claiming delivery resumes. The
     /// remedy for a wedged `ReplayAlways` subscriber is a fresh `subscribe()`
     /// with a fresh model, or opting into
-    /// [`GapPolicy::SkipAfterBackstop`](epoch_core::event_store::GapPolicy::SkipAfterBackstop)
+    /// `GapPolicy::SkipAfterBackstop`
     /// so the wedge never forms.
     ///
     /// # Errors
@@ -2862,7 +2882,7 @@ where
     /// # Amendment for `SkipAfterBackstop` subscribers (spec 0030 R9)
     /// Spec 0026 R5 ("readiness MUST NOT report caught-up while a checkpoint is
     /// legitimately held below a hole") is amended for the opt-in
-    /// [`GapPolicy::SkipAfterBackstop`](epoch_core::event_store::GapPolicy::SkipAfterBackstop)
+    /// `GapPolicy::SkipAfterBackstop`
     /// plus [`SubscriptionMode::ReplayAlways`] class only: that subscriber's
     /// position advances past an unproven hole once the backstop fires, so this
     /// call **will** report caught-up across a sequence that may still commit.

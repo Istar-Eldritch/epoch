@@ -134,3 +134,58 @@ Unit tests for the forwarding chain live in `epoch_core/src/projection.rs` and `
 Part A: `test_subscribe_gap_policy_guardrail_skip_after_backstop_replay_always_only`, `test_skip_after_backstop_advances_hwm_past_unproven_gap`, `test_skip_after_backstop_audited_row_precedes_hwm_advance`, `test_skip_after_backstop_ledger_failure_withholds_skip_then_retries`, `test_late_materialization_detected_fires_rebuild_once`, `test_release_halt_warn_does_not_promise_resume_for_replay_always`, `test_readiness_reports_caught_up_across_skipped_hole`, plus the `GapPolicy::Halt` default-unchanged pin at `:9492` and the two pre-existing fail-closed suite tests kept green.
 
 Part B: `test_per_txn_counter_rollback_burns_nothing`, `test_per_txn_counter_crash_burns_nothing` (terminates a dedicated connection via `pg_terminate_backend`), `test_per_txn_counter_allocates_once_per_transaction`, `test_per_txn_counter_construction_reseeds_counter_row`, `test_opt_in_transition_assigns_above_every_previous_value`, `test_per_txn_counter_concurrent_writers_are_contiguous`, `test_per_txn_counter_missing_counter_row_fails_the_insert`, and the default-mode regression gates `test_nextval_rollback_still_burns_and_touches_no_counter` / `test_nextval_allocation_mode_touches_no_counter_row`.
+
+---
+
+## Appendix A — Requirement and anchor index
+
+The condense pass (`493d6f4`) dropped the numbered §3.x/§5.x sections, the R1–R15
+requirement list, the OQ records, and the T0–T15 test plan. ~51 rustdoc comments,
+internal comments, and test labels still cite those anchors. This index is the
+redirect: every legacy anchor below resolves to the section above that now carries
+the behaviour. The citation sites were deliberately left unedited.
+
+### Sections
+
+| Legacy 0030 anchor | Now |
+| --- | --- |
+| §3.1 (Part A design, record-then-advance) | §2.1 |
+| §3.2 (rebuild semantics) | §2.1 "Rebuild semantics" |
+| §3.3 (late-materialization detection) | §2.1 "Late-materialization detection" |
+| §3.4 (in-flight-writer safety argument) | §2.1 "The safety argument" |
+| §3.5 (adjacent defects) | §2.3 |
+| §3.6 (Part B allocator, opt-in transition) | §2.2 |
+| §3.7 (readiness amendment) | §3, first bullet |
+| §5.1 (A vs B vs both) | §1.2 |
+| §5.2 (per-txn vs cached blocks) | §4, "Cached-block allocation — rejected" |
+
+### Requirements
+
+| Legacy 0030 anchor | Now |
+| --- | --- |
+| R1 `GapPolicy` enum + forwarding chain | §2.1, para 1 |
+| R2 `subscribe()` guardrail + `InvalidSubscriptionConfig` | §2.1 "Guardrail"; §3, bullet 4 |
+| R3 skip instead of wedge past `gap_timeout` | §2.1 "Record-then-advance" (flowchart arm `SkipAfterBackstop`) |
+| R4 confirmed ledger row before HWM advance; write failure withholds | §2.1 "Record-then-advance" |
+| R5 bus-scoped detection + rebuild callback, resolve-once | §2.1 "Late-materialization detection" |
+| R6 `Halt` byte-for-byte unchanged | §2.1, para 1 |
+| R7 no Part A migration; rustdoc carries the safety contract | §1.2 ("Additive, no migration") |
+| R8 `release_halt` WARN honesty | §2.3 |
+| R9 spec 0026 R5 amended for the opt-in class only | §3, bullet 1 |
+| R10 `AllocationMode`, zero default-mode cost | §2.2, para 1 |
+| R11 m014 counter table + fallible re-seeding constructors | §2.2 "Opt-in transition" |
+| R12 `+K` drawn once per transaction | §2.2, para 2 |
+| R13 zero burn on rollback and on crash | §2.2 "Zero burn, measured" |
+| R14 fence premise holds, no gap-machinery change | §2.2 "Fence-safe by construction" |
+| R15 `AllocationMode` rustdoc + CHANGELOG | shipped; see §6 row `db70e83` |
+
+### Open questions and test labels
+
+- **OQ-3** — no `ReplayAlways` recovery path added to `release_halt`: §2.3.
+- **OQ-4** — `AllocationMode` is a one-way, deployment-lifetime choice; switch-back is a
+  documented operator procedure: §2.2 "Opt-in transition" and §4, bullet 3.
+- **T0–T15** were the paper test plan. The shipped tests that discharge them are listed
+  by function name in §6 "Tests"; T0 is the `epoch_core` forwarding-chain unit test, T1–T8
+  are the Part A integration tests, T9–T15 the Part B ones. Cite shipped tests by function
+  name — the `T*` labels are historical, and `T7b` additionally collides with an unrelated
+  CLOUD-227 group in the same file (§5, last bullet).
