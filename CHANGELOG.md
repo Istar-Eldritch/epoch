@@ -9,6 +9,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sequence-burn resilience: opt-in `GapPolicy` for `ReplayAlways` subscribers**
+  (`epoch_core`, `epoch_pg`, CLOUD-261, spec 0030 Part A) — a burned `global_sequence`
+  (a value allocated by `nextval` and lost to a rolled-back insert) can leave a hole
+  that the snapshot fence never proves, wedging the sole fail-closed `ReplayAlways`
+  subscriber indefinitely. Subscribers may now opt into a recovery contract:
+  - **`epoch_core`** — `GapPolicy { Halt (default), SkipAfterBackstop }` enum
+    (`#[non_exhaustive]`, re-exported from the prelude), with a defaulted
+    `gap_policy()` on `EventObserver`, `Projection`, and `Saga`, forwarded by the
+    handlers/adapters. **`Halt` is the default and is byte-for-byte unchanged**: a
+    subscriber that does not opt in behaves exactly as before.
+  - **`SkipAfterBackstop`** — for fold-style `ReplayAlways` projections whose state is
+    a pure function of currently-present rows. Once the `gap_timeout` backstop would
+    fire and the fence is still unproven, the skip is **recorded** in the existing
+    `epoch_event_bus_gap_timeouts` ledger (firing `on_gap_timeout`) and only then does
+    the in-memory high-water mark advance past the hole. A ledger-write failure
+    withholds the skip: the subscriber holds below the gap and retries.
+  - **Late-materialization detection** — `PgEventBus::check_skipped_gaps()` joins
+    unresolved ledger rows against the bus's events table; when a row has since
+    committed at a skipped sequence it fires the new rebuild-needed callback
+    (`(subscriber_id, skipped_sequence)`) and marks that ledger row resolved, so the
+    signal is **at-least-once** per (subscriber, skipped sequence) rather than exactly
+    once: the callback is awaited before the resolving UPDATE and detection is a plain
+    `SELECT`, so a crash in that window or a concurrent scan can re-fire it. A spurious
+    rebuild costs work, never correctness. A panicking gap-timeout callback on the
+    `SkipAfterBackstop` arm is caught and logged (a WARN), so it cannot kill the
+    listener task; the audit row is already durable at that point, so the panic
+    still takes the skip. An optional
+    `gap_scan_interval` runs the scan automatically; it is **off by default**.
+  - **Registration guardrail** —
+    `subscribe()` rejects `GapPolicy::SkipAfterBackstop` combined with
+    `SubscriptionMode::Checkpointed` with the new
+    **`PgEventBusError::InvalidSubscriptionConfig { subscriber_id, reason }`** variant.
+    The enum is not `#[non_exhaustive]`, so this is a **minor breaking change for
+    downstream code that matches `PgEventBusError` exhaustively**. The guardrail is
+    what keeps spec 0027 §3.3 ("a persisted checkpoint MUST NEVER lead the in-memory
+    one") intact: it is **clarified, not amended** — the opt-in class persists no
+    checkpoint at all, and the one configuration that could violate the invariant is
+    refused at registration.
+  - **Readiness: spec 0026 R5 is amended for the opt-in class only** — "readiness MUST
+    NOT report caught-up while a checkpoint is legitimately held below a hole" no
+    longer holds for `SkipAfterBackstop` + `ReplayAlways` subscribers:
+    `subscriber_lag` / `wait_until_caught_up` **will** report caught-up across a
+    skipped hole. For that class this is the honest report (the position is not
+    persisted and nothing is held below the hole); the residual divergence is healed
+    by the detection-then-rebuild loop above. Every other class is unchanged.
+  - **`release_halt` WARN honesty** — the success `WARN` no longer claims "delivery
+    resumes from N" for a `ReplayAlways` subscriber, which never reads the checkpoint
+    row the call writes; it now states plainly that such a subscriber is not resumed
+    and that the remedy is a fresh `subscribe()`. Behaviour and the `Checkpointed`
+    wording are unchanged; no `ReplayAlways` recovery path was added.
+  - No schema migration (reuses the m009 gap-timeout ledger) and no write-path change.
+
+- **Sequence-burn resilience: opt-in `AllocationMode` that never burns**
+  (`epoch_pg`, CLOUD-261, spec 0030 Part B) — Part A recovers from a burned
+  `global_sequence`; Part B lets a deployment stop forming the hole in the first place.
+  Entirely additive: no breaking change.
+  - **Migration m014** adds `epoch_events_sequence_counter`, a counter table keyed by
+    events-table name (the events table is configurable, so two stores on two tables get
+    two independent counters). The migration is additive and creates the table only; it
+    is **inert until a store opts in** — nothing reads or writes the table under the
+    default allocator.
+  - **`AllocationMode { Nextval (default), PerTxnCounter }`** (`#[non_exhaustive]`) —
+    **`Nextval` is the default and is byte-for-byte unchanged**: the INSERT still omits
+    `global_sequence`, the column `DEFAULT nextval(...)` assigns it, `RETURNING
+    global_sequence` reads it back, and no counter row is touched. The mere existence of
+    the mode costs a default-mode writer nothing.
+  - **`PerTxnCounter`** draws a transaction's whole `+K` block from the counter row with a
+    single `UPDATE ... RETURNING` **inside the caller's insert transaction** and supplies
+    the values explicitly, so a rollback rewinds the draw and a crash aborts it —
+    **zero burn** on both legs. A missing counter row fails the insert
+    (`sqlx::Error::RowNotFound`); there is deliberately no fallback to `nextval`.
+    **Write tax:** writers serialize on the counter row, measured at **3.5–4.4× slower
+    than `nextval` at K=1** (per transaction, not per event, so multi-event aggregate
+    transactions amortize it) — which is why `Nextval` stays the default. Fence-safe by
+    construction: the counter lock makes sequence order equal commit order, so the gap,
+    fence, and snapshot machinery are unchanged.
+  - **`PgEventStore::with_allocation_mode` / `with_allocation_mode_and_upcasters`** — new
+    **fallible** async constructors. Under `PerTxnCounter` they re-seed the per-table
+    counter row to `GREATEST(counter, sequence last-assigned, MAX(global_sequence))`,
+    creating it if absent, and a re-seed failure **fails construction** rather than
+    letting the allocator hand out colliding values. `allocation_mode()` exposes the
+    resolved mode.
+  - **Opting in is a one-way, deployment-lifetime choice** for this release: quiesce all
+    `Nextval` writers, then construct under `PerTxnCounter`. Switching back is not a built
+    path — it is a documented operator procedure (quiesce, `setval` the events table's
+    sequence past the counter row's `val`, restart under `Nextval`).
+
 - **Per-subscriber fail-closed delivery semantics** (`epoch_core`, `epoch_pg`, CLOUD-216) —
   an opt-in `FailureMode { FailOpen (default), FailClosed }` letting a subscriber halt
   rather than silently skip an event it cannot apply in order:
@@ -298,6 +385,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fired when a fail-closed subscriber halts delivery. Code that constructs
   `ReliableDeliveryConfig` using struct-literal syntax (rather than
   `..Default::default()`) must add `on_halt: None` to the literal.
+- **Source-compat note** (`epoch_pg`, CLOUD-261, `feat(pg)!`): `ReliableDeliveryConfig`
+  gains the new `on_rebuild_needed: Option<Arc<dyn RebuildNeededCallback>>` (defaults to
+  `None`) and `gap_scan_interval: Option<Duration>` (defaults to `None`) fields. The
+  struct is not `#[non_exhaustive]`, so code that constructs `ReliableDeliveryConfig`
+  using struct-literal syntax (rather than `..Default::default()`) must add
+  `on_rebuild_needed: None` and `gap_scan_interval: None` to the literal.
 - **Source-compat note**: `ReliableDeliveryConfig` (`epoch_pg`) gains the new
   `snapshot_fencing: bool` field (defaults to `true`). Code that constructs
   `ReliableDeliveryConfig` using struct-literal syntax (rather than

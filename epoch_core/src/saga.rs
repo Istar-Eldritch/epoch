@@ -145,6 +145,17 @@ where
         crate::event_store::FailureMode::FailOpen
     }
 
+    /// How this saga reacts to gaps in the global sequence.
+    ///
+    /// Defaults to [`crate::event_store::GapPolicy::Halt`]. Override and return
+    /// [`crate::event_store::GapPolicy::SkipAfterBackstop`] only for fold-style
+    /// [`crate::event_store::SubscriptionMode::ReplayAlways`] sagas whose state is a pure
+    /// function of currently-present rows; see that variant's documentation for the
+    /// in-flight-writer safety contract.
+    fn gap_policy(&self) -> crate::event_store::GapPolicy {
+        crate::event_store::GapPolicy::Halt
+    }
+
     /// Processes an incoming event, applies it to the saga, and persists the resulting state.
     ///
     /// This method is called by the blanket [`EventObserver`] implementation. It handles:
@@ -243,6 +254,10 @@ where
     fn failure_mode(&self) -> crate::event_store::FailureMode {
         (**self).failure_mode()
     }
+
+    fn gap_policy(&self) -> crate::event_store::GapPolicy {
+        (**self).gap_policy()
+    }
 }
 
 /// A wrapper type that provides an [`EventObserver`] implementation for [`Saga`] types.
@@ -313,6 +328,10 @@ where
 
     fn failure_mode(&self) -> crate::event_store::FailureMode {
         self.0.failure_mode()
+    }
+
+    fn gap_policy(&self) -> crate::event_store::GapPolicy {
+        self.0.gap_policy()
     }
 }
 
@@ -479,13 +498,17 @@ where
     fn failure_mode(&self) -> crate::event_store::FailureMode {
         self.saga.failure_mode()
     }
+
+    fn gap_policy(&self) -> crate::event_store::GapPolicy {
+        self.saga.gap_policy()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::event::EnumConversionError;
-    use crate::event_store::{EventObserver, SubscriptionMode};
+    use crate::event_store::{EventObserver, GapPolicy, SubscriptionMode};
     use crate::state_store::StateStoreBackend;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -632,5 +655,69 @@ mod tests {
         let adapter = SagaAdapter::new(saga, "saga:adapter:test", |e: &TestEvent| Some(e.clone()));
         let observer: &dyn EventObserver<TestEvent> = &adapter;
         assert_eq!(observer.subscription_mode(), SubscriptionMode::ReplayAlways);
+    }
+
+    struct SkipAfterBackstopSaga;
+
+    impl crate::SubscriberId for SkipAfterBackstopSaga {
+        fn subscriber_id(&self) -> &str {
+            "saga:skip-after-backstop"
+        }
+    }
+
+    #[async_trait]
+    impl Saga<TestEvent> for SkipAfterBackstopSaga {
+        type State = NoState;
+        type StateStore = NoStore;
+        type SagaError = NoError;
+        type EventType = TestEvent;
+
+        fn get_state_store(&self) -> Self::StateStore {
+            NoStore
+        }
+
+        async fn handle_event(
+            &self,
+            state: Self::State,
+            _event: &Event<Self::EventType>,
+        ) -> Result<Option<Self::State>, Self::SagaError> {
+            Ok(Some(state))
+        }
+
+        fn gap_policy(&self) -> GapPolicy {
+            GapPolicy::SkipAfterBackstop
+        }
+    }
+
+    #[test]
+    fn gap_policy_defaults_to_halt_on_saga_handler() {
+        let handler = SagaHandler::new(CheckpointedSaga);
+        let observer: &dyn EventObserver<TestEvent> = &handler;
+        assert_eq!(observer.gap_policy(), GapPolicy::Halt);
+    }
+
+    #[test]
+    fn gap_policy_forwarded_through_saga_handler() {
+        let handler = SagaHandler::new(SkipAfterBackstopSaga);
+        let observer: &dyn EventObserver<TestEvent> = &handler;
+        assert_eq!(observer.gap_policy(), GapPolicy::SkipAfterBackstop);
+    }
+
+    #[test]
+    fn gap_policy_forwarded_through_arc_blanket() {
+        let saga = Arc::new(SkipAfterBackstopSaga);
+        let handler = SagaHandler::new(saga);
+        let observer: &dyn EventObserver<TestEvent> = &handler;
+        assert_eq!(observer.gap_policy(), GapPolicy::SkipAfterBackstop);
+    }
+
+    #[test]
+    fn gap_policy_forwarded_through_saga_adapter() {
+        let saga = Arc::new(SkipAfterBackstopSaga);
+        let adapter = SagaAdapter::new(saga, "saga:adapter:gap-policy", |e: &TestEvent| {
+            Some(e.clone())
+        });
+        let observer: &dyn EventObserver<TestEvent> = &adapter;
+        assert_eq!(observer.gap_policy(), GapPolicy::SkipAfterBackstop);
     }
 }

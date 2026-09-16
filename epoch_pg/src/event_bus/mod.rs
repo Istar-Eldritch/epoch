@@ -9,13 +9,15 @@ mod subscriber_state;
 pub(crate) use checkpoint::*;
 pub use config::{
     CheckpointMode, DispatchMode, DlqCallback, DlqInsertionInfo, GapTimeoutCallback,
-    GapTimeoutInfo, HaltCallback, HaltInfo, HaltReason, InstanceMode, ReliableDeliveryConfig,
+    GapTimeoutInfo, HaltCallback, HaltInfo, HaltReason, InstanceMode, RebuildNeededCallback,
+    RebuildNeededInfo, ReliableDeliveryConfig,
 };
 pub(crate) use retry::{
     ProcessResult, invoke_observer_once, panic_payload_message, process_event_with_retry,
 };
 pub(crate) use subscriber_state::{
-    SkipReason, SubscriberState, TxidSnapshot, advance_contiguous_checkpoint, compute_shared_floor,
+    SkipReason, SkippedGap, SubscriberState, TxidSnapshot, advance_contiguous_checkpoint,
+    compute_shared_floor,
 };
 
 #[cfg(test)]
@@ -23,7 +25,7 @@ pub use retry::calculate_retry_delay_no_jitter;
 
 use crate::event_store::PgDBEvent;
 use epoch_core::event::{Event, EventData};
-use epoch_core::event_store::{EventBus, FailureMode, SubscriptionMode};
+use epoch_core::event_store::{EventBus, FailureMode, GapPolicy, SubscriptionMode};
 use epoch_core::prelude::EventObserver;
 use log::{error, info, warn};
 use serde::de::DeserializeOwned;
@@ -295,6 +297,178 @@ async fn fire_on_halt(
     }
 }
 
+/// Synchronously confirms the `epoch_event_bus_gap_timeouts` row for a
+/// [`GapPolicy::SkipAfterBackstop`] skip, firing `on_gap_timeout` when the row
+/// is newly inserted (spec 0030 R4).
+///
+/// Returns `true` once the row is known to be present (inserted now, or already
+/// present via `ON CONFLICT DO NOTHING`). On the conflict path the callback is
+/// not re-fired. Within this process that is because it already fired for this
+/// row; across a crash window it may not have — if the insert committed and the
+/// process died before the position moved, the row is an orphan whose sequence
+/// was never actually skipped. Late-materialization detection (P4) must
+/// therefore not assume every ledger row corresponds to a taken skip.
+/// Returns `false` on a write failure, which withholds the skip: an unrecorded
+/// skip is one late-materialization detection can never see, so the position
+/// must not move past it.
+///
+/// The callback invocation is panic-contained (mirroring [`fire_on_halt`]).
+/// This function runs inline on the listener's per-subscriber task, so an
+/// uncontained panic would unwind the whole listener for every subscriber. The
+/// callback is consulted only *after* the ledger row is confirmed present, so a
+/// caught panic still returns `true`: the audit row detection depends on is
+/// already durable, and withholding the skip would not un-write it.
+async fn confirm_gap_timeout_record(
+    pool: &PgPool,
+    config: &ReliableDeliveryConfig,
+    subscriber_id: &str,
+    gap: &SkippedGap,
+) -> bool {
+    let bus_name = &config.events_table;
+    let result = sqlx::query(
+        r#"
+        INSERT INTO epoch_event_bus_gap_timeouts
+            (bus_name, subscriber_id, skipped_sequence, gap_duration_ms)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (bus_name, subscriber_id, skipped_sequence) DO NOTHING
+        "#,
+    )
+    .bind(bus_name)
+    .bind(subscriber_id)
+    .bind(gap.skipped_sequence as i64)
+    .bind(gap.gap_duration.as_millis() as i64)
+    .execute(pool)
+    .await;
+
+    match result {
+        Err(e) => {
+            error!(
+                "Failed to record gap timeout for '{}' on bus '{}' seq {}: {} — withholding \
+                 the SkipAfterBackstop skip; the subscriber holds below the gap and retries",
+                subscriber_id, bus_name, gap.skipped_sequence, e
+            );
+            false
+        }
+        Ok(insert_result) => {
+            if insert_result.rows_affected() > 0
+                && let Some(callback) = &config.on_gap_timeout
+            {
+                let info = GapTimeoutInfo {
+                    bus_name: bus_name.clone(),
+                    subscriber_id: subscriber_id.to_string(),
+                    skipped_sequence: gap.skipped_sequence,
+                    gap_duration: gap.gap_duration,
+                };
+                if let Err(payload) = AssertUnwindSafe(callback.on_gap_timeout(info))
+                    .catch_unwind()
+                    .await
+                {
+                    warn!(
+                        "on_gap_timeout callback panicked for '{}' on bus '{}' seq {}: {}. \
+                         The panic is contained; the ledger row is already durable, so the \
+                         SkipAfterBackstop skip proceeds.",
+                        subscriber_id,
+                        bus_name,
+                        gap.skipped_sequence,
+                        panic_payload_message(payload)
+                    );
+                }
+            }
+            true
+        }
+    }
+}
+
+/// Detection core for late-materialized skipped sequences (spec 0030 §3.3).
+///
+/// Joins this bus's unresolved `epoch_event_bus_gap_timeouts` rows against the
+/// bus's configured events table; for every hit it fires
+/// [`RebuildNeededCallback::on_rebuild_needed`] and then marks that row
+/// resolved (`resolved_by = 'gap_detection'`) on the full
+/// `(bus_name, subscriber_id, skipped_sequence)` unique key, so the callback
+/// fires at least once per skipped sequence per subscriber rather than every
+/// scan (a crash or a concurrent scan can re-fire it; the rebuild remedy is
+/// idempotent).
+///
+/// Shared by the on-demand entry point and the periodic scan.
+async fn scan_late_materialized_gaps(
+    pool: &PgPool,
+    config: &ReliableDeliveryConfig,
+) -> Result<Vec<GapTimeoutEntry>, SqlxError> {
+    use sqlx::Row;
+
+    let bus_name = &config.events_table;
+    let rows = sqlx::query(&format!(
+        r#"
+        SELECT g.id, g.bus_name, g.subscriber_id, g.skipped_sequence, g.gap_duration_ms,
+               g.timed_out_at, g.resolved_at, g.resolved_by, g.resolution_notes
+        FROM epoch_event_bus_gap_timeouts g
+        JOIN {bus_name} e ON e.global_sequence = g.skipped_sequence
+        WHERE g.bus_name = $1 AND g.resolved_at IS NULL
+        ORDER BY g.skipped_sequence ASC
+        "#
+    ))
+    .bind(bus_name)
+    .fetch_all(pool)
+    .await?;
+
+    let mut detected = Vec::with_capacity(rows.len());
+    for row in rows {
+        let entry = GapTimeoutEntry {
+            id: row.get("id"),
+            bus_name: row.get("bus_name"),
+            subscriber_id: row.get("subscriber_id"),
+            skipped_sequence: row.get::<i64, _>("skipped_sequence") as u64,
+            gap_duration_ms: row.get("gap_duration_ms"),
+            timed_out_at: row.get("timed_out_at"),
+            resolved_at: row.get("resolved_at"),
+            resolved_by: row.get("resolved_by"),
+            resolution_notes: row.get("resolution_notes"),
+        };
+
+        warn!(
+            "Late materialization on bus '{}': seq {} committed after '{}' advanced past it \
+             — that subscriber's model is missing this event and must be rebuilt (drop the \
+             model and re-subscribe)",
+            entry.bus_name, entry.skipped_sequence, entry.subscriber_id
+        );
+
+        if let Some(callback) = &config.on_rebuild_needed {
+            callback
+                .on_rebuild_needed(RebuildNeededInfo {
+                    bus_name: entry.bus_name.clone(),
+                    subscriber_id: entry.subscriber_id.clone(),
+                    skipped_sequence: entry.skipped_sequence,
+                })
+                .await;
+        }
+
+        // Keyed on the FULL unique key: resolving on (bus_name, skipped_sequence)
+        // alone would swallow another subscriber's pending callback for the same
+        // sequence.
+        sqlx::query(
+            r#"
+            UPDATE epoch_event_bus_gap_timeouts
+            SET resolved_at = NOW(),
+                resolved_by = 'gap_detection'
+            WHERE bus_name = $1
+              AND subscriber_id = $2
+              AND skipped_sequence = $3
+              AND resolved_at IS NULL
+            "#,
+        )
+        .bind(&entry.bus_name)
+        .bind(&entry.subscriber_id)
+        .bind(entry.skipped_sequence as i64)
+        .execute(pool)
+        .await?;
+
+        detected.push(entry);
+    }
+
+    Ok(detected)
+}
+
 /// Processes one subscriber against the pre-fetched batch of events.
 /// All per-subscriber state is owned, making this safe to run concurrently.
 async fn process_subscriber_for_batch<D>(
@@ -533,13 +707,59 @@ where
     // timeout-only resolver. Spec 0028 P4: pass the subscriber's failure_mode
     // so a FailClosed subscriber refuses the backstop (gap refusal leg).
     let failure_mode = state.failure_mode;
-    let outcome = advance_contiguous_checkpoint(
+    let gap_policy = state.gap_policy;
+    let mut outcome = advance_contiguous_checkpoint(
         &mut state,
         &visible_seqs,
         config.gap_timeout,
         snapshot,
         failure_mode,
+        gap_policy,
     );
+
+    // Spec 0030 §3.1 record-then-advance: under `SkipAfterBackstop` the resolver
+    // stops at the backstop and hands the skip back *unapplied*. Confirm the
+    // audit row synchronously (and fire `on_gap_timeout`) before moving the
+    // position, then re-enter the resolver to keep advancing. On a write failure
+    // the skip is withheld: the gap observation and the position are untouched,
+    // so the subscriber stays in the refused-backstop posture and the skip is
+    // re-offered on a later tick (R4, T7).
+    //
+    // Defense-in-depth (0027 §3.3): `subscription_mode()` is consumer-implemented
+    // and need not be pure, so cross-check the mode resolved for *this* cycle
+    // before applying the skip. A subscriber that flipped to `Checkpointed`
+    // mid-flight stays in the refused-backstop posture instead of routing
+    // through the skip arm.
+    let mut confirmed_skips: Vec<SkippedGap> = Vec::new();
+    while let Some(pending) = outcome.pending_backstop_skip.take() {
+        if !replay_always {
+            break;
+        }
+        if !confirm_gap_timeout_record(&checkpoint_pool, &config, &subscriber_id, &pending).await {
+            // Visibility gap (known, deliberate): a persistently failing ledger
+            // write withholds the skip silently as far as the callback surface
+            // is concerned — neither `on_halt` nor `on_gap_timeout` fires, so a
+            // subscriber can sit indefinitely in the refused-backstop posture
+            // with only the per-tick `error!` from `confirm_gap_timeout_record`
+            // to show for it. Operators must alert on that log line.
+            break;
+        }
+        state.gap_first_seen.remove(&pending.skipped_sequence);
+        state.contiguous_checkpoint = pending.skipped_sequence;
+        confirmed_skips.push(pending);
+
+        let resumed = advance_contiguous_checkpoint(
+            &mut state,
+            &visible_seqs,
+            config.gap_timeout,
+            snapshot,
+            failure_mode,
+            gap_policy,
+        );
+        outcome.skipped_gaps.extend(resumed.skipped_gaps);
+        outcome.backstop_refused = outcome.backstop_refused.or(resumed.backstop_refused);
+        outcome.pending_backstop_skip = resumed.pending_backstop_skip;
+    }
 
     // Spec 0028 P4 gap refusal: fire on_halt(GapUnproven) on the first batch
     // cycle where the backstop would have fired but was refused. Subsequent
@@ -586,9 +806,13 @@ where
     // per-gap fire-and-forget persistence/callback tasks run. This avoids
     // N×subscriber identical warnings when many sequences time out at once (e.g.
     // after a deployment restart). See CLOUD-109.
-    if !timeout_backstop.is_empty() {
+    // Already-recorded `SkipAfterBackstop` skips join the batched WARN (they are
+    // backstop skips like any other) but never the fire-and-forget recorder
+    // below: their row is confirmed and their callback already fired.
+    let warn_gaps: Vec<&SkippedGap> = timeout_backstop.iter().chain(&confirmed_skips).collect();
+    if !warn_gaps.is_empty() {
         let bus_name = &config.events_table;
-        let gaps_summary = timeout_backstop
+        let gaps_summary = warn_gaps
             .iter()
             .map(|gap| format!("seq {} ({:?})", gap.skipped_sequence, gap.gap_duration))
             .collect::<Vec<_>>()
@@ -599,7 +823,7 @@ where
              delivered to this subscriber (recorded in epoch_event_bus_gap_timeouts)",
             subscriber_id,
             bus_name,
-            timeout_backstop.len(),
+            warn_gaps.len(),
             gaps_summary
         );
 
@@ -609,7 +833,7 @@ where
         // can identify the offending long-running session via pg_stat_activity /
         // pg_prepared_xacts. Skipped when no snapshot was available this batch.
         if let Some(snap) = snapshot {
-            for gap in &timeout_backstop {
+            for gap in &warn_gaps {
                 if let Some(fence_xmax) = gap.fence_xmax
                     && snap.xmin < fence_xmax
                 {
@@ -1034,6 +1258,22 @@ pub enum PgEventBusError {
         /// The subscriber's current persisted checkpoint.
         current: u64,
     },
+    /// A [`PgEventBus::subscribe`] call presented a subscriber configuration
+    /// the bus cannot honour (spec 0030 R2). The only invalid combination is
+    /// [`GapPolicy::SkipAfterBackstop`](epoch_core::GapPolicy) on a
+    /// [`SubscriptionMode::Checkpointed`] subscriber: skipping an unproven gap
+    /// would advance a *persisted* checkpoint past the hole, letting it lead
+    /// the contiguous prefix (spec 0027 §3.3). `SkipAfterBackstop` is accepted
+    /// only for `ReplayAlways` subscribers, whose position is in-memory and
+    /// never persisted. This variant is a minor breaking change for downstream
+    /// exhaustive matches: the enum is deliberately not `#[non_exhaustive]`.
+    #[error("invalid subscription config for subscriber '{subscriber_id}': {reason}")]
+    InvalidSubscriptionConfig {
+        /// The subscriber whose configuration was rejected.
+        subscriber_id: String,
+        /// Why the configuration was rejected.
+        reason: String,
+    },
 }
 
 /// Type alias for the projections collection to reduce type complexity.
@@ -1152,7 +1392,10 @@ where
 struct ListenerState {
     /// Handle to the spawned listener task.
     handle: tokio::task::JoinHandle<()>,
-    /// Signal to trigger shutdown.
+    /// Handle to the periodic late-materialization scan task, when
+    /// [`ReliableDeliveryConfig::gap_scan_interval`] enables it.
+    scan_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Signal to trigger shutdown. Shared by both tasks.
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
@@ -1806,12 +2049,13 @@ where
                 let mut sid_to_proj: Vec<(String, _)> = Vec::new();
                 let mut replay_always_by_sid: HashMap<String, bool> = HashMap::new();
                 for projection in projections_snapshot.iter() {
-                    let (subscriber_id, replay_always, failure_mode) = {
+                    let (subscriber_id, replay_always, failure_mode, gap_policy) = {
                         let guard = projection.lock().await;
                         (
                             guard.subscriber_id().to_string(),
                             guard.subscription_mode() == SubscriptionMode::ReplayAlways,
                             guard.failure_mode(),
+                            guard.gap_policy(),
                         )
                     };
                     replay_always_by_sid.insert(subscriber_id.clone(), replay_always);
@@ -1863,6 +2107,7 @@ where
                                 checkpoint,
                                 checkpoint_event_id,
                                 failure_mode,
+                                gap_policy,
                             ),
                         );
                     }
@@ -2075,6 +2320,11 @@ where
                                     && seen_sids.insert(sid.clone())
                             })
                             .map(|(_, sid, proj)| {
+                                // Defensive only: the init pass above seeds a
+                                // state for every subscriber this cycle, with
+                                // its resolved failure_mode/gap_policy. The
+                                // fallback's defaults (FailOpen + Halt) are
+                                // therefore unreachable in practice.
                                 let state = subscriber_states
                                     .remove(sid)
                                     .unwrap_or_else(|| SubscriberState::new(0));
@@ -2134,11 +2384,45 @@ where
             }
         });
 
-        // Store the handle and shutdown sender
+        // Periodic late-materialization scan (spec 0030 §3.3). A dedicated task
+        // rather than a fold into the listener tick: the tick's cadence is the
+        // 1 s checkpoint-flush interval and its body is the delivery hot path,
+        // whereas this scan is independently configurable, off by default, and
+        // its callback is awaited inline — it has no business delaying delivery.
+        let scan_handle = self.config.gap_scan_interval.map(|interval| {
+            let scan_pool = self.pool.clone();
+            let scan_config = self.config.clone();
+            let mut scan_shutdown_rx = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = sleep(interval) => {
+                            if let Err(e) = scan_late_materialized_gaps(&scan_pool, &scan_config).await {
+                                warn!(
+                                    "Late-materialization scan on bus '{}' failed: {}; retrying on the next interval",
+                                    scan_config.events_table, e
+                                );
+                            }
+                        }
+                        res = scan_shutdown_rx.changed() => {
+                            // Sender dropped means the bus was dropped without
+                            // shutdown(); exit as documented rather than
+                            // spinning on an always-ready branch.
+                            if res.is_err() || *scan_shutdown_rx.borrow() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+        });
+
+        // Store the handles and shutdown sender
         {
             let mut state = self.listener_state.lock().await;
             *state = Some(ListenerState {
                 handle,
+                scan_handle,
                 shutdown_tx,
             });
         }
@@ -2178,6 +2462,7 @@ where
         match state {
             Some(ListenerState {
                 handle,
+                scan_handle,
                 shutdown_tx,
             }) => {
                 // Signal shutdown
@@ -2187,6 +2472,12 @@ where
                 handle
                     .await
                     .map_err(|e| format!("Listener task panicked: {}", e))?;
+
+                if let Some(scan_handle) = scan_handle {
+                    scan_handle
+                        .await
+                        .map_err(|e| format!("Gap-scan task panicked: {}", e))?;
+                }
 
                 info!("Event bus listener shut down gracefully");
                 Ok(())
@@ -2282,6 +2573,19 @@ where
     /// [`HaltCallback`] with
     /// [`HaltReason::Released`].
     ///
+    /// # A `ReplayAlways` subscriber is NOT resumed by a release (spec 0030 R8)
+    ///
+    /// This call only writes the persisted checkpoint row, and a
+    /// [`SubscriptionMode::ReplayAlways`] subscriber never reads that row — it
+    /// routes advancement through its in-memory high-water mark. Calling
+    /// `release_halt` for one writes the row and fires
+    /// [`HaltReason::Released`], but the live subscriber stays wedged; the
+    /// success `WARN` says so rather than claiming delivery resumes. The
+    /// remedy for a wedged `ReplayAlways` subscriber is a fresh `subscribe()`
+    /// with a fresh model, or opting into
+    /// `GapPolicy::SkipAfterBackstop`
+    /// so the wedge never forms.
+    ///
     /// # Errors
     ///
     /// Returns [`PgEventBusError::BackwardRelease`] when `past_sequence` is at or
@@ -2330,16 +2634,35 @@ where
         .execute(&self.pool)
         .await?;
 
-        warn!(
-            "Operator release: advanced subscriber '{}' past held sequence {} (was {}). \
-             Any sequence at or below {} the subscriber never finished is now skipped; \
-             delivery resumes from {}.",
-            subscriber_id,
-            past_sequence,
-            current,
-            past_sequence,
-            past_sequence + 1,
+        // Spec 0030 R8: only a `Checkpointed` subscriber reads the row this
+        // call writes, so only for that class may the WARN promise resumption.
+        // An unregistered subscriber_id (operator releasing ahead of
+        // registration) takes the `Checkpointed` wording — the default mode,
+        // and the one the written row serves.
+        let is_replay_always = matches!(
+            self.subscriber_modes.lock().await.get(subscriber_id),
+            Some(SubscriptionMode::ReplayAlways)
         );
+        if is_replay_always {
+            warn!(
+                "Operator release: advanced subscriber '{}' past held sequence {} (was {}) in the \
+                 checkpoint table. This subscriber is ReplayAlways: it never reads that \
+                 checkpoint row, so delivery does NOT resume — it stays wedged below {}. The \
+                 remedy is a fresh subscribe() with a fresh model.",
+                subscriber_id, past_sequence, current, past_sequence,
+            );
+        } else {
+            warn!(
+                "Operator release: advanced subscriber '{}' past held sequence {} (was {}). \
+                 Any sequence at or below {} the subscriber never finished is now skipped; \
+                 delivery resumes from {}.",
+                subscriber_id,
+                past_sequence,
+                current,
+                past_sequence,
+                past_sequence + 1,
+            );
+        }
 
         fire_on_halt(
             &self.config,
@@ -2555,6 +2878,19 @@ where
     /// covers — pins `position` at the hole's location until it resolves, so
     /// this call can stay pending even though every event visible so far has
     /// actually been processed. See spec 0026 R5.
+    ///
+    /// # Amendment for `SkipAfterBackstop` subscribers (spec 0030 R9)
+    /// Spec 0026 R5 ("readiness MUST NOT report caught-up while a checkpoint is
+    /// legitimately held below a hole") is amended for the opt-in
+    /// `GapPolicy::SkipAfterBackstop`
+    /// plus [`SubscriptionMode::ReplayAlways`] class only: that subscriber's
+    /// position advances past an unproven hole once the backstop fires, so this
+    /// call **will** report caught-up across a sequence that may still commit.
+    /// For that class this is the honest report — no checkpoint is persisted at
+    /// all, and the residual divergence across the skipped sequence is healed by
+    /// [`check_skipped_gaps`](Self::check_skipped_gaps) driving a rebuild. Spec
+    /// 0027 §3.3 (a persisted checkpoint never leads the in-memory one) is NOT
+    /// amended: it holds untouched for every class.
     ///
     /// Returns [`PgEventBusError::SubscriberNotFound`] if `subscriber_id` is
     /// not registered on this bus, or [`PgEventBusError::InlineDispatchNotSupported`]
@@ -3023,6 +3359,70 @@ where
                 resolution_notes: row.get("resolution_notes"),
             })
             .collect())
+    }
+
+    /// Detects rows that have committed at a `global_sequence` a subscriber on
+    /// this bus already advanced past, and fires the rebuild-needed signal
+    /// (spec 0030 §3.3, R5).
+    ///
+    /// Every bus fetch is `WHERE global_sequence > position`, so a row that
+    /// commits *below* a subscriber's position is otherwise invisible forever.
+    /// This runs the join that finds them: this bus's unresolved
+    /// `epoch_event_bus_gap_timeouts` rows against this bus's configured
+    /// `events_table`. For each hit it invokes
+    /// [`ReliableDeliveryConfig::on_rebuild_needed`] with
+    /// `(subscriber_id, skipped_sequence)` and then marks that row resolved.
+    ///
+    /// The signal is delivered **at least once** per
+    /// `(subscriber, skipped sequence)`. The callback is awaited *before* the
+    /// resolving `UPDATE`, so a crash or panic in that window leaves the row
+    /// unresolved and the next scan re-fires it; likewise two scans running
+    /// concurrently on the same bus (an on-demand call racing the timer, or two
+    /// processes sharing a `bus_name` — detection is a plain `SELECT`, not a
+    /// claiming `UPDATE`) can both see the same row and both fire. That is safe
+    /// by the same argument as the orphan rows below: the remedy is a
+    /// `ReplayAlways` rebuild from 0, which is idempotent, so a repeated signal
+    /// costs work, never correctness.
+    ///
+    /// Callable on demand at any time. When
+    /// [`ReliableDeliveryConfig::gap_scan_interval`] is `Some`, the listener
+    /// also calls it on that cadence; both paths share this code.
+    ///
+    /// # The three subscriber classes
+    ///
+    /// - **[`GapPolicy::SkipAfterBackstop`]
+    ///   subscribers.** This is the loop the policy's safety contract depends
+    ///   on: the position advanced past an unproven hole under an audited skip,
+    ///   and this entry point is what turns a late commit at that hole into a
+    ///   rebuild.
+    /// - **Fail-open `TimeoutBackstop` `ReplayAlways` subscribers.** The same
+    ///   remedy applies, and they need no opt-in to get it: the gap recorder
+    ///   writes ledger rows for every timeout-backstop skip regardless of
+    ///   failure mode, so their position also advanced past a hole and a
+    ///   detected late row fires the same callback.
+    /// - **Default [`GapPolicy::Halt`] subscribers.** A
+    ///   fail-closed wedge records no ledger row, so for a `Halt`-only
+    ///   deployment this finds nothing and is a harmless read-only diagnostic.
+    ///   It is **not** a general recovery API: it cannot unwedge a halted
+    ///   subscriber, and the remedy there remains a fresh `subscribe()`.
+    ///
+    /// # Candidates, not proofs
+    ///
+    /// A ledger row records that a skip was *offered and audited*, not that it
+    /// was necessarily taken. Under record-then-advance the row is committed
+    /// before the position moves, so a crash in that window leaves an orphan
+    /// row for a sequence that was never actually skipped. This method reports
+    /// candidates and may therefore fire the callback for such a row. That is
+    /// accepted by design: the remedy is a `ReplayAlways` rebuild from 0, which
+    /// is always safe, so a spurious rebuild costs work, never correctness.
+    ///
+    /// # Returns
+    ///
+    /// The entries detected and resolved by this invocation (empty when there
+    /// is nothing to detect). The returned entries carry their pre-resolution
+    /// column values.
+    pub async fn check_skipped_gaps(&self) -> Result<Vec<GapTimeoutEntry>, SqlxError> {
+        scan_late_materialized_gaps(&self.pool, &self.config).await
     }
 
     /// Marks a gap-timeout record as resolved.
@@ -3814,15 +4214,39 @@ where
             // process never drives, burning its whole timeout every time (a
             // ReplayAlways position is a per-process HWM that would then never
             // advance here).
-            let (subscriber_id, mode, failure_mode) = {
+            let (subscriber_id, mode, failure_mode, gap_policy) = {
                 let o = observer.lock().await;
                 (
                     o.subscriber_id().to_string(),
                     o.subscription_mode(),
                     o.failure_mode(),
+                    o.gap_policy(),
                 )
             };
             let replay_always = mode == SubscriptionMode::ReplayAlways;
+
+            // Spec 0030 R2 guardrail: `SkipAfterBackstop` is valid only for a
+            // `ReplayAlways` subscriber. A `Checkpointed` subscriber that skips
+            // an unproven gap would advance its *persisted* checkpoint past the
+            // hole, letting it lead the contiguous prefix (spec 0027 §3.3) —
+            // reject that combination at registration time rather than
+            // downgrading silently. `Halt` (the default) and
+            // `SkipAfterBackstop` + `ReplayAlways` both pass through unchanged.
+            // Sits before any side effect of subscribe() (inline registration,
+            // trigger probe, advisory lock, catch-up) so an invalid config
+            // fails fast and touches nothing.
+            if gap_policy == GapPolicy::SkipAfterBackstop && mode == SubscriptionMode::Checkpointed
+            {
+                return Err(PgEventBusError::InvalidSubscriptionConfig {
+                    subscriber_id,
+                    reason:
+                        "GapPolicy::SkipAfterBackstop requires SubscriptionMode::ReplayAlways: \
+                         a Checkpointed subscriber must never advance its persisted checkpoint \
+                         past an unproven gap, or the checkpoint would lead the contiguous \
+                         prefix (spec 0027 §3.3)"
+                            .to_string(),
+                });
+            }
 
             // Inline dispatch: no LISTEN task, no NOTIFY channel, no catch-up.
             // Just register the subscriber and return. Any events published

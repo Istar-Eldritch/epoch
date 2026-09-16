@@ -40,6 +40,7 @@ mod m010_strip_data_from_notify_payload;
 mod m011_add_txid_to_events;
 mod m012_add_schema_version_to_events;
 mod m013_create_snapshots_table;
+mod m014_create_events_sequence_counter;
 
 use m001_create_events_table::CreateEventsTable;
 use m002_add_global_sequence::AddGlobalSequence;
@@ -54,6 +55,7 @@ use m010_strip_data_from_notify_payload::StripDataFromNotifyPayload;
 use m011_add_txid_to_events::AddTxidToEvents;
 use m012_add_schema_version_to_events::AddSchemaVersionToEvents;
 use m013_create_snapshots_table::CreateSnapshotsTable;
+use m014_create_events_sequence_counter::CreateEventsSequenceCounter;
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -88,6 +90,7 @@ const MIGRATIONS: &[&dyn Migration] = &[
     &AddTxidToEvents,
     &AddSchemaVersionToEvents,
     &CreateSnapshotsTable,
+    &CreateEventsSequenceCounter,
 ];
 
 /// The number of registered migrations in the `MIGRATIONS` registry.

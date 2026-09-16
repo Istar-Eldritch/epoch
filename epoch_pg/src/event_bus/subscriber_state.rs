@@ -5,7 +5,7 @@
 //! correct checkpoint advancement even when events are delivered or become visible
 //! out of order (e.g., due to PostgreSQL's non-transactional `nextval()` behavior).
 
-use epoch_core::event_store::FailureMode;
+use epoch_core::event_store::{FailureMode, GapPolicy};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -120,6 +120,18 @@ pub(crate) struct SubscriberState {
     /// (`FailOpen`).
     pub failure_mode: FailureMode,
 
+    /// This subscriber's gap policy, resolved once from the observer at
+    /// state-init (spec 0030 R2). Read by the gap resolver to decide what an
+    /// unproven gap does after the timeout backstop: hold below the hole
+    /// ([`GapPolicy::Halt`]) or take the audited skip
+    /// ([`GapPolicy::SkipAfterBackstop`]).
+    ///
+    /// Under `SkipAfterBackstop` the skip is offered to the caller as
+    /// [`AdvanceOutcome::pending_backstop_skip`] rather than applied in place,
+    /// so the audit row can be confirmed before the position moves (spec 0030
+    /// §3.1 record-then-advance).
+    pub gap_policy: GapPolicy,
+
     /// The sequence a fail-closed subscriber has halted at, if any. Set on the
     /// deserialize-failure and observer-exhaustion halt paths; the general
     /// "halted-at" marker. While set, the next batch cycle re-attempts exactly
@@ -143,6 +155,7 @@ impl SubscriberState {
             processed_ahead: HashSet::new(),
             gap_first_seen: HashMap::new(),
             failure_mode: FailureMode::FailOpen,
+            gap_policy: GapPolicy::Halt,
             held_event: None,
         }
     }
@@ -154,13 +167,19 @@ impl SubscriberState {
     /// `last_global_sequence` and `last_event_id` from the checkpoints table so
     /// an eager [`PendingCheckpoint`](super::checkpoint::PendingCheckpoint) can
     /// be seeded with a correctly paired id.
-    pub fn new_with_event_id(checkpoint: u64, event_id: Uuid, failure_mode: FailureMode) -> Self {
+    pub fn new_with_event_id(
+        checkpoint: u64,
+        event_id: Uuid,
+        failure_mode: FailureMode,
+        gap_policy: GapPolicy,
+    ) -> Self {
         Self {
             contiguous_checkpoint: checkpoint,
             contiguous_event_id: event_id,
             processed_ahead: HashSet::new(),
             gap_first_seen: HashMap::new(),
             failure_mode,
+            gap_policy,
             held_event: None,
         }
     }
@@ -255,6 +274,18 @@ pub(crate) struct AdvanceOutcome {
     /// `FailClosed`. `None` on subsequent batches for the same gap (halt already
     /// recorded — fires `on_halt` only on entry). Always `None` for fail-open.
     pub backstop_refused: Option<u64>,
+    /// `FailClosed` + [`GapPolicy::SkipAfterBackstop`] only: the skip the
+    /// backstop would take, returned **without** mutating `state` so the caller
+    /// can confirm the audit row before the position moves (record-then-advance,
+    /// spec 0030 §3.1/R4).
+    ///
+    /// The resolver stops at this gap: `gap_first_seen` keeps its observation
+    /// and `contiguous_checkpoint` is unchanged, so a caller that declines to
+    /// apply the skip leaves the subscriber in the refused-backstop posture and
+    /// the skip is re-offered on a later tick. To apply it, the caller removes
+    /// the gap from `gap_first_seen`, sets `contiguous_checkpoint` to the
+    /// skipped sequence, and calls this function again to keep advancing.
+    pub pending_backstop_skip: Option<SkippedGap>,
 }
 
 /// Advances the contiguous checkpoint as far as possible given the current state.
@@ -303,15 +334,21 @@ pub(crate) struct AdvanceOutcome {
 ///   fencing is unavailable/disabled.
 /// * `failure_mode` - Whether to refuse the backstop (`FailClosed`) or advance
 ///   past it (`FailOpen`).
+/// * `gap_policy` - For a `FailClosed` subscriber, whether the refused backstop
+///   holds ([`GapPolicy::Halt`]) or is offered to the caller as a pending,
+///   record-then-advance skip ([`GapPolicy::SkipAfterBackstop`]). Ignored under
+///   `FailOpen`.
 pub(crate) fn advance_contiguous_checkpoint(
     state: &mut SubscriberState,
     visible_seqs: &BTreeSet<u64>,
     gap_timeout: Duration,
     snapshot: Option<TxidSnapshot>,
     failure_mode: FailureMode,
+    gap_policy: GapPolicy,
 ) -> AdvanceOutcome {
     let mut skipped = Vec::new();
     let mut backstop_refused: Option<u64> = None;
+    let mut pending_backstop_skip: Option<SkippedGap> = None;
     loop {
         let next = state.contiguous_checkpoint + 1;
 
@@ -373,6 +410,21 @@ pub(crate) fn advance_contiguous_checkpoint(
                 let gap_duration = first_seen.elapsed();
                 if gap_duration > gap_timeout {
                     match failure_mode {
+                        FailureMode::FailClosed if gap_policy == GapPolicy::SkipAfterBackstop => {
+                            // Spec 0030 R3/R4: the opt-in class takes the
+                            // fail-open advance, but only once the audit row is
+                            // confirmed. Hand the skip to the caller WITHOUT
+                            // mutating state (no halt_fired, gap retained) and
+                            // stop; the caller applies it after the ledger write
+                            // and re-enters, or leaves the refused-backstop
+                            // posture intact for a later tick.
+                            pending_backstop_skip = Some(SkippedGap {
+                                skipped_sequence: next,
+                                gap_duration,
+                                reason: SkipReason::TimeoutBackstop,
+                                fence_xmax,
+                            });
+                        }
                         FailureMode::FailClosed => {
                             // Refuse the backstop: hold the gap, do not push a
                             // SkippedGap, do not remove from gap_first_seen, do not
@@ -428,6 +480,7 @@ pub(crate) fn advance_contiguous_checkpoint(
     AdvanceOutcome {
         skipped_gaps: skipped,
         backstop_refused,
+        pending_backstop_skip,
     }
 }
 
@@ -469,6 +522,7 @@ mod tests {
             gap_timeout,
             snapshot,
             FailureMode::FailOpen,
+            GapPolicy::Halt,
         )
         .skipped_gaps
     }
@@ -937,6 +991,7 @@ mod tests {
             gap_timeout,
             None,
             FailureMode::FailClosed,
+            GapPolicy::Halt,
         );
 
         assert_eq!(
@@ -991,6 +1046,7 @@ mod tests {
             gap_timeout,
             None,
             FailureMode::FailClosed,
+            GapPolicy::Halt,
         );
 
         assert_eq!(
@@ -1030,6 +1086,7 @@ mod tests {
             gap_timeout,
             Some(snap),
             FailureMode::FailClosed,
+            GapPolicy::Halt,
         );
 
         assert_eq!(
@@ -1071,6 +1128,7 @@ mod tests {
             gap_timeout,
             Some(snap),
             FailureMode::FailOpen,
+            GapPolicy::Halt,
         );
 
         assert_eq!(
@@ -1254,6 +1312,7 @@ mod tests {
             gap_timeout,
             None,
             FailureMode::FailOpen,
+            GapPolicy::Halt,
         );
 
         assert_eq!(

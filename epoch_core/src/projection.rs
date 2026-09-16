@@ -189,6 +189,17 @@ where
     fn failure_mode(&self) -> crate::event_store::FailureMode {
         crate::event_store::FailureMode::FailOpen
     }
+
+    /// How this projection reacts to gaps in the global sequence.
+    ///
+    /// Defaults to [`crate::event_store::GapPolicy::Halt`]. Override and return
+    /// [`crate::event_store::GapPolicy::SkipAfterBackstop`] only for fold-style
+    /// [`crate::event_store::SubscriptionMode::ReplayAlways`] projections whose state is a
+    /// pure function of currently-present rows; see that variant's documentation for the
+    /// in-flight-writer safety contract.
+    fn gap_policy(&self) -> crate::event_store::GapPolicy {
+        crate::event_store::GapPolicy::Halt
+    }
 }
 
 /// Wraps a [`Projection`] to implement [`EventObserver`](crate::event_store::EventObserver)
@@ -272,6 +283,10 @@ where
 
     fn failure_mode(&self) -> crate::event_store::FailureMode {
         self.0.failure_mode()
+    }
+
+    fn gap_policy(&self) -> crate::event_store::GapPolicy {
+        self.0.gap_policy()
     }
 }
 
@@ -406,6 +421,41 @@ mod tests {
         }
     }
 
+    struct SkipAfterBackstopProjection;
+
+    impl crate::SubscriberId for SkipAfterBackstopProjection {
+        fn subscriber_id(&self) -> &str {
+            "projection:skip-after-backstop"
+        }
+    }
+
+    impl EventApplicator<TestEventData> for SkipAfterBackstopProjection {
+        type State = TestState;
+        type StateStore = TestStateStore;
+        type EventType = TestEventData;
+        type ApplyError = TestProjectionError;
+
+        fn get_state_store(&self) -> Self::StateStore {
+            TestStateStore
+        }
+
+        fn apply(
+            &self,
+            _state: Option<Self::State>,
+            event: &Event<Self::EventType>,
+        ) -> Result<Option<Self::State>, Self::ApplyError> {
+            Ok(Some(TestState {
+                id: event.stream_id,
+            }))
+        }
+    }
+
+    impl Projection<TestEventData> for SkipAfterBackstopProjection {
+        fn gap_policy(&self) -> crate::event_store::GapPolicy {
+            crate::event_store::GapPolicy::SkipAfterBackstop
+        }
+    }
+
     impl Projection<TestEventData> for TestProjection {}
 
     #[test]
@@ -426,6 +476,29 @@ mod tests {
         let handler = ProjectionHandler::new(ReplayAlwaysProjection);
         let observer: &dyn EventObserver<TestEventData> = &handler;
         assert_eq!(observer.subscription_mode(), SubscriptionMode::ReplayAlways);
+    }
+
+    #[test]
+    fn gap_policy_defaults_to_halt() {
+        use crate::event_store::{EventObserver, GapPolicy};
+
+        assert_eq!(GapPolicy::default(), GapPolicy::Halt);
+
+        let handler = ProjectionHandler::new(TestProjection);
+        let observer: &dyn EventObserver<TestEventData> = &handler;
+        assert_eq!(observer.gap_policy(), GapPolicy::Halt);
+    }
+
+    // T0 (spec 0030 R1): forwarding-chain reachability — a projection's
+    // `gap_policy()` override must reach through `ProjectionHandler` to the
+    // `EventObserver` surface the bus reads.
+    #[test]
+    fn gap_policy_forwarded_through_projection_handler() {
+        use crate::event_store::{EventObserver, GapPolicy};
+
+        let handler = ProjectionHandler::new(SkipAfterBackstopProjection);
+        let observer: &dyn EventObserver<TestEventData> = &handler;
+        assert_eq!(observer.gap_policy(), GapPolicy::SkipAfterBackstop);
     }
 
     #[test]

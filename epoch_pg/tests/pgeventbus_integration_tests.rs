@@ -9,6 +9,7 @@ use epoch_pg::Migrator;
 use epoch_pg::PgDBEvent;
 use epoch_pg::event_bus::PgEventBus;
 use epoch_pg::event_store::PgEventStore;
+use futures::FutureExt;
 use serial_test::serial;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -67,6 +68,7 @@ struct TestProjection {
     subscriber_id: String,
     subscription_mode: SubscriptionMode,
     failure_mode: FailureMode,
+    gap_policy: GapPolicy,
 }
 
 impl TestProjection {
@@ -80,6 +82,7 @@ impl TestProjection {
             subscriber_id,
             subscription_mode: SubscriptionMode::Checkpointed,
             failure_mode: FailureMode::FailOpen,
+            gap_policy: GapPolicy::Halt,
         }
     }
 
@@ -91,6 +94,7 @@ impl TestProjection {
             subscriber_id,
             subscription_mode: SubscriptionMode::ReplayAlways,
             failure_mode: FailureMode::FailOpen,
+            gap_policy: GapPolicy::Halt,
         }
     }
 
@@ -98,6 +102,13 @@ impl TestProjection {
     /// rather than skipping an event it cannot apply in order.
     pub fn fail_closed(mut self) -> Self {
         self.failure_mode = FailureMode::FailClosed;
+        self
+    }
+
+    /// Opts this projection into [`GapPolicy::SkipAfterBackstop`] (spec 0030):
+    /// an unproven gap past the backstop is skipped instead of wedging.
+    pub fn skip_after_backstop(mut self) -> Self {
+        self.gap_policy = GapPolicy::SkipAfterBackstop;
         self
     }
 }
@@ -141,6 +152,10 @@ impl Projection<TestEventData> for TestProjection {
 
     fn failure_mode(&self) -> FailureMode {
         self.failure_mode
+    }
+
+    fn gap_policy(&self) -> GapPolicy {
+        self.gap_policy
     }
 }
 
@@ -8687,6 +8702,1012 @@ async fn test_fail_open_gap_backstop_still_advances_pin() {
     drop_isolated_events_table(&pool, &table).await;
 }
 
+// ---- Spec 0030 P3: SkipAfterBackstop resolver arm + audited skip ----------
+
+/// T2 (spec 0030 R3): a `ReplayAlways` + `FailClosed` subscriber that opts into
+/// `GapPolicy::SkipAfterBackstop` advances its HWM past an unproven gap once
+/// the `gap_timeout` backstop fires, instead of wedging: no `GapUnproven`
+/// halt, and the post-hole events are delivered (they were applied above the
+/// hole while the gap was held).
+///
+/// Isolated table + `snapshot_fencing: false` so the burned hole can never
+/// self-heal via `FenceCleared` — the only way past it is the new skip arm.
+#[tokio::test]
+#[serial]
+async fn test_skip_after_backstop_advances_hwm_past_unproven_gap() {
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // ReplayAlways + FailClosed + SkipAfterBackstop, subscribed after
+    // start_listener so it takes the live path on an empty history.
+    let sub_id = format!("projection:skip-backstop:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone())
+        .fail_closed()
+        .skip_after_backstop();
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe SkipAfterBackstop observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    // Commit a below-hole event and wait until the subscriber's HWM reaches it
+    // (readiness for a ReplayAlways subscriber reads the in-memory HWM), which
+    // proves the write path is alive and pins the exact posture the gap must
+    // hold below.
+    let stream = Uuid::new_v4();
+    let (_below_id, seq_below) =
+        insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up"),
+        "subscriber must reach the below-hole event before the hole is opened"
+    );
+
+    // Burn a hole: claim the next sequence inside a transaction that is rolled
+    // back, so the value is permanently consumed and never commits.
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(
+        seq_hole > seq_below,
+        "hole must sit above the below-hole event"
+    );
+
+    // Commit two events above the hole so the bus sees a gap at seq_hole.
+    let (above1_id, seq_above1) =
+        insert_committed_event(&pool, &table, hole_stream, 2, "above1").await;
+    let (above2_id, seq_above2) =
+        insert_committed_event(&pool, &table, hole_stream, 3, "above2").await;
+    assert!(seq_above1 > seq_hole && seq_above2 > seq_above1);
+
+    // The post-hole events are delivered while the gap is still held (they go
+    // to processed_ahead above the hole). Release the hole tx before waiting so
+    // a failing test does not leave it open.
+    let mut above_delivered = false;
+    for _ in 0..50 {
+        let ids = applied_ids(&store, hole_stream).await;
+        if ids.contains(&above1_id) && ids.contains(&above2_id) {
+            above_delivered = true;
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    tx_hole.rollback().await.expect("rollback hole tx");
+    assert!(
+        above_delivered,
+        "post-hole events must be delivered while the gap is held"
+    );
+
+    // Wait out gap_timeout (500ms) plus several bus cycles, then require the
+    // HWM to advance past the hole to the head.
+    tokio::time::sleep(GapDuration::from_millis(1500)).await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(10))
+            .await
+            .expect("wait_until_caught_up after backstop"),
+        "SkipAfterBackstop subscriber must advance its HWM past the unproven hole \
+         at {seq_hole} once the backstop fires"
+    );
+
+    // No halt of any kind: the skip arm replaces the refusal, so
+    // on_halt(GapUnproven) must never fire for this subscriber.
+    {
+        let halts_guard = halts.lock().unwrap();
+        assert!(
+            halts_guard.is_empty(),
+            "SkipAfterBackstop must never fire on_halt(GapUnproven); got: {halts_guard:?}"
+        );
+    }
+
+    // No post-hole event was delivered twice: the skip does not re-deliver what
+    // was already applied above the hole while it was held.
+    let ids = applied_ids(&store, hole_stream).await;
+    let mut sorted = ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), ids.len(), "no duplicate delivery");
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// A `GapTimeoutCallback` that records every invocation and, on the first one,
+/// signals the test and then BLOCKS until released. Blocking the callback
+/// blocks the listener task between the synchronous ledger confirm and the HWM
+/// routing, giving the test a deterministic observation window for the
+/// record-then-advance ordering (T3, spec 0030 R4).
+struct BlockingGapCallback {
+    fired: Arc<StdMutex<Vec<epoch_pg::event_bus::GapTimeoutInfo>>>,
+    entered_tx: tokio::sync::mpsc::Sender<()>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl epoch_pg::event_bus::GapTimeoutCallback for BlockingGapCallback {
+    async fn on_gap_timeout(&self, info: epoch_pg::event_bus::GapTimeoutInfo) {
+        self.fired.lock().unwrap().push(info);
+        let _ = self.entered_tx.send(()).await;
+        // Bounded wait so a broken test fails rather than hangs the suite.
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(20), self.release.notified()).await;
+    }
+}
+
+/// T3 (spec 0030 R4): the skip is audited — exactly one
+/// `epoch_event_bus_gap_timeouts` row for the skipped sequence, and
+/// `on_gap_timeout` fires exactly once — and the record lands BEFORE the HWM
+/// advances (record-then-advance, spec 0030 §3.1).
+///
+/// The ordering is proven by parking the test inside the `on_gap_timeout`
+/// callback: the bus confirms the ledger row and fires the callback before it
+/// routes the advance to the HWM, so while the callback is parked the test can
+/// observe (a) the row already present in the ledger and (b) the HWM still
+/// below the hole. Releasing the callback then lets the advance complete.
+#[tokio::test]
+#[serial]
+async fn test_skip_after_backstop_audited_row_precedes_hwm_advance() {
+    use epoch_pg::event_bus::GapTimeoutInfo;
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let fired = Arc::new(StdMutex::new(Vec::<GapTimeoutInfo>::new()));
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        on_gap_timeout: Some(Arc::new(BlockingGapCallback {
+            fired: fired.clone(),
+            entered_tx,
+            release: release.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // Identical posture to T2: ReplayAlways + FailClosed + SkipAfterBackstop.
+    let sub_id = format!("projection:skip-audit:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone())
+        .fail_closed()
+        .skip_after_backstop();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe SkipAfterBackstop observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_, seq_below) = insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up"),
+        "subscriber must reach the below-hole event before the hole is opened"
+    );
+
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(seq_hole > seq_below);
+
+    let (_, seq_above1) = insert_committed_event(&pool, &table, hole_stream, 2, "above1").await;
+    let (_, seq_above2) = insert_committed_event(&pool, &table, hole_stream, 3, "above2").await;
+    assert!(seq_above1 > seq_hole && seq_above2 > seq_above1);
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    // Park inside on_gap_timeout once the backstop fires.
+    tokio::time::timeout(GapDuration::from_secs(15), entered_rx.recv())
+        .await
+        .expect("callback entry wait must not time out")
+        .expect("callback entry signal");
+
+    // --- Inside the record-then-advance window -----------------------------
+    // The bus is parked between the synchronous ledger confirm and the HWM
+    // routing: the audit row must already be present, and the HWM must NOT
+    // have moved past the hole yet.
+    let (row_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM epoch_event_bus_gap_timeouts \
+         WHERE bus_name = $1 AND subscriber_id = $2 AND skipped_sequence = $3",
+    )
+    .bind(&table)
+    .bind(&sub_id)
+    .bind(seq_hole)
+    .fetch_one(&pool)
+    .await
+    .expect("query gap-timeouts row inside the ordering window");
+    assert_eq!(
+        row_count, 1,
+        "the audit row must exist BEFORE the HWM advances (record-then-advance)"
+    );
+    let lag_in_window = event_bus
+        .subscriber_lag(&sub_id)
+        .await
+        .expect("subscriber_lag inside the ordering window");
+    assert_eq!(
+        lag_in_window,
+        (seq_above2 - seq_below) as u64,
+        "while the callback is parked the HWM must still sit at the below-hole \
+         position (seq {seq_below}), not past the hole (seq {seq_hole})"
+    );
+
+    // Release the callback: the advance completes.
+    release.notify_waiters();
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(10))
+            .await
+            .expect("wait_until_caught_up after release"),
+        "after the callback is released the HWM must advance past the hole"
+    );
+
+    // Exactly one audit row for the skipped sequence, and exactly one
+    // on_gap_timeout invocation.
+    let rows = event_bus
+        .list_gap_timeouts(Some(&sub_id), false, 0, 50)
+        .await
+        .expect("list_gap_timeouts");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one gap-timeout row must be recorded; got {rows:?}"
+    );
+    assert_eq!(rows[0].skipped_sequence, seq_hole as u64);
+    {
+        let fired_guard = fired.lock().unwrap();
+        assert_eq!(
+            fired_guard.len(),
+            1,
+            "on_gap_timeout must fire exactly once; got {fired_guard:?}"
+        );
+        assert_eq!(fired_guard[0].skipped_sequence, seq_hole as u64);
+        assert_eq!(fired_guard[0].subscriber_id, sub_id);
+    }
+    assert!(
+        halts.lock().unwrap().is_empty(),
+        "the audited skip must not fire on_halt(GapUnproven)"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// Captures every `RebuildNeededInfo` the late-materialization detection fires
+/// (T4, spec 0030 R5).
+struct CapturingRebuildCallback {
+    fired: Arc<StdMutex<Vec<epoch_pg::event_bus::RebuildNeededInfo>>>,
+}
+
+#[async_trait]
+impl epoch_pg::event_bus::RebuildNeededCallback for CapturingRebuildCallback {
+    async fn on_rebuild_needed(&self, info: epoch_pg::event_bus::RebuildNeededInfo) {
+        self.fired.lock().unwrap().push(info);
+    }
+}
+
+/// Inserts an event with an EXPLICIT `global_sequence`, simulating a row that
+/// commits at a sequence a subscriber already advanced past (late
+/// materialization, T4).
+async fn insert_event_at_sequence(
+    pool: &PgPool,
+    table: &str,
+    stream_id: Uuid,
+    version: i64,
+    global_sequence: i64,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let data = serde_json::to_value(Some(TestEventData::TestEvent {
+        value: "late_materialized".to_string(),
+    }))
+    .unwrap();
+    sqlx::query(&format!(
+        r#"INSERT INTO {table} (id, stream_id, stream_version, event_type, data, created_at, global_sequence)
+           VALUES ($1, $2, $3, 'MyEvent', $4, NOW(), $5)"#
+    ))
+    .bind(id)
+    .bind(stream_id)
+    .bind(version)
+    .bind(&data)
+    .bind(global_sequence)
+    .execute(pool)
+    .await
+    .expect("insert event at skipped sequence");
+    id
+}
+
+/// T4 (spec 0030 R5): a row that commits at a skipped `global_sequence` is
+/// detected and fires the rebuild-needed callback exactly once.
+///
+/// Four assertions, in order:
+/// (a) the detection core, invoked directly (cadence-independent), detects the
+///     late row and fires `on_rebuild_needed` with the skipped sequence;
+/// (b) the row is marked resolved — a SECOND invocation fires nothing;
+/// (c) with `gap_scan_interval` set, the periodic scan fires the callback with
+///     no manual invocation;
+/// (d) a `Halt`-only deployment records no ledger rows, so the entry point is a
+///     harmless no-op there.
+#[tokio::test]
+#[serial]
+async fn test_late_materialization_detected_fires_rebuild_once() {
+    use epoch_pg::event_bus::RebuildNeededInfo;
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // --- (a)/(b): a real SkipAfterBackstop skip, then a late row at the hole --
+    let table = isolated_events_table(&pool).await;
+    let rebuilds = Arc::new(StdMutex::new(Vec::<RebuildNeededInfo>::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_rebuild_needed: Some(Arc::new(CapturingRebuildCallback {
+            fired: rebuilds.clone(),
+        })),
+        // Scan OFF: (a)/(b) must observe the on-demand entry point alone.
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let sub_id = format!("projection:late-mat:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone())
+        .fail_closed()
+        .skip_after_backstop();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe SkipAfterBackstop observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_, seq_below) = insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up"),
+        "subscriber must reach the below-hole event before the hole is opened"
+    );
+
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(seq_hole > seq_below);
+    let (_, seq_above) = insert_committed_event(&pool, &table, hole_stream, 2, "above").await;
+    assert!(seq_above > seq_hole);
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    tokio::time::sleep(GapDuration::from_millis(1500)).await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(10))
+            .await
+            .expect("wait_until_caught_up after backstop"),
+        "the SkipAfterBackstop subscriber must advance past the hole at {seq_hole}"
+    );
+
+    // Nothing to detect yet: the skipped sequence has no committed row.
+    let none_yet = event_bus
+        .check_skipped_gaps()
+        .await
+        .expect("check_skipped_gaps before the late row");
+    assert!(
+        none_yet.is_empty(),
+        "an unresolved skip with no committed row must not be detected; got {none_yet:?}"
+    );
+    assert!(rebuilds.lock().unwrap().is_empty());
+
+    // The late row materializes at the skipped sequence.
+    insert_event_at_sequence(&pool, &table, hole_stream, 3, seq_hole).await;
+
+    // (a) detected on demand, callback carries the skipped sequence.
+    let detected = event_bus
+        .check_skipped_gaps()
+        .await
+        .expect("check_skipped_gaps after the late row");
+    assert_eq!(
+        detected.len(),
+        1,
+        "the late-materialized skip must be detected exactly once; got {detected:?}"
+    );
+    assert_eq!(detected[0].skipped_sequence, seq_hole as u64);
+    assert_eq!(detected[0].subscriber_id, sub_id);
+    {
+        let fired = rebuilds.lock().unwrap();
+        assert_eq!(
+            fired.len(),
+            1,
+            "on_rebuild_needed must fire once for the late row; got {fired:?}"
+        );
+        assert_eq!(fired[0].skipped_sequence, seq_hole as u64);
+        assert_eq!(fired[0].subscriber_id, sub_id);
+        assert_eq!(fired[0].bus_name, table);
+    }
+
+    // (b) the row is marked resolved, so a second invocation fires nothing.
+    let rows = event_bus
+        .list_gap_timeouts(Some(&sub_id), false, 0, 50)
+        .await
+        .expect("list_gap_timeouts");
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].resolved_at.is_some(),
+        "the detected row must be marked resolved"
+    );
+    assert_eq!(rows[0].resolved_by.as_deref(), Some("gap_detection"));
+    let second = event_bus
+        .check_skipped_gaps()
+        .await
+        .expect("second check_skipped_gaps");
+    assert!(
+        second.is_empty(),
+        "a resolved row must not be re-detected; got {second:?}"
+    );
+    assert_eq!(
+        rebuilds.lock().unwrap().len(),
+        1,
+        "on_rebuild_needed must fire exactly once per (subscriber, skipped sequence)"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+
+    // --- (c): the automatic scan drives the same core, no manual call --------
+    let scan_table = isolated_events_table(&pool).await;
+    let scan_rebuilds = Arc::new(StdMutex::new(Vec::<RebuildNeededInfo>::new()));
+    let scan_bus = start_isolated_bus(
+        &pool,
+        epoch_pg::event_bus::ReliableDeliveryConfig {
+            events_table: scan_table.clone(),
+            gap_scan_interval: Some(GapDuration::from_millis(200)),
+            on_rebuild_needed: Some(Arc::new(CapturingRebuildCallback {
+                fired: scan_rebuilds.clone(),
+            })),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // A committed row plus an unresolved ledger row naming its sequence is the
+    // exact state the scan looks for; planting it directly keeps this leg
+    // independent of the (slow) wedge machinery already exercised above.
+    let scan_sub = format!("projection:scan:{}", Uuid::new_v4());
+    let (_, scan_seq) = insert_committed_event(&pool, &scan_table, Uuid::new_v4(), 1, "late").await;
+    sqlx::query(
+        "INSERT INTO epoch_event_bus_gap_timeouts \
+         (bus_name, subscriber_id, skipped_sequence, gap_duration_ms) VALUES ($1, $2, $3, 500)",
+    )
+    .bind(&scan_table)
+    .bind(&scan_sub)
+    .bind(scan_seq)
+    .execute(&pool)
+    .await
+    .expect("plant unresolved ledger row");
+
+    let mut scan_fired = false;
+    for _ in 0..50 {
+        if !scan_rebuilds.lock().unwrap().is_empty() {
+            scan_fired = true;
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    assert!(
+        scan_fired,
+        "the periodic scan must fire on_rebuild_needed without a manual invocation"
+    );
+    {
+        let fired = scan_rebuilds.lock().unwrap();
+        assert_eq!(fired[0].skipped_sequence, scan_seq as u64);
+        assert_eq!(fired[0].subscriber_id, scan_sub);
+    }
+
+    scan_bus.shutdown().await.expect("shutdown scan bus");
+    drop_isolated_events_table(&pool, &scan_table).await;
+
+    // --- (d): a Halt-only deployment records nothing, so detection is a no-op -
+    let halt_table = isolated_events_table(&pool).await;
+    let halt_rebuilds = Arc::new(StdMutex::new(Vec::<RebuildNeededInfo>::new()));
+    let halt_bus = start_isolated_bus(
+        &pool,
+        epoch_pg::event_bus::ReliableDeliveryConfig {
+            events_table: halt_table.clone(),
+            on_rebuild_needed: Some(Arc::new(CapturingRebuildCallback {
+                fired: halt_rebuilds.clone(),
+            })),
+            ..Default::default()
+        },
+    )
+    .await;
+    let halt_sub = format!("projection:halt-only:{}", Uuid::new_v4());
+    halt_bus
+        .subscribe(ProjectionHandler::new(
+            TestProjection::replay_always(halt_sub.clone()).fail_closed(),
+        ))
+        .await
+        .expect("subscribe default-Halt observer");
+    insert_committed_event(&pool, &halt_table, Uuid::new_v4(), 1, "plain").await;
+    assert!(
+        halt_bus
+            .wait_until_caught_up(&halt_sub, GapDuration::from_secs(10))
+            .await
+            .expect("wait_until_caught_up on the Halt-only bus")
+    );
+    let halt_detected = halt_bus
+        .check_skipped_gaps()
+        .await
+        .expect("check_skipped_gaps on a Halt-only deployment");
+    assert!(
+        halt_detected.is_empty(),
+        "a Halt-only deployment records no skips, so detection must find nothing; got {halt_detected:?}"
+    );
+    assert!(
+        halt_rebuilds.lock().unwrap().is_empty(),
+        "no rebuild signal may fire for a Halt-only deployment"
+    );
+
+    halt_bus.shutdown().await.expect("shutdown halt bus");
+    drop_isolated_events_table(&pool, &halt_table).await;
+}
+
+/// T7 (spec 0030 R4): a ledger-write failure BLOCKS the skip — the subscriber
+/// stays in the refused-backstop posture (HWM below the hole, no audit row, no
+/// callback) — and once the failure is lifted the skip lands on a later tick,
+/// proving the record-then-advance retry.
+///
+/// Injection mechanism: the bus runs on a dedicated pool whose connections set
+/// `lock_timeout = '250ms'`, and the test holds `ACCESS EXCLUSIVE` on
+/// `epoch_event_bus_gap_timeouts` in an open transaction. The synchronous
+/// ledger INSERT then fails fast with a lock timeout on every backstop
+/// attempt; committing the lock transaction lifts the injection hermetically
+/// (no DDL, no privilege changes on shared objects).
+#[tokio::test]
+#[serial]
+async fn test_skip_after_backstop_ledger_failure_withholds_skip_then_retries() {
+    use epoch_pg::event_bus::{GapTimeoutCallback, GapTimeoutInfo};
+    use std::time::Duration as GapDuration;
+
+    struct CapturingGapCb {
+        fired: Arc<StdMutex<Vec<u64>>>,
+    }
+    #[async_trait]
+    impl GapTimeoutCallback for CapturingGapCb {
+        async fn on_gap_timeout(&self, info: GapTimeoutInfo) {
+            self.fired.lock().unwrap().push(info.skipped_sequence);
+        }
+    }
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+
+    // Dedicated bus pool: every bus statement gives up on a lock wait after
+    // 250ms, so the ledger INSERT fails fast while the test holds the table
+    // lock. The test's own pool (30s lock_timeout) is unaffected.
+    let bus_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(GapDuration::from_secs(5))
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SET lock_timeout = '250ms'")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&common::database_url())
+        .await
+        .expect("connect dedicated bus pool");
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let fired = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        on_gap_timeout: Some(Arc::new(CapturingGapCb {
+            fired: fired.clone(),
+        })),
+        ..Default::default()
+    };
+    let channel_name = format!("test_t7_{}", Uuid::new_v4().simple());
+    let event_bus = {
+        let bus = PgEventBus::<TestEventData>::with_config(bus_pool.clone(), channel_name, config);
+        bus.setup_trigger().await.expect("Failed to setup trigger");
+        bus.start_listener()
+            .await
+            .expect("Failed to start listener");
+        bus
+    };
+
+    let sub_id = format!("projection:skip-t7:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone())
+        .fail_closed()
+        .skip_after_backstop();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe SkipAfterBackstop observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_, seq_below) = insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up"),
+        "subscriber must reach the below-hole event before the hole is opened"
+    );
+
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(seq_hole > seq_below);
+
+    // Inject the ledger-write failure BEFORE any backstop attempt can fire:
+    // hold ACCESS EXCLUSIVE on the gap-timeouts ledger for the whole
+    // gap_timeout window (~2.7s).
+    //
+    // Assumption: `epoch_event_bus_gap_timeouts` is shared across this binary's
+    // tests, but no other test binary in the workspace contends on it in
+    // `epoch_pg_test` (the migration suite runs against
+    // `epoch_pg_test_migrations`), and a lock wait blocks rather than corrupts.
+    // Revisit this hold if another suite starts touching the ledger.
+    let mut tx_lock = pool.begin().await.expect("begin ledger-lock tx");
+    sqlx::query("LOCK TABLE epoch_event_bus_gap_timeouts IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *tx_lock)
+        .await
+        .expect("lock ledger table");
+
+    // Commit above the hole; delivery works under the lock (it touches no
+    // ledger table), and the gap arms with the injection already active.
+    let (_, seq_above1) = insert_committed_event(&pool, &table, hole_stream, 2, "above1").await;
+    let (_, seq_above2) = insert_committed_event(&pool, &table, hole_stream, 3, "above2").await;
+    assert!(seq_above1 > seq_hole && seq_above2 > seq_above1);
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    // --- Failure window: the backstop fires but the skip is withheld --------
+    // Wait past gap_timeout and then require the posture to be unchanged
+    // across a further full gap_timeout, spanning several retry ticks: HWM
+    // below the hole, no callback, no halt. (The ledger row count is not
+    // sampled here — a read would block on the held ACCESS EXCLUSIVE lock; a
+    // successful confirm would have fired the callback, so an empty callback
+    // log plus the unadvanced HWM pins the no-record/no-skip posture.)
+    tokio::time::sleep(GapDuration::from_millis(1200)).await;
+    let expected_lag = (seq_above2 - seq_below) as u64;
+    for i in 0..10 {
+        let lag = event_bus
+            .subscriber_lag(&sub_id)
+            .await
+            .expect("subscriber_lag in failure window");
+        assert_eq!(
+            lag, expected_lag,
+            "iteration {i}: ledger failure must withhold the skip — the HWM must \
+             stay at the below-hole position (seq {seq_below}), not advance past \
+             the hole (seq {seq_hole})"
+        );
+        assert!(
+            halts.lock().unwrap().is_empty(),
+            "the withheld skip must not degrade into on_halt(GapUnproven)"
+        );
+        tokio::time::sleep(GapDuration::from_millis(150)).await;
+    }
+    assert!(
+        fired.lock().unwrap().is_empty(),
+        "no on_gap_timeout may fire while the ledger write fails"
+    );
+
+    // Lift the injection: the skip lands on a later tick.
+    tx_lock
+        .commit()
+        .await
+        .expect("commit ledger-lock tx (lift)");
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(10))
+            .await
+            .expect("wait_until_caught_up after lift"),
+        "once the ledger write succeeds the withheld skip must land on a later \
+         tick and advance the HWM past the hole (seq {seq_hole})"
+    );
+
+    // The eventual skip is audited exactly once.
+    let rows = event_bus
+        .list_gap_timeouts(Some(&sub_id), false, 0, 50)
+        .await
+        .expect("list_gap_timeouts after lift");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one gap-timeout row after the retried skip lands; got {rows:?}"
+    );
+    assert_eq!(rows[0].skipped_sequence, seq_hole as u64);
+    assert_eq!(
+        *fired.lock().unwrap(),
+        vec![seq_hole as u64],
+        "on_gap_timeout fires exactly once for the retried skip"
+    );
+    assert!(halts.lock().unwrap().is_empty());
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+// T5 (spec 0030 R6): `GapPolicy::Halt` (the default) is byte-for-byte
+// unchanged. This is pinned by the two shipped fail-closed tests, which run in
+// this suite unchanged and must stay green:
+//   - `test_fail_closed_gap_refusal_and_fence_cleared_recovery` (fence-cleared
+//     recovery + backstop refusal + `on_halt(GapUnproven)` fires once), and
+//   - `test_wedged_gap_does_not_starve_peer_and_release_resumes` (`Checkpointed`
+//     release + peer non-starvation).
+// T6 below also exercises the default `Halt` wedge for a `ReplayAlways`
+// subscriber. No new test is added for T5 on purpose: duplicating those two
+// would pin the same behaviour twice.
+
+/// T6 (spec 0030 R8): `release_halt`'s success WARN no longer over-promises for
+/// a `ReplayAlways` subscriber. Such a subscriber routes advancement through its
+/// in-memory high-water mark and never reads the checkpoint row the call writes,
+/// so the WARN must NOT claim delivery resumes — it must say plainly that the
+/// subscriber is not resumed. No recovery path is added to `release_halt` (spec
+/// 0030 OQ-3); the `Checkpointed` wording stays pinned by
+/// `test_wedged_gap_does_not_starve_peer_and_release_resumes`.
+///
+/// Setup mirrors T2 minus the opt-in, so the subscriber takes the default
+/// `Halt` path and genuinely wedges on the unproven hole before the release.
+#[tokio::test]
+#[serial]
+async fn test_release_halt_warn_does_not_promise_resume_for_replay_always() {
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // ReplayAlways + FailClosed, default GapPolicy::Halt: this one wedges.
+    let sub_id = format!("projection:release-warn:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe fail-closed ReplayAlways observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_below_id, seq_below) =
+        insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up"),
+        "subscriber must reach the below-hole event before the hole is opened"
+    );
+
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(
+        seq_hole > seq_below,
+        "hole must sit above the below-hole event"
+    );
+
+    let (_, seq_above1) = insert_committed_event(&pool, &table, hole_stream, 2, "above1").await;
+    assert!(seq_above1 > seq_hole);
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    // Wait for the default-Halt wedge: on_halt(GapUnproven) after gap_timeout.
+    let mut wedged = false;
+    for _ in 0..60 {
+        if !halts.lock().unwrap().is_empty() {
+            wedged = true;
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    assert!(
+        wedged,
+        "default GapPolicy::Halt must still wedge the ReplayAlways subscriber with \
+         on_halt(GapUnproven) (spec 0030 R6)"
+    );
+
+    let log_start = common::captured_logs_len();
+    event_bus
+        .release_halt(&sub_id, seq_hole as u64)
+        .await
+        .expect("release_halt writes the checkpoint row");
+
+    assert!(
+        !common::captured_logs_contain_since(log_start, "delivery resumes from"),
+        "release_halt must not claim delivery resumes for a ReplayAlways subscriber"
+    );
+    assert!(
+        common::captured_logs_contain_since(log_start, "delivery does NOT resume"),
+        "release_halt's WARN must state plainly that a ReplayAlways subscriber is not \
+         resumed by the release"
+    );
+    assert!(
+        common::captured_logs_contain_since(log_start, &sub_id),
+        "the WARN must name the released subscriber"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T8 (spec 0030 R9): readiness across a skipped hole. A
+/// `GapPolicy::SkipAfterBackstop` + `ReplayAlways` subscriber that has skipped a
+/// hole reports caught-up *while the skip is still unresolved in the ledger* —
+/// the amended spec 0026 R5 contract (§3.7): for this class no checkpoint is
+/// held below the hole, so caught-up is the honest report, and the residual
+/// divergence is healed by late-materialization detection driving a rebuild.
+#[tokio::test]
+#[serial]
+async fn test_readiness_reports_caught_up_across_skipped_hole() {
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let sub_id = format!("projection:readiness-skip:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone())
+        .fail_closed()
+        .skip_after_backstop();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe SkipAfterBackstop observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_, seq_below) = insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up"),
+        "subscriber must reach the below-hole event before the hole is opened"
+    );
+
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(
+        seq_hole > seq_below,
+        "hole must sit above the below-hole event"
+    );
+
+    let (_, seq_above1) = insert_committed_event(&pool, &table, hole_stream, 2, "above1").await;
+    assert!(seq_above1 > seq_hole);
+    // Let the backstop fire and the skip land, then release the hole tx so a
+    // failing test does not leave it open.
+    tokio::time::sleep(GapDuration::from_millis(1500)).await;
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    // Readiness reports caught-up even though the hole at `seq_hole` was never
+    // proven — the position advanced past it under the opt-in policy.
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(10))
+            .await
+            .expect("wait_until_caught_up across the skipped hole"),
+        "readiness must report caught-up across a skipped hole for the opt-in class"
+    );
+    assert_eq!(
+        event_bus
+            .subscriber_lag(&sub_id)
+            .await
+            .expect("subscriber_lag"),
+        0,
+        "lag must be zero across the skipped hole for the opt-in class"
+    );
+
+    // And the hole really is still an unresolved skip in the ledger: readiness
+    // is reporting caught-up over an unhealed divergence, by design.
+    let unresolved = event_bus
+        .list_gap_timeouts(Some(&sub_id), true, 0, 50)
+        .await
+        .expect("list unresolved gap timeouts");
+    assert_eq!(
+        unresolved.len(),
+        1,
+        "the skipped hole must still be an unresolved ledger row; got {unresolved:?}"
+    );
+    assert_eq!(unresolved[0].skipped_sequence, seq_hole as u64);
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
 /// Polls until `subscriber_id`'s persisted checkpoint is at least `expected`.
 async fn poll_checkpoint_at_least(
     event_bus: &PgEventBus<TestEventData>,
@@ -9494,4 +10515,1304 @@ async fn test_update_checkpoint_contract_unchanged_pin() {
     );
 
     event_bus.shutdown().await.expect("shutdown");
+}
+
+// ==================== spec 0030 P2: gap-policy guardrail at subscribe (T1) ====================
+
+// T1 (spec 0030 R2): the subscribe-time gap-policy guardrail.
+//
+// `GapPolicy::SkipAfterBackstop` is valid only for `ReplayAlways` subscribers
+// (spec 0030 §3.1): a `Checkpointed` subscriber that skips an unproven gap
+// would advance a *persisted* checkpoint past the hole, letting it lead the
+// contiguous prefix in violation of spec 0027 §3.3. `subscribe()` must reject
+// that combination as a registration-time error
+// (`PgEventBusError::InvalidSubscriptionConfig`) and accept the
+// `SkipAfterBackstop` + `ReplayAlways` combination unchanged.
+#[tokio::test]
+#[serial]
+async fn test_subscribe_gap_policy_guardrail_skip_after_backstop_replay_always_only() {
+    use epoch_pg::PgEventBusError;
+    use epoch_pg::event_bus::DispatchMode;
+
+    let Some((pool, event_bus)) = setup_without_listener().await else {
+        return;
+    };
+
+    // (a) SkipAfterBackstop + Checkpointed: registration-time error.
+    let checkpointed = TestProjection::new().skip_after_backstop();
+    let rejected = event_bus
+        .subscribe(ProjectionHandler::new(checkpointed))
+        .await;
+    assert!(
+        matches!(
+            &rejected,
+            Err(PgEventBusError::InvalidSubscriptionConfig { .. })
+        ),
+        "SkipAfterBackstop + Checkpointed must be rejected with \
+         InvalidSubscriptionConfig at subscribe: {rejected:?}"
+    );
+    if let Err(PgEventBusError::InvalidSubscriptionConfig {
+        subscriber_id,
+        reason,
+    }) = rejected
+    {
+        assert!(
+            subscriber_id.starts_with("projection:test:"),
+            "the error must identify the rejected subscriber: {subscriber_id}"
+        );
+        assert!(
+            reason.contains("ReplayAlways"),
+            "the error must explain the ReplayAlways-only rule: {reason}"
+        );
+    }
+
+    // (b) SkipAfterBackstop + ReplayAlways: accepted.
+    let replay = TestProjection::replay_always(format!("projection:gap-ra:{}", Uuid::new_v4()))
+        .skip_after_backstop();
+    event_bus
+        .subscribe(ProjectionHandler::new(replay))
+        .await
+        .expect("SkipAfterBackstop + ReplayAlways must be accepted at subscribe");
+
+    // (c) Inline dispatch (spec 0030 R2 review note): the guardrail sits before
+    // the inline registration branch in subscribe(), so an Inline bus rejects
+    // the forbidden combination with the same variant — inline delivery would
+    // otherwise have no registration-time protection at all.
+    let inline_config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        dispatch_mode: DispatchMode::Inline,
+        ..Default::default()
+    };
+    let inline_bus: PgEventBus<TestEventData> = PgEventBus::with_config(
+        pool.clone(),
+        format!("test_inline_gap_{}", Uuid::new_v4().simple()),
+        inline_config,
+    );
+    let rejected_inline = inline_bus
+        .subscribe(ProjectionHandler::new(
+            TestProjection::new().skip_after_backstop(),
+        ))
+        .await;
+    assert!(
+        matches!(
+            &rejected_inline,
+            Err(PgEventBusError::InvalidSubscriptionConfig { .. })
+        ),
+        "Inline dispatch must reject SkipAfterBackstop + Checkpointed with the \
+         same InvalidSubscriptionConfig variant: {rejected_inline:?}"
+    );
+}
+
+// ==================== Part B: AllocationMode surface (spec 0030 P6) ====================
+
+/// Reads the `epoch_events_sequence_counter` row for `table`.
+async fn sequence_counter_val(pool: &PgPool, table: &str) -> Option<i64> {
+    sqlx::query_scalar("SELECT val FROM epoch_events_sequence_counter WHERE name = $1")
+        .bind(table)
+        .fetch_optional(pool)
+        .await
+        .expect("query the per-table counter row")
+}
+
+// T13 (spec 0030 R11): constructing under `PerTxnCounter` creates and seeds the
+// per-events-table counter row above the table's high-water mark, including
+// sequence values that were assigned but never committed (burn). Observed via
+// direct SQL on the counter row only — no allocator behaviour is exercised here
+// (that is P7). Also pins idempotency (a second construction never lowers the
+// counter) and that the default `Nextval` path touches no counter row.
+#[tokio::test]
+#[serial]
+async fn test_per_txn_counter_construction_reseeds_counter_row() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let seq = format!("{table}_seq");
+    let bus = || {
+        PgEventBus::<TestEventData>::new(
+            pool.clone(),
+            format!("alloc_ch_{}", Uuid::new_v4().simple()),
+        )
+    };
+
+    // A virgin sequence (is_called = false) has assigned nothing, and an empty
+    // table has no MAX: the seed floor is 0, and the row is created regardless.
+    let empty_store = PgEventStore::with_allocation_mode(
+        pool.clone(),
+        bus(),
+        table.clone(),
+        epoch_pg::AllocationMode::PerTxnCounter,
+    )
+    .await
+    .expect("construction under PerTxnCounter must succeed");
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        Some(0),
+        "a virgin sequence over an empty table seeds the counter at 0"
+    );
+    assert_eq!(
+        empty_store.allocation_mode(),
+        epoch_pg::AllocationMode::PerTxnCounter
+    );
+
+    // Commit rows under the default Nextval path, then burn sequence values
+    // without committing rows, so the sequence's last-assigned value leads
+    // MAX(global_sequence) — the case a MAX-only seed would get wrong.
+    let nextval_store = PgEventStore::with_table(pool.clone(), bus(), table.clone()).await;
+    let stream_id = Uuid::new_v4();
+    nextval_store
+        .store_event(new_event(stream_id, 1, "seeded"))
+        .await
+        .expect("store under Nextval");
+    nextval_store
+        .store_event(new_event(stream_id, 2, "seeded"))
+        .await
+        .expect("store under Nextval");
+    for _ in 0..3 {
+        sqlx::query(&format!("SELECT nextval('{seq}')"))
+            .execute(&pool)
+            .await
+            .expect("burn a sequence value");
+    }
+
+    let max_committed: i64 =
+        sqlx::query_scalar(&format!("SELECT MAX(global_sequence) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .expect("read MAX(global_sequence)");
+    let sequence_high_water: i64 = sqlx::query_scalar(&format!("SELECT last_value FROM {seq}"))
+        .fetch_one(&pool)
+        .await
+        .expect("read the sequence high-water");
+    assert!(
+        sequence_high_water > max_committed,
+        "setup: the burned sequence must lead the committed rows"
+    );
+
+    PgEventStore::with_allocation_mode(
+        pool.clone(),
+        bus(),
+        table.clone(),
+        epoch_pg::AllocationMode::PerTxnCounter,
+    )
+    .await
+    .expect("re-seeding construction must succeed");
+
+    let seeded = sequence_counter_val(&pool, &table)
+        .await
+        .expect("the counter row must exist after PerTxnCounter construction");
+    assert_eq!(
+        seeded, sequence_high_water,
+        "the counter is raised to the sequence's last-assigned value, \
+         which is above every value the sequence has handed out"
+    );
+    assert!(
+        seeded > max_committed,
+        "the counter must lead every committed global_sequence, so the first \
+         counter-drawn value cannot collide"
+    );
+
+    // Idempotency: re-seeding never lowers an already-higher counter.
+    sqlx::query("UPDATE epoch_events_sequence_counter SET val = val + 100 WHERE name = $1")
+        .bind(&table)
+        .execute(&pool)
+        .await
+        .expect("raise the counter above the sequence");
+    PgEventStore::with_allocation_mode(
+        pool.clone(),
+        bus(),
+        table.clone(),
+        epoch_pg::AllocationMode::PerTxnCounter,
+    )
+    .await
+    .expect("repeat construction must succeed");
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        Some(seeded + 100),
+        "re-seeding must never lower an already-higher counter"
+    );
+
+    drop_isolated_events_table(&pool, &table).await;
+    sqlx::query("DELETE FROM epoch_events_sequence_counter WHERE name = $1")
+        .bind(&table)
+        .execute(&pool)
+        .await
+        .expect("clean up the counter row");
+}
+
+// R10: the default `Nextval` mode allocates exactly as it does today and creates
+// no counter row — neither via the new constructor nor via the pre-existing
+// infallible ones.
+#[tokio::test]
+#[serial]
+async fn test_nextval_allocation_mode_touches_no_counter_row() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let bus = PgEventBus::<TestEventData>::new(
+        pool.clone(),
+        format!("alloc_ch_{}", Uuid::new_v4().simple()),
+    );
+
+    let store = PgEventStore::with_allocation_mode(
+        pool.clone(),
+        bus,
+        table.clone(),
+        epoch_pg::AllocationMode::Nextval,
+    )
+    .await
+    .expect("construction under Nextval must succeed");
+    assert_eq!(store.allocation_mode(), epoch_pg::AllocationMode::Nextval);
+
+    // The pre-existing infallible constructors are unchanged and default to Nextval.
+    let default_store = PgEventStore::new(
+        pool.clone(),
+        PgEventBus::<TestEventData>::new(
+            pool.clone(),
+            format!("alloc_ch_{}", Uuid::new_v4().simple()),
+        ),
+    );
+    assert_eq!(
+        default_store.allocation_mode(),
+        epoch_pg::AllocationMode::Nextval
+    );
+
+    store
+        .store_event(new_event(Uuid::new_v4(), 1, "nextval"))
+        .await
+        .expect("store under Nextval");
+
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        None,
+        "the default mode must not create a counter row"
+    );
+
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+// ==================== Part B: PerTxnCounter write path (spec 0030 P7) ====================
+
+/// Builds a `PerTxnCounter` store over `table` with a Uuid-unique bus channel.
+async fn per_txn_counter_store(
+    pool: &PgPool,
+    table: &str,
+) -> PgEventStore<PgEventBus<TestEventData>> {
+    PgEventStore::with_allocation_mode(
+        pool.clone(),
+        PgEventBus::<TestEventData>::new(
+            pool.clone(),
+            format!("alloc_ch_{}", Uuid::new_v4().simple()),
+        ),
+        table.to_string(),
+        epoch_pg::AllocationMode::PerTxnCounter,
+    )
+    .await
+    .expect("construction under PerTxnCounter must succeed")
+}
+
+/// Reads the committed `global_sequence` of the event `id` on `table`.
+async fn committed_sequence(pool: &PgPool, table: &str, id: Uuid) -> i64 {
+    sqlx::query_scalar(&format!(
+        "SELECT global_sequence FROM {table} WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("read the committed global_sequence")
+}
+
+/// Drops the isolated table and its counter row.
+async fn cleanup_counter_table(pool: &PgPool, table: &str) {
+    drop_isolated_events_table(pool, table).await;
+    sqlx::query("DELETE FROM epoch_events_sequence_counter WHERE name = $1")
+        .bind(table)
+        .execute(pool)
+        .await
+        .expect("clean up the counter row");
+}
+
+// T9 (spec 0030 R13): under `PerTxnCounter` a rolled-back transaction burns
+// zero — the counter draw is an uncommitted MVCC version, so it rewinds and the
+// next committed writer takes the value the rolled-back txn had drawn.
+#[tokio::test]
+#[serial]
+async fn test_per_txn_counter_rollback_burns_nothing() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let store = per_txn_counter_store(&pool, &table).await;
+
+    let anchor = new_event(Uuid::new_v4(), 1, "anchor");
+    let anchor_id = anchor.id;
+    store.store_event(anchor).await.expect("store the anchor");
+    let anchor_seq = committed_sequence(&pool, &table, anchor_id).await;
+
+    // A K-row insert that draws +K and then rolls back.
+    let mut tx = pool.begin().await.expect("begin the doomed txn");
+    let doomed_stream = Uuid::new_v4();
+    let doomed: Vec<_> = (1..=3u64)
+        .map(|v| new_event(doomed_stream, v, "doomed"))
+        .collect();
+    let drawn = store
+        .store_events_in_tx(&mut tx, doomed)
+        .await
+        .expect("the doomed insert itself succeeds");
+    assert_eq!(drawn.len(), 3);
+    tx.rollback().await.expect("roll the doomed txn back");
+
+    let after = new_event(Uuid::new_v4(), 1, "after_rollback");
+    let after_id = after.id;
+    store
+        .store_event(after)
+        .await
+        .expect("store after rollback");
+
+    assert_eq!(
+        committed_sequence(&pool, &table, after_id).await,
+        anchor_seq + 1,
+        "a rolled-back PerTxnCounter txn must burn zero: the next committed \
+         writer takes the very next value"
+    );
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        Some(anchor_seq + 1),
+        "the counter rewound with the rollback"
+    );
+
+    cleanup_counter_table(&pool, &table).await;
+}
+
+// T10 (spec 0030 R13): under `PerTxnCounter` a *crashed* writer burns zero. A
+// dedicated `PgConnection` allocates a block of K through `store_events_in_tx`
+// and is then terminated mid-transaction via `pg_terminate_backend`; the abort
+// discards both the draw and the rows.
+#[tokio::test]
+#[serial]
+async fn test_per_txn_counter_crash_burns_nothing() {
+    use sqlx::Connection;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let store = per_txn_counter_store(&pool, &table).await;
+
+    let anchor = new_event(Uuid::new_v4(), 1, "anchor");
+    let anchor_id = anchor.id;
+    store.store_event(anchor).await.expect("store the anchor");
+    let anchor_seq = committed_sequence(&pool, &table, anchor_id).await;
+    let before = sequence_counter_val(&pool, &table)
+        .await
+        .expect("counter row exists");
+
+    // Dedicated connection: draw a block of 3 through the ALLOCATOR (not raw
+    // SQL — raw SQL would only pin MVCC rollback, not the write path) inside an
+    // uncommitted transaction, then kill the backend holding it.
+    let mut victim = sqlx::PgConnection::connect(&common::database_url())
+        .await
+        .expect("dedicated victim connection");
+    let victim_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut victim)
+        .await
+        .expect("read the victim's backend pid");
+    let victim_stream = Uuid::new_v4();
+    let mut victim_tx = victim.begin().await.expect("begin on the victim");
+    let victim_batch: Vec<_> = (1..=3u64)
+        .map(|v| new_event(victim_stream, v, "victim"))
+        .collect();
+    let drawn = store
+        .store_events_in_tx(&mut victim_tx, victim_batch)
+        .await
+        .expect("the victim allocates a block of 3");
+    let drawn_seqs: Vec<u64> = drawn
+        .iter()
+        .map(|e| e.global_sequence.expect("RETURNING must yield a sequence"))
+        .collect();
+    assert_eq!(
+        drawn_seqs,
+        vec![
+            (before + 1) as u64,
+            (before + 2) as u64,
+            (before + 3) as u64
+        ],
+        "the victim drew a contiguous block of 3 from the counter"
+    );
+
+    // Kill it from the pool, so the terminate result is observable, then wait
+    // (bounded) for the backend to actually disappear rather than hanging.
+    sqlx::query("SELECT pg_terminate_backend($1)")
+        .bind(victim_pid)
+        .execute(&pool)
+        .await
+        .expect("terminate the victim backend");
+    let mut gone = false;
+    for _ in 0..50 {
+        let still_there: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pg_stat_activity WHERE pid = $1")
+                .bind(victim_pid)
+                .fetch_one(&pool)
+                .await
+                .expect("poll pg_stat_activity for the victim");
+        if still_there == 0 {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        gone,
+        "victim backend {victim_pid} did not disappear within 5s of \
+         pg_terminate_backend — the crash never happened, so the zero-burn \
+         assertions below would be vacuous"
+    );
+    drop(victim_tx);
+    drop(victim);
+
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        Some(before),
+        "the aborted transaction leaves the counter unchanged — zero burn"
+    );
+    let victim_rows: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM {table} WHERE stream_id = $1"
+    ))
+    .bind(victim_stream)
+    .fetch_one(&pool)
+    .await
+    .expect("count the victim's (absent) rows");
+    assert_eq!(
+        victim_rows, 0,
+        "the crashed transaction committed none of its 3 events — the second \
+         zero-burn source"
+    );
+
+    let after = new_event(Uuid::new_v4(), 1, "after_crash");
+    let after_id = after.id;
+    store
+        .store_event(after)
+        .await
+        .expect("store after the crash");
+    assert_eq!(
+        committed_sequence(&pool, &table, after_id).await,
+        anchor_seq + 1,
+        "the fresh writer gets the same relative value the aborted txn drew — \
+         no committed value was reused or skipped"
+    );
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        Some(before + 1),
+        "the fresh writer's value came from the counter (one draw past the \
+         pre-crash value), not from nextval"
+    );
+
+    cleanup_counter_table(&pool, &table).await;
+}
+
+// T11 (spec 0030 R10) — P7's MERGE GATE: the default `Nextval` write path is
+// unchanged. A rolled-back K-row insert burns K (a relative gap of K), exactly
+// as today, and no counter row is created or touched.
+#[tokio::test]
+#[serial]
+async fn test_nextval_rollback_still_burns_and_touches_no_counter() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    for explicit_mode in [false, true] {
+        let table = isolated_events_table(&pool).await;
+        let bus = PgEventBus::<TestEventData>::new(
+            pool.clone(),
+            format!("alloc_ch_{}", Uuid::new_v4().simple()),
+        );
+        let store = if explicit_mode {
+            PgEventStore::with_allocation_mode(
+                pool.clone(),
+                bus,
+                table.clone(),
+                epoch_pg::AllocationMode::Nextval,
+            )
+            .await
+            .expect("construction under Nextval must succeed")
+        } else {
+            PgEventStore::with_table(pool.clone(), bus, table.clone()).await
+        };
+
+        let anchor = new_event(Uuid::new_v4(), 1, "anchor");
+        let anchor_id = anchor.id;
+        store.store_event(anchor).await.expect("store the anchor");
+        let anchor_seq = committed_sequence(&pool, &table, anchor_id).await;
+
+        let mut tx = pool.begin().await.expect("begin the doomed txn");
+        let doomed_stream = Uuid::new_v4();
+        let doomed: Vec<_> = (1..=3u64)
+            .map(|v| new_event(doomed_stream, v, "doomed"))
+            .collect();
+        store
+            .store_events_in_tx(&mut tx, doomed)
+            .await
+            .expect("the doomed insert itself succeeds");
+        tx.rollback().await.expect("roll the doomed txn back");
+
+        let after = new_event(Uuid::new_v4(), 1, "after_rollback");
+        let after_id = after.id;
+        store
+            .store_event(after)
+            .await
+            .expect("store after rollback");
+
+        assert_eq!(
+            committed_sequence(&pool, &table, after_id).await,
+            anchor_seq + 4,
+            "the default path must keep burning K=3 on rollback (mode set \
+             explicitly: {explicit_mode})"
+        );
+        assert_eq!(
+            sequence_counter_val(&pool, &table).await,
+            None,
+            "the default path must never touch a counter row (mode set \
+             explicitly: {explicit_mode})"
+        );
+
+        drop_isolated_events_table(&pool, &table).await;
+    }
+}
+
+// T12 (spec 0030 R12): a multi-event transaction allocates +K exactly once and
+// the K events get a contiguous range, all of it returned by
+// `RETURNING global_sequence`.
+#[tokio::test]
+#[serial]
+async fn test_per_txn_counter_allocates_once_per_transaction() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let store = per_txn_counter_store(&pool, &table).await;
+    let before = sequence_counter_val(&pool, &table)
+        .await
+        .expect("counter row exists");
+
+    let stream_id = Uuid::new_v4();
+    let batch: Vec<_> = (1..=4u64)
+        .map(|v| new_event(stream_id, v, "batched"))
+        .collect();
+    let mut tx = pool.begin().await.expect("begin the batch txn");
+    let stored = store
+        .store_events_in_tx(&mut tx, batch)
+        .await
+        .expect("store the batch");
+    tx.commit().await.expect("commit the batch");
+
+    let seqs: Vec<u64> = stored
+        .iter()
+        .map(|e| e.global_sequence.expect("RETURNING must yield a sequence"))
+        .collect();
+    assert_eq!(seqs.len(), 4, "RETURNING yields all K values");
+    for pair in seqs.windows(2) {
+        assert_eq!(
+            pair[1],
+            pair[0] + 1,
+            "the K events must occupy a contiguous range: {seqs:?}"
+        );
+    }
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        Some(before + 4),
+        "the counter advanced by exactly K — one draw for the whole txn"
+    );
+    assert_eq!(
+        seqs[0] as i64,
+        before + 1,
+        "the block starts immediately above the pre-txn counter value"
+    );
+
+    cleanup_counter_table(&pool, &table).await;
+}
+
+// T14 (spec 0030 R11/R13): the end-to-end opt-in transition is collision-free —
+// after `Nextval` writers have advanced the sequence past any earlier seed, a
+// quiesced switch to `PerTxnCounter` assigns sequences above every previously
+// assigned value.
+#[tokio::test]
+#[serial]
+async fn test_opt_in_transition_assigns_above_every_previous_value() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let seq = format!("{table}_seq");
+
+    // Seed the counter early, then keep running Nextval past it — the case the
+    // construction-time re-seed exists for.
+    let _early = per_txn_counter_store(&pool, &table).await;
+
+    let nextval_store = PgEventStore::with_table(
+        pool.clone(),
+        PgEventBus::<TestEventData>::new(
+            pool.clone(),
+            format!("alloc_ch_{}", Uuid::new_v4().simple()),
+        ),
+        table.clone(),
+    )
+    .await;
+    let stream_id = Uuid::new_v4();
+    for v in 1..=3u64 {
+        nextval_store
+            .store_event(new_event(stream_id, v, "nextval"))
+            .await
+            .expect("store under Nextval");
+    }
+    for _ in 0..2 {
+        sqlx::query(&format!("SELECT nextval('{seq}')"))
+            .execute(&pool)
+            .await
+            .expect("burn a sequence value");
+    }
+    let sequence_high_water: i64 = sqlx::query_scalar(&format!("SELECT last_value FROM {seq}"))
+        .fetch_one(&pool)
+        .await
+        .expect("read the sequence high-water");
+
+    // Writers quiesced; construct under PerTxnCounter and commit.
+    let counter_store = per_txn_counter_store(&pool, &table).await;
+    let switched = new_event(Uuid::new_v4(), 1, "after_switch");
+    let switched_id = switched.id;
+    counter_store
+        .store_event(switched)
+        .await
+        .expect("store under PerTxnCounter");
+
+    assert_eq!(
+        committed_sequence(&pool, &table, switched_id).await,
+        sequence_high_water + 1,
+        "the first counter-assigned value exceeds every value the sequence \
+         ever assigned — no collision"
+    );
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        Some(sequence_high_water + 1),
+        "the post-switch value was drawn from the counter, not the sequence"
+    );
+
+    cleanup_counter_table(&pool, &table).await;
+}
+
+// T15 (spec 0030 R14): concurrent `PerTxnCounter` writers commit a gapless
+// contiguous block — the counter row serializes them, so no hole ever forms and
+// the gap/fence machinery never engages.
+#[tokio::test]
+#[serial]
+async fn test_per_txn_counter_concurrent_writers_are_contiguous() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let store = Arc::new(per_txn_counter_store(&pool, &table).await);
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let store = Arc::clone(&store);
+        handles.push(tokio::spawn(async move {
+            let stream_id = Uuid::new_v4();
+            for v in 1..=3u64 {
+                store
+                    .store_event(new_event(stream_id, v, "concurrent"))
+                    .await
+                    .expect("concurrent store");
+            }
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("writer task panicked");
+    }
+
+    let seqs: Vec<i64> = sqlx::query_scalar(&format!(
+        "SELECT global_sequence FROM {table} ORDER BY global_sequence"
+    ))
+    .fetch_all(&pool)
+    .await
+    .expect("read the committed sequences");
+
+    assert_eq!(seqs.len(), 24, "every concurrent write committed");
+    for pair in seqs.windows(2) {
+        assert_eq!(
+            pair[1],
+            pair[0] + 1,
+            "concurrent PerTxnCounter writers must leave no hole: {seqs:?}"
+        );
+    }
+    assert_eq!(
+        sequence_counter_val(&pool, &table).await,
+        seqs.last().copied(),
+        "every concurrent value was drawn from the counter row that serialized \
+         the writers"
+    );
+
+    cleanup_counter_table(&pool, &table).await;
+}
+
+// T7b-pin (spec 0030 R12 review finding): under `PerTxnCounter` a missing
+// counter row makes the insert FAIL — there is no silent fallback to the
+// column DEFAULT `nextval`, which would reintroduce exactly the collision
+// hazard the opt-in exists to remove. This pins the documented failure mode.
+#[tokio::test]
+#[serial]
+async fn test_per_txn_counter_missing_counter_row_fails_the_insert() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let store = per_txn_counter_store(&pool, &table).await;
+
+    // Remove the per-table counter row the constructor seeded.
+    sqlx::query("DELETE FROM epoch_events_sequence_counter WHERE name = $1")
+        .bind(&table)
+        .execute(&pool)
+        .await
+        .expect("delete the counter row");
+
+    let stream_id = Uuid::new_v4();
+    let event = new_event(stream_id, 1, "no_counter_row");
+    let result = store.store_event(event).await;
+
+    let err = result.expect_err("missing counter row must fail the insert");
+    assert!(
+        matches!(
+            err,
+            epoch_pg::PgEventStoreError::DBError(sqlx::error::Error::RowNotFound)
+        ),
+        "expected RowNotFound from the missing counter draw, got: {err:?}"
+    );
+
+    // Nothing was written: the events table has no row for this stream.
+    let written: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM {table} WHERE stream_id = $1"
+    ))
+    .bind(stream_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count the (absent) rows");
+    assert_eq!(written, 0, "a failed counter draw must not write the event");
+
+    cleanup_counter_table(&pool, &table).await;
+}
+
+// Discriminating pin for spec 0030 R12/R14 (review finding, round 1): the two
+// shipped allocator tests cannot tell per-txn allocation from per-row. The
+// single-txn test is single-threaded, and the concurrency test uses K=1
+// `store_event`, where a per-row draw is indistinguishable from a per-txn one.
+//
+// N concurrent transactions each commit K=3 events.
+//
+// NOTE on what actually discriminates. Contiguity does NOT: the first draw
+// takes the counter row's lock for the rest of the transaction, so concurrent
+// transactions serialize there and even a per-row draw yields adjacent blocks.
+// (Verified by injecting the regression — the contiguity assertions stayed
+// green.) The same lock makes the final counter value +N*K either way, so zero
+// burn does not discriminate either. The discriminator is assertion (e): a
+// row-level trigger counts UPDATEs against the counter row, which is exactly
+// one per transaction under per-txn allocation and K per transaction under a
+// per-row draw. (a)-(d) remain as R14 coverage — gapless, unique, zero burn,
+// and the returned blocks matching what landed.
+#[tokio::test]
+#[serial]
+async fn test_per_txn_counter_concurrent_multi_event_txns_get_contiguous_blocks() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    const TXNS: usize = 8;
+    const K: u64 = 3;
+
+    let table = isolated_events_table(&pool).await;
+    let store = Arc::new(per_txn_counter_store(&pool, &table).await);
+    let before = sequence_counter_val(&pool, &table)
+        .await
+        .expect("counter row exists");
+
+    // Count every UPDATE landing on the counter row. The audit insert runs
+    // inside the drawing transaction, so it commits (or aborts) with it.
+    let suffix = Uuid::new_v4().simple().to_string();
+    let audit = format!("eb_draw_audit_{suffix}");
+    let audit_fn = format!("eb_draw_audit_fn_{suffix}");
+    let audit_trg = format!("eb_draw_audit_trg_{suffix}");
+    for ddl in [
+        format!("CREATE TABLE {audit} (name TEXT)"),
+        format!(
+            "CREATE FUNCTION {audit_fn}() RETURNS trigger AS $$ BEGIN \
+             INSERT INTO {audit} (name) VALUES (NEW.name); RETURN NULL; END; $$ \
+             LANGUAGE plpgsql"
+        ),
+        format!(
+            "CREATE TRIGGER {audit_trg} AFTER UPDATE ON epoch_events_sequence_counter \
+             FOR EACH ROW EXECUTE FUNCTION {audit_fn}()"
+        ),
+    ] {
+        sqlx::query(&ddl)
+            .execute(&pool)
+            .await
+            .expect("install the counter-draw audit trigger");
+    }
+
+    let mut handles = Vec::new();
+    for _ in 0..TXNS {
+        let store = Arc::clone(&store);
+        let pool = pool.clone();
+        handles.push(tokio::spawn(async move {
+            let stream_id = Uuid::new_v4();
+            let batch: Vec<_> = (1..=K).map(|v| new_event(stream_id, v, "block")).collect();
+            let mut tx = pool.begin().await.expect("begin the block txn");
+            let stored = store
+                .store_events_in_tx(&mut tx, batch)
+                .await
+                .expect("store the block");
+            tx.commit().await.expect("commit the block");
+            stored
+                .iter()
+                .map(|e| e.global_sequence.expect("RETURNING must yield a sequence"))
+                .collect::<Vec<u64>>()
+        }));
+    }
+
+    let mut blocks: Vec<Vec<u64>> = Vec::new();
+    for handle in handles {
+        blocks.push(handle.await.expect("writer task panicked"));
+    }
+
+    // Read every fact the assertions need BEFORE tearing the audit objects off
+    // the shared counter table, so a failing assertion below can never leave a
+    // trigger installed for the rest of the suite.
+    let after = sequence_counter_val(&pool, &table)
+        .await
+        .expect("counter row exists after the run");
+    let committed: Vec<i64> = sqlx::query_scalar(&format!(
+        "SELECT global_sequence FROM {table} ORDER BY global_sequence"
+    ))
+    .fetch_all(&pool)
+    .await
+    .expect("read the committed sequences");
+    let draws: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {audit} WHERE name = $1"))
+        .bind(&table)
+        .fetch_one(&pool)
+        .await
+        .expect("count the counter-row draws");
+
+    for ddl in [
+        format!("DROP TRIGGER {audit_trg} ON epoch_events_sequence_counter"),
+        format!("DROP FUNCTION {audit_fn}()"),
+        format!("DROP TABLE {audit}"),
+    ] {
+        sqlx::query(&ddl)
+            .execute(&pool)
+            .await
+            .expect("remove the counter-draw audit trigger");
+    }
+
+    // (a) each transaction's K events are adjacent — the per-txn discriminator.
+    for block in &blocks {
+        assert_eq!(block.len(), K as usize, "RETURNING yields all K values");
+        let first = block[0];
+        let expected: Vec<u64> = (0..K).map(|i| first + i).collect();
+        assert_eq!(
+            block, &expected,
+            "a transaction's K events must occupy ONE contiguous block starting \
+             at its returned first sequence (a per-row draw would interleave \
+             them across concurrent txns); blocks: {blocks:?}"
+        );
+    }
+
+    // (b) the union is exactly the contiguous range — no gaps, no duplicates.
+    let mut all: Vec<u64> = blocks.iter().flatten().copied().collect();
+    all.sort_unstable();
+    assert_eq!(
+        all.len(),
+        TXNS * K as usize,
+        "every event of every transaction committed: {all:?}"
+    );
+    let lowest = all[0];
+    let contiguous: Vec<u64> = (0..all.len() as u64).map(|i| lowest + i).collect();
+    assert_eq!(
+        all, contiguous,
+        "the union across transactions must be one gapless, duplicate-free \
+         range: {all:?}"
+    );
+
+    // (c) zero burn: the counter advanced by exactly N*K.
+    assert_eq!(
+        Some(after),
+        Some(before + (TXNS as i64) * (K as i64)),
+        "the counter advanced by exactly N*K — one draw of +K per transaction, \
+         nothing burned"
+    );
+    assert_eq!(
+        lowest as i64,
+        before + 1,
+        "the first block starts immediately above the pre-run counter value"
+    );
+
+    // (d) what the table holds matches the returned blocks.
+    assert_eq!(
+        committed,
+        all.iter().map(|s| *s as i64).collect::<Vec<i64>>(),
+        "the events table must hold exactly the sequences the allocator returned"
+    );
+
+    // (e) THE DISCRIMINATOR: one counter UPDATE per transaction, not per row.
+    assert_eq!(
+        draws, TXNS as i64,
+        "the counter row must be UPDATEd exactly ONCE per transaction (+K in one \
+         step). {} draws for {TXNS} transactions of K={K} means the allocator \
+         drew per row, not per transaction",
+        draws
+    );
+
+    cleanup_counter_table(&pool, &table).await;
+}
+
+/// Reads `(last_value, is_called)` of the sequence owning `table.global_sequence`.
+async fn owned_sequence_state(pool: &PgPool, table: &str) -> (i64, bool) {
+    let sequence: String =
+        sqlx::query_scalar("SELECT pg_get_serial_sequence($1, 'global_sequence')")
+            .bind(table)
+            .fetch_one(pool)
+            .await
+            .expect("the isolated table's global_sequence is sequence-owned");
+    sqlx::query_as(&format!("SELECT last_value, is_called FROM {sequence}"))
+        .fetch_one(pool)
+        .await
+        .expect("read the owned sequence state")
+}
+
+// F3 mirror pin (spec 0030 R12, review finding): the counter is the ONLY
+// allocator under `PerTxnCounter`. The column DEFAULT `nextval(...)` is still
+// on the table, so a regression that omitted `global_sequence` from the INSERT
+// would silently fall back to it and keep passing the contiguity tests. This
+// pins the negative directly: the owned sequence is never advanced.
+#[tokio::test]
+#[serial]
+async fn test_per_txn_counter_never_touches_the_column_default_sequence() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let store = per_txn_counter_store(&pool, &table).await;
+    let before = owned_sequence_state(&pool, &table).await;
+
+    let stream_id = Uuid::new_v4();
+    let batch: Vec<_> = (1..=3u64)
+        .map(|v| new_event(stream_id, v, "no_nextval"))
+        .collect();
+    let mut tx = pool.begin().await.expect("begin the batch txn");
+    store
+        .store_events_in_tx(&mut tx, batch)
+        .await
+        .expect("store the batch");
+    tx.commit().await.expect("commit the batch");
+
+    assert_eq!(
+        owned_sequence_state(&pool, &table).await,
+        before,
+        "under PerTxnCounter the events table's own sequence must be untouched \
+         (last_value/is_called unchanged) — any movement means the insert fell \
+         through to the column DEFAULT nextval"
+    );
+
+    cleanup_counter_table(&pool, &table).await;
+}
+
+// F5 fail-construction pin (spec 0030 R11, review finding): a re-seed failure
+// must FAIL construction rather than warn-and-continue, because a store serving
+// writes on an unseeded counter can hand out colliding values. Dropping the
+// counter table is the bluntest re-seed failure available. The test restores
+// the table by re-running the migrator, so the suite stays green.
+#[tokio::test]
+#[serial]
+async fn test_reseed_failure_fails_construction() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+
+    sqlx::query("DROP TABLE epoch_events_sequence_counter")
+        .execute(&pool)
+        .await
+        .expect("drop the counter table");
+
+    // catch_unwind closes the drop→restore window: even a library PANIC (not
+    // just an Err) cannot skip the restore below and poison every later
+    // PerTxnCounter test in this binary.
+    let result = std::panic::AssertUnwindSafe(async {
+        PgEventStore::with_allocation_mode(
+            pool.clone(),
+            PgEventBus::<TestEventData>::new(
+                pool.clone(),
+                format!("alloc_ch_{}", Uuid::new_v4().simple()),
+            ),
+            table.clone(),
+            epoch_pg::AllocationMode::PerTxnCounter,
+        )
+        .await
+        .map(|_| ())
+    })
+    .catch_unwind()
+    .await;
+
+    // Restore before asserting, so a failed assertion cannot leave the schema
+    // broken for the rest of the suite. The migrator is ledger-driven, so m014
+    // must be un-recorded before the re-run will re-apply it.
+    sqlx::query("DELETE FROM _epoch_migrations WHERE version = 14")
+        .execute(&pool)
+        .await
+        .expect("un-record m014 so the migrator re-applies it");
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("restore the counter table via the migrator");
+
+    assert!(
+        matches!(&result, Ok(Err(_))),
+        "a failed re-seed must fail construction with an Err — warn-and-continue \
+         would serve writes on an unseeded counter, and a panic here would be a \
+         library bug: {result:?}"
+    );
+    assert!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM epoch_events_sequence_counter")
+            .fetch_one(&pool)
+            .await
+            .is_ok(),
+        "the counter table is restored for the rest of the suite"
+    );
+
+    cleanup_counter_table(&pool, &table).await;
+}
+
+/// A `GapTimeoutCallback` that records the invocation and then PANICS. Under
+/// `GapPolicy::SkipAfterBackstop` the callback is awaited inline on the
+/// listener's per-subscriber task, so without containment this panic unwinds
+/// the whole listener for every subscriber.
+struct PanickingGapCallback {
+    fired: Arc<StdMutex<Vec<epoch_pg::event_bus::GapTimeoutInfo>>>,
+}
+
+#[async_trait]
+impl epoch_pg::event_bus::GapTimeoutCallback for PanickingGapCallback {
+    async fn on_gap_timeout(&self, info: epoch_pg::event_bus::GapTimeoutInfo) {
+        self.fired.lock().unwrap().push(info);
+        panic!("deliberate on_gap_timeout panic (containment pin)");
+    }
+}
+
+// Panic-containment pin (spec 0030 R4, review finding round 1): on the
+// `SkipAfterBackstop` arm `on_gap_timeout` is awaited INLINE on the listener
+// task, so a panicking user callback must be caught. The decision rule follows
+// record-then-advance: the ledger row is confirmed BEFORE the callback is
+// consulted, so a caught panic still TAKES the skip — the audit row detection
+// depends on is already durable.
+//
+// Asserts: (a) the listener survives (events committed after the panic are
+// still delivered), (b) the skip was taken, (c) the position state is
+// consistent — HWM past the hole, exactly one audit row, no GapUnproven halt.
+#[tokio::test]
+#[serial]
+async fn test_skip_after_backstop_panicking_gap_callback_is_contained_and_skip_is_taken() {
+    use epoch_pg::event_bus::GapTimeoutInfo;
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let fired = Arc::new(StdMutex::new(Vec::<GapTimeoutInfo>::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        on_gap_timeout: Some(Arc::new(PanickingGapCallback {
+            fired: fired.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let sub_id = format!("projection:skip-panic:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone())
+        .fail_closed()
+        .skip_after_backstop();
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe SkipAfterBackstop observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let (_, seq_below) = insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up"),
+        "subscriber must reach the below-hole event before the hole is opened"
+    );
+
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(seq_hole > seq_below);
+    let (_, seq_above1) = insert_committed_event(&pool, &table, hole_stream, 2, "above1").await;
+    let (_, seq_above2) = insert_committed_event(&pool, &table, hole_stream, 3, "above2").await;
+    assert!(seq_above1 > seq_hole && seq_above2 > seq_above1);
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    // Wait out gap_timeout: the backstop fires, the ledger row is written, the
+    // callback panics.
+    tokio::time::sleep(GapDuration::from_millis(1500)).await;
+
+    // (b) the skip was taken despite the panic.
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(10))
+            .await
+            .expect("wait_until_caught_up after the panicking callback"),
+        "a panicking on_gap_timeout must NOT withhold the skip — the ledger row \
+         was already durable when the callback was consulted"
+    );
+    {
+        let fired_guard = fired.lock().unwrap();
+        assert_eq!(
+            fired_guard.len(),
+            1,
+            "the panicking callback must have been invoked exactly once; got \
+             {fired_guard:?}"
+        );
+    }
+
+    // (a) the listener survived: an event committed AFTER the panic is still
+    // delivered. A dead listener task never delivers it.
+    let post_stream = Uuid::new_v4();
+    let (post_id, seq_post) =
+        insert_committed_event(&pool, &table, post_stream, 1, "after_panic").await;
+    assert!(seq_post > seq_above2);
+    let mut delivered = false;
+    for _ in 0..60 {
+        if applied_ids(&store, post_stream).await.contains(&post_id) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    assert!(
+        delivered,
+        "the listener task must survive the panicking callback and keep \
+         delivering (seq {seq_post} never arrived)"
+    );
+
+    // (c) consistent position state: HWM at the head, one audit row, no halt.
+    assert_eq!(
+        event_bus
+            .subscriber_lag(&sub_id)
+            .await
+            .expect("subscriber_lag"),
+        0,
+        "the HWM must sit at the head — no wedge below the skipped hole"
+    );
+    let rows = event_bus
+        .list_gap_timeouts(Some(&sub_id), false, 0, 50)
+        .await
+        .expect("list_gap_timeouts");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one audit row for the skipped sequence; got {rows:?}"
+    );
+    assert_eq!(rows[0].skipped_sequence, seq_hole as u64);
+    assert!(
+        halts.lock().unwrap().is_empty(),
+        "the contained panic must not turn the audited skip into a GapUnproven halt"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
 }

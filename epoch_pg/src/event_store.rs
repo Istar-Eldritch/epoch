@@ -11,6 +11,225 @@ use std::sync::Arc;
 use std::{pin::Pin, task::Poll};
 use uuid::Uuid;
 
+/// Raises the `epoch_events_sequence_counter` row for `events_table` to the
+/// table's current high-water mark, creating it if absent.
+///
+/// The floor combines the sequence's last-*assigned* value (`is_called = false`
+/// means a virgin sequence has assigned nothing) with the largest committed
+/// `global_sequence`, so the first counter-drawn value cannot collide with a
+/// value `nextval` already handed out.
+///
+/// The read and the insert are separate statements on the pool; the
+/// [`AllocationMode::PerTxnCounter`] opt-in contract (spec 0030 §3.6 / OQ-4)
+/// makes a quiesced writer set the operator's obligation, and the
+/// `GREATEST`-on-conflict keeps the row monotone even if a straggler
+/// `nextval` writer interleaves — a higher value drawn after the read still
+/// wins on conflict, so this never regresses.
+///
+/// The floor is **degraded** for a custom events table whose `global_sequence`
+/// is not owned by a sequence (`pg_get_serial_sequence` returns `NULL`): the
+/// sequence term drops out and only `MAX(global_sequence)` is used. That is
+/// safe for a table with no `nextval` DEFAULT, but it is logged as a WARN
+/// because a table that draws from an unowned sequence could still collide.
+async fn reseed_sequence_counter(postgres: &PgPool, events_table: &str) -> Result<(), sqlx::Error> {
+    let sequence: Option<String> =
+        sqlx::query_scalar("SELECT pg_get_serial_sequence($1, 'global_sequence')")
+            .bind(events_table)
+            .fetch_one(postgres)
+            .await?;
+
+    let sequence_last_assigned = match sequence {
+        // pg_get_serial_sequence returns an already-quoted, schema-qualified name.
+        Some(sequence) => {
+            let (last_value, is_called): (i64, bool) =
+                sqlx::query_as(&format!("SELECT last_value, is_called FROM {sequence}"))
+                    .fetch_one(postgres)
+                    .await?;
+            if is_called {
+                last_value
+            } else {
+                last_value - 1
+            }
+        }
+        None => {
+            log::warn!(
+                "No owned sequence for '{events_table}'.global_sequence \
+                 (pg_get_serial_sequence returned NULL): seeding the PerTxnCounter floor from \
+                 MAX(global_sequence) alone. If that column draws from an unowned sequence, \
+                 counter-drawn values may collide with values it already handed out."
+            );
+            0
+        }
+    };
+
+    let max_global_sequence: Option<i64> =
+        sqlx::query_scalar(&format!("SELECT MAX(global_sequence) FROM {events_table}"))
+            .fetch_one(postgres)
+            .await?;
+
+    let floor = sequence_last_assigned.max(max_global_sequence.unwrap_or(0));
+
+    sqlx::query(
+        "INSERT INTO epoch_events_sequence_counter (name, val) VALUES ($1, $2) \
+         ON CONFLICT (name) DO UPDATE \
+         SET val = GREATEST(epoch_events_sequence_counter.val, EXCLUDED.val)",
+    )
+    .bind(events_table)
+    .bind(floor)
+    .execute(postgres)
+    .await?;
+
+    Ok(())
+}
+
+/// Ensures the optional per-table columns a custom events table needs.
+///
+/// Both are best-effort: a failure is logged and construction continues with
+/// the documented degradation, which is why this returns nothing.
+async fn ensure_custom_table_columns(postgres: &PgPool, events_table: &str) {
+    if let Err(e) = crate::event_bus::ensure_txid_column(postgres, events_table).await {
+        log::warn!(
+            "Failed to ensure txid column on custom events table '{events_table}'; \
+             snapshot fencing degrades to timeout-only for this table: {e}"
+        );
+    }
+    if let Err(e) = crate::event_bus::ensure_schema_version_column(postgres, events_table).await {
+        log::warn!(
+            "Failed to ensure schema_version column on custom events table '{events_table}'; \
+             schema version will be read as NULL (treated as v1) for this table: {e}"
+        );
+    }
+}
+
+/// Draws `k` `global_sequence` values for `events_table` from the counter row,
+/// inside the caller's transaction, returning the **first** value of the block
+/// (the block is `first ..= first + k - 1`).
+///
+/// The draw is an ordinary row UPDATE, so it takes the counter row's lock for
+/// the remainder of the transaction: concurrent writers serialize here, and a
+/// rollback or crash rewinds the draw (zero burn).
+///
+/// # Failure
+///
+/// If the counter row for `events_table` is absent (the table was dropped, or
+/// migration m014 never ran) the UPDATE matches no row and this returns
+/// [`sqlx::Error::RowNotFound`], failing the insert. There is deliberately no
+/// fallback to `nextval`: a silent fallback would hand out values the counter
+/// has already promised.
+async fn draw_sequence_block(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    events_table: &str,
+    k: i64,
+) -> Result<i64, sqlx::Error> {
+    let last: i64 = sqlx::query_scalar(
+        "UPDATE epoch_events_sequence_counter SET val = val + $2 WHERE name = $1 RETURNING val",
+    )
+    .bind(events_table)
+    .bind(k)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(last - k + 1)
+}
+
+/// How `global_sequence` values are allocated on the insert path.
+///
+/// Selected once at [`PgEventStore`] construction: this is a store-wide
+/// choice, not a per-writer or per-subscriber one. The default
+/// ([`AllocationMode::Nextval`]) is today's path, unchanged; the mere existence
+/// of this enum costs a default-mode writer nothing.
+///
+/// # The counter row is keyed by events-table name
+///
+/// Under [`AllocationMode::PerTxnCounter`] the allocator draws from a row of
+/// `epoch_events_sequence_counter` (migration m014) keyed by the store's events
+/// table, because that table is configurable (see
+/// [`with_table`](PgEventStore::with_table)). Two stores on two tables have two
+/// independent counters, exactly as they have two independent sequences.
+///
+/// # Opting in is a one-way, deployment-lifetime choice
+///
+/// `nextval` is non-transactional, so a `Nextval` writer running concurrently
+/// with a `PerTxnCounter` writer can hand out a value the counter has already
+/// promised. The transition therefore requires, in order:
+///
+/// 1. **Quiesce the writers.** No `Nextval` writer may be running.
+/// 2. **Construct under `PerTxnCounter`** via
+///    [`with_allocation_mode`](PgEventStore::with_allocation_mode), which
+///    re-seeds the counter row above the current high-water mark and fails
+///    construction if it cannot.
+///
+/// Switching back is not a built path. It remains a documented operator
+/// procedure: quiesce writers, `setval` the events table's sequence past the
+/// counter row's `val`, then restart under `Nextval`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum AllocationMode {
+    /// The column `DEFAULT nextval(...)` assigns `global_sequence` — byte-for-byte
+    /// today's path, and the default.
+    ///
+    /// The INSERT omits the `global_sequence` column entirely, the DEFAULT
+    /// fires, and `RETURNING global_sequence` reads the assigned value back. No
+    /// counter row is read, written, or required.
+    ///
+    /// `nextval` is deliberately non-transactional, which is what makes it
+    /// cheap: it never blocks a concurrent writer. The cost is that a
+    /// rolled-back or crashed transaction **permanently burns** the values it
+    /// drew, leaving a hole in `global_sequence` that no row will ever fill.
+    #[default]
+    Nextval,
+    /// Each insert transaction draws its `global_sequence` values from the
+    /// per-events-table counter row **inside that same transaction** — zero burn.
+    ///
+    /// Because the draw is an ordinary row UPDATE, both zero-burn legs are just
+    /// MVCC: a rollback rewinds the counter's uncommitted new version and a
+    /// crash aborts that version's xid, so the pre-draw value is what any other
+    /// writer sees. Neither burns a value, so the committed sequence is
+    /// contiguous.
+    ///
+    /// # Write-tax trade-off
+    ///
+    /// The counter row serializes every writer on the events table. Measured at
+    /// **3.5–4.4× slower than `nextval` for single-event transactions** (K=1);
+    /// the cost is per transaction, not per event, so a multi-event aggregate
+    /// transaction amortizes it across its K events. This is why `Nextval`
+    /// remains the default: pay this tax only if contiguous sequences are worth
+    /// more to you than write throughput.
+    ///
+    /// Read those figures as a floor, not a budget. They were measured on bare
+    /// inserts, and the draw happens at the *top* of `store_events_in_tx`, so
+    /// the counter row's lock is held for the remainder of the caller's
+    /// transaction — including any aggregate state-upsert and the commit
+    /// round-trip that follow. A fat aggregate transaction therefore serializes
+    /// other writers for longer than the bare number implies; keep the work
+    /// after the insert short. The single-event `store_event`
+    /// additionally pays an explicit `BEGIN`/`COMMIT` round-trip under this
+    /// mode that the `Nextval` path does not need.
+    ///
+    /// # Fence-safe by construction
+    ///
+    /// That same serialization is what keeps the gap/fence machinery valid with
+    /// no change (spec 0030 §3.6, §5.2): the counter lock makes sequence order
+    /// equal commit order, so a committed event can never appear above a hole,
+    /// and a missing sequence's writer (if any) necessarily holds an xid inside
+    /// the transaction that drew the value — precisely the premise the snapshot
+    /// fence already assumes under `nextval`. No gap or fence machinery changes
+    /// for this mode.
+    ///
+    /// This is the decisive contrast with the rejected cached-block allocator
+    /// (§5.2): a block cached outside the insert transaction breaks both halves
+    /// — sequence order stops tracking commit order, and a missing sequence's
+    /// writer need hold no xid at detection — which would have forced a fence
+    /// rework. Exact per-transaction allocation buys fence validity for free.
+    ///
+    /// # Opting in
+    ///
+    /// Requires migration m014 and the fallible constructor
+    /// [`with_allocation_mode`](PgEventStore::with_allocation_mode) with writers
+    /// quiesced; see the type-level docs for the full one-way transition
+    /// contract.
+    PerTxnCounter,
+}
+
 /// A postgres based event store.
 ///
 #[derive(Clone)]
@@ -19,6 +238,7 @@ pub struct PgEventStore<B: EventBus + Clone> {
     bus: B,
     events_table: String,
     upcasters: Arc<UpcasterRegistry>,
+    allocation_mode: AllocationMode,
 }
 
 impl<B: EventBus + Clone> std::fmt::Debug for PgEventStore<B> {
@@ -38,6 +258,7 @@ impl<B: EventBus + Clone> PgEventStore<B> {
             bus,
             events_table: "epoch_events".to_string(),
             upcasters: Arc::new(UpcasterRegistry::new()),
+            allocation_mode: AllocationMode::default(),
         }
     }
 
@@ -58,6 +279,7 @@ impl<B: EventBus + Clone> PgEventStore<B> {
             bus,
             events_table: "epoch_events".to_string(),
             upcasters,
+            allocation_mode: AllocationMode::default(),
         }
     }
 
@@ -73,31 +295,83 @@ impl<B: EventBus + Clone> PgEventStore<B> {
     pub async fn with_table(postgres: PgPool, bus: B, events_table: impl Into<String>) -> Self {
         let events_table = events_table.into();
         log::debug!("Creating a new PgEventStore targeting table '{events_table}'");
-        if let Err(e) = crate::event_bus::ensure_txid_column(&postgres, &events_table).await {
-            log::warn!(
-                "Failed to ensure txid column on custom events table '{events_table}'; \
-                 snapshot fencing degrades to timeout-only for this table: {e}"
-            );
-        }
-        if let Err(e) =
-            crate::event_bus::ensure_schema_version_column(&postgres, &events_table).await
-        {
-            log::warn!(
-                "Failed to ensure schema_version column on custom events table '{events_table}'; \
-                 schema version will be read as NULL (treated as v1) for this table: {e}"
-            );
-        }
+        ensure_custom_table_columns(&postgres, &events_table).await;
         Self {
             postgres,
             bus,
             events_table,
             upcasters: Arc::new(UpcasterRegistry::new()),
+            allocation_mode: AllocationMode::default(),
         }
+    }
+
+    /// Creates a new `PgEventStore` with an explicit [`AllocationMode`].
+    ///
+    /// Unlike [`with_table`](Self::with_table) this constructor is fallible:
+    /// under [`AllocationMode::PerTxnCounter`] it re-seeds the per-table counter
+    /// row to `GREATEST(existing counter, sequence last-assigned, MAX(global_sequence))`,
+    /// creating the row if absent, and a failure to do so fails construction —
+    /// a silently-failed re-seed would let the allocator hand out values that
+    /// collide with existing rows.
+    ///
+    /// The re-seed is idempotent and runs on every construction. Transitioning a
+    /// live deployment from `Nextval` to `PerTxnCounter` additionally requires
+    /// quiescing writers, since `nextval` is non-transactional and would keep
+    /// advancing past the seed.
+    ///
+    /// Requires migration m014 (`epoch_events_sequence_counter`).
+    pub async fn with_allocation_mode(
+        postgres: PgPool,
+        bus: B,
+        events_table: impl Into<String>,
+        allocation_mode: AllocationMode,
+    ) -> Result<Self, PgEventStoreError<B::Error>> {
+        Self::with_allocation_mode_and_upcasters(
+            postgres,
+            bus,
+            events_table,
+            allocation_mode,
+            Arc::new(UpcasterRegistry::new()),
+        )
+        .await
+    }
+
+    /// Like [`with_allocation_mode`](Self::with_allocation_mode), but also
+    /// installs an [`UpcasterRegistry`] — the two options are independent, so a
+    /// `PerTxnCounter` store can still upcast on read (see
+    /// [`with_upcasters`](Self::with_upcasters) for the registry's role).
+    pub async fn with_allocation_mode_and_upcasters(
+        postgres: PgPool,
+        bus: B,
+        events_table: impl Into<String>,
+        allocation_mode: AllocationMode,
+        upcasters: Arc<UpcasterRegistry>,
+    ) -> Result<Self, PgEventStoreError<B::Error>> {
+        let events_table = events_table.into();
+        log::debug!(
+            "Creating a new PgEventStore targeting table '{events_table}' with {allocation_mode:?} allocation"
+        );
+        ensure_custom_table_columns(&postgres, &events_table).await;
+        if allocation_mode == AllocationMode::PerTxnCounter {
+            reseed_sequence_counter(&postgres, &events_table).await?;
+        }
+        Ok(Self {
+            postgres,
+            bus,
+            events_table,
+            upcasters,
+            allocation_mode,
+        })
     }
 
     /// Returns the name of the events table this store writes to.
     pub fn events_table(&self) -> &str {
         &self.events_table
+    }
+
+    /// Returns the `global_sequence` allocation mode this store writes under.
+    pub fn allocation_mode(&self) -> AllocationMode {
+        self.allocation_mode
     }
 
     /// Exposes the event store bus
@@ -119,6 +393,19 @@ impl<B: EventBus + Clone> PgEventStore<B> {
     /// after committing the transaction using [`publish_events`](Self::publish_events).
     ///
     /// Returns events with `global_sequence` populated.
+    ///
+    /// # Allocation
+    ///
+    /// Under the default [`AllocationMode::Nextval`] the INSERT omits
+    /// `global_sequence`, the column DEFAULT `nextval(...)` assigns it, and a
+    /// rollback or crash permanently burns the values drawn.
+    ///
+    /// Under [`AllocationMode::PerTxnCounter`] the whole batch draws `+K` once
+    /// from this table's counter row inside `tx` (serializing writers on that
+    /// row) and the values are supplied explicitly, so a rollback or crash
+    /// burns nothing. If the counter row is missing the insert fails with
+    /// [`sqlx::Error::RowNotFound`] — there is no fallback to `nextval`.
+    /// Either way `RETURNING global_sequence` remains the read-back contract.
     ///
     /// # Example
     ///
@@ -142,16 +429,35 @@ impl<B: EventBus + Clone> PgEventStore<B> {
     {
         let mut stored_events = Vec::with_capacity(events.len());
 
-        let insert_sql = format!(
-            "INSERT INTO {} (id, stream_id, stream_version, event_type, data, \
-             created_at, actor_id, purger_id, purged_at, causation_id, correlation_id, \
-             schema_version) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-             RETURNING global_sequence",
-            self.events_table,
-        );
+        // PerTxnCounter draws the whole block once, inside the caller's txn.
+        let mut next_sequence = match self.allocation_mode {
+            AllocationMode::Nextval => None,
+            AllocationMode::PerTxnCounter if events.is_empty() => None,
+            AllocationMode::PerTxnCounter => {
+                Some(draw_sequence_block(tx, &self.events_table, events.len() as i64).await?)
+            }
+        };
+
+        let insert_sql = match self.allocation_mode {
+            AllocationMode::Nextval => format!(
+                "INSERT INTO {} (id, stream_id, stream_version, event_type, data, \
+                 created_at, actor_id, purger_id, purged_at, causation_id, correlation_id, \
+                 schema_version) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                 RETURNING global_sequence",
+                self.events_table,
+            ),
+            AllocationMode::PerTxnCounter => format!(
+                "INSERT INTO {} (id, stream_id, stream_version, event_type, data, \
+                 created_at, actor_id, purger_id, purged_at, causation_id, correlation_id, \
+                 schema_version, global_sequence) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                 RETURNING global_sequence",
+                self.events_table,
+            ),
+        };
         for event in events {
-            let row: (i64,) = sqlx::query_as(&insert_sql)
+            let mut query = sqlx::query_as(&insert_sql)
                 .bind(event.id)
                 .bind(event.stream_id)
                 .bind(TryInto::<i64>::try_into(event.stream_version).map_err(|e| {
@@ -170,9 +476,12 @@ impl<B: EventBus + Clone> PgEventStore<B> {
                 .bind(event.purged_at)
                 .bind(event.causation_id)
                 .bind(event.correlation_id)
-                .bind(event.schema_version as i32)
-                .fetch_one(&mut **tx)
-                .await?;
+                .bind(event.schema_version as i32);
+            if let Some(sequence) = next_sequence {
+                query = query.bind(sequence);
+                next_sequence = Some(sequence + 1);
+            }
+            let row: (i64,) = query.fetch_one(&mut **tx).await?;
 
             stored_events.push(Event {
                 id: event.id,
@@ -451,7 +760,28 @@ where
         Ok(event_stream)
     }
 
+    /// Stores a single event and publishes it.
+    ///
+    /// # Allocation
+    ///
+    /// Under the default [`AllocationMode::Nextval`] the INSERT omits
+    /// `global_sequence` and runs directly on the pool: the column DEFAULT
+    /// assigns the value and a failed insert burns it.
+    ///
+    /// Under [`AllocationMode::PerTxnCounter`] the insert runs in its own
+    /// transaction that first draws `+1` from this table's counter row and then
+    /// supplies the value explicitly, so a rollback or crash burns nothing;
+    /// writers serialize on the counter row. A missing counter row fails the
+    /// insert with [`sqlx::Error::RowNotFound`] — never a fallback to `nextval`.
+    /// `RETURNING global_sequence` remains the read-back contract in both modes.
     async fn store_event(&self, event: Event<Self::EventType>) -> Result<(), Self::Error> {
+        if self.allocation_mode == AllocationMode::PerTxnCounter {
+            let mut tx = self.postgres.begin().await?;
+            let stored = self.store_events_in_tx(&mut tx, vec![event]).await?;
+            tx.commit().await?;
+            return self.publish_events(stored).await;
+        }
+
         // Insert the event and get back the assigned global_sequence
         let store_sql = format!(
             "INSERT INTO {} (id, stream_id, stream_version, event_type, data, \

@@ -325,6 +325,62 @@ pub enum SubscriptionMode {
     ReplayAlways,
 }
 
+/// How a subscriber reacts to a gap in the global event sequence.
+///
+/// Global sequence numbers can have holes: a value that was allocated but never
+/// committed (e.g. a PostgreSQL sequence value burned by a rolled-back insert),
+/// leaving events `n-1` and `n+1` in the log with no event `n`. This policy
+/// controls what the bus does when such a gap remains unproven — i.e. the
+/// snapshot fence cannot confirm that no writer is still in flight for the
+/// missing sequence — after the timeout backstop would fire.
+///
+/// # Default
+///
+/// The default is [`GapPolicy::Halt`]: fail-closed subscribers hold below the
+/// gap exactly as they do today. Opting into [`GapPolicy::SkipAfterBackstop`]
+/// is a deliberate trade-off with a narrow safety contract; see that variant's
+/// documentation before enabling it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum GapPolicy {
+    /// Default. A fail-closed subscriber holds below an unproven gap (today's
+    /// fail-closed gap wedge). No behaviour change.
+    #[default]
+    Halt,
+    /// Opt-in for fold-style [`SubscriptionMode::ReplayAlways`] projections
+    /// whose state is a pure function of currently-present rows. After the
+    /// backstop would fire and the fence is still unproven, the skip is
+    /// recorded, then the subscriber's high-water mark advances past the hole;
+    /// if a row later materializes at a skipped sequence, late-materialization
+    /// detection finds it and triggers a rebuild.
+    ///
+    /// # In-flight-writer safety contract
+    ///
+    /// The skip decision is made at backstop time, while the snapshot fence is
+    /// still pinned — exactly when an in-flight writer may still commit the
+    /// skipped sequence. The skip is therefore safe **only** for fold-style
+    /// `ReplayAlways` projections whose state is a pure function of
+    /// currently-present rows: for those, a transiently-missing row means a
+    /// transiently-incomplete fold, detected by late-materialization detection
+    /// and healed by a rebuild (a fresh subscribe replaying from sequence 0).
+    /// It is not a general-purpose "skip gaps" switch: for any subscriber whose
+    /// position is persisted, or whose state is not a pure fold over
+    /// currently-present rows, skipping an unproven gap risks permanently
+    /// missing an event that later commits.
+    ///
+    /// # Readiness reports caught-up across a skipped hole
+    ///
+    /// Because the position advances past the hole, backend readiness checks
+    /// (lag / wait-until-caught-up) will report this subscriber caught-up
+    /// across a sequence that may still commit. For this class that is the
+    /// honest report: nothing is held below the hole and no checkpoint is
+    /// persisted, and the residual divergence is what late-materialization
+    /// detection and the rebuild it triggers exist to heal. Subscribers that
+    /// need readiness to mean "no sequence unaccounted for" must stay on
+    /// [`GapPolicy::Halt`].
+    SkipAfterBackstop,
+}
+
 /// Traits to define observers to the event bus.
 ///
 /// Observers receive events wrapped in `Arc` for efficient sharing. Observers can:
@@ -377,6 +433,18 @@ where
     /// subscribers that must never silently diverge from the event log.
     fn failure_mode(&self) -> FailureMode {
         FailureMode::FailOpen
+    }
+
+    /// How the bus reacts to an unproven gap in the global sequence for this
+    /// subscriber.
+    ///
+    /// Defaults to [`GapPolicy::Halt`]: a fail-closed subscriber holds below
+    /// the gap. Override and return [`GapPolicy::SkipAfterBackstop`] only for
+    /// fold-style [`SubscriptionMode::ReplayAlways`] subscribers whose state is
+    /// a pure function of currently-present rows; see that variant's
+    /// documentation for the in-flight-writer safety contract.
+    fn gap_policy(&self) -> GapPolicy {
+        GapPolicy::Halt
     }
 }
 
