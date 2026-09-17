@@ -297,6 +297,133 @@ pub trait RebuildNeededCallback: Send + Sync {
     async fn on_rebuild_needed(&self, info: RebuildNeededInfo);
 }
 
+/// Context handed to [`WedgeRetiredCallback::on_wedge_retired`] after epoch
+/// retires a wedged subscriber (spec 0031 R12-R15).
+///
+/// Carries everything needed to mint the next generation's id under the
+/// `{base}#gen{N}` convention: the fresh id is
+/// `format!("{}#gen{}", info.base_subscriber_id, info.generation)`.
+#[derive(Debug, Clone)]
+pub struct WedgeRetiredInfo {
+    /// The subscriber family's root id: the original, unsuffixed id passed to
+    /// `subscribe()` at boot. Stable across every generation of the family.
+    pub base_subscriber_id: String,
+    /// The id that was just retired: either `base_subscriber_id` itself (a
+    /// boot-generation wedge, the family's first heal) or a previous
+    /// `{base}#gen{N}` id (a heal-generation re-halt).
+    pub retired_subscriber_id: String,
+    /// The generation number just allocated for the fresh id the callback
+    /// should `subscribe()`. Generation 1 is the unsuffixed boot id;
+    /// generation 2 is the first healed id (`{base_subscriber_id}#gen2`), and
+    /// so on.
+    pub generation: u32,
+    /// The sequence `retired_subscriber_id` was held below when it wedged.
+    pub held_below_sequence: u64,
+}
+
+/// Callback invoked when epoch retires a wedged subscriber under the P5
+/// wedge-heal policy (spec 0031 R12-R15), signalling that the application may
+/// register a fresh model under the next generation's id.
+///
+/// # What the consumer MUST do
+///
+/// Construct a fresh observer for
+/// `format!("{}#gen{}", info.base_subscriber_id, info.generation)` and
+/// `subscribe()` it on this bus. Epoch provides the *trigger*, not the
+/// rebuild: it cannot construct a consumer's type-erased observer for it —
+/// the same limitation documented on [`RebuildNeededCallback`].
+///
+/// # Who receives it
+///
+/// Fires from the bus's single heal-actor task — never inline on the batch
+/// loop that observed the wedge — when a
+/// [`ReplayAlways`](epoch_core::SubscriptionMode::ReplayAlways) +
+/// [`FailClosed`](epoch_core::FailureMode::FailClosed) +
+/// [`GapPolicy::Halt`](epoch_core::GapPolicy::Halt) subscriber wedges on
+/// [`HaltReason::GapUnproven`] and [`ReliableDeliveryConfig::on_wedge_retired`]
+/// is configured. Never fires for
+/// [`GapPolicy::SkipAfterBackstop`](epoch_core::GapPolicy::SkipAfterBackstop)
+/// subscribers (they never gap-wedge) or for deserialize/observer wedges
+/// (those need operator action, not replay) — the gate is exact, not a
+/// catch-all for every halt.
+///
+/// # Blocking contract
+///
+/// Awaited on the heal actor's own task, never on the batch loop's task: a
+/// slow implementation delays only this subscriber family's next heal, never
+/// event delivery for any subscriber.
+///
+/// # Generation cap
+///
+/// [`WedgeHealPolicy::max_generations`] bounds how many times a family may be
+/// healed. Once the cap is reached, the wedged id is retired WITHOUT invoking
+/// this callback (an ERROR is logged instead) and the family heals no more.
+///
+/// # Opt-in contract
+///
+/// This callback's presence *is* the opt-in (OQ-5): a `None`
+/// [`ReliableDeliveryConfig::on_wedge_retired`] leaves `GapPolicy::Halt`
+/// behaviour byte-for-byte unchanged — a wedged subscriber simply stays
+/// wedged, exactly as it did before this policy existed.
+#[async_trait]
+pub trait WedgeRetiredCallback: Send + Sync {
+    /// Called after the wedged id in `info.retired_subscriber_id` has been
+    /// retired via the same removal [`PgEventBus::unsubscribe`] performs.
+    ///
+    /// [`PgEventBus::unsubscribe`]: crate::event_bus::PgEventBus::unsubscribe
+    async fn on_wedge_retired(&self, info: WedgeRetiredInfo);
+}
+
+/// Configures the P5 wedge-heal policy (spec 0031 R14): the backoff schedule
+/// between heal-generation re-halts, and the generation cap.
+///
+/// # Boot vs. heal generations
+///
+/// A **boot-generation** wedge (the unsuffixed id a caller originally
+/// `subscribe()`d) heals immediately — no backoff. A **heal-generation**
+/// wedge (a previously-healed `{base}#gen{N}` id re-halting on the same or a
+/// new gap) waits [`rehalt_backoff`](Self::rehalt_backoff) before healing: the
+/// first re-halt waits `rehalt_backoff[0]`, the second `rehalt_backoff[1]`,
+/// and so on, capped at the schedule's last entry for every further re-halt.
+/// An empty schedule means every heal-generation re-halt is also immediate.
+///
+/// # Generation cap
+///
+/// [`max_generations`](Self::max_generations) bounds the family's total
+/// lifetime generation count. Once a family would need to mint a generation
+/// beyond the cap, epoch retires the wedged id, logs an ERROR, and heals that
+/// family no more — [`WedgeRetiredCallback::on_wedge_retired`] is NOT invoked
+/// for that final retirement, since there is no fresh generation to hand the
+/// caller.
+#[derive(Debug, Clone)]
+pub struct WedgeHealPolicy {
+    /// Maximum generation number a family may reach. Reaching it ends the
+    /// family's heal chain: the wedged id is retired, an ERROR is logged, and
+    /// no further heals are attempted for that family.
+    ///
+    /// Default: `5` — an arbitrary, conservative cap (unlike catacloud, which
+    /// heals unboundedly); override for workloads that legitimately need a
+    /// longer chain.
+    pub max_generations: u32,
+    /// Backoff durations applied before healing a heal-generation re-halt
+    /// (never a boot-generation wedge, which is always immediate). Indexed by
+    /// how many heal-generation re-halts this family has already had; the
+    /// last entry is reused as a cap for every re-halt beyond the schedule's
+    /// length.
+    ///
+    /// Default: `[30s, 60s]` (catacloud's converged numbers, OQ-4).
+    pub rehalt_backoff: Vec<Duration>,
+}
+
+impl Default for WedgeHealPolicy {
+    fn default() -> Self {
+        Self {
+            max_generations: 5,
+            rehalt_backoff: vec![Duration::from_secs(30), Duration::from_secs(60)],
+        }
+    }
+}
+
 /// How events are dispatched from the bus to subscribers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -345,6 +472,8 @@ pub enum DispatchMode {
 /// | `snapshot_fencing` | `true` |
 /// | `on_rebuild_needed` | `None` |
 /// | `gap_scan_interval` | `None` (scan disabled) |
+/// | `on_wedge_retired` | `None` |
+/// | `wedge_heal` | `None` |
 ///
 /// Using `..Default::default()` avoids this churn for all optional fields.
 #[derive(Clone)]
@@ -517,6 +646,30 @@ pub struct ReliableDeliveryConfig {
     /// [`start_listener`]: crate::event_bus::PgEventBus::start_listener
     /// [`PgEventBus::check_skipped_gaps`]: crate::event_bus::PgEventBus::check_skipped_gaps
     pub gap_scan_interval: Option<Duration>,
+
+    /// Optional callback invoked when epoch retires a wedged subscriber under
+    /// the P5 wedge-heal policy (spec 0031 R12-R15).
+    ///
+    /// This callback's presence *is* the opt-in (OQ-5): with `None` (the
+    /// default), `GapPolicy::Halt` behaviour is byte-for-byte unchanged — a
+    /// wedged subscriber simply stays wedged. When `Some`, a
+    /// `ReplayAlways` + `FailClosed` + `GapPolicy::Halt` subscriber wedged by
+    /// `HaltReason::GapUnproven` is retired and this callback is invoked with
+    /// a fresh generation id to `subscribe()`. See [`WedgeRetiredCallback`]
+    /// for the full gate and blocking contract.
+    ///
+    /// Default: `None` (no callback; the heal is inactive)
+    pub on_wedge_retired: Option<Arc<dyn WedgeRetiredCallback>>,
+
+    /// Backoff schedule and generation cap for the P5 wedge-heal policy (spec
+    /// 0031 R14).
+    ///
+    /// `None` uses [`WedgeHealPolicy::default`] — there is no separate enable
+    /// flag beyond [`on_wedge_retired`](Self::on_wedge_retired) being `Some`.
+    /// This field has no effect while `on_wedge_retired` is `None`.
+    ///
+    /// Default: `None` (uses [`WedgeHealPolicy::default`])
+    pub wedge_heal: Option<WedgeHealPolicy>,
 }
 
 impl Default for ReliableDeliveryConfig {
@@ -538,6 +691,8 @@ impl Default for ReliableDeliveryConfig {
             snapshot_fencing: true,
             on_rebuild_needed: None,
             gap_scan_interval: None,
+            on_wedge_retired: None,
+            wedge_heal: None,
         }
     }
 }
@@ -573,6 +728,11 @@ impl std::fmt::Debug for ReliableDeliveryConfig {
                 &self.on_rebuild_needed.as_ref().map(|_| "Some(<callback>)"),
             )
             .field("gap_scan_interval", &self.gap_scan_interval)
+            .field(
+                "on_wedge_retired",
+                &self.on_wedge_retired.as_ref().map(|_| "Some(<callback>)"),
+            )
+            .field("wedge_heal", &self.wedge_heal)
             .finish()
     }
 }
@@ -736,6 +896,8 @@ mod tests {
             snapshot_fencing: false,
             on_rebuild_needed: None,
             gap_scan_interval: None,
+            on_wedge_retired: None,
+            wedge_heal: None,
         };
 
         assert_eq!(config.max_retries, 5);

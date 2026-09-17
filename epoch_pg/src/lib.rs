@@ -64,7 +64,8 @@ pub use epoch_core::{GapPolicy, SubscriptionMode};
 pub use event_bus::{
     CheckpointMode, DispatchMode, DlqCallback, DlqEntry, DlqInsertionInfo, GapTimeoutCallback,
     GapTimeoutEntry, GapTimeoutInfo, InstanceMode, PgEventBus, PgEventBusError,
-    RebuildNeededCallback, RebuildNeededInfo, ReliableDeliveryConfig,
+    RebuildNeededCallback, RebuildNeededInfo, ReliableDeliveryConfig, WedgeHealPolicy,
+    WedgeRetiredCallback, WedgeRetiredInfo,
 };
 pub use event_store::*;
 pub use migrations::{AppliedMigration, Migration, MigrationError, Migrator};

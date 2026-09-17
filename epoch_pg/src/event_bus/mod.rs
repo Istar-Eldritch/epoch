@@ -10,7 +10,8 @@ pub(crate) use checkpoint::*;
 pub use config::{
     CheckpointMode, DispatchMode, DlqCallback, DlqInsertionInfo, GapTimeoutCallback,
     GapTimeoutInfo, HaltCallback, HaltInfo, HaltReason, InstanceMode, RebuildNeededCallback,
-    RebuildNeededInfo, ReliableDeliveryConfig,
+    RebuildNeededInfo, ReliableDeliveryConfig, WedgeHealPolicy, WedgeRetiredCallback,
+    WedgeRetiredInfo,
 };
 pub(crate) use retry::{
     ProcessResult, invoke_observer_once, panic_payload_message, process_event_with_retry,
@@ -34,7 +35,7 @@ use sqlx::postgres::{PgListener, PgPool};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
@@ -82,6 +83,23 @@ struct BatchContext {
     /// `None` when fencing is disabled, no gaps were active, or the snapshot
     /// query failed (graceful timeout-only fallback for the batch).
     snapshot: Option<TxidSnapshot>,
+    /// The heal actor's request sender (spec 0031 Phase 4, R12/R14), or `None`
+    /// when no `on_wedge_retired` callback is configured — the unconfigured
+    /// path costs nothing beyond this `Option` check (opt-in by construction).
+    heal_tx: Option<mpsc::UnboundedSender<HealRequest>>,
+}
+
+/// A gated `GapUnproven` wedge, sent from the fire site
+/// (`process_subscriber_for_batch`) to the bus's single heal-actor task (spec
+/// 0031 Phase 4). The fire site only gate-checks and emits: it does no
+/// unsubscribe/mint/callback work itself.
+#[derive(Clone)]
+struct HealRequest {
+    /// The wedged subscriber id (either the unsuffixed boot id or a previous
+    /// `{base}#gen{N}` heal-generation id).
+    subscriber_id: String,
+    /// The sequence `subscriber_id` is held below.
+    held_below_sequence: u64,
 }
 
 /// The pre-per-channel trigger name, kept only so [`PgEventBus::setup_trigger`]
@@ -491,6 +509,7 @@ where
         checkpoint_pool,
         snapshot,
         hwm,
+        heal_tx,
     } = ctx;
     // R5: a ReplayAlways subscriber advances its in-memory HWM instead of the
     // persisted checkpoint (§4.5).
@@ -795,6 +814,30 @@ where
             HaltReason::GapUnproven,
         )
         .await;
+
+        // Spec 0031 R12 (CLOUD-262 Phase 4): gate-check and emit only — this
+        // fire site has no bus handle, registry access, tombstone, or family
+        // counter in scope, so it does no unsubscribe/mint/callback work
+        // itself. `failure_mode`/`gap_policy` reaching this arm are already
+        // guaranteed FailClosed + Halt by `advance_contiguous_checkpoint` (a
+        // `SkipAfterBackstop` gap routes through `pending_backstop_skip`
+        // instead, never through `backstop_refused`) — checked explicitly
+        // anyway so the gate documents its own contract rather than leaning
+        // on a silent invariant elsewhere. `replay_always` reuses the
+        // subscription-mode read already taken at the top of this function
+        // (no new observer locking, R12). Once-per-(generation, gap) is
+        // guaranteed upstream by `halt_fired` (subscriber_state.rs); this
+        // site never sets it.
+        if replay_always
+            && failure_mode == FailureMode::FailClosed
+            && gap_policy == GapPolicy::Halt
+            && let Some(tx) = &heal_tx
+        {
+            let _ = tx.send(HealRequest {
+                subscriber_id: subscriber_id.clone(),
+                held_below_sequence: refused_seq,
+            });
+        }
     }
 
     // Partition by reason: `FenceCleared` skips are expected, lossless rollbacks
@@ -1152,6 +1195,15 @@ where
         checkpoint_pool: checkpoint_pool.clone(),
         snapshot,
         hwm,
+        // P4b's private fetch drives WEDGED
+        // `Checkpointed` subscribers only — a
+        // `ReplayAlways` wedge (the heal gate's
+        // subject) is exactly what this path
+        // excludes, so the heal channel is
+        // never reachable here. (Review cycle
+        // 1: the threaded sender was dead
+        // plumbing.)
+        heal_tx: None,
     };
 
     process_subscriber_for_batch(
@@ -1423,6 +1475,13 @@ struct ListenerState {
     /// Handle to the periodic late-materialization scan task, when
     /// [`ReliableDeliveryConfig::gap_scan_interval`] enables it.
     scan_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Handle to the P5 wedge-heal actor task (spec 0031 Phase 4), when
+    /// [`ReliableDeliveryConfig::on_wedge_retired`] enables it. The actor's
+    /// receive loop ends when its request-channel sender — owned solely by
+    /// the listener task's `handle` — drops, which happens when `handle`
+    /// itself returns; `shutdown()` awaits this handle AFTER `handle`, so a
+    /// bus that never started a listener never has an actor to leak.
+    heal_actor_handle: Option<tokio::task::JoinHandle<()>>,
     /// Signal to trigger shutdown. Shared by both tasks.
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
@@ -1877,8 +1936,42 @@ where
         let retired_ids = self.retired_ids.clone();
         let subscriber_modes = self.subscriber_modes.clone();
 
-        // Create shutdown signal channel
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        // Spec 0031 Phase 4 (R14): the heal actor is spawned only when
+        // `on_wedge_retired` is configured — an unconfigured bus never heals
+        // and never has an actor to leak (opt-in by construction, OQ-5). The
+        // actor gets its own clones of the narrowed sub-handles it needs
+        // (never a `PgEventBus` clone, which would keep the pool/registry/hwm
+        // alive independently of the caller's own handle).
+        // Create shutdown signal channel — BEFORE the heal-actor spawn so the
+        // actor can select on it: a shutdown landing mid-backoff must
+        // interrupt the actor immediately, not wait out a 30 s/60 s delay.
+        let (shutdown_tx, shutdown_rx_for_actor) = tokio::sync::watch::channel(false);
+
+        let (heal_tx, heal_actor_handle): (
+            Option<mpsc::UnboundedSender<HealRequest>>,
+            Option<tokio::task::JoinHandle<()>>,
+        ) = match self.config.on_wedge_retired.clone() {
+            Some(callback) => {
+                let (tx, rx) = mpsc::unbounded_channel::<HealRequest>();
+                let policy = self.config.wedge_heal.clone().unwrap_or_default();
+                let actor_handle = tokio::spawn(run_heal_actor(
+                    rx,
+                    shutdown_rx_for_actor.clone(),
+                    callback,
+                    policy,
+                    self.projections.clone(),
+                    self.subscriber_modes.clone(),
+                    self.hwm.clone(),
+                    self.pending_delivered_sets.clone(),
+                    self.retired_ids.clone(),
+                    self.pool.clone(),
+                    self.config.clone(),
+                ));
+                (Some(tx), Some(actor_handle))
+            }
+            None => (None, None),
+        };
+        let mut shutdown_rx = shutdown_rx_for_actor.clone();
 
         let handle = tokio::spawn(async move {
             // No priority sort of `projections` here. The batch loop below reads
@@ -2572,6 +2665,7 @@ where
                                         checkpoint_pool: checkpoint_pool.clone(),
                                         snapshot: batch_snapshot,
                                         hwm: hwm.clone(),
+                                        heal_tx: heal_tx.clone(),
                                     },
                                 )
                             })
@@ -2650,6 +2744,7 @@ where
             *state = Some(ListenerState {
                 handle,
                 scan_handle,
+                heal_actor_handle,
                 shutdown_tx,
             });
         }
@@ -2690,6 +2785,7 @@ where
             Some(ListenerState {
                 handle,
                 scan_handle,
+                heal_actor_handle,
                 shutdown_tx,
             }) => {
                 // Signal shutdown
@@ -2704,6 +2800,19 @@ where
                     scan_handle
                         .await
                         .map_err(|e| format!("Gap-scan task panicked: {}", e))?;
+                }
+
+                // Spec 0031 Phase 4: joined AFTER `handle`, whose async block
+                // owns the last live clone of the heal actor's request-channel
+                // sender. The actor breaks on the shutdown watch signal
+                // (interrupting any in-flight backoff immediately): queued
+                // requests that never started processing are dropped, not
+                // drained — retiring during shutdown is pointless. This join
+                // is bounded by the actor's break, never by a backoff delay.
+                if let Some(heal_actor_handle) = heal_actor_handle {
+                    heal_actor_handle
+                        .await
+                        .map_err(|e| format!("Wedge-heal actor task panicked: {}", e))?;
                 }
 
                 info!("Event bus listener shut down gracefully");
@@ -3268,121 +3377,24 @@ where
     ///
     /// `Ok(true)` if the id was registered and is now removed; `Ok(false)` if
     /// it was already absent (idempotent re-call or unknown id).
+    ///
+    /// Delegates to the narrowed-handle [`unsubscribe_core`] (spec 0031 Phase
+    /// 4) so the same removal is reachable from the P5 heal actor without a
+    /// full `PgEventBus` clone; see that function for the removal-inventory
+    /// steps.
     pub async fn unsubscribe(&self, subscriber_id: &str) -> Result<bool, PgEventBusError> {
-        // (a) Capture the id's handles under the registry guard, then drop
-        // the guard BEFORE touching the projections Vec — lock-ordering
-        // contract on `remove_captured_observers`: no path holds both
-        // mutexes. Removing the entry atomically with the capture also drops
-        // the registry entry (step (c)) in the same critical section, so a
-        // retired id can never be re-observed as registered between capture
-        // and entry-drop.
-        let captured: Option<Vec<Arc<Mutex<dyn EventObserver<D>>>>> = {
-            let mut registry = self.subscriber_modes.lock().await;
-            registry.remove(subscriber_id).map(|(_, handles)| handles)
-        };
-
-        // Idempotency (R4, OQ-2): an unknown id is `Ok(false)`. Nothing below
-        // runs for it — with no registry entry there is nothing to remove,
-        // resolve, or release.
-        let Some(captured) = captured else {
-            return Ok(false);
-        };
-
-        // (b) Remove every captured Arc (all same-id handles, including the
-        // delivering one and any inert same-id duplicates) from the
-        // projections Vec, by `Arc::ptr_eq` under the outer mutex.
-        let removed_handles = remove_captured_observers(&self.projections, &captured).await;
-        // `removed_handles` can legitimately be FEWER than `captured.len()`:
-        // a handle registered by a racing same-id subscribe (registry insert
-        // at `warn_if_subscriber_id_reused`) that had not reached its push
-        // site yet is captured here with nothing in the projections Vec to
-        // remove — that window is closed by the push sites' own post-push
-        // re-check (R9 subscribe/retire race), which removes the Arc after
-        // pushing when the registry entry is already gone.
-        log::debug!(
-            "unsubscribe: removed {removed_handles} of {} captured handle(s) for \
-             '{subscriber_id}' from the projections Vec",
-            captured.len()
-        );
-
-        // (d) Remove listener-visible per-id state: the ReplayAlways HWM and
-        // the delivered-set handoff carrier (a stale unconsumed set must
-        // never be inherited by a re-seeded lifecycle — spec 0031 Phase 3
-        // step (d)). The four listener-lifetime maps are pruned by the
-        // consuming wake's init pass via the tombstone marker (step (h)),
-        // not here: they are listener-task state.
-        self.hwm.lock().await.remove(subscriber_id);
-        self.pending_delivered_sets
-            .lock()
-            .await
-            .remove(subscriber_id);
-
-        // (e) Resolve unresolved gap-timeout rows for this subscriber with
-        // the audit marker (R8). Rows are only ever written when a
-        // TimeoutBackstop skip was taken, so this is commonly a no-op for
-        // FailClosed+Halt subscribers (they refuse the backstop and write
-        // none).
-        let resolved = sqlx::query(
-            r#"
-            UPDATE epoch_event_bus_gap_timeouts
-            SET resolved_at = NOW(),
-                resolved_by = 'unsubscribe'
-            WHERE bus_name = $1
-              AND subscriber_id = $2
-              AND resolved_at IS NULL
-            "#,
+        unsubscribe_core(
+            subscriber_id,
+            &self.projections,
+            &self.subscriber_modes,
+            &self.hwm,
+            &self.pending_delivered_sets,
+            &self.retired_ids,
+            &self.pool,
+            &self.config,
+            Some(&self.listener_state),
         )
-        .bind(&self.config.events_table)
-        .bind(subscriber_id)
-        .execute(&self.pool)
-        .await?;
-        if resolved.rows_affected() > 0 {
-            log::debug!(
-                "unsubscribe: resolved {} gap-timeout row(s) for '{subscriber_id}'",
-                resolved.rows_affected()
-            );
-        }
-
-        // (f) Coordinated mode: best-effort advisory-lock release (R10). The
-        // lock is session-scoped on a pooled connection, so the release is
-        // UNRELIABLE: it may land on a different session than the one
-        // holding the lock (no-op), or the holding session may already be
-        // gone (auto-released). Failure never blocks retirement — the lock
-        // dies with its session regardless.
-        if self.config.instance_mode == config::InstanceMode::Coordinated {
-            match self.release_subscriber_lock(subscriber_id).await {
-                Ok(true) => {}
-                Ok(false) => log::debug!(
-                    "unsubscribe: advisory lock for '{subscriber_id}' was not held by this \
-                     session (already released or held elsewhere); continuing",
-                ),
-                Err(e) => warn!(
-                    "unsubscribe: best-effort advisory-lock release for '{subscriber_id}' \
-                     failed (continuing; the session-scoped lock is released when its \
-                     holding session ends): {e}",
-                ),
-            }
-        }
-
-        // (g) Checkpoint and DLQ rows are deliberately RETAINED (R8): audit
-        // trail, and a same-id re-subscribe must resume cleanly from them
-        // (Checkpointed) or replay from 0 (ReplayAlways). No DELETE here.
-
-        // (h) Retired-id tombstone marker, LAST — only when a listener is
-        // running. An Inline bus has no listener and no listener-lifetime
-        // maps, so there is nothing to prune and no marker is needed. The
-        // consuming wake's init pass (before the `contains_key` gate)
-        // prunes the id's listener-lifetime entries, re-clears its `hwm`
-        // entry, fences the id's pre-unsubscribe snapshot Arc from that one
-        // wake, and drops the marker (spec 0031 R7/R9).
-        if self.listener_state.lock().await.is_some() {
-            self.retired_ids
-                .lock()
-                .await
-                .insert(subscriber_id.to_string());
-        }
-
-        Ok(true)
+        .await
     }
 
     /// Fast-forwards every currently-registered subscriber's checkpoint to the
@@ -3912,20 +3924,10 @@ where
     /// Releases an advisory lock for a subscriber.
     ///
     /// Returns `true` if the lock was released, `false` if it wasn't held.
+    /// Delegates to the pool-only [`release_subscriber_lock_core`], also used
+    /// by `unsubscribe_core`'s best-effort Coordinated-mode release.
     pub async fn release_subscriber_lock(&self, subscriber_id: &str) -> Result<bool, SqlxError> {
-        let result: (bool,) = sqlx::query_as(
-            r#"
-            SELECT pg_advisory_unlock(
-                ('x' || substr(md5($1), 1, 8))::bit(32)::int,
-                ('x' || substr(md5($1), 9, 8))::bit(32)::int
-            )
-            "#,
-        )
-        .bind(subscriber_id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(result.0)
+        release_subscriber_lock_core(&self.pool, subscriber_id).await
     }
 
     /// Bus identity for `INLINE_CTX` bookkeeping: the shared `inline_state`
@@ -4253,6 +4255,473 @@ where
         !drop_it
     });
     removed
+}
+
+/// Narrowed-handle core of [`PgEventBus::unsubscribe`] (spec 0031 Phase 4):
+/// takes only the sub-handles the removal touches — never a full bus clone —
+/// so the P5 heal actor can retire a wedged id without holding a `PgEventBus`
+/// clone (which would keep the pool/registry/hwm alive independently of the
+/// caller's own handle, exactly the leak the heal actor's lifecycle exists to
+/// prevent). The inherent [`PgEventBus::unsubscribe`] delegates to this
+/// function with its own fields; see that method's rustdoc for the full
+/// removal-inventory and timing contract this implements.
+///
+/// `listener_state` preserves step (h)'s original placement: the
+/// `listener_running` sample is taken at the marker-insert step, AFTER the DB
+/// work, not up front — an `unsubscribe` racing a concurrent
+/// `start_listener` must not miss its tombstone marker. The inherent method
+/// passes `Some(&self.listener_state)`; the heal actor passes `None` (it only
+/// exists between `start_listener` spawning it and `shutdown()` joining it —
+/// a window in which a listener is, by construction, always running).
+///
+/// Narrowing note: the handles here are STRUCTURAL — they are the only
+/// state this function touches — but the carried `ReliableDeliveryConfig`
+/// transitively holds the application's callback Arc, which in a realistic
+/// consumer may itself hold a `PgEventBus` clone. The narrowing guarantees
+/// the *removal logic* never needs a full bus handle; it cannot guarantee
+/// that the actor's memory footprint is bus-free when a consumer's callback
+/// closes over one.
+#[allow(clippy::too_many_arguments)]
+async fn unsubscribe_core<D>(
+    subscriber_id: &str,
+    projections: &Projections<D>,
+    subscriber_modes: &Arc<Mutex<SubscriberRegistry<D>>>,
+    hwm: &Arc<Mutex<HashMap<String, u64>>>,
+    pending_delivered_sets: &Arc<Mutex<HashMap<String, HashSet<u64>>>>,
+    retired_ids: &Arc<Mutex<HashSet<String>>>,
+    pool: &PgPool,
+    config: &ReliableDeliveryConfig,
+    listener_state: Option<&Arc<Mutex<Option<ListenerState>>>>,
+) -> Result<bool, PgEventBusError>
+where
+    D: EventData + Send + Sync + 'static,
+{
+    // (a) Capture the id's handles under the registry guard, then drop the
+    // guard BEFORE touching the projections Vec — lock-ordering contract on
+    // `remove_captured_observers`: no path holds both mutexes.
+    let captured: Option<Vec<Arc<Mutex<dyn EventObserver<D>>>>> = {
+        let mut registry = subscriber_modes.lock().await;
+        registry.remove(subscriber_id).map(|(_, handles)| handles)
+    };
+
+    // Idempotency (R4, OQ-2): an unknown id is `Ok(false)`.
+    let Some(captured) = captured else {
+        return Ok(false);
+    };
+
+    // (b) Remove every captured Arc from the projections Vec by `Arc::ptr_eq`.
+    let removed_handles = remove_captured_observers(projections, &captured).await;
+    log::debug!(
+        "unsubscribe: removed {removed_handles} of {} captured handle(s) for \
+         '{subscriber_id}' from the projections Vec",
+        captured.len()
+    );
+
+    // (d) Remove listener-visible per-id state: the ReplayAlways HWM and the
+    // delivered-set handoff carrier.
+    hwm.lock().await.remove(subscriber_id);
+    pending_delivered_sets.lock().await.remove(subscriber_id);
+
+    // (e) Resolve unresolved gap-timeout rows for this subscriber (R8).
+    let resolved = sqlx::query(
+        r#"
+        UPDATE epoch_event_bus_gap_timeouts
+        SET resolved_at = NOW(),
+            resolved_by = 'unsubscribe'
+        WHERE bus_name = $1
+          AND subscriber_id = $2
+          AND resolved_at IS NULL
+        "#,
+    )
+    .bind(&config.events_table)
+    .bind(subscriber_id)
+    .execute(pool)
+    .await?;
+    if resolved.rows_affected() > 0 {
+        log::debug!(
+            "unsubscribe: resolved {} gap-timeout row(s) for '{subscriber_id}'",
+            resolved.rows_affected()
+        );
+    }
+
+    // (f) Coordinated mode: best-effort advisory-lock release (R10).
+    if config.instance_mode == config::InstanceMode::Coordinated {
+        match release_subscriber_lock_core(pool, subscriber_id).await {
+            Ok(true) => {}
+            Ok(false) => log::debug!(
+                "unsubscribe: advisory lock for '{subscriber_id}' was not held by this \
+                 session (already released or held elsewhere); continuing",
+            ),
+            Err(e) => warn!(
+                "unsubscribe: best-effort advisory-lock release for '{subscriber_id}' \
+                 failed (continuing; the session-scoped lock is released when its \
+                 holding session ends): {e}",
+            ),
+        }
+    }
+
+    // (g) Checkpoint and DLQ rows are deliberately RETAINED (R8). No DELETE here.
+
+    // (h) Retired-id tombstone marker, LAST — only when a listener is
+    // running. The sample is taken HERE (after the DB work), preserving the
+    // committed placement: a retire racing a concurrent start_listener must
+    // not miss its marker.
+    let listener_running = match listener_state {
+        Some(state) => state.lock().await.is_some(),
+        // The heal actor's window always has a running listener.
+        None => true,
+    };
+    if listener_running {
+        retired_ids.lock().await.insert(subscriber_id.to_string());
+    }
+
+    Ok(true)
+}
+
+/// Pool-only core of [`PgEventBus::release_subscriber_lock`], also used by
+/// [`unsubscribe_core`]'s best-effort Coordinated-mode release: needs nothing
+/// but the pool, so it composes into `unsubscribe_core`'s narrowed handles
+/// without requiring a bus clone.
+async fn release_subscriber_lock_core(
+    pool: &PgPool,
+    subscriber_id: &str,
+) -> Result<bool, SqlxError> {
+    let result: (bool,) = sqlx::query_as(
+        r#"
+        SELECT pg_advisory_unlock(
+            ('x' || substr(md5($1), 1, 8))::bit(32)::int,
+            ('x' || substr(md5($1), 9, 8))::bit(32)::int
+        )
+        "#,
+    )
+    .bind(subscriber_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(result.0)
+}
+
+/// Per-family in-memory bookkeeping for the P5 wedge-heal actor (spec 0031
+/// Phase 4): the next generation number to mint, how many heal-generation
+/// re-halts this family has already had (drives the backoff index), and
+/// whether the family has hit its `max_generations` cap and stopped healing.
+struct HealFamilyState {
+    next_generation: u32,
+    rehalt_count: u32,
+    retired: bool,
+}
+
+/// Splits a wedged subscriber id into its wedge-heal family base and the
+/// generation the id itself represents (spec 0031 R13).
+///
+/// Family match is exact: either `subscriber_id` IS the base (an unsuffixed
+/// boot id, generation 1), or it is exactly `{base}#gen{digits}` (a
+/// heal-generation id). Near-miss rejection falls out of requiring the ENTIRE
+/// suffix after the last `#gen` to be non-empty ASCII digits: `base-suffix`
+/// has no `#gen` substring at all, and `base#gen2extra`'s suffix `2extra` is
+/// not all-digit, so both fall through to being treated as their OWN,
+/// independent base at generation 1 rather than being folded into `base`'s
+/// family.
+fn wedge_family(subscriber_id: &str) -> (String, u32) {
+    if let Some(idx) = subscriber_id.rfind("#gen") {
+        let (base, marker) = subscriber_id.split_at(idx);
+        let digits = &marker["#gen".len()..];
+        if !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(generation) = digits.parse::<u32>()
+        {
+            return (base.to_string(), generation);
+        }
+    }
+    (subscriber_id.to_string(), 1)
+}
+
+/// The bus's single heal-actor task (spec 0031 Phase 4, R14): owns every
+/// piece of state the fire site cannot reach — the per-family generation
+/// counters and the backoff schedule — and performs the actual
+/// unsubscribe/mint/callback work the fire site's gate only requests over the
+/// channel. Spawned by `start_listener` only when `on_wedge_retired` is
+/// configured; ends when its request-channel `rx` closes, which happens once
+/// every clone of the paired sender has dropped — the sender lives inside the
+/// listener task's own `async move` block, so it drops when that task itself
+/// returns on `shutdown()` (see [`PgEventBus::shutdown`]).
+///
+/// [`PgEventBus::shutdown`]: crate::event_bus::PgEventBus::shutdown
+/// The bus-owned wedge-heal actor (spec 0031 Phase 4, R14). Receives
+/// `HealRequest`s from the fire-site gate and, per request: retires the wedged
+/// id (via the narrowed-handle [`unsubscribe_core`], never a bus clone), mints
+/// the fresh `{base}#gen{N}` id, invokes the application callback, and logs.
+///
+/// Termination: the `shutdown_rx` watch channel (shared with the listener
+/// task) interrupts the loop immediately — including mid-backoff — and
+/// `shutdown()` joins this task's handle alongside the listener's. A request
+/// for a family whose re-halt backoff has not yet elapsed is DEFERRED (never
+/// blocks the loop): other families' immediate boot-generation heals proceed
+/// while the backing-off family waits, and the deferred request is processed
+/// when its backoff elapses (or dropped at shutdown — the bus is going away).
+#[allow(clippy::too_many_arguments)]
+async fn run_heal_actor<D>(
+    mut rx: mpsc::UnboundedReceiver<HealRequest>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    callback: Arc<dyn WedgeRetiredCallback>,
+    policy: WedgeHealPolicy,
+    projections: Projections<D>,
+    subscriber_modes: Arc<Mutex<SubscriberRegistry<D>>>,
+    hwm: Arc<Mutex<HashMap<String, u64>>>,
+    pending_delivered_sets: Arc<Mutex<HashMap<String, HashSet<u64>>>>,
+    retired_ids: Arc<Mutex<HashSet<String>>>,
+    pool: PgPool,
+    config: ReliableDeliveryConfig,
+) where
+    D: EventData + Send + Sync + 'static,
+{
+    let mut families: HashMap<String, HealFamilyState> = HashMap::new();
+    // Requests deferred behind a family's re-halt backoff: (request, due-at).
+    // Deferral keeps one family's backoff from serializing every other
+    // family's immediate boot-generation heal behind it (per-family policy,
+    // single actor).
+    let mut deferred: Vec<(HealRequest, tokio::time::Instant)> = Vec::new();
+
+    loop {
+        let next_due = deferred.iter().map(|(_, due)| *due).min();
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                // Shutdown signalled (or the channel closed): stop now. Any
+                // deferred requests are dropped — the bus is going away.
+                let _ = changed;
+                break;
+            }
+            maybe_request = rx.recv() => {
+                match maybe_request {
+                    None => break,
+                    Some(request) => {
+                        match process_heal_request(
+                            request.clone(),
+                            &mut families,
+                            &policy,
+                            &callback,
+                            &projections,
+                            &subscriber_modes,
+                            &hwm,
+                            &pending_delivered_sets,
+                            &retired_ids,
+                            &pool,
+                            &config,
+                            false,
+                        )
+                        .await
+                        {
+                            Some(delay) if !delay.is_zero() => {
+                                deferred.push((request, tokio::time::Instant::now() + delay));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ = async {
+                    match next_due {
+                        Some(due) => tokio::time::sleep_until(due).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if next_due.is_some() => {
+                let now = tokio::time::Instant::now();
+                let mut due_requests = Vec::new();
+                deferred.retain(|(req, due)| {
+                    if *due <= now {
+                        due_requests.push(req.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                for request in due_requests {
+                    // Re-processed with `from_deferred = true`: the backoff has
+                    // elapsed, so the heal proceeds immediately (never
+                    // re-defers — the backoff decision is skipped on this
+                    // path).
+                    process_heal_request(
+                        request,
+                        &mut families,
+                        &policy,
+                        &callback,
+                        &projections,
+                        &subscriber_modes,
+                        &hwm,
+                        &pending_delivered_sets,
+                        &retired_ids,
+                        &pool,
+                        &config,
+                        true,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+}
+
+/// Handles one heal request: family bookkeeping (generation floor from the
+/// wedged id's own generation, cap, retirement), the mint, the retirement,
+/// the callback, and the WARN. Returns `Some(backoff)` when the family must
+/// back off before this request can proceed (the caller defers it), `None`
+/// when the request was fully handled.
+#[allow(clippy::too_many_arguments)]
+async fn process_heal_request<D>(
+    request: HealRequest,
+    families: &mut HashMap<String, HealFamilyState>,
+    policy: &WedgeHealPolicy,
+    callback: &Arc<dyn WedgeRetiredCallback>,
+    projections: &Projections<D>,
+    subscriber_modes: &Arc<Mutex<SubscriberRegistry<D>>>,
+    hwm: &Arc<Mutex<HashMap<String, u64>>>,
+    pending_delivered_sets: &Arc<Mutex<HashMap<String, HashSet<u64>>>>,
+    retired_ids: &Arc<Mutex<HashSet<String>>>,
+    pool: &PgPool,
+    config: &ReliableDeliveryConfig,
+    from_deferred: bool,
+) -> Option<Duration>
+where
+    D: EventData + Send + Sync + 'static,
+{
+    let (base, wedged_generation) = wedge_family(&request.subscriber_id);
+    let family = families
+        .entry(base.clone())
+        .or_insert_with(|| HealFamilyState {
+            // Floor the counter on the wedged id's own generation: a request
+            // arriving from an already-healed id (e.g. after a listener
+            // restart re-spawned this actor with empty counters, or any
+            // out-of-order delivery) must never mint a generation that
+            // already existed — its checkpoint/DLQ rows are retained (step
+            // (g)) and a colliding fresh subscribe onto a stale name would
+            // inherit them. The floor also keeps the cap honest across
+            // restarts.
+            next_generation: 2.max(wedged_generation.saturating_add(1)),
+            rehalt_count: 0,
+            retired: false,
+        });
+    family.next_generation = family
+        .next_generation
+        .max(wedged_generation.saturating_add(1));
+
+    // Cap already reached for this family in an earlier request: no
+    // further heals, and no repeat ERROR spam (R14).
+    if family.retired {
+        return None;
+    }
+
+    // Generation cap (R14): retire the chain instead of minting beyond
+    // `max_generations`. No callback — there is no fresh generation to
+    // hand the caller.
+    if family.next_generation > policy.max_generations {
+        family.retired = true;
+        if let Err(e) = unsubscribe_core(
+            &request.subscriber_id,
+            projections,
+            subscriber_modes,
+            hwm,
+            pending_delivered_sets,
+            retired_ids,
+            pool,
+            config,
+            None,
+        )
+        .await
+        {
+            warn!(
+                "wedge heal: cap-retirement unsubscribe of '{}' (family '{}') failed: {}; \
+                 the family still stops healing",
+                request.subscriber_id, base, e
+            );
+        }
+        error!(
+            "Wedge heal for family '{}' reached max_generations ({}): retired '{}' \
+             permanently — no further heals for this family",
+            base, policy.max_generations, request.subscriber_id
+        );
+        return None;
+    }
+
+    // Backoff (R14): a boot-generation wedge (the unsuffixed base) heals
+    // immediately; a heal-generation re-halt waits the configured
+    // schedule, capped at its last entry. A deferred request re-enters with
+    // `from_deferred = true`: its backoff has already elapsed.
+    let delay = if from_deferred || wedged_generation <= 1 {
+        if wedged_generation <= 1 {
+            family.rehalt_count = 0;
+        }
+        Duration::ZERO
+    } else {
+        let idx = (family.rehalt_count as usize).min(policy.rehalt_backoff.len().saturating_sub(1));
+        let d = policy
+            .rehalt_backoff
+            .get(idx)
+            .copied()
+            .unwrap_or(Duration::ZERO);
+        family.rehalt_count += 1;
+        d
+    };
+    if !delay.is_zero() {
+        return Some(delay);
+    }
+
+    let generation = family.next_generation;
+    family.next_generation += 1;
+
+    // (ii) Retire the wedged observer via the same removal `unsubscribe`
+    // performs.
+    if let Err(e) = unsubscribe_core(
+        &request.subscriber_id,
+        projections,
+        subscriber_modes,
+        hwm,
+        pending_delivered_sets,
+        retired_ids,
+        pool,
+        config,
+        None,
+    )
+    .await
+    {
+        warn!(
+            "wedge heal: unsubscribe of '{}' failed: {}; invoking the callback for \
+             generation {} anyway (the wedged id may still linger until a retry)",
+            request.subscriber_id, e, generation
+        );
+    }
+
+    // (iv) WARN once per heal (old id, new id, generation, held-below) —
+    // logged BEFORE the callback so a slow or hanging consumer cannot
+    // suppress the operator's record of a heal that already happened (the
+    // retirement above is done regardless of callback outcome).
+    warn!(
+        "Wedge heal: retired '{}' (family '{}'), generation {} minted as '{}#gen{}', \
+         held below seq {}",
+        request.subscriber_id, base, generation, base, generation, request.held_below_sequence
+    );
+
+    // (iii) Invoke the application callback, panic-contained (mirroring
+    // `fire_on_halt`): a panicking callback never unwinds the actor task,
+    // and the retirement above already happened regardless of outcome.
+    let info = WedgeRetiredInfo {
+        base_subscriber_id: base.clone(),
+        retired_subscriber_id: request.subscriber_id.clone(),
+        generation,
+        held_below_sequence: request.held_below_sequence,
+    };
+    if let Err(payload) = AssertUnwindSafe(callback.on_wedge_retired(info))
+        .catch_unwind()
+        .await
+    {
+        warn!(
+            "on_wedge_retired callback panicked for '{}' -> generation {}: {}. The panic \
+             is contained; the wedged id remains retired.",
+            request.subscriber_id,
+            generation,
+            panic_payload_message(payload)
+        );
+    }
+    None
 }
 
 /// Advances the contiguous-prefix checkpoint for one caught-up event (spec
@@ -5388,6 +5857,31 @@ mod tests {
 
         assert_eq!(payload.id, id);
         assert_eq!(payload.global_sequence, Some(42));
+    }
+
+    #[test]
+    fn wedge_family_parses_base_and_generation() {
+        assert_eq!(wedge_family("acct"), ("acct".to_string(), 1));
+        assert_eq!(wedge_family("acct#gen2"), ("acct".to_string(), 2));
+        assert_eq!(wedge_family("acct#gen10"), ("acct".to_string(), 10));
+    }
+
+    #[test]
+    fn wedge_family_rejects_near_miss_suffixes() {
+        // `base-suffix` must never match `base`: no `#gen` substring at all.
+        assert_eq!(
+            wedge_family("acct-archive"),
+            ("acct-archive".to_string(), 1)
+        );
+        // Trailing non-digit content after `#gen` is not a generation marker.
+        assert_eq!(
+            wedge_family("acct#gen2extra"),
+            ("acct#gen2extra".to_string(), 1)
+        );
+        // Empty digit suffix is not a generation marker.
+        assert_eq!(wedge_family("acct#gen"), ("acct#gen".to_string(), 1));
+        // A non-digit generation is not a generation marker.
+        assert_eq!(wedge_family("acct#genX"), ("acct#genX".to_string(), 1));
     }
 
     #[test]

@@ -13636,3 +13636,995 @@ async fn test_resubscribe_same_id_before_next_wake_starts_clean() {
     event_bus.shutdown().await.expect("shutdown");
     drop_isolated_events_table(&pool, &table).await;
 }
+
+// ==================== P5 wedge heal: retire-and-notify (spec 0031 Phase 4, R12-R15) ====================
+
+use epoch_pg::event_bus::{WedgeHealPolicy, WedgeRetiredCallback, WedgeRetiredInfo};
+
+/// Captures every `WedgeRetiredInfo` the bus fires, for assertions on heal entry.
+struct CapturingWedgeRetiredCallback {
+    heals: Arc<StdMutex<Vec<WedgeRetiredInfo>>>,
+}
+
+#[async_trait]
+impl WedgeRetiredCallback for CapturingWedgeRetiredCallback {
+    async fn on_wedge_retired(&self, info: WedgeRetiredInfo) {
+        self.heals.lock().unwrap().push(info);
+    }
+}
+
+/// T1 (R14 default-on guard, OQ-5): with both `on_wedge_retired` and
+/// `wedge_heal` left at their default `None`, a `ReplayAlways`+`FailClosed`
+/// subscriber wedged by `GapUnproven` behaves byte-for-byte as it did before
+/// this policy existed — it simply stays wedged, registered, forever.
+#[tokio::test]
+#[serial]
+async fn test_unconfigured_bus_never_heals() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        events_table: table.clone(),
+        gap_timeout: GapDuration::from_millis(300),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        on_wedge_retired: None,
+        wedge_heal: None,
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (_id_below, _seq_below) =
+        insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_id_hole, _seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    tx_hole.rollback().await.expect("rollback hole tx");
+    let (_id_a1, _seq_a1) = insert_committed_event(&pool, &table, stream, 2, "above1").await;
+
+    let sub_id = format!("projection:no-heal-default:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe");
+
+    assert!(
+        wait_for_gap_unproven_halt(&halts, &sub_id).await,
+        "subscriber must wedge at the hole"
+    );
+
+    // Give any (absent) heal machinery ample time to act, then confirm the
+    // original id is still registered and readiness still resolves for it —
+    // the default (both fields None) must be a true no-op.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    let lag = event_bus.subscriber_lag(&sub_id).await;
+    assert!(
+        lag.is_ok(),
+        "unconfigured bus must never retire the wedged id: {lag:?}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T2 (R12/R13, once-per-generation): a `ReplayAlways`+`FailClosed`+`Halt`
+/// subscriber wedged by `GapUnproven` is retired exactly once and the
+/// configured callback fires exactly once, with the fresh generation's
+/// context (base, wedged id, generation 2, held-below the hole).
+#[tokio::test]
+#[serial]
+async fn test_wedge_heal_fires_once_per_generation_on_gap_unproven() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let heals = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        events_table: table.clone(),
+        gap_timeout: GapDuration::from_millis(300),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        on_wedge_retired: Some(Arc::new(CapturingWedgeRetiredCallback {
+            heals: heals.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (_id_below, _seq_below) =
+        insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_id_hole, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    tx_hole.rollback().await.expect("rollback hole tx");
+    let (_id_a1, _seq_a1) = insert_committed_event(&pool, &table, stream, 2, "above1").await;
+
+    let sub_id = format!("projection:heal-once:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe");
+
+    assert!(
+        wait_for_gap_unproven_halt(&halts, &sub_id).await,
+        "subscriber must wedge at the hole"
+    );
+
+    let mut got = None;
+    for _ in 0..80 {
+        {
+            let g = heals.lock().unwrap();
+            if !g.is_empty() {
+                got = Some(g[0].clone());
+            }
+        }
+        if got.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let info = got.expect("heal must fire for the GapUnproven wedge");
+    assert_eq!(info.base_subscriber_id, sub_id);
+    assert_eq!(info.retired_subscriber_id, sub_id);
+    assert_eq!(info.generation, 2);
+    assert_eq!(info.held_below_sequence, seq_hole as u64);
+
+    // The wedged id must actually be retired (readiness flips to
+    // SubscriberNotFound, mirroring plain `unsubscribe`).
+    let lag_result = event_bus.subscriber_lag(&sub_id).await;
+    assert!(
+        matches!(
+            lag_result,
+            Err(epoch_pg::PgEventBusError::SubscriberNotFound(_))
+        ),
+        "healed (retired) id must read back SubscriberNotFound: {lag_result:?}"
+    );
+
+    // Once per (generation, gap): no second heal fires while nothing new
+    // wedges (the boot id is gone; no fresh generation was re-subscribed by
+    // this test).
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        heals.lock().unwrap().len(),
+        1,
+        "heal must fire exactly once for this wedge"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// A `WedgeRetiredCallback` that re-subscribes a fresh `{base}#gen{N}`
+/// `ReplayAlways`+`FailClosed` projection on the same bus, so a persistent
+/// hole drives a real heal CHAIN: each fresh generation re-wedges on the same
+/// unresolved hole and is healed again. Also stashes each generation's state
+/// store so a test can inspect exactly what that generation applied.
+struct AutoResubscribeWedgeCallback {
+    heals: Arc<StdMutex<Vec<WedgeRetiredInfo>>>,
+    bus: Arc<StdMutex<Option<PgEventBus<TestEventData>>>>,
+    stores: Arc<StdMutex<StdHashMap<u32, InMemoryStateStore<TestState>>>>,
+}
+
+#[async_trait]
+impl WedgeRetiredCallback for AutoResubscribeWedgeCallback {
+    async fn on_wedge_retired(&self, info: WedgeRetiredInfo) {
+        let fresh_id = format!("{}#gen{}", info.base_subscriber_id, info.generation);
+        let projection = TestProjection::replay_always(fresh_id).fail_closed();
+        let store = projection.get_state_store().clone();
+        self.stores.lock().unwrap().insert(info.generation, store);
+        self.heals.lock().unwrap().push(info);
+        let bus = self.bus.lock().unwrap().clone();
+        if let Some(bus) = bus {
+            let _ = bus.subscribe(ProjectionHandler::new(projection)).await;
+        }
+    }
+}
+
+/// Burns a permanent hole (claim-in-open-tx-then-rollback) above a below-hole
+/// event on `stream`/`hole_stream`, and commits two events above the hole.
+/// Returns `(seq_below, seq_hole)`. Shared recipe for the wedge-heal battery.
+async fn burn_permanent_hole(
+    pool: &PgPool,
+    table: &str,
+    stream: Uuid,
+    hole_stream: Uuid,
+) -> (i64, i64) {
+    let (_id_below, seq_below) = insert_committed_event(pool, table, stream, 1, "below_hole").await;
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_id_hole, seq_hole) = claim_hole_uncommitted(&mut tx_hole, table, hole_stream).await;
+    tx_hole.rollback().await.expect("rollback hole tx");
+    let (_id_a1, _seq_a1) = insert_committed_event(pool, table, hole_stream, 2, "above1").await;
+    let (_id_a2, _seq_a2) = insert_committed_event(pool, table, hole_stream, 3, "above2").await;
+    (seq_below, seq_hole)
+}
+
+/// T3 (R12): `GapPolicy::SkipAfterBackstop` subscribers never gap-wedge (they
+/// take the fail-open advance once the backstop fires instead), so the wedge
+/// heal must never fire for one even with a callback configured.
+#[tokio::test]
+#[serial]
+async fn test_wedge_heal_never_fires_for_skip_after_backstop() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let heals = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(300),
+        events_table: table.clone(),
+        on_wedge_retired: Some(Arc::new(CapturingWedgeRetiredCallback {
+            heals: heals.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let sub_id = format!("projection:heal-skip-backstop:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone())
+        .fail_closed()
+        .skip_after_backstop();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe SkipAfterBackstop observer");
+    tokio::time::sleep(GapDuration::from_millis(100)).await;
+
+    let stream = Uuid::new_v4();
+    let hole_stream = Uuid::new_v4();
+    burn_permanent_hole(&pool, &table, stream, hole_stream).await;
+
+    // Wait out the backstop (it takes the fail-open advance, no wedge) plus
+    // several extra cycles.
+    tokio::time::sleep(GapDuration::from_millis(1500)).await;
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up after backstop"),
+        "SkipAfterBackstop subscriber must advance past the hole (no wedge)"
+    );
+
+    assert!(
+        heals.lock().unwrap().is_empty(),
+        "SkipAfterBackstop must never trigger the wedge heal: {:?}",
+        heals.lock().unwrap()
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T4 (R12): a deserialize wedge (`HaltReason::DeserializeFailure`) needs
+/// operator action, not replay — the wedge heal must never fire for it, even
+/// on a `ReplayAlways`+`FailClosed` subscriber with a callback configured.
+#[tokio::test]
+#[serial]
+async fn test_wedge_heal_never_fires_for_deser_wedge() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let heals = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        on_wedge_retired: Some(Arc::new(CapturingWedgeRetiredCallback {
+            heals: heals.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let sub_id = format!("projection:heal-deser-wedge:{}", Uuid::new_v4());
+    let stream = Uuid::new_v4();
+    let (_valid_id, _seq1) = insert_committed_event(&pool, &table, stream, 1, "v1").await;
+    let (_corrupt_id, seq2) = insert_corrupt_event(&pool, &table, stream, 2).await;
+
+    let projection = TestProjection::replay_always(sub_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe fail-closed ReplayAlways");
+
+    assert!(
+        poll_halt_count_at_least(&halts, &sub_id, 1).await,
+        "on_halt(DeserializeFailure) must fire for the wedged subscriber"
+    );
+    {
+        let hs = halts.lock().unwrap();
+        assert!(
+            hs.iter().any(|h| h.subscriber_id == sub_id
+                && h.reason == HaltReason::DeserializeFailure
+                && h.held_below_sequence == seq2 as u64),
+            "must wedge on DeserializeFailure at seq2: {hs:?}"
+        );
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    assert!(
+        heals.lock().unwrap().is_empty(),
+        "a deserialize wedge must never trigger the wedge heal: {:?}",
+        heals.lock().unwrap()
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T5 (R13): repeated heals over the same permanent hole allocate strictly
+/// sequential, monotonic generation ids for one family (`#gen2` through
+/// `#gen10`), while an independently-wedged, differently-named family heals
+/// on its own counter starting at `#gen2` too (family isolation — the
+/// integration-level half of near-miss rejection; the string-parsing half is
+/// pinned by the `wedge_family` unit tests in `event_bus::mod`).
+#[tokio::test]
+#[serial]
+async fn test_heal_allocates_fresh_generation_ids() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let heals = Arc::new(StdMutex::new(Vec::new()));
+    let bus_slot = Arc::new(StdMutex::new(None));
+    let stores = Arc::new(StdMutex::new(StdHashMap::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(150),
+        events_table: table.clone(),
+        on_wedge_retired: Some(Arc::new(AutoResubscribeWedgeCallback {
+            heals: heals.clone(),
+            bus: bus_slot.clone(),
+            stores: stores.clone(),
+        })),
+        wedge_heal: Some(WedgeHealPolicy {
+            max_generations: 12,
+            rehalt_backoff: vec![
+                std::time::Duration::from_millis(30),
+                std::time::Duration::from_millis(60),
+            ],
+        }),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+    *bus_slot.lock().unwrap() = Some(event_bus.clone());
+
+    let base_id = format!("projection:heal-gen-chain:{}", Uuid::new_v4());
+    let other_base = format!("{base_id}-other");
+
+    let stream = Uuid::new_v4();
+    let hole_stream = Uuid::new_v4();
+    burn_permanent_hole(&pool, &table, stream, hole_stream).await;
+
+    let projection = TestProjection::replay_always(base_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe boot id");
+
+    // A second, unrelated family (near-miss shaped: shares `base_id` as a
+    // strict prefix) wedged on the SAME hole, to prove independent counters.
+    let other_projection = TestProjection::replay_always(other_base.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(other_projection))
+        .await
+        .expect("subscribe near-miss id");
+
+    // Poll until the primary family reaches generation 10 (9 heals: 2..=10).
+    // Each generation's steady-state cycle costs roughly two periodic 1 s
+    // wake ticks (one to observe the gap, one to detect the elapsed
+    // gap_timeout), so budget generously.
+    let mut reached_gen10 = false;
+    for _ in 0..120 {
+        let found = heals
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|h| h.base_subscriber_id == base_id && h.generation == 10);
+        if found {
+            reached_gen10 = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(
+        reached_gen10,
+        "family must reach generation 10 via repeated heals: {:?}",
+        heals.lock().unwrap()
+    );
+
+    let generations: Vec<u32> = {
+        let g = heals.lock().unwrap();
+        let mut v: Vec<u32> = g
+            .iter()
+            .filter(|h| h.base_subscriber_id == base_id)
+            .map(|h| h.generation)
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(
+        generations,
+        (2..=*generations.last().unwrap()).collect::<Vec<_>>(),
+        "generations must be strictly sequential with no gaps: {generations:?}"
+    );
+    assert!(
+        generations.contains(&2) && generations.contains(&10),
+        "must include gen2 and gen10: {generations:?}"
+    );
+
+    // The independent family must also have healed, starting at its OWN
+    // gen2 — never continuing the primary family's counter.
+    let other_min_gen = {
+        let g = heals.lock().unwrap();
+        g.iter()
+            .filter(|h| h.base_subscriber_id == other_base)
+            .map(|h| h.generation)
+            .min()
+    };
+    assert_eq!(
+        other_min_gen,
+        Some(2),
+        "the near-miss family must start its own counter at gen2, independent of \
+         the primary family's progress"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T6 (R14): a boot-generation wedge heals immediately (negligible delay
+/// between the halt and the callback firing); a heal-generation re-halt waits
+/// the configured backoff, capped at the schedule's last entry for every
+/// re-halt beyond it.
+#[tokio::test]
+#[serial]
+async fn test_heal_backoff_boot_immediate_rehalt_capped() {
+    use std::time::{Duration as GapDuration, Instant};
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+
+    struct TimestampedHalt {
+        subscriber_id: String,
+        at: Instant,
+    }
+    struct TimestampedHaltCallback {
+        halts: Arc<StdMutex<Vec<TimestampedHalt>>>,
+    }
+    #[async_trait]
+    impl HaltCallback for TimestampedHaltCallback {
+        async fn on_halt(&self, info: HaltInfo) {
+            if info.reason == HaltReason::GapUnproven {
+                self.halts.lock().unwrap().push(TimestampedHalt {
+                    subscriber_id: info.subscriber_id,
+                    at: Instant::now(),
+                });
+            }
+        }
+    }
+
+    struct TimestampedHeal {
+        info: WedgeRetiredInfo,
+        at: Instant,
+    }
+    struct TimestampedWedgeCallback {
+        heals: Arc<StdMutex<Vec<TimestampedHeal>>>,
+        bus: Arc<StdMutex<Option<PgEventBus<TestEventData>>>>,
+    }
+    #[async_trait]
+    impl WedgeRetiredCallback for TimestampedWedgeCallback {
+        async fn on_wedge_retired(&self, info: WedgeRetiredInfo) {
+            self.heals.lock().unwrap().push(TimestampedHeal {
+                info: info.clone(),
+                at: Instant::now(),
+            });
+            let fresh_id = format!("{}#gen{}", info.base_subscriber_id, info.generation);
+            let projection = TestProjection::replay_always(fresh_id).fail_closed();
+            let bus = self.bus.lock().unwrap().clone();
+            if let Some(bus) = bus {
+                let _ = bus.subscribe(ProjectionHandler::new(projection)).await;
+            }
+        }
+    }
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let heals = Arc::new(StdMutex::new(Vec::new()));
+    let bus_slot = Arc::new(StdMutex::new(None));
+    const REHALT_1: GapDuration = GapDuration::from_millis(300);
+    const REHALT_CAP: GapDuration = GapDuration::from_millis(600);
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(150),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(TimestampedHaltCallback {
+            halts: halts.clone(),
+        })),
+        on_wedge_retired: Some(Arc::new(TimestampedWedgeCallback {
+            heals: heals.clone(),
+            bus: bus_slot.clone(),
+        })),
+        wedge_heal: Some(WedgeHealPolicy {
+            max_generations: 6,
+            rehalt_backoff: vec![REHALT_1, REHALT_CAP],
+        }),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+    *bus_slot.lock().unwrap() = Some(event_bus.clone());
+
+    let base_id = format!("projection:heal-backoff:{}", Uuid::new_v4());
+    let stream = Uuid::new_v4();
+    let hole_stream = Uuid::new_v4();
+    burn_permanent_hole(&pool, &table, stream, hole_stream).await;
+
+    let projection = TestProjection::replay_always(base_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe boot id");
+
+    // Wait until generation 4 has healed (boot -> gen2 immediate, gen2's
+    // re-halt -> gen3 after REHALT_1, gen3's re-halt -> gen4 after REHALT_CAP).
+    let mut reached_gen4 = false;
+    for _ in 0..150 {
+        if heals.lock().unwrap().iter().any(|h| h.info.generation == 4) {
+            reached_gen4 = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(reached_gen4, "must reach generation 4 via two re-halts");
+
+    let find_halt_at_or_after = |subscriber_id: &str, after: Instant| -> Option<Instant> {
+        halts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|h| h.subscriber_id == subscriber_id && h.at >= after)
+            .map(|h| h.at)
+            .min()
+    };
+    let heal_at = |generation: u32| -> Option<(Instant, String)> {
+        heals
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|h| h.info.generation == generation)
+            .map(|h| (h.at, h.info.retired_subscriber_id.clone()))
+    };
+
+    // Boot heal (gen2): halt on the base id -> heal, must be near-immediate.
+    let boot_halt = find_halt_at_or_after(&base_id, Instant::now() - GapDuration::from_secs(60))
+        .expect("boot halt must be recorded");
+    let (gen2_at, _) = heal_at(2).expect("gen2 heal recorded");
+    let boot_delay = gen2_at.saturating_duration_since(boot_halt);
+    assert!(
+        boot_delay < GapDuration::from_millis(200),
+        "boot-generation heal must be immediate, got {boot_delay:?}"
+    );
+
+    // First re-halt (on gen2's id) -> gen3, must wait ~REHALT_1.
+    let (gen3_at, gen2_id) = heal_at(3).expect("gen3 heal recorded");
+    let gen2_halt =
+        find_halt_at_or_after(&gen2_id, gen2_at).expect("gen2's own re-halt must be recorded");
+    let rehalt1_delay = gen3_at.saturating_duration_since(gen2_halt);
+    assert!(
+        rehalt1_delay >= REHALT_1.mul_f32(0.7),
+        "first heal-generation re-halt must wait ~{REHALT_1:?}, got {rehalt1_delay:?}"
+    );
+
+    // Second re-halt (on gen3's id) -> gen4, must wait ~REHALT_CAP (capped,
+    // clearly longer than the first re-halt's wait).
+    let (gen4_at, gen3_id) = heal_at(4).expect("gen4 heal recorded");
+    let gen3_halt =
+        find_halt_at_or_after(&gen3_id, gen3_at).expect("gen3's own re-halt must be recorded");
+    let rehalt2_delay = gen4_at.saturating_duration_since(gen3_halt);
+    assert!(
+        rehalt2_delay >= REHALT_CAP.mul_f32(0.7),
+        "capped heal-generation re-halt must wait ~{REHALT_CAP:?}, got {rehalt2_delay:?}"
+    );
+    assert!(
+        rehalt2_delay > rehalt1_delay,
+        "capped backoff ({rehalt2_delay:?}) must exceed the first re-halt's backoff \
+         ({rehalt1_delay:?})"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T7 (R14): reaching `max_generations` retires the family (the wedged id is
+/// unsubscribed) and stops healing — no callback fires for the cap event
+/// itself.
+#[tokio::test]
+#[serial]
+async fn test_generation_cap_retires_family_and_errors() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let heals = Arc::new(StdMutex::new(Vec::new()));
+    let bus_slot = Arc::new(StdMutex::new(None));
+    let stores = Arc::new(StdMutex::new(StdHashMap::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(150),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        on_wedge_retired: Some(Arc::new(AutoResubscribeWedgeCallback {
+            heals: heals.clone(),
+            bus: bus_slot.clone(),
+            stores: stores.clone(),
+        })),
+        wedge_heal: Some(WedgeHealPolicy {
+            max_generations: 2,
+            rehalt_backoff: vec![std::time::Duration::from_millis(30)],
+        }),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+    *bus_slot.lock().unwrap() = Some(event_bus.clone());
+
+    let base_id = format!("projection:heal-cap:{}", Uuid::new_v4());
+    let stream = Uuid::new_v4();
+    let hole_stream = Uuid::new_v4();
+    burn_permanent_hole(&pool, &table, stream, hole_stream).await;
+
+    let projection = TestProjection::replay_always(base_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe boot id");
+
+    // gen2 heals (max_generations=2 allows exactly one heal); gen2 re-wedges
+    // and its heal request hits the cap: retired, no gen3 heal ever fires.
+    let mut got_gen2 = false;
+    for _ in 0..80 {
+        if heals.lock().unwrap().iter().any(|h| h.generation == 2) {
+            got_gen2 = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(got_gen2, "gen2 heal must fire (within the cap)");
+
+    let gen2_id = format!("{base_id}#gen2");
+    // Prove gen2 truly re-wedged (a cap-triggering HealRequest was actually
+    // generated) before checking the cap's effect — otherwise a passing
+    // `heals.len() == 1` assertion would be equally consistent with gen2
+    // simply not having re-wedged yet.
+    assert!(
+        wait_for_gap_unproven_halt(&halts, &gen2_id).await,
+        "gen2 must re-wedge on the still-open hole"
+    );
+
+    // The cap-retirement must have actually unsubscribed gen2's wedged id;
+    // poll since the actor processes the request slightly after the halt.
+    let mut retired = false;
+    for _ in 0..80 {
+        if matches!(
+            event_bus.subscriber_lag(&gen2_id).await,
+            Err(epoch_pg::PgEventBusError::SubscriberNotFound(_))
+        ) {
+            retired = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        retired,
+        "cap-retired id must eventually read back SubscriberNotFound"
+    );
+
+    assert_eq!(
+        heals.lock().unwrap().len(),
+        1,
+        "no heal beyond the cap must ever invoke the callback: {:?}",
+        heals.lock().unwrap()
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T8 (Phase 1's exactly-once property held across the heal — the
+/// "dishonesty pin"): a fresh generation's own catch-up + first live wake
+/// over the SAME still-open hole applies every above-hole row EXACTLY ONCE,
+/// never twice, before it re-wedges.
+#[tokio::test]
+#[serial]
+async fn test_healed_replay_delivers_exactly_once() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let heals = Arc::new(StdMutex::new(Vec::new()));
+    let bus_slot = Arc::new(StdMutex::new(None));
+    let stores = Arc::new(StdMutex::new(StdHashMap::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(300),
+        events_table: table.clone(),
+        on_wedge_retired: Some(Arc::new(AutoResubscribeWedgeCallback {
+            heals: heals.clone(),
+            bus: bus_slot.clone(),
+            stores: stores.clone(),
+        })),
+        wedge_heal: Some(WedgeHealPolicy {
+            max_generations: 4,
+            rehalt_backoff: vec![std::time::Duration::from_millis(200)],
+        }),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+    *bus_slot.lock().unwrap() = Some(event_bus.clone());
+
+    let base_id = format!("projection:heal-exactly-once:{}", Uuid::new_v4());
+    let stream = Uuid::new_v4();
+    let hole_stream = Uuid::new_v4();
+    let (_seq_below, seq_hole) = burn_permanent_hole(&pool, &table, stream, hole_stream).await;
+
+    let projection = TestProjection::replay_always(base_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe boot id");
+
+    // Wait for gen2 to heal (its store is now recorded) AND then re-wedge
+    // (proving its own catch-up + first live wake already ran to completion
+    // over the still-open hole).
+    let mut got_gen2 = false;
+    for _ in 0..80 {
+        if heals.lock().unwrap().iter().any(|h| h.generation == 2) {
+            got_gen2 = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(got_gen2, "gen2 heal must fire");
+
+    // Wait for gen2 to re-wedge and heal into gen3 — proof that gen2's own
+    // catch-up + first live wake already ran to completion over the hole.
+    let mut got_gen3 = false;
+    for _ in 0..80 {
+        if heals.lock().unwrap().iter().any(|h| h.generation == 3) {
+            got_gen3 = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(got_gen3, "gen2 must re-wedge and heal into gen3");
+
+    // Inspect generation 2's OWN store: each above-hole row must have been
+    // applied exactly once (not twice) during its single lifetime.
+    let gen2_store = stores
+        .lock()
+        .unwrap()
+        .get(&2)
+        .cloned()
+        .expect("gen2 store must have been recorded");
+    let counts = delivery_counts_by_seq(&gen2_store, hole_stream).await;
+    assert!(
+        !counts.is_empty(),
+        "gen2 must have applied at least one above-hole row: {counts:?}"
+    );
+    assert!(
+        counts.values().all(|&c| c == 1),
+        "Phase 1's exactly-once property must hold across the heal (no double \
+         delivery of above-hole rows): {counts:?}"
+    );
+    let _ = seq_hole;
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// T9 (lifecycle): with a heal callback configured and a wedge already fired
+/// (so a `HealRequest` is in flight or already queued), `shutdown()` still
+/// completes within a bounded time and the bus is fully reusable afterward —
+/// the heal-actor task does not hang shutdown or leak into the next
+/// `#[serial]` test.
+#[tokio::test]
+#[serial]
+async fn test_heal_actor_stops_on_shutdown() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let heals = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(300),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        on_wedge_retired: Some(Arc::new(CapturingWedgeRetiredCallback {
+            heals: heals.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let sub_id = format!("projection:heal-shutdown:{}", Uuid::new_v4());
+    let stream = Uuid::new_v4();
+    let hole_stream = Uuid::new_v4();
+    burn_permanent_hole(&pool, &table, stream, hole_stream).await;
+
+    let projection = TestProjection::replay_always(sub_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe");
+
+    assert!(
+        wait_for_gap_unproven_halt(&halts, &sub_id).await,
+        "subscriber must wedge (a HealRequest is now in flight or queued)"
+    );
+
+    // shutdown() must complete promptly even with a heal in flight: the
+    // actor breaks on the shutdown watch signal (interrupting any in-flight
+    // backoff immediately); queued-but-unstarted requests are dropped.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), event_bus.shutdown())
+        .await
+        .expect("shutdown must not hang with a heal actor running");
+    result.expect("shutdown must succeed");
+    assert!(!event_bus.is_running().await);
+
+    // The bus (and a fresh listener on it) must be fully reusable afterward —
+    // proof the prior lifecycle left nothing wedged.
+    event_bus
+        .setup_trigger()
+        .await
+        .expect("setup_trigger again");
+    event_bus
+        .start_listener()
+        .await
+        .expect("start_listener again after shutdown");
+    assert!(event_bus.is_running().await);
+    event_bus.shutdown().await.expect("second shutdown");
+
+    drop_isolated_events_table(&pool, &table).await;
+}
+/// R14 lifecycle pin (review cycle 1): a shutdown landing DURING a re-halt
+/// backoff must interrupt the heal actor immediately — never wait out the
+/// configured delay. Boot wedge heals immediately (gen2 auto re-subscribed);
+/// gen2's re-halt defers behind a LONG (10 s) backoff window; shutdown() must
+/// return well inside that window.
+#[tokio::test]
+#[serial]
+async fn test_shutdown_interrupts_rehalt_backoff() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let heals = Arc::new(StdMutex::new(Vec::new()));
+    let bus_slot = Arc::new(StdMutex::new(None));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(150),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        on_wedge_retired: Some(Arc::new(AutoResubscribeWedgeCallback {
+            heals: heals.clone(),
+            bus: bus_slot.clone(),
+            stores: Arc::new(StdMutex::new(StdHashMap::new())),
+        })),
+        wedge_heal: Some(WedgeHealPolicy {
+            max_generations: 5,
+            rehalt_backoff: vec![std::time::Duration::from_secs(10)],
+        }),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+    *bus_slot.lock().unwrap() = Some(event_bus.clone());
+
+    let base_id = format!("projection:heal-backoff:{}", Uuid::new_v4());
+    let gen2_id = format!("{base_id}#gen2");
+    let stream = Uuid::new_v4();
+    let hole_stream = Uuid::new_v4();
+    burn_permanent_hole(&pool, &table, stream, hole_stream).await;
+
+    let projection = TestProjection::replay_always(base_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe boot id");
+
+    // heal 1 (immediate, boot generation): gen2 minted and auto re-subscribed.
+    let mut heal1 = false;
+    for _ in 0..60 {
+        if heals
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|h| h.base_subscriber_id == base_id && h.generation == 2)
+        {
+            heal1 = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(heal1, "heal 1 must fire immediately (boot generation)");
+
+    // gen2 wedges at the same hole -> its heal is deferred behind the 10 s
+    // re-halt backoff. Wait for gen2's wedge so the deferral is in flight.
+    assert!(
+        wait_for_gap_unproven_halt(&halts, &gen2_id).await,
+        "gen2 must wedge (its heal request is now deferred behind the 10 s backoff)"
+    );
+
+    // shutdown() must complete well inside the 10 s backoff window.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), event_bus.shutdown())
+        .await
+        .expect("shutdown must interrupt the re-halt backoff, not wait it out");
+    result.expect("shutdown must succeed");
+
+    // Load-bearing deferral pin: the gen2 heal was DEFERRED behind the 10 s
+    // backoff and must NOT have fired before shutdown — exactly one heal
+    // (the boot generation's) for this family, ever.
+    assert_eq!(
+        heals.lock().unwrap().len(),
+        1,
+        "the re-halt heal must have been deferred (never fired): {:?}",
+        heals.lock().unwrap()
+    );
+
+    drop_isolated_events_table(&pool, &table).await;
+}
