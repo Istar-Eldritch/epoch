@@ -12676,3 +12676,963 @@ async fn test_fresh_subscribe_checkpointed_over_open_hole_delivers_exactly_once(
     event_bus.shutdown().await.expect("shutdown");
     drop_isolated_events_table(&pool, &table).await;
 }
+
+// ==================== Phase 3: unsubscribe retire API (spec 0031) ====================
+
+#[tokio::test]
+#[serial]
+async fn test_unsubscribe_removes_registered_subscriber_returns_true() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (id1, _seq1) = insert_committed_event(&pool, &table, stream, 1, "before").await;
+
+    let sub_id = format!("projection:unsub-basic:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe");
+
+    let mut delivered = false;
+    for _ in 0..50 {
+        if applied_ids(&store, stream).await.contains(&id1) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        delivered,
+        "subscriber must receive the pre-unsubscribe event"
+    );
+
+    let removed = event_bus
+        .unsubscribe(&sub_id)
+        .await
+        .expect("unsubscribe registered id");
+    assert!(removed, "unsubscribe of a registered id returns Ok(true)");
+    let removed_again = event_bus
+        .unsubscribe(&sub_id)
+        .await
+        .expect("unsubscribe same id again");
+    assert!(
+        !removed_again,
+        "idempotent second unsubscribe returns Ok(false)"
+    );
+
+    // A post-unsubscribe publish reaches nobody: the observer Arc is gone.
+    let (id2, _seq2) = insert_committed_event(&pool, &table, stream, 2, "after").await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let ids = applied_ids(&store, stream).await;
+    assert!(!ids.contains(&id2), "no delivery after unsubscribe");
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_unsubscribe_unknown_id_is_idempotent() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let never_registered = format!("projection:never:{}", Uuid::new_v4());
+    let first = event_bus
+        .unsubscribe(&never_registered)
+        .await
+        .expect("unsubscribe unknown id");
+    let second = event_bus
+        .unsubscribe(&never_registered)
+        .await
+        .expect("unsubscribe unknown id again");
+    assert!(!first && !second, "unknown id is Ok(false), idempotent");
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_unsubscribe_inline_bus() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        events_table: table.clone(),
+        dispatch_mode: epoch_pg::event_bus::DispatchMode::Inline,
+        ..Default::default()
+    };
+    // start_isolated_bus on an Inline bus exercises the start_listener no-op
+    // path: delivery happens synchronously inside store_event, never from a
+    // listener task, so there is no listener-lifetime state to tombstone.
+    let event_bus = start_isolated_bus(&pool, config).await;
+    let event_store =
+        PgEventStore::with_table(pool.clone(), event_bus.clone(), table.clone()).await;
+
+    let stream = Uuid::new_v4();
+    let sub_id = format!("projection:unsub-inline:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe");
+
+    event_store
+        .store_event(new_event(stream, 1, "inline-before"))
+        .await
+        .expect("store event (inline dispatch)");
+    let ids = applied_ids(&store, stream).await;
+    assert_eq!(ids.len(), 1, "inline dispatch delivers synchronously");
+
+    let removed = event_bus
+        .unsubscribe(&sub_id)
+        .await
+        .expect("unsubscribe on inline bus");
+    assert!(
+        removed,
+        "unsubscribe is valid on a DispatchMode::Inline bus"
+    );
+    let removed_again = event_bus
+        .unsubscribe(&sub_id)
+        .await
+        .expect("unsubscribe inline idempotent");
+    assert!(
+        !removed_again,
+        "idempotent second unsubscribe on inline bus"
+    );
+
+    event_store
+        .store_event(new_event(stream, 2, "inline-after"))
+        .await
+        .expect("store event after unsubscribe");
+    let ids = applied_ids(&store, stream).await;
+    assert_eq!(
+        ids.len(),
+        1,
+        "no inline delivery after unsubscribe (retired observer is gone)"
+    );
+
+    // NOTE: no shutdown() here — a DispatchMode::Inline bus never starts a
+    // listener (start_listener is a no-op), so shutdown would error with
+    // "Listener was not started". The isolated table is dropped directly.
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_retired_id_readiness_returns_subscriber_not_found() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (id1, _seq1) = insert_committed_event(&pool, &table, stream, 1, "before").await;
+
+    let sub_id = format!("projection:unsub-ready:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe");
+
+    let mut delivered = false;
+    for _ in 0..50 {
+        if applied_ids(&store, stream).await.contains(&id1) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(delivered);
+
+    // Readiness works for the registered id before retirement.
+    let lag = event_bus.subscriber_lag(&sub_id).await.expect("lag");
+    assert_eq!(lag, 0, "delivered subscriber is at head");
+
+    event_bus.unsubscribe(&sub_id).await.expect("unsubscribe");
+
+    // R6: per-id readiness flips to SubscriberNotFound for the retired id —
+    // it behaves as unknown (registry entry dropped at step (c)).
+    let lag_result = event_bus.subscriber_lag(&sub_id).await;
+    assert!(
+        matches!(
+            lag_result,
+            Err(epoch_pg::PgEventBusError::SubscriberNotFound(_))
+        ),
+        "retired id readiness must return SubscriberNotFound, got {lag_result:?}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_unsubscribe_wedged_subscriber_restores_all_caught_up_gate() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        events_table: table.clone(),
+        gap_timeout: GapDuration::from_millis(500),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (_id_below, _seq_below) =
+        insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    // Burn the hole (claim-in-open-tx-then-rollback, spec 0030 recipe).
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_id_hole, _seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    tx_hole.rollback().await.expect("rollback hole tx");
+    let (_id_a1, _seq_a1) = insert_committed_event(&pool, &table, stream, 2, "above1").await;
+    let (_id_a2, _seq_a2) = insert_committed_event(&pool, &table, stream, 3, "above2").await;
+
+    let sub_id = format!("projection:unsub-wedge:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe");
+
+    // The subscriber wedges at the hole (ReplayAlways + FailClosed + Halt over
+    // GapUnproven — the P5 wedge, report 3 B2).
+    assert!(
+        wait_for_gap_unproven_halt(&halts, &sub_id).await,
+        "subscriber must wedge at the hole"
+    );
+
+    // While wedged, the gate is pinned false (the position cannot reach head
+    // over the unproven hole) — 3 rounds, report 3 B2's observation.
+    for round in 0..3 {
+        let caught_up = event_bus
+            .wait_until_all_caught_up(std::time::Duration::from_millis(300))
+            .await
+            .expect("gate while wedged");
+        assert!(
+            !caught_up,
+            "wedged ReplayAlways+Halt must pin the gate false (round {round})"
+        );
+    }
+
+    let removed = event_bus
+        .unsubscribe(&sub_id)
+        .await
+        .expect("unsubscribe wedged subscriber");
+    assert!(removed);
+
+    // R6: the gate resolves — the retired id leaves the registry, so
+    // wait_until_all_caught_up is no longer pinned by it.
+    let caught_up = event_bus
+        .wait_until_all_caught_up(std::time::Duration::from_secs(2))
+        .await
+        .expect("gate after unsubscribe");
+    assert!(
+        caught_up,
+        "unsubscribe must un-pin wait_until_all_caught_up (report 3 B2)"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_retired_id_does_not_pin_shared_floor() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (id1, _seq1) = insert_committed_event(&pool, &table, stream, 1, "e1").await;
+
+    // Two Checkpointed subscribers; both reach head on e1 so both hold
+    // listener-lifetime state (the shared fetch floor is computed from
+    // `subscriber_states` values).
+    //
+    // Honest contract note: the floor drag itself is fetch-side and
+    // delivery-invariant — a lingering stale state entry makes each wake
+    // re-fetch from the retired id's position, which the healthy subscriber's
+    // dedup silently absorbs, so no delivery assertion can distinguish a
+    // pruned from an un-pruned stale entry. This test pins the OBSERVABLE
+    // retirement consequences (A's exactly-once continuity across
+    // post-retire publishes, B's readiness flip); the prune itself is pinned
+    // structurally by `test_resubscribe_same_id_before_next_wake_starts_clean`
+    // (a stale state entry would break the fresh lifecycle's clean replay).
+    // B is not waited for after e2, so it may be behind head at retirement
+    // (its lingering entry would then sit below head if un-pruned).
+    let id_a = format!("projection:floor-healthy:{}", Uuid::new_v4());
+    let id_b = format!("projection:floor-retired:{}", Uuid::new_v4());
+    let proj_a = TestProjection::with_subscriber_id(id_a.clone());
+    let store_a = proj_a.get_state_store().clone();
+    let proj_b = TestProjection::with_subscriber_id(id_b.clone());
+    event_bus
+        .subscribe(ProjectionHandler::new(proj_a))
+        .await
+        .expect("subscribe A");
+    event_bus
+        .subscribe(ProjectionHandler::new(proj_b))
+        .await
+        .expect("subscribe B");
+
+    let mut delivered_e1 = false;
+    for _ in 0..50 {
+        let ids = applied_ids(&store_a, stream).await;
+        if ids.contains(&id1) {
+            delivered_e1 = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(delivered_e1, "subscribers must reach head on e1");
+
+    // Publish e2 and wait for A only — B is not waited for, so it may be
+    // behind head at retirement (its listener-lifetime entry would then sit
+    // below the stream head).
+    let (id2, _seq2) = insert_committed_event(&pool, &table, stream, 2, "e2").await;
+    let mut a_at_e2 = false;
+    for _ in 0..50 {
+        if applied_ids(&store_a, stream).await.contains(&id2) {
+            a_at_e2 = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(a_at_e2, "A must reach e2 before B is retired");
+
+    // Retire the lagging B.
+    let removed = event_bus.unsubscribe(&id_b).await.expect("unsubscribe B");
+    assert!(removed);
+
+    // Post-retire publishes: A keeps receiving exactly once (no starvation,
+    // no double delivery), and the retired id never reappears.
+    let (id3, _seq3) = insert_committed_event(&pool, &table, stream, 3, "e3").await;
+    let mut a_caught_up = false;
+    for _ in 0..50 {
+        let ids = applied_ids(&store_a, stream).await;
+        if ids.contains(&id3) {
+            a_caught_up = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(a_caught_up, "healthy subscriber A must keep delivering");
+    let lag_b = event_bus.subscriber_lag(&id_b).await;
+    assert!(
+        matches!(lag_b, Err(epoch_pg::PgEventBusError::SubscriberNotFound(_))),
+        "retired B must be gone from readiness"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_unsubscribe_resolves_gap_ledger_rows_with_unsubscribe_marker() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        events_table: table.clone(),
+        gap_timeout: std::time::Duration::from_millis(500),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // R8: the ledger-resolve subject must be one that actually WRITES
+    // gap-timeout rows — the FailOpen TimeoutBackstop skip (a FailClosed+Halt
+    // subscriber refuses the backstop and writes none). Subject: ReplayAlways
+    // + FailOpen (the default builder).
+    //
+    // The hole must be burned AFTER the subscriber is caught up: the
+    // subscribe-time catch-up delivers above-hole rows as it finds them
+    // (Phase 1's exactly-once handoff), so a pre-existing hole is never
+    // observed live and never reaches the backstop. Subscribe first, reach
+    // head, then burn + publish above.
+    let sub_id = format!("projection:unsub-ledger:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe");
+
+    let stream = Uuid::new_v4();
+    let (_id_below, seq_below) =
+        insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    let mut at_head = false;
+    for _ in 0..50 {
+        // ReplayAlways writes no checkpoint rows — readiness lag is the
+        // observable position (lag 0 = the in-memory HWM reached head).
+        let lag = event_bus
+            .subscriber_lag(&sub_id)
+            .await
+            .expect("subscriber_lag");
+        let head = event_bus.head_sequence().await.expect("head").unwrap_or(0);
+        if lag == 0 && head >= seq_below as u64 {
+            at_head = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        at_head,
+        "subscriber must reach head before the hole is burned"
+    );
+
+    // NOW burn the hole and publish above it — the live wake observes the gap.
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_id_hole, _seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    tx_hole.rollback().await.expect("rollback hole tx");
+    let (id_a1, _seq_a1) = insert_committed_event(&pool, &table, stream, 2, "above1").await;
+
+    // The backstop skip (after gap_timeout) writes the ledger row and
+    // unblocks delivery of the above-hole row.
+    let mut delivered = false;
+    for _ in 0..80 {
+        if applied_ids(&store, stream).await.contains(&id_a1) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(delivered, "backstop skip must unblock above-hole delivery");
+
+    // The unresolved ledger row exists before retirement. The row is written
+    // by a fire-and-forget task spawned when the backstop fires (~gap_timeout
+    // after the gap was first observed — the above-hole row itself is applied
+    // by the first wake's row loop immediately), so poll instead of a single
+    // read.
+    // The unresolved ledger row exists before retirement. The row is written
+    // by a fire-and-forget task spawned when the backstop fires (~gap_timeout
+    // after the gap was first observed — the above-hole row itself is applied
+    // by the first wake's row loop immediately), so poll instead of a single
+    // read. Capture the unresolved rows' sequences so the post-retire
+    // assertion is scoped to rows THIS test observed unresolved (a row the
+    // gap-detection scan resolved earlier must not fail the assertion).
+    let mut unresolved_seqs: Vec<i64> = Vec::new();
+    for _ in 0..40 {
+        unresolved_seqs = sqlx::query_scalar(
+            "SELECT skipped_sequence FROM epoch_event_bus_gap_timeouts \
+             WHERE bus_name = $1 AND subscriber_id = $2 AND resolved_at IS NULL",
+        )
+        .bind(&table)
+        .bind(&sub_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read unresolved ledger rows");
+        if !unresolved_seqs.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        !unresolved_seqs.is_empty(),
+        "backstop skip must have written an unresolved gap-timeout row"
+    );
+
+    let removed = event_bus.unsubscribe(&sub_id).await.expect("unsubscribe");
+    assert!(removed);
+
+    // R8: the rows observed unresolved before retirement are resolved with
+    // resolved_by='unsubscribe' (scoped to those rows; unrelated rows for the
+    // id resolved by other mechanisms are out of this assertion's scope).
+    let rows: Vec<(i64, bool, String)> = sqlx::query_as(
+        "SELECT skipped_sequence, (resolved_at IS NOT NULL) AS resolved, resolved_by \
+         FROM epoch_event_bus_gap_timeouts \
+         WHERE bus_name = $1 AND subscriber_id = $2",
+    )
+    .bind(&table)
+    .bind(&sub_id)
+    .fetch_all(&pool)
+    .await
+    .expect("read ledger rows");
+    let by_seq: std::collections::HashMap<i64, (bool, String)> = rows
+        .into_iter()
+        .map(|(seq, resolved, resolved_by)| (seq, (resolved, resolved_by)))
+        .collect();
+    for seq in &unresolved_seqs {
+        let (resolved, resolved_by) = by_seq
+            .get(seq)
+            .expect("previously unresolved row must still exist");
+        assert!(
+            *resolved,
+            "ledger row {seq} must be resolved after unsubscribe"
+        );
+        assert_eq!(
+            resolved_by, "unsubscribe",
+            "ledger row {seq} must carry resolved_by='unsubscribe'"
+        );
+    }
+
+    // Idempotent re-unsubscribe must not duplicate or change anything.
+    let removed_again = event_bus
+        .unsubscribe(&sub_id)
+        .await
+        .expect("re-unsubscribe");
+    assert!(!removed_again);
+    let rows_after: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM epoch_event_bus_gap_timeouts \
+         WHERE bus_name = $1 AND subscriber_id = $2",
+    )
+    .bind(&table)
+    .bind(&sub_id)
+    .fetch_one(&pool)
+    .await
+    .expect("re-read ledger rows");
+    assert_eq!(
+        rows_after.0 as usize,
+        by_seq.len(),
+        "no duplicate ledger rows"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_unsubscribe_retains_checkpoint_row_and_resubscribe_resumes() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (id1, seq1) = insert_committed_event(&pool, &table, stream, 1, "e1").await;
+
+    let sub_id = format!("projection:unsub-retain:{}", Uuid::new_v4());
+    let projection = TestProjection::with_subscriber_id(sub_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe");
+
+    let mut delivered = false;
+    for _ in 0..50 {
+        if applied_ids(&store, stream).await.contains(&id1) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(delivered);
+
+    // Wait for the checkpoint row to be flushed (batched, ~1s interval).
+    let mut cp_seq: Option<i64> = None;
+    for _ in 0..50 {
+        cp_seq = sqlx::query_scalar(
+            "SELECT last_global_sequence FROM epoch_event_bus_checkpoints \
+             WHERE bus_name = $1 AND subscriber_id = $2",
+        )
+        .bind(&table)
+        .bind(&sub_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("read checkpoint row");
+        if cp_seq.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let cp_seq = cp_seq.expect("checkpoint row must be flushed before retire");
+    assert!(cp_seq >= seq1, "checkpoint must cover e1");
+
+    let removed = event_bus.unsubscribe(&sub_id).await.expect("unsubscribe");
+    assert!(removed);
+
+    // R8: the checkpoint row is RETAINED (no DELETE), unchanged.
+    let retained: (i64,) = sqlx::query_as(
+        "SELECT last_global_sequence FROM epoch_event_bus_checkpoints \
+         WHERE bus_name = $1 AND subscriber_id = $2",
+    )
+    .bind(&table)
+    .bind(&sub_id)
+    .fetch_one(&pool)
+    .await
+    .expect("checkpoint row must be retained after unsubscribe");
+    assert_eq!(retained.0, cp_seq, "retained checkpoint must be unchanged");
+
+    // Same-id re-subscribe starts a CLEAN lifecycle that RESUMES from the
+    // retained checkpoint: e1 is not re-delivered; e2 is.
+    let projection2 = TestProjection::with_subscriber_id(sub_id.clone());
+    let store2 = projection2.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection2))
+        .await
+        .expect("re-subscribe same id");
+
+    let (id2, _seq2) = insert_committed_event(&pool, &table, stream, 2, "e2").await;
+    let mut resumed = false;
+    for _ in 0..50 {
+        let ids = applied_ids(&store2, stream).await;
+        if ids.contains(&id2) {
+            resumed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(resumed, "re-subscribed lifecycle must deliver e2");
+    let ids = applied_ids(&store2, stream).await;
+    assert_eq!(
+        ids.len(),
+        1,
+        "resume from the retained checkpoint: e1 must NOT be re-delivered"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_unsubscribe_effect_at_next_wake() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (id1, _seq1) = insert_committed_event(&pool, &table, stream, 1, "e1").await;
+
+    let sub_id = format!("projection:unsub-wake:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe");
+
+    let mut delivered = false;
+    for _ in 0..50 {
+        if applied_ids(&store, stream).await.contains(&id1) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(delivered);
+
+    event_bus.unsubscribe(&sub_id).await.expect("unsubscribe");
+
+    // R9 timing pin: the retired observer receives nothing after retirement,
+    // across BOTH wake triggers — the NOTIFY wake fired by this publish and
+    // the ~1 s flush_interval timer wake that follows.
+    let (id2, _seq2) = insert_committed_event(&pool, &table, stream, 2, "e2").await;
+    tokio::time::sleep(GapDuration::from_millis(1500)).await;
+    let ids = applied_ids(&store, stream).await;
+    assert!(
+        !ids.contains(&id2),
+        "retired observer must not receive the NOTIFY-wake event"
+    );
+    let (id3, _seq3) = insert_committed_event(&pool, &table, stream, 3, "e3").await;
+    tokio::time::sleep(GapDuration::from_millis(1500)).await;
+    let ids = applied_ids(&store, stream).await;
+    assert!(
+        !ids.contains(&id3),
+        "retired observer must not receive the timer-wake event"
+    );
+    let lag_result = event_bus.subscriber_lag(&sub_id).await;
+    assert!(matches!(
+        lag_result,
+        Err(epoch_pg::PgEventBusError::SubscriberNotFound(_))
+    ));
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_unsubscribe_coordinated_best_effort_lock_release() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        events_table: table.clone(),
+        instance_mode: epoch_pg::event_bus::InstanceMode::Coordinated,
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (id1, _seq1) = insert_committed_event(&pool, &table, stream, 1, "e1").await;
+
+    let sub_id = format!("projection:unsub-coord:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe (Coordinated)");
+
+    let mut delivered = false;
+    for _ in 0..50 {
+        if applied_ids(&store, stream).await.contains(&id1) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(delivered);
+
+    // R10: unsubscribe works end-to-end on a Coordinated bus; the advisory
+    // lock release is best-effort by contract (session-scoped on a pooled
+    // connection — the release may be a no-op or the lock already gone), so
+    // the pin is that retirement SUCCEEDS and the release attempt never
+    // errors the unsubscribe.
+    let removed = event_bus
+        .unsubscribe(&sub_id)
+        .await
+        .expect("unsubscribe on Coordinated bus must succeed");
+    assert!(removed);
+    let lag_result = event_bus.subscriber_lag(&sub_id).await;
+    assert!(matches!(
+        lag_result,
+        Err(epoch_pg::PgEventBusError::SubscriberNotFound(_))
+    ));
+    let removed_again = event_bus
+        .unsubscribe(&sub_id)
+        .await
+        .expect("re-unsubscribe");
+    assert!(!removed_again);
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_resubscribe_same_id_before_next_wake_starts_clean() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // --- Variant 1: ReplayAlways re-subscribe replays from 0, cleanly. ---
+    let stream = Uuid::new_v4();
+    let (id1, _seq1) = insert_committed_event(&pool, &table, stream, 1, "e1").await;
+    let sub_id = format!("projection:resub-replay:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe v1");
+    let mut delivered = false;
+    for _ in 0..50 {
+        if applied_ids(&store, stream).await.contains(&id1) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(delivered);
+
+    // Unsubscribe then immediately re-subscribe the SAME id (ReplayAlways).
+    // Publish NOTHING in between: a wake may land inside the window (NOTIFY
+    // or the ~1 s timer), and the assertions below tolerate either
+    // interleaving — the marker-consuming wake prunes + fences (no re-seed,
+    // registry empty at that instant), or the marker is still pending when
+    // the next wake runs (prune + fence + registry re-seed). Both must leave
+    // a fresh lifecycle.
+    let removed = event_bus.unsubscribe(&sub_id).await.expect("unsubscribe");
+    assert!(removed);
+    let projection_v1b = TestProjection::replay_always(sub_id.clone());
+    let store_v1b = projection_v1b.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection_v1b))
+        .await
+        .expect("re-subscribe ReplayAlways same id");
+
+    // The fresh ReplayAlways lifecycle replays from 0: e1 is delivered to the
+    // NEW store exactly once (a stale inherited state would suppress e1 or
+    // double-deliver it), and a new event is delivered exactly once.
+    let mut replayed = false;
+    for _ in 0..50 {
+        if applied_ids(&store_v1b, stream).await.contains(&id1) {
+            replayed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        replayed,
+        "ReplayAlways re-subscribe must replay from 0 (e1 delivered to the new store)"
+    );
+    let (id2, _seq2) = insert_committed_event(&pool, &table, stream, 2, "e2").await;
+    let mut got_e2 = false;
+    for _ in 0..50 {
+        if applied_ids(&store_v1b, stream).await.contains(&id2) {
+            got_e2 = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(got_e2);
+    let counts = delivery_counts_by_seq(&store_v1b, stream).await;
+    assert!(
+        counts.values().all(|&c| c <= 1),
+        "no double delivery in the fresh lifecycle (counts: {counts:?})"
+    );
+
+    // --- Variant 2: Checkpointed re-subscribe resumes from the retained row. ---
+    let stream2 = Uuid::new_v4();
+    let (idc1, _seqc1) = insert_committed_event(&pool, &table, stream2, 1, "c1").await;
+    let sub_id_c = format!("projection:resub-cp:{}", Uuid::new_v4());
+    let projection_c = TestProjection::with_subscriber_id(sub_id_c.clone());
+    let store_c = projection_c.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection_c))
+        .await
+        .expect("subscribe v2");
+    delivered = false;
+    for _ in 0..50 {
+        if applied_ids(&store_c, stream2).await.contains(&idc1) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(delivered);
+    // Wait for the checkpoint flush so the retained row covers c1.
+    let mut cp: Option<i64> = None;
+    for _ in 0..50 {
+        cp = sqlx::query_scalar(
+            "SELECT last_global_sequence FROM epoch_event_bus_checkpoints \
+             WHERE bus_name = $1 AND subscriber_id = $2",
+        )
+        .bind(&table)
+        .bind(&sub_id_c)
+        .fetch_optional(&pool)
+        .await
+        .expect("read checkpoint");
+        if cp.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(cp.is_some(), "checkpoint must be flushed");
+
+    let removed_c = event_bus.unsubscribe(&sub_id_c).await.expect("unsubscribe");
+    assert!(removed_c);
+    let projection_c2 = TestProjection::with_subscriber_id(sub_id_c.clone());
+    let store_c2 = projection_c2.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection_c2))
+        .await
+        .expect("re-subscribe Checkpointed same id");
+
+    let (idc2, _seqc2) = insert_committed_event(&pool, &table, stream2, 2, "c2").await;
+    let mut resumed = false;
+    for _ in 0..50 {
+        if applied_ids(&store_c2, stream2).await.contains(&idc2) {
+            resumed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(resumed, "resumed lifecycle must deliver c2");
+    let ids = applied_ids(&store_c2, stream2).await;
+    assert_eq!(
+        ids.len(),
+        1,
+        "Checkpointed re-subscribe resumes from the retained checkpoint: c1 must NOT \
+         be re-delivered, and no retired state may leak into the new lifecycle"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}

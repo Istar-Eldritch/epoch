@@ -735,17 +735,32 @@ then implement to green, matching how spec 0030's phases were executed (tests in
     step (g) and never inserts a marker. On a bus with a running listener, at each
     wake's init pass (`mod.rs:2063` region), **before** the `contains_key` gate: for
     every id present in `retired_ids`, (i) prune its entries from the four
-    listener-lifetime maps (`mod.rs:1872-1885`) **and** remove its `hwm` entry
-    (`mod.rs:1420`) — the ReplayAlways advance path can re-insert `hwm[id]` after
-    step (d) already removed it (`mod.rs:3821-3823`), so the prune must re-clear it
-    or a retired `ReplayAlways` id leaves a permanent orphan `hwm` entry,
-    accumulating across a `#genN` heal chain; (ii) **fence that id's pre-unsubscribe
+    listener-lifetime maps (`mod.rs:1872-1885`) **and** re-clear its `hwm` entry
+    (`mod.rs:1420`) **only when the id is not currently registered** — the
+    ReplayAlways advance path can re-insert `hwm[id]` after step (d) already removed
+    it (`mod.rs:3821-3823`), so an ownerless id's resurrected entry must be
+    re-cleared or it accumulates permanently across a `#genN` heal chain; but a
+    same-id re-subscribe that landed between the unsubscribe and this wake owns a
+    FRESH hwm lifecycle (zeroed at its subscribe, advanced by its own catch-up) —
+    clearing it would regress the new lifecycle's seed below its delivered set and
+    double-deliver on the next wake (the delivered-set narrowing against the final
+    catch-up contiguous assumes the seed reads that same contiguous). The orphan
+    hazard the re-clear exists for applies only to an id with no owner.
+    (Conditional amendment 2026-09-17, Phase 3 implementation — the original text
+    re-cleared unconditionally.); (ii) **fence that id's pre-unsubscribe
     snapshotted observer `Arc`** (the wake's own snapshot, `mod.rs:2038-2041`)
     **from this wake's dispatch**, whether or not the id is currently registered
     again — the snapshot was taken before the unsubscribe, so its Arc for that id is
     necessarily the retired one; a re-registered replacement's Arc was pushed after
     the snapshot and joins delivery from the next wake, consistent with R9's "inert
-    for up to one wake"; and then (iii) **drop the id from `retired_ids`** — the
+    for up to one wake". (The implemented filter is ID-scoped, not Arc-identity-
+    scoped: in the retire → re-subscribe → wake interleaving where the replacement's
+    Arc landed in the snapshot before the consuming wake, the filter fences the NEW
+    Arc too for that one wake — inside R9's inert window and safe (no seed, the hwm
+    conditional keeps the fresh lifecycle's advanced hwm, the delivered set is
+    kept); the spec text's "necessarily the retired one" holds only for the
+    retire → wake → re-subscribe ordering. Amendment 2026-09-17, Phase 3 review
+    cycle 1.); and then (iii) **drop the id from `retired_ids`** — the
     marker is consumed, not left standing. The fence is load-bearing, not cosmetic:
     without it, (a) a pruned-and-not-re-registered id's stale Arc would still be
     dispatched to on this wake, and the per-priority dispatch's

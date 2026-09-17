@@ -1501,6 +1501,24 @@ where
     /// Phase 3's `unsubscribe` removes the entry as part of its retirement
     /// inventory (spec 0031 Phase 3 step (d)).
     pending_delivered_sets: Arc<Mutex<HashMap<String, HashSet<u64>>>>,
+    /// Retired subscriber ids awaiting the listener's next wake init pass
+    /// (spec 0031 Phase 3 step (h), R7). `unsubscribe` inserts the id here
+    /// ONLY when a listener is running — a [`DispatchMode::Inline`] bus has
+    /// no listener and no listener-lifetime maps to prune, so no marker is
+    /// needed. The wake init pass consumes each marker before the
+    /// `contains_key` gate: it prunes the id's listener-lifetime map entries,
+    /// re-clears its `hwm` entry (the ReplayAlways advance path can
+    /// resurrect it), fences the id's pre-unsubscribe snapshotted observer
+    /// Arc from that one wake, and drops the marker — so on a bus with a
+    /// running listener the set stays bounded at one entry per retirement
+    /// until the next wake. Markers linger across a listener shutdown (step
+    /// (h) is gated on a running listener; the consumer is the wake loop) and
+    /// are drained by the NEXT listener's first wake — the prune is then a
+    /// no-op against the fresh maps, and a re-subscribed id's fence may cost
+    /// it one wake. `subscribe()` never reads or writes this set, which is
+    /// what makes the retire/re-subscribe race clean in both orderings (spec
+    /// 0031 R8/R9).
+    retired_ids: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Poll cadence for `wait_until_caught_up` / `wait_until_all_caught_up`.
@@ -1533,6 +1551,7 @@ where
             hwm: Arc::new(Mutex::new(HashMap::new())),
             subscriber_modes: Arc::new(Mutex::new(HashMap::new())),
             pending_delivered_sets: Arc::new(Mutex::new(HashMap::new())),
+            retired_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -1855,6 +1874,8 @@ where
         let config = self.config.clone();
         let hwm = self.hwm.clone();
         let pending_delivered_sets = self.pending_delivered_sets.clone();
+        let retired_ids = self.retired_ids.clone();
+        let subscriber_modes = self.subscriber_modes.clone();
 
         // Create shutdown signal channel
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -2146,6 +2167,90 @@ where
                     guard.iter().cloned().collect()
                 };
 
+                // === Retired-id marker consumption (spec 0031 Phase 3, R7/R9) ===
+                //
+                // Consume pending-prune markers AFTER the snapshot (so the fenced
+                // Arcs are exactly the ones this wake captured) and BEFORE the
+                // `contains_key` gate below. For every id whose `unsubscribe`
+                // inserted a marker: prune the four listener-lifetime maps and
+                // re-clear the bus-level `hwm` entry (unsubscribe's step (d)
+                // removed it, but the ReplayAlways advance path can resurrect it
+                // during the current-wake tail), then drop the marker — consumed,
+                // not standing, so the set stays bounded at one entry per
+                // retirement until the next wake. The consumed ids also FENCE the
+                // id's pre-unsubscribe snapshot Arc from THIS wake's dispatch
+                // (skipped in the tagged loop below): the snapshot predates the
+                // unsubscribe, so its Arc for that id is necessarily the retired
+                // one, and a re-registered replacement's Arc (pushed after the
+                // snapshot) is not in the snapshot at all — it joins delivery
+                // from the next wake, consistent with R9's "inert for up to one
+                // wake". The fence is load-bearing: without it a
+                // pruned-and-not-re-registered id would reach the dispatch path's
+                // `SubscriberState::new(0)` fallback (normally unreachable — this
+                // init pass seeds every dispatched subscriber) and silently
+                // substitute FailOpen+Halt defaults for what was a FailClosed
+                // subscriber, and a pruned-and-re-registered id's stale Arc would
+                // consume the new lifecycle's replay-from-0 and advance its
+                // position. `pending_delivered_sets` is deliberately NOT
+                // re-cleared here (spec Phase 3 step (d)): a same-id re-subscribe
+                // that recorded a fresh set between the unsubscribe and this wake
+                // must keep it.
+                let drained_markers: Vec<String> = retired_ids.lock().await.drain().collect();
+                let mut retired_consumed: HashSet<String> =
+                    HashSet::with_capacity(drained_markers.len());
+                for id in drained_markers {
+                    subscriber_states.remove(&id);
+                    pending_checkpoints.remove(&id);
+                    checkpoint_cache.remove(&id);
+                    last_event_ids.remove(&id);
+                    // Re-clear the bus-level `hwm` entry ONLY when the id is
+                    // not currently registered: a same-id re-subscribe that
+                    // landed between the unsubscribe and this wake owns a
+                    // FRESH hwm lifecycle (zeroed at its subscribe, advanced
+                    // by its own catch-up) — clearing it here would regress
+                    // the new lifecycle's seed below its delivered set and
+                    // double-deliver on the next wake. The orphan-hwm hazard
+                    // the re-clear exists for (the ReplayAlways advance path
+                    // resurrecting `hwm[id]` after unsubscribe's step (d))
+                    // applies only to an id with no owner.
+                    let registered = subscriber_modes.lock().await.contains_key(&id);
+                    if !registered {
+                        hwm.lock().await.remove(&id);
+                    }
+                    retired_consumed.insert(id);
+                }
+                // Fence: drop the consumed ids' pre-unsubscribe snapshot Arcs
+                // from the wake's snapshot ITSELF — the init pass below AND the
+                // batch dispatch loop (and the P4b private fetch via
+                // `sid_to_proj`) all read this snapshot, so filtering here is
+                // the single fence point. The snapshot predates the
+                // unsubscribe, so its Arc for a consumed id is necessarily the
+                // retired one; a re-registered replacement's Arc was pushed
+                // after the snapshot and is not in it — it joins delivery from
+                // the next wake through the normal `contains_key` gate. Without
+                // the fence a pruned-and-not-re-registered id would dispatch
+                // through the `SubscriberState::new(0)` fallback (silently
+                // substituting FailOpen+Halt defaults for a FailClosed
+                // subscriber) and a pruned-and-re-registered id's stale Arc
+                // would consume the new lifecycle's replay-from-0. Filtering
+                // locks each remaining observer once, only on wakes that
+                // consumed a marker; no dispatch is in flight at wake start.
+                let projections_snapshot: Vec<_> = if retired_consumed.is_empty() {
+                    projections_snapshot
+                } else {
+                    let mut fenced = Vec::with_capacity(projections_snapshot.len());
+                    for projection in projections_snapshot {
+                        let sid = {
+                            let guard = projection.lock().await;
+                            guard.subscriber_id().to_string()
+                        };
+                        if !retired_consumed.contains(&sid) {
+                            fenced.push(projection);
+                        }
+                    }
+                    fenced
+                };
+
                 // Initialize per-subscriber state for any new subscribers.
                 //
                 // spec 0028 P4b: also record, per wake, an id -> projection map
@@ -2164,6 +2269,9 @@ where
                             guard.gap_policy(),
                         )
                     };
+                    // (The R9 fence for consumed retirements is applied to
+                    // `projections_snapshot` itself above — this loop reads the
+                    // already-fenced snapshot.)
                     replay_always_by_sid.insert(subscriber_id.clone(), replay_always);
                     sid_to_proj.push((subscriber_id.clone(), projection.clone()));
                     if !subscriber_states.contains_key(&subscriber_id) {
@@ -2218,6 +2326,7 @@ where
                             .await
                             .remove(&subscriber_id)
                             .unwrap_or_default();
+
                         subscriber_states.insert(
                             subscriber_id.clone(),
                             SubscriberState::new_with_event_id(
@@ -3100,6 +3209,182 @@ where
             .await
     }
 
+    /// Retires a registered subscriber: removes every observer handle for
+    /// `subscriber_id` from the bus and resolves the subscriber's outstanding
+    /// bookkeeping.
+    ///
+    /// # Contract
+    ///
+    /// * **Idempotent** (spec 0031 R4, OQ-2): returns `Ok(true)` when the id
+    ///   was registered and has now been removed, `Ok(false)` when it was
+    ///   already absent (unknown id or retired twice).
+    /// * **Removal inventory** (R6): all same-id observer Arcs (identified by
+    ///   [`Arc::ptr_eq`] under the outer mutex, including the delivering
+    ///   handle and any inert same-id duplicates), the `subscriber_modes`
+    ///   registry entry, the ReplayAlways `hwm` entry, and the delivered-set
+    ///   handoff carrier entry. Per-id readiness methods (`subscriber_lag`,
+    ///   `wait_until_caught_up`) return [`PgEventBusError::SubscriberNotFound`]
+    ///   for the retired id from then on.
+    /// * **Retained state** (R8): checkpoint rows and DLQ rows are kept — no
+    ///   DELETE is issued. A same-id re-subscribe starts a clean new
+    ///   lifecycle: `Checkpointed` resumes from the retained checkpoint row,
+    ///   `ReplayAlways` replays from 0.
+    /// * **Ledger** (R8): unresolved `epoch_event_bus_gap_timeouts` rows for
+    ///   `(events_table, subscriber_id)` are resolved with
+    ///   `resolved_by = 'unsubscribe'`, silencing zombie rebuild callbacks.
+    /// * **Coordinated buses** (R10, best-effort): the advisory
+    ///   subscriber lock is released, but the release is UNRELIABLE — the
+    ///   lock is session-scoped on a pooled connection, so the call may land
+    ///   on a different session than the one holding it (no-op `false`) or
+    ///   the holding session may already be gone. Release failure is logged
+    ///   and never blocks retirement; the lock dies with its session
+    ///   regardless.
+    /// * **Timing** (R9): removal takes effect at the next wake; the current
+    ///   wake may still deliver to and advance the retired observer via its
+    ///   pre-unsubscribe snapshot — EXCEPT the one wake that consumes the
+    ///   id's tombstone marker, which prunes the id's listener-lifetime
+    ///   state, re-clears its `hwm` entry, and FENCES that snapshotted Arc
+    ///   from its own dispatch (the snapshot predates the unsubscribe, so
+    ///   its Arc for that id is necessarily the retired one; a re-registered
+    ///   replacement's Arc was pushed after the snapshot and joins delivery
+    ///   from the next wake). An unsubscribe racing an in-flight `subscribe`
+    ///   of the same id wins: the push sites' post-push re-check removes the
+    ///   just-pushed Arc and aborts the subscribe with
+    ///   [`PgEventBusError::SubscriberNotFound`] — the caller may re-issue
+    ///   the subscribe if still wanted. On an
+    ///   [`DispatchMode::Inline`] bus there is no listener and no
+    ///   listener-lifetime state, so removal is immediate and no tombstone
+    ///   marker is recorded.
+    /// * **Empty-registry hazard**: retiring the last subscriber leaves the
+    ///   registry empty, which makes `wait_until_all_caught_up` return
+    ///   `Ok(true)` trivially — an empty registry is not evidence that any
+    ///   work was done.
+    ///
+    /// # Arguments
+    ///
+    /// * `subscriber_id` - The subscriber id to retire.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` if the id was registered and is now removed; `Ok(false)` if
+    /// it was already absent (idempotent re-call or unknown id).
+    pub async fn unsubscribe(&self, subscriber_id: &str) -> Result<bool, PgEventBusError> {
+        // (a) Capture the id's handles under the registry guard, then drop
+        // the guard BEFORE touching the projections Vec — lock-ordering
+        // contract on `remove_captured_observers`: no path holds both
+        // mutexes. Removing the entry atomically with the capture also drops
+        // the registry entry (step (c)) in the same critical section, so a
+        // retired id can never be re-observed as registered between capture
+        // and entry-drop.
+        let captured: Option<Vec<Arc<Mutex<dyn EventObserver<D>>>>> = {
+            let mut registry = self.subscriber_modes.lock().await;
+            registry.remove(subscriber_id).map(|(_, handles)| handles)
+        };
+
+        // Idempotency (R4, OQ-2): an unknown id is `Ok(false)`. Nothing below
+        // runs for it — with no registry entry there is nothing to remove,
+        // resolve, or release.
+        let Some(captured) = captured else {
+            return Ok(false);
+        };
+
+        // (b) Remove every captured Arc (all same-id handles, including the
+        // delivering one and any inert same-id duplicates) from the
+        // projections Vec, by `Arc::ptr_eq` under the outer mutex.
+        let removed_handles = remove_captured_observers(&self.projections, &captured).await;
+        // `removed_handles` can legitimately be FEWER than `captured.len()`:
+        // a handle registered by a racing same-id subscribe (registry insert
+        // at `warn_if_subscriber_id_reused`) that had not reached its push
+        // site yet is captured here with nothing in the projections Vec to
+        // remove — that window is closed by the push sites' own post-push
+        // re-check (R9 subscribe/retire race), which removes the Arc after
+        // pushing when the registry entry is already gone.
+        log::debug!(
+            "unsubscribe: removed {removed_handles} of {} captured handle(s) for \
+             '{subscriber_id}' from the projections Vec",
+            captured.len()
+        );
+
+        // (d) Remove listener-visible per-id state: the ReplayAlways HWM and
+        // the delivered-set handoff carrier (a stale unconsumed set must
+        // never be inherited by a re-seeded lifecycle — spec 0031 Phase 3
+        // step (d)). The four listener-lifetime maps are pruned by the
+        // consuming wake's init pass via the tombstone marker (step (h)),
+        // not here: they are listener-task state.
+        self.hwm.lock().await.remove(subscriber_id);
+        self.pending_delivered_sets
+            .lock()
+            .await
+            .remove(subscriber_id);
+
+        // (e) Resolve unresolved gap-timeout rows for this subscriber with
+        // the audit marker (R8). Rows are only ever written when a
+        // TimeoutBackstop skip was taken, so this is commonly a no-op for
+        // FailClosed+Halt subscribers (they refuse the backstop and write
+        // none).
+        let resolved = sqlx::query(
+            r#"
+            UPDATE epoch_event_bus_gap_timeouts
+            SET resolved_at = NOW(),
+                resolved_by = 'unsubscribe'
+            WHERE bus_name = $1
+              AND subscriber_id = $2
+              AND resolved_at IS NULL
+            "#,
+        )
+        .bind(&self.config.events_table)
+        .bind(subscriber_id)
+        .execute(&self.pool)
+        .await?;
+        if resolved.rows_affected() > 0 {
+            log::debug!(
+                "unsubscribe: resolved {} gap-timeout row(s) for '{subscriber_id}'",
+                resolved.rows_affected()
+            );
+        }
+
+        // (f) Coordinated mode: best-effort advisory-lock release (R10). The
+        // lock is session-scoped on a pooled connection, so the release is
+        // UNRELIABLE: it may land on a different session than the one
+        // holding the lock (no-op), or the holding session may already be
+        // gone (auto-released). Failure never blocks retirement — the lock
+        // dies with its session regardless.
+        if self.config.instance_mode == config::InstanceMode::Coordinated {
+            match self.release_subscriber_lock(subscriber_id).await {
+                Ok(true) => {}
+                Ok(false) => log::debug!(
+                    "unsubscribe: advisory lock for '{subscriber_id}' was not held by this \
+                     session (already released or held elsewhere); continuing",
+                ),
+                Err(e) => warn!(
+                    "unsubscribe: best-effort advisory-lock release for '{subscriber_id}' \
+                     failed (continuing; the session-scoped lock is released when its \
+                     holding session ends): {e}",
+                ),
+            }
+        }
+
+        // (g) Checkpoint and DLQ rows are deliberately RETAINED (R8): audit
+        // trail, and a same-id re-subscribe must resume cleanly from them
+        // (Checkpointed) or replay from 0 (ReplayAlways). No DELETE here.
+
+        // (h) Retired-id tombstone marker, LAST — only when a listener is
+        // running. An Inline bus has no listener and no listener-lifetime
+        // maps, so there is nothing to prune and no marker is needed. The
+        // consuming wake's init pass (before the `contains_key` gate)
+        // prunes the id's listener-lifetime entries, re-clears its `hwm`
+        // entry, fences the id's pre-unsubscribe snapshot Arc from that one
+        // wake, and drops the marker (spec 0031 R7/R9).
+        if self.listener_state.lock().await.is_some() {
+            self.retired_ids
+                .lock()
+                .await
+                .insert(subscriber_id.to_string());
+        }
+
+        Ok(true)
+    }
+
     /// Fast-forwards every currently-registered subscriber's checkpoint to the
     /// current head of this bus (its maximum `global_sequence`).
     ///
@@ -3942,16 +4227,16 @@ async fn warn_if_subscriber_id_reused<D>(
 /// the guard before dispatching, so nothing holds the outer mutex across an
 /// `on_event` await.
 ///
-/// Written in Phase 2 per spec 0031 (exercised from Phase 3's `unsubscribe`,
-/// which captures the id's Arcs before dropping the registry entry); the unit
-/// test below pins the contract until then.
+/// Written in Phase 2 per spec 0031; first production caller is Phase 3's
+/// `unsubscribe` (which captures the id's Arcs before dropping the registry
+/// entry). The unit test below additionally pins the pointer-identity
+/// contract (a fresh same-id Arc must NOT match).
 ///
 /// Lock ordering: this helper takes the projections mutex internally. Callers
 /// that also touch the registry must DROP the registry guard before calling —
 /// Phase 3's `unsubscribe` captures the `Vec` under the registry guard, drops
 /// that guard, then calls this helper — so no path ever holds both mutexes
 /// (spec 0031 Phase 2 review, cycle 1).
-#[allow(dead_code)]
 async fn remove_captured_observers<D>(
     projections: &Projections<D>,
     captured: &[Arc<Mutex<dyn EventObserver<D>>>],
@@ -4505,7 +4790,30 @@ where
                 // the subscribe path; ensures the queue is initialized.
                 let _ = inline_state.lock().await;
                 let mut guard = projections.lock().await;
-                guard.push(observer);
+                guard.push(observer.clone());
+                drop(guard);
+                // R9 subscribe/retire race re-check (spec 0031 Phase 3): an
+                // `unsubscribe` of the same id can land between the registry insert
+                // above and this push. Re-verify — immediately after the push, with
+                // the projections guard released so no path ever holds both
+                // mutexes — that the id still has a live registry entry. If the
+                // unsubscribe won the race, remove the Arc just pushed (the
+                // helper's `removed_handles` may legitimately be 0 or 1 here:
+                // between our push and the removal the retired id's own
+                // `unsubscribe` may have captured and removed nothing, since this
+                // Arc was not yet present) and abort the subscribe — `unsubscribe`
+                // wins over a racing `subscribe()`; the caller may re-issue it.
+                // The brief push-to-re-check window may deliver one in-flight event
+                // to the observer — at-least-once, and R9's current-wake-tail
+                // semantics already permit delivery to a retiring observer.
+                let still_registered = {
+                    let registry = subscriber_modes.lock().await;
+                    registry.contains_key(&subscriber_id)
+                };
+                if !still_registered {
+                    remove_captured_observers(&projections, std::slice::from_ref(&observer)).await;
+                    return Err(PgEventBusError::SubscriberNotFound(subscriber_id));
+                }
                 return Ok(());
             }
 
@@ -5019,8 +5327,36 @@ where
             // The only edge case is if checkpoint flush fails above - in that case,
             // events may be reprocessed when the subscriber restarts, which is acceptable
             // for at-least-once delivery semantics.
-            let mut projections = projections.lock().await;
-            projections.push(observer);
+            {
+                let mut projections = projections.lock().await;
+                projections.push(observer.clone());
+            }
+            // R9 subscribe/retire race re-check (spec 0031 Phase 3): an
+            // `unsubscribe` of the same id can land between the registry insert
+            // (via `warn_if_subscriber_id_reused`) and this push — the whole
+            // catch-up + buffer drain above is the wide window. Re-verify
+            // immediately after the push, with the projections guard dropped so
+            // no path ever holds both mutexes: if the unsubscribe won the race,
+            // remove the Arc just pushed and abort the subscribe — `unsubscribe`
+            // wins over a racing `subscribe()` of the same id (the caller may
+            // re-issue it). The brief push-to-re-check window may deliver one
+            // in-flight event to the observer — at-least-once, and R9's
+            // current-wake-tail semantics already permit delivery to a retiring
+            // observer.
+            let still_registered = {
+                let registry = subscriber_modes.lock().await;
+                registry.contains_key(&subscriber_id)
+            };
+            if !still_registered {
+                remove_captured_observers(&projections, std::slice::from_ref(&observer)).await;
+                // Cleanup-on-error for the pre-drain handoff record (same
+                // contract as the drain's error path above, and the reason
+                // Phase 3 step (d) removes this map: an aborted subscribe's
+                // entry is post-(d) but has no owner and no consumer — drop it
+                // so every still-present entry stays provably fresh).
+                pending_delivered_sets.lock().await.remove(&subscriber_id);
+                return Err(PgEventBusError::SubscriberNotFound(subscriber_id));
+            }
 
             Ok(())
         })
