@@ -112,11 +112,18 @@ gate.
   subscribe-time catch-up pass and all subsequent live wakes (observed counts
   `(3,1),(4,1)`, not `(3,2),(4,2)`), while the subscriber's position remains pinned
   below the hole per the CLOUD-227 unbroken-prefix guard.
-- **R2.** The exactly-once guarantee of R1 must hold on **every process boot** and
-  listener restart of a `ReplayAlways` subscriber over an open historical burn: both
-  catch-up call sites (`subscribe()` and the R2 startup replay pass,
+- **R2.** The live-wake exactly-once guarantee of R1 must hold on **every process
+  boot** and listener restart of a `ReplayAlways` subscriber over an open historical
+  burn: both catch-up call sites (`subscribe()` and the R2 startup replay pass,
   `mod.rs:1846-1856`) must hand off what they delivered above the prefix to the live
-  state seed.
+  state seed, so the live wake loop never duplicates a catch-up-applied row. Catch-up
+  passes themselves remain **at-least-once per pass** while the prefix stays pinned
+  (a row above the hole is delivered once per catch-up pass that runs — subscribe-time
+  plus one per listener boot): the handoff is in-memory and `catch_up_from_checkpoint`'s
+  delivery behaviour is fenced unchanged (no migration in scope), so per-row copies are
+  bounded by the number of catch-up passes, never by the live loop. (Scope note amended
+  2026-09-17, Phase 1 review cycle 1 — the prior wording implied cross-restart
+  exactly-once, which is unachievable without persisting the delivered set.)
 - **R3.** The dedup handoff must be non-regressive: hole-free streams deliver
   byte-for-byte unchanged; the shared fetch floor and the pinned position must never
   advance past a hole because of it; `Checkpointed` catch-up semantics and the
@@ -226,8 +233,14 @@ gate.
 - [ ] A fresh `ReplayAlways` `subscribe()` over a burned hole delivers every above-hole
       row exactly once (counts `(3,1),(4,1)`) while its position stays pinned below the
       hole — DB-gated integration test green (today: `(3,2),(4,2)` per report 4 B1).
-- [ ] A process restart (listener R2 pass) over an open burn does not re-deliver
-      catch-up-applied rows (test green).
+- [ ] A process restart (listener R2 pass) over an open burn leaves the live wake
+      loop adding no further copies: above-hole rows applied by a catch-up pass are
+      re-delivered only by later catch-up passes (subscribe-time and one per listener
+      boot — at-least-once per pass; the handoff is in-memory and no migration is in
+      scope), never by the live wake path (test green). (Amended 2026-09-17, Phase 1
+      review cycle 1: the original wording — "does not re-deliver catch-up-applied
+      rows" — is unachievable within Phase 1's own fences, which forbid changing what
+      `catch_up_from_checkpoint` delivers and forbid a migration.)
 - [ ] `unsubscribe` on a wedged `ReplayAlways`+`Halt` subscriber un-pins
       `wait_until_all_caught_up` on the live bus without restarting it (report 3 B2's
       inference turned into a passing test).
@@ -576,11 +589,19 @@ then implement to green, matching how spec 0030's phases were executed (tests in
     exactly the sequences delivered above the prefix — never an upper bound alone.
   - Amend the hole-blind comment `mod.rs:2032-2039` (CLOUD-225 "does not
     double-deliver") to state the now-true behaviour.
+  - Document the amended R2 contract in rustdoc on the handoff carrier
+    (`pending_delivered_sets`) and `CatchUpOutcome`: catch-up passes remain
+    at-least-once per pass while the prefix stays pinned; the handoff guarantees only
+    that the live wake loop adds no further copies; a startup catch-up that errors
+    mid-pass drops its partial handoff and the live pass re-delivers that partial
+    batch (at-least-once). (Added 2026-09-17, Phase 1 review cycle 1.)
   - Create tests in `epoch_pg/tests/pgeventbus_integration_tests.rs` (pattern: the
     CLOUD-261 wedge recipes from report 4's Method section — `isolated_events_table`,
     burn via claim-in-open-tx-then-rollback, `snapshot_fencing: false`, tiny
     `gap_timeout`): failing-test-first `test_fresh_subscribe_over_open_hole_delivers_exactly_once`,
-    `test_listener_restart_over_open_burn_delivers_exactly_once` (R2 pass leg),
+    `test_listener_restart_over_open_burn_live_pass_adds_no_copies` (R2 pass leg;
+    pins amended R2 — the live pass adds no copies, catch-up passes remain
+    at-least-once per pass),
     `test_fresh_subscribe_hole_free_stream_unchanged` and
     `test_fresh_subscribe_position_still_pins_at_hole` (R3 pins),
     `test_fresh_subscribe_late_materialized_row_inside_catchup_range_delivered_once`
@@ -688,7 +709,14 @@ then implement to green, matching how spec 0030's phases were executed (tests in
     projections Vec via the Phase 2 `ptr_eq` helper (all same-id Arcs, including the
     delivering one, not just the last-registered duplicate); (c) drop the
     `subscriber_modes` entry — readiness flips here; (d) `hwm` entry out
-    (`mod.rs:1420`); (e) unresolved `epoch_event_bus_gap_timeouts` rows for
+    (`mod.rs:1420`) **and** the id's `pending_delivered_sets` entry out (the Phase 1
+    delivered-set handoff carrier — removing it here makes every still-present entry
+    provably fresh, recorded by a post-(d) subscribe; a stale unconsumed set inherited
+    by a re-seeded lifecycle would silently suppress deliveries it never received. Do
+    **not** also re-clear this map in the init-pass prune (i): a same-id re-subscribe
+    that recorded a fresh set between step (d) and the consuming wake must keep it —
+    over-pruning only degrades that interleaving to at-least-once, never suppresses);
+    (e) unresolved `epoch_event_bus_gap_timeouts` rows for
     `(bus_name, subscriber_id)` resolved with `resolved_by='unsubscribe'` (one
     UPDATE, mirroring `mod.rs:447-468` / `resolve_gap_timeout` `mod.rs:3446`);
     (f) Coordinated mode: best-effort `release_subscriber_lock`
