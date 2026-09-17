@@ -109,6 +109,22 @@ pub(crate) struct SubscriberState {
     /// concurrent uncommitted transactions (typically 0–2 entries).
     pub processed_ahead: HashSet<u64>,
 
+    /// Global sequences that a catch-up pass (a fresh `subscribe()`'s own pass,
+    /// its buffer drain, or the R2 startup replay pass) already **delivered to
+    /// the observer above the pinned contiguous prefix** before this state
+    /// existed (spec 0031 R1/R2, CLOUD-262 Part A).
+    ///
+    /// Over an open hole the prefix cannot advance past it (CLOUD-227
+    /// unbroken-prefix guard), so a single `u64` position cannot record what
+    /// catch-up already applied — this exact set closes that blind spot. The
+    /// live batch path consumes an entry the first time it sees the row: the
+    /// re-delivery is skipped and the sequence is promoted into
+    /// [`processed_ahead`](Self::processed_ahead) so the gap resolver can fold
+    /// it into the prefix once the hole below resolves. Entries whose rows were
+    /// purged before the first live wake linger; the set is bounded by one
+    /// catch-up pass's visible rows.
+    pub delivered_above_prefix: HashSet<u64>,
+
     /// Tracks gaps that have been observed, for fence- and timeout-based resolution.
     /// Key: the missing global_sequence. Value: the [`GapObservation`] captured
     /// when the gap was first noticed.
@@ -153,6 +169,7 @@ impl SubscriberState {
             contiguous_checkpoint: checkpoint,
             contiguous_event_id: Uuid::nil(),
             processed_ahead: HashSet::new(),
+            delivered_above_prefix: HashSet::new(),
             gap_first_seen: HashMap::new(),
             failure_mode: FailureMode::FailOpen,
             gap_policy: GapPolicy::Halt,
@@ -167,16 +184,33 @@ impl SubscriberState {
     /// `last_global_sequence` and `last_event_id` from the checkpoints table so
     /// an eager [`PendingCheckpoint`](super::checkpoint::PendingCheckpoint) can
     /// be seeded with a correctly paired id.
+    ///
+    /// # Arguments
+    ///
+    /// * `checkpoint` - The last persisted contiguous global_sequence for this
+    ///   subscriber. Pass `0` if no checkpoint exists yet.
+    /// * `event_id` - The event id paired with `checkpoint` (`Uuid::nil()` when
+    ///   none is known).
+    /// * `failure_mode` - The subscriber's fail-closed/fail-open policy.
+    /// * `gap_policy` - The subscriber's unproven-gap policy.
+    /// * `delivered_above_prefix` - The exact set of sequences a catch-up pass
+    ///   already delivered **above `checkpoint`** while the prefix stayed
+    ///   pinned below a hole (spec 0031 R1/R2). Every entry must be greater
+    ///   than `checkpoint`; pass an empty set when no above-prefix delivery
+    ///   happened (the common case). Consumed by the live batch path so rows
+    ///   the catch-up applied are not re-delivered.
     pub fn new_with_event_id(
         checkpoint: u64,
         event_id: Uuid,
         failure_mode: FailureMode,
         gap_policy: GapPolicy,
+        delivered_above_prefix: HashSet<u64>,
     ) -> Self {
         Self {
             contiguous_checkpoint: checkpoint,
             contiguous_event_id: event_id,
             processed_ahead: HashSet::new(),
+            delivered_above_prefix,
             gap_first_seen: HashMap::new(),
             failure_mode,
             gap_policy,
@@ -213,6 +247,7 @@ impl SubscriberState {
     /// the cursor are cleared, since the release accepts the skip past them.
     pub(crate) fn adopt_released_cursor(&mut self, cursor: u64, cursor_event_id: Uuid) {
         self.processed_ahead.retain(|&seq| seq > cursor);
+        self.delivered_above_prefix.retain(|&seq| seq > cursor);
         self.gap_first_seen.retain(|&seq, _| seq > cursor);
         if let Some(held) = self.held_event
             && held <= cursor

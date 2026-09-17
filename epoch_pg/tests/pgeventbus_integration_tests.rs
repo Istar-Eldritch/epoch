@@ -11816,3 +11816,764 @@ async fn test_skip_after_backstop_panicking_gap_callback_is_contained_and_skip_i
     event_bus.shutdown().await.expect("shutdown");
     drop_isolated_events_table(&pool, &table).await;
 }
+
+// ---- Spec 0031 Phase 1 (CLOUD-262 Part A): exactly-once fresh subscribe ----
+// over an open hole. The subscribe-time catch-up delivers every visible row
+// above a burned hole while the contiguous prefix (and the ReplayAlways HWM)
+// stays pinned below it; the listener's one-time state seed must know what was
+// already delivered or the first live wake re-delivers it (report 4 B1:
+// observed counts `(3,2),(4,2)`).
+
+/// Counts applied deliveries per `global_sequence` from a projection's state
+/// store. Every delivery is a push, duplicates included, so this is the exact
+/// per-sequence delivery count the observer experienced.
+async fn delivery_counts_by_seq(
+    store: &InMemoryStateStore<TestState>,
+    stream: Uuid,
+) -> std::collections::BTreeMap<u64, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    if let Some(state) = store.get_state(stream).await.unwrap() {
+        for event in &state.0 {
+            *counts
+                .entry(event.global_sequence.unwrap_or(0))
+                .or_insert(0usize) += 1;
+        }
+    }
+    counts
+}
+
+/// Waits until a `GapUnproven` halt has fired for `subscriber_id` (the fresh
+/// subscriber re-wedges at the hole) — the deterministic signal that the live
+/// batch pass has processed the above-hole rows — bounded well beyond the
+/// 500 ms `gap_timeout`.
+async fn wait_for_gap_unproven_halt(halts: &StdMutex<Vec<HaltInfo>>, subscriber_id: &str) -> bool {
+    for _ in 0..80 {
+        if halts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|h| h.subscriber_id == subscriber_id && h.reason == HaltReason::GapUnproven)
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Spec 0031 R1 (CLOUD-262 Part A, report 4 B1 repro): a fresh `ReplayAlways`
+/// subscribe over a burned hole must deliver every above-hole row exactly once
+/// across the subscribe-time catch-up and all subsequent live wakes
+/// (`(3,1),(4,1)`, not `(3,2),(4,2)`), while its position stays pinned below
+/// the hole (CLOUD-227 unbroken-prefix guard).
+///
+/// Recipe from the probe report: isolated events table with its own sequence,
+/// `snapshot_fencing: false` so the hole can never self-heal via
+/// `FenceCleared`, tiny `gap_timeout` so the fresh subscriber re-wedges at the
+/// hole quickly (the deterministic signal that the live pass ran), hole burned
+/// via claim-in-open-tx-then-rollback, relative sequence assertions only.
+#[tokio::test]
+#[serial]
+async fn test_fresh_subscribe_over_open_hole_delivers_exactly_once() {
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (_id_below, seq_below) =
+        insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+
+    // Burn the hole: claim the next sequence inside a transaction that is
+    // rolled back, so the value is permanently consumed and never commits.
+    // The claim's row itself never commits, so its stream id is irrelevant —
+    // a separate one avoids the (stream_id, stream_version) unique constraint
+    // against the committed events (same technique as the spec 0030 tests).
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(seq_hole > seq_below, "hole must sit above the below event");
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    let (_id_a1, seq_above1) = insert_committed_event(&pool, &table, stream, 2, "above1").await;
+    let (_id_a2, seq_above2) = insert_committed_event(&pool, &table, stream, 3, "above2").await;
+    assert!(seq_above1 > seq_hole && seq_above2 > seq_above1);
+
+    // Fresh ReplayAlways + FailClosed + Halt subscriber over the open hole.
+    let sub_id = format!("projection:fresh-hole:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone()).fail_closed();
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe fresh subscriber");
+
+    // The live pass runs and the fresh subscriber re-wedges at the hole
+    // (GapUnproven after gap_timeout) — proof the live batch processed the
+    // above-hole rows, whatever it decided to do with them.
+    assert!(
+        wait_for_gap_unproven_halt(&halts, &sub_id).await,
+        "fresh subscriber must re-wedge at the hole; the live pass never ran"
+    );
+    // Settle past the wedge so any (buggy) duplicate delivery has landed;
+    // a wedged subscriber is excluded from the shared batch, so counts are
+    // stable from here on (report 4 B1 checked stability at +4 s).
+    tokio::time::sleep(GapDuration::from_millis(1000)).await;
+
+    // THE PIN: every visible row delivered exactly once.
+    let counts = delivery_counts_by_seq(&store, stream).await;
+    assert_eq!(
+        counts.get(&(seq_below as u64)),
+        Some(&1),
+        "below-hole row {seq_below} delivered {counts:?} times"
+    );
+    assert_eq!(
+        counts.get(&(seq_above1 as u64)),
+        Some(&1),
+        "above-hole row {seq_above1} must be delivered exactly once; got \
+         {counts:?} (a second copy is the CLOUD-262 fresh-subscribe double \
+         delivery over the hole at {seq_hole})"
+    );
+    assert_eq!(
+        counts.get(&(seq_above2 as u64)),
+        Some(&1),
+        "above-hole row {seq_above2} must be delivered exactly once; got {counts:?}"
+    );
+
+    // R3: the position stays pinned below the hole — lag is head minus the
+    // pinned prefix (seq_below), never smaller.
+    let lag = event_bus
+        .subscriber_lag(&sub_id)
+        .await
+        .expect("subscriber_lag");
+    assert_eq!(
+        lag,
+        seq_above2 as u64 - seq_below as u64,
+        "position must stay pinned below the hole at {seq_hole} (head {}, \
+         prefix {seq_below})",
+        seq_above2
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// Spec 0031 R2, amended 2026-09-17 (CLOUD-262 Part A): on a listener restart
+/// over an open burn, the live wake loop adds **no copies** of what a
+/// catch-up pass delivered. Catch-up passes themselves remain at-least-once
+/// per pass — subscribe-time plus one per listener boot — while the prefix
+/// stays pinned: the R2 startup replay pass re-runs `catch_up_from_checkpoint`
+/// from the HWM pinned below the open hole and re-delivers the above-hole rows
+/// itself (what `catch_up_from_checkpoint` delivers is a hard fence; the
+/// handoff is in-memory, so no migration-backed dedup is in scope). The pin
+/// is that the R2 pass hands off what IT delivered above the prefix, so the
+/// post-restart live pass adds no further copies: the rows published before
+/// the subscribe end at two deliveries (subscribe-time catch-up, then the
+/// restart pass), and the rows published after the subscribe end at two
+/// deliveries (the pre-restart live pass, then the restart pass) — never
+/// three.
+#[tokio::test]
+#[serial]
+async fn test_listener_restart_over_open_burn_live_pass_adds_no_copies() {
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (_id_below, seq_below) =
+        insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+
+    // Burn the hole (claim-in-open-tx-then-rollback; the claim's own row never
+    // commits, so a separate stream sidesteps the (stream_id, stream_version)
+    // unique constraint, as in the spec 0030 tests).
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(seq_hole > seq_below);
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    let (_id_a1, seq_above1) = insert_committed_event(&pool, &table, stream, 2, "above1").await;
+    let (_id_a2, seq_above2) = insert_committed_event(&pool, &table, stream, 3, "above2").await;
+    assert!(seq_above1 > seq_hole && seq_above2 > seq_above1);
+
+    let sub_id = format!("projection:restart-hole:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone()).fail_closed();
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe subscriber");
+
+    // Publish two more events above the hole immediately, so the FIRST live
+    // wake delivers them (and observes the gap) before the backstop wedge can
+    // freeze the subscriber.
+    let (_id_a3, seq_above3) = insert_committed_event(&pool, &table, stream, 4, "above3").await;
+    let (_id_a4, seq_above4) = insert_committed_event(&pool, &table, stream, 5, "above4").await;
+    let mut delivered = false;
+    for _ in 0..50 {
+        let ids = applied_ids(&store, stream).await;
+        if ids.contains(&_id_a3) && ids.contains(&_id_a4) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    assert!(delivered, "post-subscribe events must be delivered live");
+
+    // The pre-restart live pass ran to its wedge (GapUnproven at the hole).
+    assert!(
+        wait_for_gap_unproven_halt(&halts, &sub_id).await,
+        "subscriber must wedge at the hole before the restart"
+    );
+    let halts_before_restart = halts.lock().unwrap().len();
+
+    // Restart the listener: same bus, same observer, fresh listener task (and
+    // therefore fresh listener-lifetime state maps and a fresh R2 pass).
+    event_bus.shutdown().await.expect("shutdown");
+    event_bus.start_listener().await.expect("restart listener");
+
+    // The restarted task re-wedges at the hole — proof its live pass ran.
+    let mut rewedged = false;
+    for _ in 0..80 {
+        if halts.lock().unwrap().len() > halts_before_restart {
+            rewedged = true;
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    assert!(
+        rewedged,
+        "restarted listener must re-wedge; its live pass never ran"
+    );
+    tokio::time::sleep(GapDuration::from_millis(1000)).await;
+
+    // The pre-subscribe rows above the hole were delivered by the
+    // subscribe-time catch-up; the post-subscribe rows by the pre-restart
+    // live pass; each row was then delivered once more by the restart's R2
+    // pass — and NOT a third time by the post-restart live pass. The
+    // below-hole row was delivered exactly once (covered by the position).
+    let counts = delivery_counts_by_seq(&store, stream).await;
+    for (seq, expected) in [
+        (seq_above1, 2),
+        (seq_above2, 2),
+        (seq_above3, 2),
+        (seq_above4, 2),
+    ] {
+        assert_eq!(
+            counts.get(&(seq as u64)),
+            Some(&expected),
+            "above-hole row {seq} must be delivered exactly {expected} times \
+             (copy 1: subscribe-time catch-up for pre-subscribe rows, the \
+             pre-restart live pass for post-subscribe rows; copy 2: the \
+             restart's R2 pass); got {counts:?} (a third copy is the \
+             post-restart live pass re-delivering what the R2 pass handed \
+             off, over the hole at {seq_hole})"
+        );
+    }
+    assert_eq!(
+        counts.get(&(seq_below as u64)),
+        Some(&1),
+        "below-hole row {seq_below} delivered {counts:?} times"
+    );
+
+    // Position still pinned below the hole after the restart.
+    let lag = event_bus
+        .subscriber_lag(&sub_id)
+        .await
+        .expect("subscriber_lag");
+    assert_eq!(
+        lag,
+        seq_above4 as u64 - seq_below as u64,
+        "position must stay pinned below the hole at {seq_hole} after the restart"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// Spec 0031 R3 (non-regression): on a hole-free stream the fresh-subscribe
+/// dedup handoff must be byte-for-byte inert — every row delivered exactly
+/// once by the subscribe-time catch-up, live events delivered once, readiness
+/// and lag resolving normally (an empty delivered set is recorded and consumed).
+#[tokio::test]
+#[serial]
+async fn test_fresh_subscribe_hole_free_stream_unchanged() {
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    // Four committed events, NO hole.
+    let stream = Uuid::new_v4();
+    let mut seqs = Vec::new();
+    for v in 1..=4 {
+        let (_, seq) = insert_committed_event(&pool, &table, stream, v, "no_hole").await;
+        seqs.push(seq);
+    }
+
+    let sub_id = format!("projection:hole-free:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe subscriber");
+
+    // Catch-up covers the whole stream and readiness resolves.
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up"),
+        "hole-free subscriber must be caught up right after subscribe"
+    );
+    assert_eq!(
+        event_bus.subscriber_lag(&sub_id).await.expect("lag"),
+        0,
+        "hole-free subscriber must sit at the head"
+    );
+
+    // Every row delivered exactly once by the catch-up pass.
+    let counts = delivery_counts_by_seq(&store, stream).await;
+    for seq in &seqs {
+        assert_eq!(
+            counts.get(&(*seq as u64)),
+            Some(&1),
+            "row {seq} must be delivered exactly once on a hole-free stream; got {counts:?}"
+        );
+    }
+
+    // Live events still flow, once each.
+    let (id5, seq5) = insert_committed_event(&pool, &table, stream, 5, "live5").await;
+    let (id6, seq6) = insert_committed_event(&pool, &table, stream, 6, "live6").await;
+    let mut delivered = false;
+    for _ in 0..50 {
+        let ids = applied_ids(&store, stream).await;
+        if ids.contains(&id5) && ids.contains(&id6) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    assert!(delivered, "live events must be delivered");
+    assert!(
+        event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_secs(5))
+            .await
+            .expect("wait_until_caught_up after live events"),
+        "subscriber must stay caught up"
+    );
+    let counts = delivery_counts_by_seq(&store, stream).await;
+    assert_eq!(
+        counts.get(&(seq5 as u64)),
+        Some(&1),
+        "live row {seq5} must be delivered exactly once; got {counts:?}"
+    );
+    assert_eq!(
+        counts.get(&(seq6 as u64)),
+        Some(&1),
+        "live row {seq6} must be delivered exactly once; got {counts:?}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// Spec 0031 R3 (position pin): the dedup handoff must never advance the
+/// position past a hole. A fresh `ReplayAlways` subscriber over a burned hole
+/// keeps its HWM pinned below the hole (lag constant, not caught up, no
+/// checkpoint row) across the wedge and every subsequent wake — the fix shapes
+/// that would advance the position (skipping the hole, or a range watermark
+/// folded into the prefix) go red here.
+#[tokio::test]
+#[serial]
+async fn test_fresh_subscribe_position_still_pins_at_hole() {
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (_id_below, seq_below) =
+        insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(seq_hole > seq_below);
+    tx_hole.rollback().await.expect("rollback hole tx");
+    let (_id_a1, seq_above1) = insert_committed_event(&pool, &table, stream, 2, "above1").await;
+    let (_id_a2, seq_above2) = insert_committed_event(&pool, &table, stream, 3, "above2").await;
+    assert!(seq_above1 > seq_hole && seq_above2 > seq_above1);
+
+    let sub_id = format!("projection:pin-hole:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone()).fail_closed();
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe subscriber");
+
+    assert!(
+        wait_for_gap_unproven_halt(&halts, &sub_id).await,
+        "subscriber must wedge at the hole; the live pass never ran"
+    );
+    tokio::time::sleep(GapDuration::from_millis(1000)).await;
+
+    // The pinned lag: head minus the prefix below the hole. Re-checked over a
+    // window so an advance that happens on any wake in that window goes red.
+    let expected_lag = seq_above2 as u64 - seq_below as u64;
+    for round in 0..3 {
+        let lag = event_bus
+            .subscriber_lag(&sub_id)
+            .await
+            .expect("subscriber_lag");
+        assert_eq!(
+            lag, expected_lag,
+            "round {round}: position must stay pinned below the hole at \
+             {seq_hole} (expected lag {expected_lag}, got {lag})"
+        );
+        tokio::time::sleep(GapDuration::from_millis(500)).await;
+    }
+
+    // Readiness must not report caught-up while the hole is open...
+    assert!(
+        !event_bus
+            .wait_until_caught_up(&sub_id, GapDuration::from_millis(300))
+            .await
+            .expect("wait_until_caught_up"),
+        "a subscriber pinned below an open hole must not report caught-up"
+    );
+    // ...and the above-hole rows were still delivered exactly once (the pin
+    // is about the POSITION, not about withholding delivery).
+    let counts = delivery_counts_by_seq(&store, stream).await;
+    assert_eq!(
+        counts.get(&(seq_above1 as u64)),
+        Some(&1),
+        "above-hole row {seq_above1} delivered {counts:?} times"
+    );
+    assert_eq!(
+        counts.get(&(seq_above2 as u64)),
+        Some(&1),
+        "above-hole row {seq_above2} delivered {counts:?} times"
+    );
+    // A ReplayAlways subscriber writes no checkpoint row at all (R5).
+    assert_eq!(
+        event_bus
+            .get_checkpoint(&sub_id)
+            .await
+            .expect("get_checkpoint"),
+        None,
+        "ReplayAlways subscriber must not write a checkpoint row"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// Spec 0031 Phase 1 (CLOUD-262 Part A): the exact-delivered-set shape — the
+/// pin that kills the rejected range-watermark alternative. A row that
+/// materializes INSIDE the catch-up-delivered window (held open in an
+/// uncommitted transaction while the fresh subscribe ran) must be delivered
+/// exactly once by the first live wake after it commits. A range watermark
+/// (max delivered sequence) would treat it as already-delivered and skip it
+/// forever — a silent loss.
+///
+/// `gap_timeout` is deliberately LONG (60 s) here, unlike the 500 ms wedge
+/// recipes: the burned hole must stay open (subscriber unwedged, position
+/// pinned) for the whole delivery window so the late-materialized row is
+/// deliverable — a margin against slow CI, not a wedge recipe.
+#[tokio::test]
+#[serial]
+async fn test_fresh_subscribe_late_materialized_row_inside_catchup_range_delivered_once() {
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_secs(60),
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (_id_below, seq_below) =
+        insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+
+    // Burn the hole at seq_hole.
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(seq_hole > seq_below);
+    tx_hole.rollback().await.expect("rollback hole tx");
+
+    // Commit one row above the hole...
+    let (_id_a1, seq_above1) = insert_committed_event(&pool, &table, stream, 2, "above1").await;
+    assert!(seq_above1 > seq_hole);
+
+    // ...then HOLD the very next sequence in an open transaction (this is the
+    // row that will materialize late, inside the catch-up-delivered window).
+    let held_stream = Uuid::new_v4();
+    let mut tx_held = pool.begin().await.expect("begin held tx");
+    let (held_id, seq_held) = claim_hole_uncommitted(&mut tx_held, &table, held_stream).await;
+    assert!(seq_held > seq_above1);
+
+    // Commit two rows above the held one; they are visible, the held row is not.
+    let (_id_a2, seq_above2) = insert_committed_event(&pool, &table, stream, 3, "above2").await;
+    let (_id_a3, seq_above3) = insert_committed_event(&pool, &table, stream, 4, "above3").await;
+    assert!(seq_above2 > seq_held && seq_above3 > seq_above2);
+
+    // Fresh ReplayAlways + FailOpen subscriber (no wedge — the hole at
+    // {seq_hole} stays open through the whole window). Catch-up delivers
+    // {seq_below, seq_above1, seq_above2, seq_above3} and pins the prefix at
+    // seq_below; the held row {seq_held} is inside that delivered window but
+    // was NOT visible to catch-up.
+    let sub_id = format!("projection:late-row:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe subscriber");
+
+    // Commit the held row so it materializes above the pinned prefix, inside
+    // the window catch-up already delivered around.
+    tx_held.commit().await.expect("commit held tx");
+
+    // The first live wake must deliver it — exactly once.
+    let mut delivered = false;
+    for _ in 0..50 {
+        if applied_ids(&store, held_stream).await.contains(&held_id) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(GapDuration::from_millis(100)).await;
+    }
+    assert!(
+        delivered,
+        "the late-materialized row {seq_held} must be delivered by a live wake \
+         (a range watermark would skip it forever)"
+    );
+    tokio::time::sleep(GapDuration::from_millis(1000)).await;
+
+    // Merge the counts across the two streams that carry committed rows.
+    let mut counts = delivery_counts_by_seq(&store, stream).await;
+    for (seq, n) in delivery_counts_by_seq(&store, held_stream).await {
+        *counts.entry(seq).or_insert(0) += n;
+    }
+    for (seq, expected) in [
+        (seq_below, 1),
+        (seq_above1, 1),
+        (seq_held, 1),
+        (seq_above2, 1),
+        (seq_above3, 1),
+    ] {
+        assert_eq!(
+            counts.get(&(seq as u64)),
+            Some(&expected),
+            "row {seq} must be delivered exactly once; got {counts:?} \
+             (0 would mean the late-materialized row was skipped by a range \
+             watermark; 2 would mean the fresh-subscribe double delivery)"
+        );
+    }
+
+    // The burned hole still pins the position (never advanced past it).
+    let lag = event_bus
+        .subscriber_lag(&sub_id)
+        .await
+        .expect("subscriber_lag");
+    assert_eq!(
+        lag,
+        seq_above3 as u64 - seq_below as u64,
+        "position must stay pinned below the burned hole at {seq_hole}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// Spec 0031 Phase 1, report 4 OQ-2 confirm leg: the Checkpointed variant of
+/// the fresh-subscribe double delivery — same code shape, different position
+/// source (the persisted checkpoint row instead of the in-memory HWM). A fresh
+/// `Checkpointed` subscribe over the same burned hole must also deliver the
+/// above-hole rows exactly once, with the persisted checkpoint pinned below
+/// the hole.
+#[tokio::test]
+#[serial]
+async fn test_fresh_subscribe_checkpointed_over_open_hole_delivers_exactly_once() {
+    use std::time::Duration as GapDuration;
+
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    let table = isolated_events_table(&pool).await;
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(500),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (_id_below, seq_below) =
+        insert_committed_event(&pool, &table, stream, 1, "below_hole").await;
+    let hole_stream = Uuid::new_v4();
+    let mut tx_hole = pool.begin().await.expect("begin hole tx");
+    let (_, seq_hole) = claim_hole_uncommitted(&mut tx_hole, &table, hole_stream).await;
+    assert!(seq_hole > seq_below);
+    tx_hole.rollback().await.expect("rollback hole tx");
+    let (_id_a1, seq_above1) = insert_committed_event(&pool, &table, stream, 2, "above1").await;
+    let (_id_a2, seq_above2) = insert_committed_event(&pool, &table, stream, 3, "above2").await;
+    assert!(seq_above1 > seq_hole && seq_above2 > seq_above1);
+
+    // Fresh Checkpointed + FailClosed + Halt subscriber over the open hole
+    // (no prior checkpoint row — catch-up starts from 0 exactly like the
+    // ReplayAlways repro, but seeds its state from the persisted row).
+    let sub_id = format!("projection:cp-hole:{}", Uuid::new_v4());
+    let projection = TestProjection::with_subscriber_id(sub_id.clone()).fail_closed();
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe checkpointed subscriber");
+
+    assert!(
+        wait_for_gap_unproven_halt(&halts, &sub_id).await,
+        "checkpointed subscriber must wedge at the hole; the live pass never ran"
+    );
+    tokio::time::sleep(GapDuration::from_millis(1000)).await;
+
+    let counts = delivery_counts_by_seq(&store, stream).await;
+    assert_eq!(
+        counts.get(&(seq_below as u64)),
+        Some(&1),
+        "below-hole row {seq_below} delivered {counts:?} times"
+    );
+    assert_eq!(
+        counts.get(&(seq_above1 as u64)),
+        Some(&1),
+        "above-hole row {seq_above1} must be delivered exactly once for the \
+         Checkpointed variant; got {counts:?} (a second copy is the same \
+         CLOUD-262 bug through the checkpoint-row position source)"
+    );
+    assert_eq!(
+        counts.get(&(seq_above2 as u64)),
+        Some(&1),
+        "above-hole row {seq_above2} must be delivered exactly once; got {counts:?}"
+    );
+
+    // The persisted checkpoint resumes from (and stays pinned below) the hole.
+    assert_eq!(
+        event_bus
+            .get_checkpoint(&sub_id)
+            .await
+            .expect("get_checkpoint"),
+        Some(seq_below as u64),
+        "checkpoint row must stay pinned at the prefix below the hole {seq_hole}"
+    );
+    let lag = event_bus
+        .subscriber_lag(&sub_id)
+        .await
+        .expect("subscriber_lag");
+    assert_eq!(
+        lag,
+        seq_above2 as u64 - seq_below as u64,
+        "position must stay pinned below the hole at {seq_hole}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}

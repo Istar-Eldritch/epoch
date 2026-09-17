@@ -31,7 +31,7 @@ use log::{error, info, warn};
 use serde::de::DeserializeOwned;
 use sqlx::Error as SqlxError;
 use sqlx::postgres::{PgListener, PgPool};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
@@ -531,6 +531,28 @@ where
         }
 
         if state.processed_ahead.contains(&event_seq) {
+            last_event_id = Some(event_id);
+            continue;
+        }
+
+        // Spec 0031 R1/R2 (CLOUD-262 Part A): this row was already delivered to
+        // the observer by a catch-up pass (subscribe()'s own pass, its buffer
+        // drain, or the R2 startup replay pass) while the contiguous prefix
+        // stayed pinned below a hole — the fresh state's born-empty
+        // `processed_ahead` cannot know that, so the exact delivered set was
+        // handed off via `pending_delivered_sets` and seeded into
+        // `delivered_above_prefix`. Skip the re-delivery, but promote the
+        // sequence into `processed_ahead` so the gap resolver can fold it into
+        // the contiguous prefix once the hole below it resolves — the same
+        // bookkeeping the re-delivery used to perform, minus the duplicate
+        // observer invocation. Unlike `record_applied!` below, this
+        // deliberately seeds neither `pending_checkpoints` nor `processed_any`:
+        // the row was applied to the observer by the catch-up pass, not by
+        // this wake, and its position bookkeeping is the promotion itself
+        // (spec 0031 R2, Phase 1 review cycle 1).
+        if state.delivered_above_prefix.contains(&event_seq) {
+            state.delivered_above_prefix.remove(&event_seq);
+            state.processed_ahead.insert(event_seq);
             last_event_id = Some(event_id);
             continue;
         }
@@ -1427,6 +1449,43 @@ where
     /// indefinitely, ignoring the timeout it was given. This registry is only ever
     /// locked for the length of a map operation.
     subscriber_modes: Arc<Mutex<HashMap<String, SubscriptionMode>>>,
+    /// `subscriber_id` -> the exact set of global sequences the most recent
+    /// catch-up pass delivered to that subscriber **above the pinned contiguous
+    /// prefix** (spec 0031 R1/R2, CLOUD-262 Part A).
+    ///
+    /// Over an open hole, catch-up delivers the rows above it while the prefix
+    /// (and the [`ReplayAlways`](SubscriptionMode::ReplayAlways) high-water
+    /// mark) stays pinned below — a single `u64` position cannot record what
+    /// was applied. This map is the handoff to the listener's one-time state
+    /// seed, which consumes it when constructing the fresh [`SubscriberState`]
+    /// so the live batch path does not re-deliver those rows. Written
+    /// (overwritten, never merged) by every catch-up call site — subscribe()'s
+    /// catch-up, its buffer drain, and the R2 startup replay pass — always
+    /// before the observer becomes visible to a wake; entries for ids whose
+    /// state already exists linger until the next catch-up pass or listener
+    /// restart overwrites them. Shared across `Clone`s for the same reason as
+    /// [`Self::hwm`].
+    ///
+    /// Growth is bounded at one set per subscriber id: the seed consumes
+    /// (removes) the entry when it constructs the id's first state, and every
+    /// later pass overwrites the entry rather than merging into it. A pass
+    /// racing an unconsumed sibling record for the same id therefore
+    /// overwrites it (duplication-direction only: the dropped leg's rows
+    /// re-deliver via the live pass, never suppressed). An entry
+    /// can still outlive its consumer in three ways: (1) a
+    /// [`DispatchMode::Inline`] bus has no listener, so the state seed never
+    /// runs; (2) a duplicate same-id subscribe whose live state already
+    /// exists is skipped by the seed's `contains_key` gate; (3) a subscribe
+    /// that errors after its pre-drain record — that path removes the entry
+    /// on the way out (cleanup-on-error), so a stale set can never seed a
+    /// state that never received those deliveries. The removal is id-scoped,
+    /// not record-scoped: a same-id subscribe racing a failing sibling can
+    /// lose its fresh record — that only degrades to at-least-once (the live
+    /// pass re-delivers), never suppresses. Paths (1) and (2) leave a
+    /// single stale entry per id, overwritten by the id's next catch-up pass.
+    /// Phase 3's `unsubscribe` removes the entry as part of its retirement
+    /// inventory (spec 0031 Phase 3 step (d)).
+    pending_delivered_sets: Arc<Mutex<HashMap<String, HashSet<u64>>>>,
 }
 
 /// Poll cadence for `wait_until_caught_up` / `wait_until_all_caught_up`.
@@ -1458,6 +1517,7 @@ where
             inline_state: Arc::new(Mutex::new(InlineDispatchState::default())),
             hwm: Arc::new(Mutex::new(HashMap::new())),
             subscriber_modes: Arc::new(Mutex::new(HashMap::new())),
+            pending_delivered_sets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1779,6 +1839,7 @@ where
         let projections = self.projections.clone();
         let config = self.config.clone();
         let hwm = self.hwm.clone();
+        let pending_delivered_sets = self.pending_delivered_sets.clone();
 
         // Create shutdown signal channel
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1843,7 +1904,7 @@ where
             tagged.sort_by_key(|(priority, _, _, _, _)| *priority);
 
             for (_, subscriber_id, replay_always, failure_mode, projection) in tagged {
-                if let Err(e) = catch_up_from_checkpoint(
+                match catch_up_from_checkpoint(
                     projection,
                     &subscriber_id,
                     replay_always,
@@ -1854,11 +1915,36 @@ where
                 )
                 .await
                 {
-                    warn!(
-                        "start_listener: initial catch-up for '{}' failed: {}; \
-                         the listener will retry on its next loop iteration",
-                        subscriber_id, e
-                    );
+                    Ok(outcome) => {
+                        // Spec 0031 R2 (CLOUD-262 Part A): hand off what this
+                        // startup pass delivered above the pinned prefix so the
+                        // one-time state seed (below) constructs the fresh
+                        // `SubscriberState` with it and the live batch path adds
+                        // no copies of those rows. Per the amended R2, catch-up
+                        // passes remain at-least-once per pass: the set is only
+                        // recorded on success (see the Err arm).
+                        pending_delivered_sets
+                            .lock()
+                            .await
+                            .insert(subscriber_id.clone(), outcome.delivered_above_prefix);
+                    }
+                    Err(e) => {
+                        // Spec 0031 R2, amended 2026-09-17 (CLOUD-262 Part A): a
+                        // startup catch-up which delivers rows and then errors
+                        // drops its partial handoff — nothing is recorded here.
+                        // Absent a stale leftover entry (paths (1)/(2) on the
+                        // `pending_delivered_sets` rustdoc) the live pass
+                        // re-delivers the partial batch (at-least-once per the
+                        // amended R2 contract); a stale leftover is consumed
+                        // instead — bounded impact, since the same in-process
+                        // observer already received those rows and they are
+                        // promoted into `processed_ahead`.
+                        warn!(
+                            "start_listener: initial catch-up for '{}' failed: {}; \
+                             the listener will retry on its next loop iteration",
+                            subscriber_id, e
+                        );
+                    }
                 }
             }
 
@@ -2031,8 +2117,13 @@ where
                 //
                 // Releasing it lets a `subscribe()` land mid-drain. That is safe and
                 // does not double-deliver: `subscribe()` registers its observer last,
-                // only after its own synchronous catch-up and checkpoint flush, and the
-                // per-event checkpoint check skips anything at or below the checkpoint.
+                // only after its own synchronous catch-up and checkpoint flush, the
+                // per-event checkpoint check skips anything at or below the
+                // checkpoint, and the delivered-above-prefix handoff (spec 0031 R1,
+                // CLOUD-262 Part A) seeded the fresh state with exactly what that
+                // catch-up applied above a pinned prefix — over an open hole the
+                // checkpoint alone does not cover the rows above it, so the handed-off
+                // set is what keeps the first live wake from re-delivering them.
                 // A subscriber that arrives mid-drain is simply picked up on the next
                 // wake.
                 let projections_snapshot: Vec<_> = {
@@ -2101,6 +2192,17 @@ where
                                 }
                             }
                         };
+                        // Spec 0031 R1/R2 (CLOUD-262 Part A): consume the
+                        // delivered-above-prefix set handed off by the catch-up
+                        // call site (subscribe()'s own pass, its buffer drain,
+                        // or this listener's R2 startup pass) so the fresh
+                        // state knows which rows above the pinned prefix were
+                        // already applied and the live batch path skips them.
+                        let delivered_above_prefix = pending_delivered_sets
+                            .lock()
+                            .await
+                            .remove(&subscriber_id)
+                            .unwrap_or_default();
                         subscriber_states.insert(
                             subscriber_id.clone(),
                             SubscriberState::new_with_event_id(
@@ -2108,6 +2210,7 @@ where
                                 checkpoint_event_id,
                                 failure_mode,
                                 gap_policy,
+                                delivered_above_prefix,
                             ),
                         );
                     }
@@ -3846,6 +3949,34 @@ async fn advance_catchup_prefix(
     .await;
 }
 
+/// What one [`catch_up_from_checkpoint`] pass did, returned to its caller so
+/// the delivered-above-prefix set can be handed off to the listener's
+/// one-time state seed (spec 0031 R1/R2, CLOUD-262 Part A).
+///
+/// Amended R2 contract (spec 0031, amended 2026-09-17, Phase 1 review cycle
+/// 1): catch-up passes remain **at-least-once per pass** while the prefix
+/// stays pinned — this handoff guarantees only that the live wake loop adds
+/// no further copies of what a pass delivered. A startup pass that delivers
+/// rows and then errors drops its partial handoff (the caller records the
+/// set only on success), and the live pass re-delivers that partial batch
+/// (at-least-once).
+pub(crate) struct CatchUpOutcome {
+    /// The contiguous prefix the pass actually advanced to — routed to the
+    /// persisted checkpoint, or to the ReplayAlways in-memory HWM. Over an
+    /// open hole this stays pinned below it (CLOUD-227 unbroken-prefix
+    /// guard).
+    pub prefix: u64,
+    /// The pagination cursor: the highest `global_sequence` reached, and the
+    /// correct `> cursor` lower bound for `subscribe()`'s buffer drain.
+    pub cursor: u64,
+    /// The exact set of sequences this pass delivered to the observer **above
+    /// `prefix`**. Rows at or below `prefix` were folded into the contiguous
+    /// prefix and need no dedup. Delivered attempts that did not apply
+    /// (fail-open DLQ exhaustions) are excluded so the live path re-attempts
+    /// them. Consumed by the listener's one-time state seed (spec 0031 R1/R2).
+    pub delivered_above_prefix: HashSet<u64>,
+}
+
 /// Runs one catch-up pass for a single subscriber.
 ///
 /// For a `Checkpointed` subscriber this reads the persisted checkpoint, then
@@ -3878,17 +4009,24 @@ async fn advance_catchup_prefix(
 /// instead of the checkpoints table, which is never written for such a
 /// subscriber.
 ///
-/// Returns `(pagination_cursor, contiguous_prefix)`. The cursor is the highest
+/// Returns a [`CatchUpOutcome`]: the pagination cursor (`cursor`) is the highest
 /// `global_sequence` reached and is the correct `> cursor` lower bound for the
-/// `subscribe()` buffer drain; the contiguous prefix is what was actually
-/// persisted, so the drain can continue the *same* counter over the drained
-/// range and never flush above the hole (§4.3, spec 0026 R2). Shared by
-/// `subscribe` and the pre-loop pass in `start_listener` so the two catch-up
-/// paths cannot drift apart.
+/// `subscribe()` buffer drain; the contiguous prefix (`prefix`) is what was
+/// actually persisted, so the drain can continue the *same* counter over the
+/// drained range and never flush above the hole (§4.3, spec 0026 R2);
+/// `delivered_above_prefix` is the exact set of sequences the pass delivered
+/// to the observer above the pinned prefix, for the spec 0031 R1/R2
+/// (CLOUD-262 Part A) handoff to the listener's one-time state seed. Shared
+/// by `subscribe` and the pre-loop pass in `start_listener` so the two
+/// catch-up paths cannot drift apart.
 ///
 /// `replay_always` is resolved once by the caller (it reads the observer's own
 /// mutex) rather than re-derived here, so a single `subscribe()` call only
 /// resolves the subscription mode once.
+///
+/// What this pass delivers is unchanged by the delivered-set exposure: every
+/// visible row above the cursor is still attempted exactly once (spec 0031
+/// hard fence).
 pub(crate) async fn catch_up_from_checkpoint<ED>(
     observer: &Arc<Mutex<dyn EventObserver<ED>>>,
     subscriber_id: &str,
@@ -3897,7 +4035,7 @@ pub(crate) async fn catch_up_from_checkpoint<ED>(
     config: &ReliableDeliveryConfig,
     pool: &PgPool,
     hwm: &Arc<Mutex<HashMap<String, u64>>>,
-) -> Result<(u64, u64), SqlxError>
+) -> Result<CatchUpOutcome, SqlxError>
 where
     ED: EventData + Send + Sync + DeserializeOwned + 'static,
 {
@@ -3937,6 +4075,12 @@ where
     let mut pending_checkpoint: Option<PendingCheckpoint> = None;
     // Local checkpoint cache for flush_checkpoint
     let mut checkpoint_cache: HashMap<String, u64> = HashMap::new();
+    // Exact set of sequences delivered to the observer above the pinned prefix
+    // (spec 0031 R1/R2, CLOUD-262 Part A). Recorded on successful delivery
+    // only — a fail-open DLQ exhaustion must stay re-attemptable by the live
+    // path — and narrowed to `> contiguous` at the end, since rows the prefix
+    // folded in need no dedup.
+    let mut delivered: HashSet<u64> = HashSet::new();
 
     // Process catch-up events from the database
     let subscriber_catchup_query = format!(
@@ -4106,6 +4250,7 @@ where
             total_caught_up += 1;
 
             if let ProcessResult::Success = result {
+                delivered.insert(event_global_seq);
                 log::debug!(
                     "Catch-up: processed event {} for '{}'",
                     event_id,
@@ -4159,7 +4304,15 @@ where
         );
     }
 
-    Ok((current_sequence, contiguous))
+    // Only sequences above the final prefix need the handoff: rows the prefix
+    // folded in were covered by the position itself.
+    delivered.retain(|&seq| seq > contiguous);
+
+    Ok(CatchUpOutcome {
+        prefix: contiguous,
+        cursor: current_sequence,
+        delivered_above_prefix: delivered,
+    })
 }
 
 impl<D> EventBus for PgEventBus<D>
@@ -4199,6 +4352,7 @@ where
         let channel_name = self.channel_name.clone();
         let hwm = self.hwm.clone();
         let subscriber_modes = self.subscriber_modes.clone();
+        let pending_delivered_sets = self.pending_delivered_sets.clone();
 
         let inline_state = self.inline_state.clone();
         Box::pin(async move {
@@ -4431,12 +4585,15 @@ where
             // Catch up from the persisted checkpoint. Reuses the same paginated,
             // retry/DLQ-backed pass that start_listener runs before entering its
             // loop (spec 0026 R2), so the two paths cannot drift.
-            // `current_sequence` is the pagination cursor (max seen), the correct
-            // `> current_sequence` lower bound for the drain below. `contiguous`
+            // `outcome.cursor` is the pagination cursor (max seen), the correct
+            // `> current_sequence` lower bound for the drain below. `outcome.prefix`
             // is what catch-up actually persisted; the drain continues this same
             // counter so it can never flush above a hole catch-up stopped at
-            // (spec 0026 R2).
-            let (mut current_sequence, mut contiguous) = catch_up_from_checkpoint(
+            // (spec 0026 R2). `outcome.delivered_above_prefix` is the exact set
+            // the pass applied above the pinned prefix (spec 0031 R1, CLOUD-262
+            // Part A); the drain extends it and the final record below hands the
+            // whole set to the listener's state seed.
+            let outcome = catch_up_from_checkpoint(
                 &observer,
                 &subscriber_id,
                 replay_always,
@@ -4446,6 +4603,18 @@ where
                 &hwm,
             )
             .await?;
+            let mut current_sequence = outcome.cursor;
+            let mut contiguous = outcome.prefix;
+            let mut delivered_above_prefix = outcome.delivered_above_prefix;
+            // Recorded before the drain too, so a wake landing mid-drain still
+            // finds the catch-up leg's set when the id's state is seeded. If
+            // the drain then errors, the error path below removes this record
+            // (cleanup-on-error): a failed subscribe never registers its
+            // observer, so nothing would ever consume a stale set.
+            pending_delivered_sets
+                .lock()
+                .await
+                .insert(subscriber_id.clone(), delivered_above_prefix.clone());
 
             // Continues catch-up's contiguous-prefix counter over the drained
             // range (§4.3). advance_catchup_prefix flushes according to the
@@ -4493,7 +4662,7 @@ where
                     // A transient DB error here returns Err from subscribe(), which is
                     // safe under at-least-once semantics: checkpoints are durable and
                     // the caller can retry subscribe() to resume from where it left off.
-                    let rows: Vec<PgDBEvent> = sqlx::query_as(&format!(
+                    let rows: Vec<PgDBEvent> = match sqlx::query_as(&format!(
                         "SELECT id, stream_id, stream_version, event_type, data, \
                          created_at, actor_id, purger_id, purged_at, \
                          global_sequence, causation_id, correlation_id, schema_version \
@@ -4505,7 +4674,20 @@ where
                     .bind(max_buffered_seq as i64)
                     .bind(config.catch_up_batch_size as i64)
                     .fetch_all(&pool)
-                    .await?;
+                    .await
+                    {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            // Spec 0031 (CLOUD-262 Part A): cleanup-on-error. The
+                            // pre-drain record above must not outlive a subscribe
+                            // that fails: registration never happened, so nothing
+                            // would consume the set, and a stale set could later
+                            // suppress deliveries a fresh same-id subscribe never
+                            // received. Drop it, then propagate.
+                            pending_delivered_sets.lock().await.remove(&subscriber_id);
+                            return Err(PgEventBusError::from(e));
+                        }
+                    };
 
                     if rows.is_empty() {
                         break;
@@ -4634,6 +4816,11 @@ where
                             }
 
                             if let ProcessResult::Success = result {
+                                // Spec 0031 R1 (CLOUD-262 Part A): the drain
+                                // delivered this row above the pinned prefix;
+                                // it joins the handoff set like the catch-up
+                                // leg's deliveries.
+                                delivered_above_prefix.insert(event_global_seq);
                                 log::debug!(
                                     "Processed buffered event {} for '{}'",
                                     event_id,
@@ -4675,6 +4862,16 @@ where
                     }
                 }
             }
+
+            // Spec 0031 R1 (CLOUD-262 Part A): hand the complete delivered set
+            // (catch-up leg + drain leg, narrowed to sequences above the final
+            // prefix) to the listener's one-time state seed. Recorded before
+            // registration so no wake can observe the id without its set.
+            delivered_above_prefix.retain(|&seq| seq > contiguous);
+            pending_delivered_sets
+                .lock()
+                .await
+                .insert(subscriber_id.clone(), delivered_above_prefix);
 
             // Final unconditional flush after buffer processing (spec 0026
             // §4.2/§4.3, R2, R4). `flush_checkpoint` is a blind, non-monotonic
@@ -5089,7 +5286,7 @@ mod tests {
         let (_, s4) = cu_insert(&pool, &table, stream_id, 4).await;
         let (_, s5) = cu_insert(&pool, &table, stream_id, 5).await;
 
-        let (cursor, contiguous) = catch_up_from_checkpoint(
+        let outcome = catch_up_from_checkpoint(
             &observer,
             &sub_id,
             false,
@@ -5100,6 +5297,7 @@ mod tests {
         )
         .await
         .expect("catch_up_from_checkpoint");
+        let (cursor, contiguous) = (outcome.cursor, outcome.prefix);
 
         // Prefix must stop before the hole. This table is exclusive to this
         // test, so no concurrent process can extend the contiguous run; the
@@ -5165,7 +5363,7 @@ mod tests {
         let (_, s4) = cu_insert(&pool, &table, stream_id, 4).await;
         let (_, s5) = cu_insert(&pool, &table, stream_id, 5).await;
 
-        let (cursor, contiguous) = catch_up_from_checkpoint(
+        let outcome = catch_up_from_checkpoint(
             &observer,
             &sub_id,
             false,
@@ -5176,6 +5374,7 @@ mod tests {
         )
         .await
         .expect("catch_up_from_checkpoint");
+        let (cursor, contiguous) = (outcome.cursor, outcome.prefix);
 
         assert!(
             contiguous < s3 as u64,
@@ -5226,7 +5425,7 @@ mod tests {
         let (_, _s2) = cu_insert(&pool, table, stream_id, 2).await;
         let (_, s3) = cu_insert(&pool, table, stream_id, 3).await;
 
-        let (cursor, contiguous) = catch_up_from_checkpoint(
+        let outcome = catch_up_from_checkpoint(
             &observer,
             &sub_id,
             false,
@@ -5237,6 +5436,7 @@ mod tests {
         )
         .await
         .expect("catch_up_from_checkpoint");
+        let (cursor, contiguous) = (outcome.cursor, outcome.prefix);
 
         // The cursor scans to the head regardless of gaps, so it must reach s3
         // whether or not the range is contiguous.
@@ -5299,7 +5499,7 @@ mod tests {
         // cu_set_checkpoint for Checkpointed subscribers).
         hwm.lock().await.insert(sub_id.clone(), s3 as u64 - 3);
 
-        let (cursor, _contiguous) = catch_up_from_checkpoint(
+        let outcome = catch_up_from_checkpoint(
             &observer,
             &sub_id,
             true,
@@ -5310,6 +5510,7 @@ mod tests {
         )
         .await
         .expect("catch_up_from_checkpoint");
+        let (cursor, _contiguous) = (outcome.cursor, outcome.prefix);
 
         // Cursor must reach at least s3.
         assert!(cursor >= s3 as u64, "cursor must reach at least s3");
