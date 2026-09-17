@@ -767,6 +767,35 @@ where
             Ok(())
         })
     }
+
+    /// Removes a registered observer by subscriber id, idempotently.
+    ///
+    /// There is no persisted state to resolve (mem-bus checkpoints are
+    /// in-memory only, and the DLQ is not keyed for cleanup on retire), so
+    /// this is exactly a removal from `projections`.
+    ///
+    /// # Timing vs. `PgEventBus`
+    ///
+    /// The background delivery loop holds the `projections` **read** lock
+    /// across its whole per-event observer loop, including retry sleeps
+    /// (see the loop spawned in [`InMemoryEventBus::with_config`]). Taking
+    /// the **write** lock here therefore blocks until that loop is not
+    /// mid-delivery, and any event already dispatched to observers before
+    /// this call acquires the lock still reaches the retired observer. Once
+    /// this call completes, no further event reaches it. This is
+    /// "immediate-when-not-mid-delivery", not pg's documented "next wake":
+    /// same contract (idempotent, `Ok(true)`/`Ok(false)`), different timing.
+    fn unsubscribe<'a>(
+        &'a self,
+        subscriber_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, Self::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut projections = self.projections.write().await;
+            let before = projections.len();
+            projections.retain(|observer| observer.subscriber_id() != subscriber_id);
+            Ok(projections.len() != before)
+        })
+    }
 }
 
 /// Implementation of an InMemory State Storage
@@ -1119,6 +1148,36 @@ mod tests {
 
         let projections = bus.projections.read().await;
         assert_eq!(projections.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_bus_unsubscribe_stops_delivery() {
+        let bus = InMemoryEventBus::<MyEventData>::new();
+        let projection = TestProjection::new();
+        let storage = projection.get_state_store().clone();
+        bus.subscribe(ProjectionHandler::new(projection))
+            .await
+            .unwrap();
+
+        let stream_id = Uuid::new_v4();
+        let event1 = new_event(stream_id, 1, "before_unsubscribe");
+        bus.publish(Arc::new(event1.clone())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let events: TestState = storage.get_state(stream_id).await.unwrap().unwrap();
+        assert_eq!(events.0.len(), 1);
+
+        let removed = bus.unsubscribe("projection:test").await.unwrap();
+        assert!(removed);
+        assert!(bus.projections.read().await.is_empty());
+
+        let event2 = new_event(stream_id, 2, "after_unsubscribe");
+        bus.publish(Arc::new(event2)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let events: TestState = storage.get_state(stream_id).await.unwrap().unwrap();
+        assert_eq!(events.0.len(), 1, "no delivery after unsubscribe");
+
+        let removed_again = bus.unsubscribe("projection:test").await.unwrap();
+        assert!(!removed_again, "idempotent second call returns Ok(false)");
     }
 
     #[tokio::test]

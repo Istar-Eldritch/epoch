@@ -250,6 +250,26 @@ pub trait EventBus {
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>>
     where
         T: EventObserver<Self::EventType> + Send + Sync + 'static;
+
+    /// Retires a previously registered subscriber, idempotently.
+    ///
+    /// The default body returns `Ok(false)` unconditionally, meaning "this
+    /// backend does not support removal" — it is a compatibility no-op for
+    /// backends that predate this method, not a claim about `subscriber_id`.
+    /// An overriding backend's `Ok(false)` means something different: "the id
+    /// is not currently registered" (idempotent re-call, or it was never
+    /// registered). `Ok(true)` always means "a registered id was removed".
+    ///
+    /// A trait-level `Err(Unsupported)` default is not possible here: this
+    /// trait's `Self::Error: std::error::Error` carries no construction bound,
+    /// so the default body cannot build one without adding a breaking bound
+    /// to every implementor.
+    fn unsubscribe<'a>(
+        &'a self,
+        _subscriber_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, Self::Error>> + Send + 'a>> {
+        Box::pin(async { Ok(false) })
+    }
 }
 
 /// How a subscriber reacts when an event cannot be applied.

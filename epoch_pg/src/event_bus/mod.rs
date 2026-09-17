@@ -5830,6 +5830,26 @@ where
             Ok(())
         })
     }
+
+    /// Overrides the trait-default no-op by delegating to the inherent
+    /// [`PgEventBus::unsubscribe`] (spec 0031 Phase 3), so a generic caller
+    /// going through `EventBus::unsubscribe` gets the real retire-and-remove
+    /// behaviour instead of the trait default's unconditional `Ok(false)`.
+    /// See the inherent method's rustdoc for the full removal-inventory
+    /// contract (R6–R10).
+    fn unsubscribe<'a>(
+        &'a self,
+        subscriber_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, Self::Error>> + Send + 'a>> {
+        // Qualified call: pins this to the INHERENT method. An unqualified
+        // `self.unsubscribe(...)` resolves to the inherent candidate today,
+        // but if the inherent method were ever renamed or its bounds drifted,
+        // it would silently become unbounded recursion into THIS trait method
+        // (clippy's unconditional_recursion does not fire through the
+        // Box::pin boundary; the failure is a runtime stack overflow). The
+        // qualified form turns any drift into a compile error.
+        Box::pin(async move { PgEventBus::unsubscribe(self, subscriber_id).await })
+    }
 }
 
 #[cfg(test)]

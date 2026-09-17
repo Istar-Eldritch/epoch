@@ -7,7 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`SubscriberNotFound` readiness flip for retired ids** (CLOUD-262) — after
+  `unsubscribe`, `subscriber_lag` and `wait_until_caught_up` return
+  `Err(PgEventBusError::SubscriberNotFound)` for the retired id instead of
+  stale readiness data, and `wait_until_all_caught_up` no longer waits on it
+  (retiring the last subscriber makes it return `Ok(true)` trivially — an
+  empty registry is not evidence work was done).
+
 ### Added
+
+- **Subscriber retire API, wedge self-heal, and `EventBus::unsubscribe`**
+  (`epoch_core`, `epoch_pg`, `epoch_mem`, CLOUD-262, spec 0031) — a registered
+  subscriber can now be removed from a bus at runtime, and a permanently
+  gap-wedged `ReplayAlways` subscriber can be configured to retire and
+  self-heal into a fresh generation instead of staying wedged forever:
+  - **`PgEventBus::unsubscribe(subscriber_id) -> Result<bool, PgEventBusError>`**
+    — retires a registered observer: `Ok(true)` removed, `Ok(false)` idempotent
+    on an unknown/already-removed id. Valid on both `DispatchMode::Async` and
+    `DispatchMode::Inline`. Removes every in-memory registry trace of the id
+    (`subscriber_modes`, `hwm` for `ReplayAlways`, all same-id observer `Arc`s
+    in the projections Vec, and cross-task listener state so a retired
+    subscriber stops pinning the shared fetch floor); resolves unresolved
+    `epoch_event_bus_gap_timeouts` rows for the id with `resolved_by =
+    'unsubscribe'` (silencing zombie rebuild callbacks); **retains** checkpoint
+    and DLQ rows for audit, so a same-id re-subscribe after retire starts a
+    clean lifecycle (`Checkpointed` resumes from the retained row,
+    `ReplayAlways` replays from 0) with no first-registration-wins warning. On
+    `InstanceMode::Coordinated` buses the advisory-lock release is attempted
+    best-effort and is not guaranteed. Timing: removal takes effect at the
+    next wake; the in-flight wake may still deliver to and advance the
+    retired observer via its pre-unsubscribe snapshot.
+  - **`epoch_core::EventBus::unsubscribe`** — the retire operation is now part
+    of the generic bus trait, as a **defaulted** method returning `Ok(false)`
+    unconditionally (this is a compatibility no-op, not a claim about the id —
+    a trait-level `Err(Unsupported)` default is impossible without adding a
+    breaking construction bound to `Self::Error`). `PgEventBus`'s trait impl
+    overrides it by delegating to the inherent `unsubscribe` above, so generic
+    callers get real removal. **Non-breaking**: existing third-party `EventBus`
+    implementors compile unchanged.
+  - **`InMemoryEventBus::unsubscribe`** — same contract (idempotent,
+    `Ok(true)`/`Ok(false)`), different timing: the mem-bus delivery loop holds
+    the projections read lock across its whole per-event observer loop
+    including retry sleeps, so removal here is immediate-when-not-mid-delivery
+    rather than pg's next-wake semantics. No persisted state to resolve.
+  - **P5 wedge self-heal** — `ReliableDeliveryConfig::on_wedge_retired` (an
+    optional `WedgeRetiredCallback`) and `wedge_heal` (an optional
+    `WedgeHealPolicy`, defaulting to a 5-generation cap with a 30s/60s
+    heal-generation backoff schedule) configure epoch to retire-and-notify
+    instead of leaving a subscriber wedged forever. The heal fires **only**
+    for a `ReplayAlways` + `FailClosed` + `GapPolicy::Halt` subscriber wedged
+    by `HaltReason::GapUnproven`, exactly once per (generation, gap); never
+    for `SkipAfterBackstop` subscribers (they never gap-wedge) and never for
+    deserialize/observer wedges. On trigger, epoch retires the wedged
+    observer (via the same removal `unsubscribe` performs) and invokes the
+    callback with enough context (`base_subscriber_id`,
+    `retired_subscriber_id`, `generation`, `held_below_sequence`) to
+    re-`subscribe()` a fresh model under the `{base}#gen{N}` family
+    convention (near-miss rejection: a heal for `base` never matches
+    `base-suffix`). Epoch never constructs, clears, or subscribes the fresh
+    model itself. The heal work runs on a bus-owned heal-actor task, never
+    inline on the halt callback, so a slow implementation delays only that
+    subscriber family's next heal. Reaching `max_generations` retires the
+    chain, logs an ERROR, and stops healing that family without invoking the
+    callback. This is opt-in: `on_wedge_retired: None` (the default) leaves
+    `GapPolicy::Halt` behaviour byte-for-byte unchanged. One WARN is logged
+    per heal (old id, new id, generation, held-below sequence).
+  - **Exactly-once fix over open holes** (spec 0031 R1/R2) — a fresh
+    `subscribe()` of a `ReplayAlways` subscriber over a stream containing an
+    unfilled hole now delivers every row above the hole exactly once across
+    the subscribe-time catch-up pass and all subsequent live wakes, instead
+    of re-delivering rows the catch-up pass already applied. The fix holds on
+    every process boot and listener restart; catch-up passes themselves
+    remain at-least-once per pass while the prefix stays pinned below the
+    hole. Hole-free streams are unaffected; `Checkpointed` catch-up semantics
+    and the `GapPolicy::Halt` default are unchanged.
+  - **CLOUD-259 coordination note**: catacloud's interim wedge-recovery code
+    at `integration/src/policy_projection_heal.rs` predates this epoch-side
+    heal and can be retired now that epoch retires-and-notifies natively —
+    that deletion is catacloud's move, to be made after a soak period, not
+    part of this change. For any window where both healers run concurrently,
+    catacloud should keep its two interim guards from paper 2 §8.2: the
+    stale-generation CAS, and the retired-check via the new
+    `SubscriberNotFound` readiness flip above.
 
 - **Sequence-burn resilience: opt-in `GapPolicy` for `ReplayAlways` subscribers**
   (`epoch_core`, `epoch_pg`, CLOUD-261, spec 0030 Part A) — a burned `global_sequence`
