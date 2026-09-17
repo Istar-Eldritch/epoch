@@ -4690,6 +4690,105 @@ async fn test_fast_forward_skips_replay_always() {
     );
 }
 
+/// Spec 0031 Phase 2 (R5): `fast_forward_all_subscribers` must identify every
+/// subscriber from the id→observer registry, never by locking each observer.
+/// Delivery (`process_event_with_retry`) holds an observer's mutex across its
+/// whole `on_event` await, so the pre-registry implementation — locking every
+/// observer in the projections snapshot to read `subscriber_id` and
+/// `subscription_mode` — blocks indefinitely behind one parked handler. This
+/// test parks a subscriber inside `on_event` and pins that fast-forward still
+/// completes and writes that subscriber's checkpoint. The bounded
+/// `tokio::time::timeout` is the failure mode: without the registry the call
+/// deadlocks on the parked mutex and the timeout fires, failing this test
+/// instead of hanging the whole suite.
+#[tokio::test]
+#[serial]
+async fn test_fast_forward_completes_while_observer_mutex_held() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone())
+        .run()
+        .await
+        .expect("Failed to run migrations");
+
+    // Isolated events table + unique channel: no shared-table history can
+    // advance this subscriber's checkpoint or head behind the test's back.
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let sub_id = format!("projection:ff-wedge:{}", Uuid::new_v4());
+    let (gated, released, mut entered) = GatedObserver::new_with_entry_signal(sub_id.clone());
+    event_bus
+        .subscribe(gated)
+        .await
+        .expect("Failed to subscribe gated observer");
+
+    // One event, committed after the subscribe: the listener delivers it, the
+    // observer signals entry and parks inside on_event holding its mutex.
+    let stream_id = Uuid::new_v4();
+    let (_event_id, head) =
+        insert_committed_event(&pool, &table, stream_id, 1, "wedges-the-observer").await;
+
+    // Wait until the observer is provably parked: from that moment its mutex is
+    // held across the pending on_event await, and any metadata read that locks
+    // observers blocks forever behind it.
+    let mut parked = false;
+    for _ in 0..400 {
+        if *entered.borrow_and_update() {
+            parked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        parked,
+        "listener never entered the gated observer's on_event"
+    );
+
+    // THE PIN (spec 0031 Phase 2): fast-forward must complete while the parked
+    // observer's mutex is held, resolving id and mode from the registry instead
+    // of locking the observer.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        event_bus.fast_forward_all_subscribers(),
+    )
+    .await
+    .expect(
+        "fast_forward_all_subscribers blocked behind the parked observer's held \
+         mutex: it must resolve subscribers from the registry, not by locking \
+         each observer",
+    )
+    .expect("fast_forward_all_subscribers failed");
+
+    // The parked subscriber cannot have advanced its own checkpoint (it is
+    // parked mid-on_event, and delivery only advances the checkpoint after
+    // on_event returns), so a row at head proves fast-forward actually
+    // identified this subscriber and wrote it — the registry supplied real
+    // metadata, this is not just an early return.
+    assert_eq!(
+        event_bus
+            .get_checkpoint(&sub_id)
+            .await
+            .expect("get_checkpoint"),
+        Some(head as u64),
+        "fast_forward must park the parked subscriber's checkpoint at head {head}"
+    );
+
+    // Release the observer so the listener can finish its batch, then tear
+    // everything down so no parked task leaks into the next #[serial] test.
+    released
+        .send(true)
+        .expect("GatedObserver's receiver was dropped");
+    event_bus.shutdown().await.expect("shutdown failed");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
 /// R-5 (Correction 2): after subscribe()'s catch-up advances the in-memory HWM,
 /// the listener seeds a ReplayAlways subscriber's state from that HWM rather than
 /// the (absent) checkpoint row, so the first live batch delivers only new events

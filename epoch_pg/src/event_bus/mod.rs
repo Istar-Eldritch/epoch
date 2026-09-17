@@ -1325,6 +1325,12 @@ pub enum PgEventBusError {
 /// happen at startup, the current design is sufficient.
 type Projections<D> = Arc<Mutex<Vec<Arc<Mutex<dyn EventObserver<D>>>>>>;
 
+/// The id→observer registry value shape: `subscriber_id` -> (mode, every
+/// observer handle registered under the id). See the bus's `subscriber_modes`
+/// field rustdoc for the ownership rules (handles accumulate, mode is per-id).
+type SubscriberRegistry<D> =
+    HashMap<String, (SubscriptionMode, Vec<Arc<Mutex<dyn EventObserver<D>>>>)>;
+
 /// A publish deferred by [`PgEventBus::dispatch_inline`] because it targeted a
 /// bus other than the one currently draining on this task. Boxed/type-erased
 /// so buses over different `EventData` types can share one queue.
@@ -1440,15 +1446,24 @@ where
     /// from 0, which is the intended contract. Shared across `Clone`s so
     /// `subscribe`, the listener task, and readiness queries observe the same value.
     hwm: Arc<Mutex<HashMap<String, u64>>>,
-    /// `subscriber_id` -> [`SubscriptionMode`] for every registered subscriber.
+    /// `subscriber_id` -> (`SubscriptionMode`, every registered observer handle)
+    /// for every registered subscriber — the id→observer registry.
     ///
-    /// Readiness queries need only this static metadata, and reading it from the
-    /// observers themselves would deadlock: `process_event_with_retry` holds an
-    /// observer's mutex across its `on_event` await, so a subscriber that is slow
-    /// or blocked makes any caller that locks it wait for the whole handler,
-    /// indefinitely, ignoring the timeout it was given. This registry is only ever
-    /// locked for the length of a map operation.
-    subscriber_modes: Arc<Mutex<HashMap<String, SubscriptionMode>>>,
+    /// The `Vec` carries **all** handles ever registered under the id, not just
+    /// the first: delivery is first-registration-wins (`seen_sids` in the wake
+    /// init pass), so a same-id re-subscribe leaves the first Arc driving the
+    /// subscriber and later Arcs inert duplicates. An overwriting single-Arc
+    /// value would therefore retain the inert duplicate and lose the delivering
+    /// observer, making any future removal of all same-id handles unachievable.
+    ///
+    /// Readiness and other metadata queries need only this static data, and
+    /// reading it from the observers themselves would deadlock:
+    /// `process_event_with_retry` holds an observer's mutex across its `on_event`
+    /// await, so a subscriber that is slow or blocked makes any caller that locks
+    /// it wait for the whole handler, indefinitely, ignoring the timeout it was
+    /// given. This registry is only ever locked for the length of a map
+    /// operation.
+    subscriber_modes: Arc<Mutex<SubscriberRegistry<D>>>,
     /// `subscriber_id` -> the exact set of global sequences the most recent
     /// catch-up pass delivered to that subscriber **above the pinned contiguous
     /// prefix** (spec 0031 R1/R2, CLOUD-262 Part A).
@@ -2744,7 +2759,7 @@ where
         // and the one the written row serves.
         let is_replay_always = matches!(
             self.subscriber_modes.lock().await.get(subscriber_id),
-            Some(SubscriptionMode::ReplayAlways)
+            Some((SubscriptionMode::ReplayAlways, _))
         );
         if is_replay_always {
             warn!(
@@ -2824,12 +2839,13 @@ where
     ) -> Result<SubscriptionMode, PgEventBusError> {
         // Read the registry rather than the observers: locking an observer here
         // would block for the duration of its current `on_event`, which is
-        // unbounded (see `subscriber_modes`).
+        // unbounded (see `subscriber_modes`). The mode is per-id, so it is read
+        // off the entry, not off any particular observer handle.
         self.subscriber_modes
             .lock()
             .await
             .get(subscriber_id)
-            .copied()
+            .map(|(mode, _)| *mode)
             .ok_or_else(|| PgEventBusError::SubscriberNotFound(subscriber_id.to_string()))
     }
 
@@ -3066,12 +3082,13 @@ where
         // this avoids a full registry scan on every 25 ms poll iteration. Taken
         // from the registry, never from the observers, which may each be locked
         // for the length of an in-flight `on_event` (see `subscriber_modes`).
+        // The mode is per-id, so it is read off the entry.
         let subscribers: Vec<(String, SubscriptionMode)> = self
             .subscriber_modes
             .lock()
             .await
             .iter()
-            .map(|(id, mode)| (id.clone(), *mode))
+            .map(|(id, (mode, _))| (id.clone(), *mode))
             .collect();
 
         if subscribers.is_empty() {
@@ -3115,24 +3132,35 @@ where
         };
 
         // Snapshot the observer list and release the `projections` guard before
-        // locking each observer: `process_event_with_retry` holds an observer's
-        // mutex across its `on_event` await, so doing this under `projections`
-        // would let one slow handler block every other caller of `subscribe()`/
-        // `start_listener()` for as long as that handler runs. R5: skip
-        // ReplayAlways subscribers — they have no persisted checkpoint, and
-        // parking one at head would suppress the replay-from-zero their next
-        // boot depends on.
+        // resolving metadata: delivery (`process_event_with_retry`) holds an
+        // observer's mutex across its `on_event` await, so doing anything under
+        // `projections` would let one slow handler block every other caller of
+        // `subscribe()`/`start_listener()` for as long as that handler runs.
         let snapshot: Vec<_> = { self.projections.lock().await.iter().cloned().collect() };
+        // R5 (spec 0031 Phase 2): resolve each live observer's (subscriber id,
+        // mode) from the registry by pointer identity instead of locking the
+        // observer — locking it here would block for as long as its current
+        // `on_event` runs, indefinitely. The registry is only ever locked for a
+        // map operation. A `projections` Arc without a registry match cannot
+        // occur (both registration sites record the id before pushing), and a
+        // ReplayAlways entry is skipped: it has no persisted checkpoint, and
+        // parking one at head would suppress the replay-from-zero its next boot
+        // depends on.
         let subscriber_ids: Vec<String> = {
-            let mut ids = Vec::with_capacity(snapshot.len());
-            for observer in &snapshot {
-                let o = observer.lock().await;
-                if o.subscription_mode() == SubscriptionMode::ReplayAlways {
-                    continue;
-                }
-                ids.push(o.subscriber_id().to_string());
-            }
-            ids
+            let registry = self.subscriber_modes.lock().await;
+            snapshot
+                .iter()
+                .filter_map(|observer| {
+                    registry
+                        .iter()
+                        .find(|(_, (_, handles))| {
+                            handles.iter().any(|handle| Arc::ptr_eq(handle, observer))
+                        })
+                        .and_then(|(id, (mode, _))| {
+                            (mode != &SubscriptionMode::ReplayAlways).then(|| id.clone())
+                        })
+                })
+                .collect()
         };
 
         for subscriber_id in subscriber_ids {
@@ -3848,8 +3876,9 @@ async fn try_flush_pending_checkpoint(
     }
 }
 
-/// Records `subscriber_id -> mode` in the registry, warning if the id is
-/// already present.
+/// Records `subscriber_id -> (mode, [observer])` in the registry, warning if
+/// the id is already present, and appends the new observer handle to the
+/// entry's handle list.
 ///
 /// The listener seeds `subscriber_states` and the per-priority dispatch list
 /// first-wins on a duplicate id (mod.rs `subscriber_states.contains_key`), so a
@@ -3858,23 +3887,87 @@ async fn try_flush_pending_checkpoint(
 /// subscriber silently. This is reachable through the documented `ReplayAlways`
 /// re-subscribe path (spec 0024 §4.5 Correction 3), not just a copy-pasted id, so
 /// it is a warning rather than an error — flagging it, not blocking it.
-async fn warn_if_subscriber_id_reused(
-    subscriber_modes: &Arc<Mutex<HashMap<String, SubscriptionMode>>>,
+///
+/// The new handle is **appended** to the entry's `Vec`, never replacing it:
+/// delivery is first-registration-wins, so the first handle is the one that
+/// actually receives events; dropping it from the registry (a single-Arc
+/// overwrite) would leave the inert duplicate behind and lose the delivering
+/// observer. The mode stays per-id (it is not moved into the `Vec`); matching
+/// the previous single-value `insert`, a reuse overwrites the entry's mode with
+/// the most recently registered observer's mode.
+async fn warn_if_subscriber_id_reused<D>(
+    subscriber_modes: &Arc<Mutex<SubscriberRegistry<D>>>,
     subscriber_id: &str,
     mode: SubscriptionMode,
-) {
-    let previous = subscriber_modes
-        .lock()
-        .await
-        .insert(subscriber_id.to_string(), mode);
-    if previous.is_some() {
-        warn!(
-            "subscribe(): subscriber id '{}' is already registered on this bus. The \
-             existing observer keeps receiving events; this new subscription will not \
-             receive any live event (first-registration wins).",
-            subscriber_id
-        );
+    observer: &Arc<Mutex<dyn EventObserver<D>>>,
+) where
+    D: EventData + Send + Sync,
+{
+    let mut registry = subscriber_modes.lock().await;
+    match registry.get_mut(subscriber_id) {
+        Some((entry_mode, observers)) => {
+            warn!(
+                "subscribe(): subscriber id '{}' is already registered on this bus. The \
+                 existing observer keeps receiving events; this new subscription will not \
+                 receive any live event (first-registration wins).",
+                subscriber_id
+            );
+            *entry_mode = mode;
+            observers.push(observer.clone());
+        }
+        None => {
+            registry.insert(subscriber_id.to_string(), (mode, vec![observer.clone()]));
+        }
     }
+}
+
+/// Removes every Arc in `captured` from the projections Vec, matching by
+/// [`Arc::ptr_eq`] under the outer `projections` mutex, preserving the order of
+/// the remaining observers. Returns the number of Arcs removed.
+///
+/// # Capture-based contract (spec 0031 Phase 2)
+///
+/// `captured` must already hold the caller's own clones of the target id's Arcs,
+/// taken out of the `subscriber_modes` registry entry while holding the
+/// registry's mutex. This helper deliberately does **not** look the id up in the
+/// registry and does **not** drop the registry entry — both are the caller's
+/// responsibility, in that order (capture the Arcs first, then drop the entry),
+/// because a caller that drops the entry first leaves nothing for a lookup to
+/// find. Callers therefore cannot be broken by a future re-shape of the
+/// registry's value type; only this helper and the registry's writers ever
+/// touch that shape.
+///
+/// Removal is safe under the outer mutex: wake, catch-up, inline and
+/// fast-forward paths clone the `Arc`s out of the Vec under the lock and drop
+/// the guard before dispatching, so nothing holds the outer mutex across an
+/// `on_event` await.
+///
+/// Written in Phase 2 per spec 0031 (exercised from Phase 3's `unsubscribe`,
+/// which captures the id's Arcs before dropping the registry entry); the unit
+/// test below pins the contract until then.
+///
+/// Lock ordering: this helper takes the projections mutex internally. Callers
+/// that also touch the registry must DROP the registry guard before calling —
+/// Phase 3's `unsubscribe` captures the `Vec` under the registry guard, drops
+/// that guard, then calls this helper — so no path ever holds both mutexes
+/// (spec 0031 Phase 2 review, cycle 1).
+#[allow(dead_code)]
+async fn remove_captured_observers<D>(
+    projections: &Projections<D>,
+    captured: &[Arc<Mutex<dyn EventObserver<D>>>],
+) -> usize
+where
+    D: EventData + Send + Sync,
+{
+    let mut removed = 0;
+    projections.lock().await.retain(|live| {
+        let drop_it = captured.iter().any(|gone| Arc::ptr_eq(gone, live));
+        if drop_it {
+            removed += 1;
+        }
+        !drop_it
+    });
+    removed
 }
 
 /// Advances the contiguous-prefix checkpoint for one caught-up event (spec
@@ -4406,7 +4499,8 @@ where
             // Just register the subscriber and return. Any events published
             // before subscription are not replayed (intentional for tests).
             if config.dispatch_mode == config::DispatchMode::Inline {
-                warn_if_subscriber_id_reused(&subscriber_modes, &subscriber_id, mode).await;
+                warn_if_subscriber_id_reused(&subscriber_modes, &subscriber_id, mode, &observer)
+                    .await;
                 // Touch inline_state so the field isn't considered unused on
                 // the subscribe path; ensures the queue is initialized.
                 let _ = inline_state.lock().await;
@@ -4480,7 +4574,7 @@ where
 
             // Past the Coordinated-mode gate: this instance will actually drive
             // the subscriber, so it is safe to make it visible to readiness.
-            warn_if_subscriber_id_reused(&subscriber_modes, &subscriber_id, mode).await;
+            warn_if_subscriber_id_reused(&subscriber_modes, &subscriber_id, mode, &observer).await;
 
             // A fresh subscribe of a ReplayAlways subscriber rebuilds its in-memory
             // model from empty, so reset the HWM before catch-up: readiness must not
@@ -5527,5 +5621,84 @@ mod tests {
             cp.is_none(),
             "ReplayAlways must not write to the checkpoints table"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Spec 0031 Phase 2 — registry shape and the capture-based removal helper.
+    // Both are pure in-memory: no database needed.
+    // -------------------------------------------------------------------------
+
+    /// Same-id double registration must yield ONE registry entry whose value
+    /// carries the (per-id) mode and BOTH observer handles: an overwriting
+    /// single-Arc value would retain the inert duplicate and lose the
+    /// delivering observer (first-registration-wins via `seen_sids`).
+    #[tokio::test]
+    async fn registry_entry_accumulates_same_id_observer_handles() {
+        let registry: Arc<Mutex<SubscriberRegistry<CuTestEvent>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let first = cu_observer("dup:id".to_string(), SubscriptionMode::Checkpointed);
+        let second = cu_observer("dup:id".to_string(), SubscriptionMode::ReplayAlways);
+
+        warn_if_subscriber_id_reused(&registry, "dup:id", SubscriptionMode::Checkpointed, &first)
+            .await;
+        warn_if_subscriber_id_reused(&registry, "dup:id", SubscriptionMode::ReplayAlways, &second)
+            .await;
+
+        let registry = registry.lock().await;
+        assert_eq!(
+            registry.len(),
+            1,
+            "a same-id double registration must produce exactly one registry entry"
+        );
+        let (mode, handles) = registry.get("dup:id").expect("entry must exist");
+        assert_eq!(
+            *mode,
+            SubscriptionMode::ReplayAlways,
+            "mode is per-id; a reuse overwrites it (previous single-value insert semantics)"
+        );
+        assert_eq!(
+            handles.len(),
+            2,
+            "both same-id observer handles must be retained, not overwritten"
+        );
+        assert!(
+            Arc::ptr_eq(&handles[0], &first),
+            "the first-registered handle (the delivering one) stays first"
+        );
+        assert!(Arc::ptr_eq(&handles[1], &second));
+    }
+
+    /// Pins `remove_captured_observers`' capture-based contract: removal is by
+    /// `Arc::ptr_eq` against the captured handles only (never by subscriber id
+    /// or value equality), survivors keep their order, the count is returned,
+    /// and the registry is structurally untouched (the helper takes no registry
+    /// at all — capture and entry-drop are the caller's job, in that order).
+    #[tokio::test]
+    async fn remove_captured_observers_removes_only_captured_arcs_by_ptr_eq() {
+        let first = cu_observer("obs:first".to_string(), SubscriptionMode::Checkpointed);
+        let second = cu_observer("obs:second".to_string(), SubscriptionMode::Checkpointed);
+        let projections: Projections<CuTestEvent> = Arc::new(Mutex::new(vec![
+            first.clone(),
+            second.clone(),
+            first.clone(),
+        ]));
+
+        // Capturing only the second handle must remove only its entries,
+        // preserving the survivors' order, and return the removal count.
+        let removed = remove_captured_observers(&projections, std::slice::from_ref(&second)).await;
+        assert_eq!(removed, 1, "exactly the captured Arc is removed");
+        {
+            let live = projections.lock().await;
+            assert_eq!(live.len(), 2, "survivors keep their order");
+            assert!(Arc::ptr_eq(&live[0], &first));
+            assert!(Arc::ptr_eq(&live[1], &first));
+        }
+
+        // A fresh Arc for the same subscriber id must NOT match: removal is
+        // pointer identity on the captured handles, never id-based.
+        let reregistered = cu_observer("obs:first".to_string(), SubscriptionMode::Checkpointed);
+        let removed = remove_captured_observers(&projections, &[reregistered]).await;
+        assert_eq!(removed, 0, "an uncaptured same-id Arc must survive");
+        assert_eq!(projections.lock().await.len(), 2);
     }
 }
