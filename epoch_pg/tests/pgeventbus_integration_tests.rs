@@ -12706,6 +12706,18 @@ async fn test_unsubscribe_removes_registered_subscriber_returns_true() {
         .await
         .expect("subscribe");
 
+    // A never-retired peer: positive control proving the listener actually
+    // woke and processed the post-unsubscribe publish below, so the retired
+    // subscriber's silence is meaningful rather than vacuous (it would also
+    // pass if the listener had stalled entirely).
+    let peer_id = format!("projection:unsub-basic-peer:{}", Uuid::new_v4());
+    let peer_projection = TestProjection::replay_always(peer_id.clone());
+    let peer_store = peer_projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(peer_projection))
+        .await
+        .expect("subscribe peer");
+
     let mut delivered = false;
     for _ in 0..50 {
         if applied_ids(&store, stream).await.contains(&id1) {
@@ -12735,7 +12747,18 @@ async fn test_unsubscribe_removes_registered_subscriber_returns_true() {
 
     // A post-unsubscribe publish reaches nobody: the observer Arc is gone.
     let (id2, _seq2) = insert_committed_event(&pool, &table, stream, 2, "after").await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let mut peer_delivered = false;
+    for _ in 0..50 {
+        if applied_ids(&peer_store, stream).await.contains(&id2) {
+            peer_delivered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        peer_delivered,
+        "never-retired peer must receive the post-unsubscribe event (positive control)"
+    );
     let ids = applied_ids(&store, stream).await;
     assert!(!ids.contains(&id2), "no delivery after unsubscribe");
 
@@ -12774,6 +12797,192 @@ async fn test_unsubscribe_unknown_id_is_idempotent() {
     drop_isolated_events_table(&pool, &table).await;
 }
 
+/// Calls `unsubscribe` through the generic `epoch_core::EventBus` trait
+/// (never a backend's inherent method), so a caller using it exercises
+/// `impl EventBus for PgEventBus` specifically rather than the inherent
+/// method that shadows it.
+async fn retire_via_trait<B: EventBus>(bus: &B, id: &str) -> bool {
+    bus.unsubscribe(id).await.unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn test_unsubscribe_via_event_bus_trait_removes_subscriber() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    let (id1, _seq1) = insert_committed_event(&pool, &table, stream, 1, "before").await;
+
+    let sub_id = format!("projection:unsub-trait:{}", Uuid::new_v4());
+    let projection = TestProjection::replay_always(sub_id.clone());
+    let store = projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe");
+
+    // A never-retired peer: positive control proving the listener actually
+    // woke and processed the post-unsubscribe publish below.
+    let peer_id = format!("projection:unsub-trait-peer:{}", Uuid::new_v4());
+    let peer_projection = TestProjection::replay_always(peer_id.clone());
+    let peer_store = peer_projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(peer_projection))
+        .await
+        .expect("subscribe peer");
+
+    let mut delivered = false;
+    for _ in 0..50 {
+        if applied_ids(&store, stream).await.contains(&id1) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        delivered,
+        "subscriber must receive the pre-unsubscribe event"
+    );
+
+    // Retire through the generic trait method, not the inherent
+    // `PgEventBus::unsubscribe` every other test in this file calls directly
+    // (the inherent method shadows the trait impl, so only this path
+    // exercises `impl EventBus for PgEventBus`).
+    let removed = retire_via_trait(&event_bus, &sub_id).await;
+    assert!(removed, "trait unsubscribe of a registered id returns true");
+    let removed_again = retire_via_trait(&event_bus, &sub_id).await;
+    assert!(
+        !removed_again,
+        "idempotent second trait unsubscribe returns false"
+    );
+
+    // A post-unsubscribe publish reaches nobody: the observer Arc is gone.
+    let (id2, _seq2) = insert_committed_event(&pool, &table, stream, 2, "after").await;
+    let mut peer_delivered = false;
+    for _ in 0..50 {
+        if applied_ids(&peer_store, stream).await.contains(&id2) {
+            peer_delivered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        peer_delivered,
+        "never-retired peer must receive the post-unsubscribe event (positive control)"
+    );
+    let ids = applied_ids(&store, stream).await;
+    assert!(
+        !ids.contains(&id2),
+        "no delivery to the trait-retired subscriber after unsubscribe"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// R9's subscribe/retire race invariant (spec 0031 Phase 3 risk watchlist):
+/// a `subscribe()` that loses the race to a concurrent `unsubscribe` of the
+/// same id must remove the Arc it just pushed and abort with
+/// `SubscriberNotFound`, rather than leaving a dangling observer with no live
+/// registry entry.
+///
+/// Deterministic injection (mirrors
+/// `test_subscribe_drain_does_not_flush_above_held_hole`'s `GatedObserver`
+/// technique): a pre-existing event makes catch-up call `on_event` before
+/// `subscribe()` reaches its projections push, and the gate parks it there.
+/// `warn_if_subscriber_id_reused` (the registry insert) runs strictly before
+/// catch-up starts, so by the time `on_event` is entered the registry entry
+/// is already in place but the push and its post-push re-check have not run
+/// — exactly the window a concurrent `unsubscribe` must be able to win.
+#[tokio::test]
+#[serial]
+async fn test_subscribe_retire_race_push_loses_returns_subscriber_not_found() {
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        events_table: table.clone(),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+
+    let stream = Uuid::new_v4();
+    insert_committed_event(&pool, &table, stream, 1, "before").await;
+
+    let sub_id = format!("projection:subscribe-race:{}", Uuid::new_v4());
+    let (gated, released, mut entered_rx) = GatedObserver::new_with_entry_signal(sub_id.clone());
+
+    let subscribe_bus = event_bus.clone();
+    let subscribe_task = tokio::spawn(async move { subscribe_bus.subscribe(gated).await });
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !*entered_rx.borrow() {
+            entered_rx
+                .changed()
+                .await
+                .expect("entered signal sender dropped");
+        }
+    })
+    .await
+    .expect("catch-up did not reach the gated observer");
+
+    // Win the race: unsubscribe while subscribe() is parked mid-catch-up, its
+    // own push not yet reached.
+    let removed = event_bus
+        .unsubscribe(&sub_id)
+        .await
+        .expect("unsubscribe while subscribe is parked");
+    assert!(
+        removed,
+        "unsubscribe must see the registry entry subscribe() already inserted"
+    );
+
+    // Release catch-up: subscribe() finishes the pass, reaches the push + its
+    // post-push re-check, finds the registry entry gone, removes the Arc it
+    // just pushed, and aborts.
+    released
+        .send(true)
+        .expect("GatedObserver's receiver was dropped");
+
+    let subscribe_result = subscribe_task.await.expect("subscribe task must not panic");
+    assert!(
+        matches!(
+            &subscribe_result,
+            Err(epoch_pg::PgEventBusError::SubscriberNotFound(id)) if id == &sub_id
+        ),
+        "a subscribe() that loses the race to a concurrent unsubscribe must abort with \
+         SubscriberNotFound (R9), got {subscribe_result:?}"
+    );
+
+    // The losing push must not leave a dangling Arc: readiness is gone too.
+    let lag_result = event_bus.subscriber_lag(&sub_id).await;
+    assert!(
+        matches!(
+            lag_result,
+            Err(epoch_pg::PgEventBusError::SubscriberNotFound(_))
+        ),
+        "no trace of the aborted subscription may remain, got {lag_result:?}"
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
+    drop_isolated_events_table(&pool, &table).await;
+}
+
 #[tokio::test]
 #[serial]
 async fn test_unsubscribe_inline_bus() {
@@ -12805,6 +13014,17 @@ async fn test_unsubscribe_inline_bus() {
         .await
         .expect("subscribe");
 
+    // A never-retired peer: positive control proving inline dispatch actually
+    // ran the second store_event below, so the retired subscriber's silence
+    // is meaningful rather than vacuous.
+    let peer_id = format!("projection:unsub-inline-peer:{}", Uuid::new_v4());
+    let peer_projection = TestProjection::replay_always(peer_id.clone());
+    let peer_store = peer_projection.get_state_store().clone();
+    event_bus
+        .subscribe(ProjectionHandler::new(peer_projection))
+        .await
+        .expect("subscribe peer");
+
     event_store
         .store_event(new_event(stream, 1, "inline-before"))
         .await
@@ -12833,6 +13053,12 @@ async fn test_unsubscribe_inline_bus() {
         .store_event(new_event(stream, 2, "inline-after"))
         .await
         .expect("store event after unsubscribe");
+    let peer_ids = applied_ids(&peer_store, stream).await;
+    assert_eq!(
+        peer_ids.len(),
+        2,
+        "never-retired peer must receive both events (positive control)"
+    );
     let ids = applied_ids(&store, stream).await;
     assert_eq!(
         ids.len(),
@@ -12984,9 +13210,20 @@ async fn test_unsubscribe_wedged_subscriber_restores_all_caught_up_gate() {
     drop_isolated_events_table(&pool, &table).await;
 }
 
+/// Retiring a lagging subscriber (B) neither disrupts a healthy peer's (A's)
+/// continued exactly-once delivery nor leaves B reachable through readiness.
+///
+/// Scope note: this does NOT observe the shared fetch floor itself — the
+/// floor drag is fetch-side and delivery-invariant (a lingering stale state
+/// entry makes each wake re-fetch from the retired id's position, which the
+/// healthy subscriber's dedup silently absorbs), so no delivery assertion
+/// here can distinguish a pruned from an un-pruned stale entry. The prune
+/// itself is pinned structurally by
+/// `test_resubscribe_same_id_before_next_wake_starts_clean` (a stale state
+/// entry would break that test's fresh lifecycle's clean replay).
 #[tokio::test]
 #[serial]
-async fn test_retired_id_does_not_pin_shared_floor() {
+async fn test_retiring_lagging_subscriber_does_not_disrupt_peer_and_flips_readiness() {
     common::init_test_logger();
     let Some(pool) = common::try_get_pg_pool().await else {
         return;
@@ -13007,15 +13244,6 @@ async fn test_retired_id_does_not_pin_shared_floor() {
     // listener-lifetime state (the shared fetch floor is computed from
     // `subscriber_states` values).
     //
-    // Honest contract note: the floor drag itself is fetch-side and
-    // delivery-invariant — a lingering stale state entry makes each wake
-    // re-fetch from the retired id's position, which the healthy subscriber's
-    // dedup silently absorbs, so no delivery assertion can distinguish a
-    // pruned from an un-pruned stale entry. This test pins the OBSERVABLE
-    // retirement consequences (A's exactly-once continuity across
-    // post-retire publishes, B's readiness flip); the prune itself is pinned
-    // structurally by `test_resubscribe_same_id_before_next_wake_starts_clean`
-    // (a stale state entry would break the fresh lifecycle's clean replay).
     // B is not waited for after e2, so it may be behind head at retirement
     // (its lingering entry would then sit below head if un-pruned).
     let id_a = format!("projection:floor-healthy:{}", Uuid::new_v4());
@@ -14626,5 +14854,107 @@ async fn test_shutdown_interrupts_rehalt_backoff() {
         heals.lock().unwrap()
     );
 
+    drop_isolated_events_table(&pool, &table).await;
+}
+
+/// A deferred heal-generation re-halt actually fires once its backoff
+/// elapses, minting the NEXT generation and invoking the callback — the
+/// success-path complement to `test_shutdown_interrupts_rehalt_backoff`
+/// (which only proves it does NOT fire early). Same recipe (boot wedge →
+/// heal 1 immediate → gen2 re-wedges at the same permanent hole → heal 2
+/// deferred), but with a short backoff so heal 2 is observed firing.
+#[tokio::test]
+#[serial]
+async fn test_deferred_rehalt_heals_after_backoff_elapses() {
+    use std::time::Duration as GapDuration;
+    common::init_test_logger();
+    let Some(pool) = common::try_get_pg_pool().await else {
+        return;
+    };
+    Migrator::new(pool.clone()).run().await.expect("migrations");
+    let table = isolated_events_table(&pool).await;
+
+    let halts = Arc::new(StdMutex::new(Vec::new()));
+    let heals = Arc::new(StdMutex::new(Vec::new()));
+    let bus_slot = Arc::new(StdMutex::new(None));
+    let config = epoch_pg::event_bus::ReliableDeliveryConfig {
+        snapshot_fencing: false,
+        gap_timeout: GapDuration::from_millis(150),
+        events_table: table.clone(),
+        on_halt: Some(Arc::new(CapturingHaltCallback {
+            halts: halts.clone(),
+        })),
+        on_wedge_retired: Some(Arc::new(AutoResubscribeWedgeCallback {
+            heals: heals.clone(),
+            bus: bus_slot.clone(),
+            stores: Arc::new(StdMutex::new(StdHashMap::new())),
+        })),
+        wedge_heal: Some(WedgeHealPolicy {
+            max_generations: 5,
+            rehalt_backoff: vec![std::time::Duration::from_millis(300)],
+        }),
+        ..Default::default()
+    };
+    let event_bus = start_isolated_bus(&pool, config).await;
+    *bus_slot.lock().unwrap() = Some(event_bus.clone());
+
+    let base_id = format!("projection:heal-deferred-fires:{}", Uuid::new_v4());
+    let gen2_id = format!("{base_id}#gen2");
+    let stream = Uuid::new_v4();
+    let hole_stream = Uuid::new_v4();
+    burn_permanent_hole(&pool, &table, stream, hole_stream).await;
+
+    let projection = TestProjection::replay_always(base_id.clone()).fail_closed();
+    event_bus
+        .subscribe(ProjectionHandler::new(projection))
+        .await
+        .expect("subscribe boot id");
+
+    // heal 1 (immediate, boot generation): gen2 minted and auto re-subscribed.
+    let mut heal1 = false;
+    for _ in 0..60 {
+        if heals
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|h| h.base_subscriber_id == base_id && h.generation == 2)
+        {
+            heal1 = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(heal1, "heal 1 must fire immediately (boot generation)");
+
+    // gen2 wedges at the same hole -> its heal is deferred behind the 300ms
+    // re-halt backoff.
+    assert!(
+        wait_for_gap_unproven_halt(&halts, &gen2_id).await,
+        "gen2 must wedge (its heal request is now deferred behind the backoff)"
+    );
+
+    // Poll past the backoff window for heal 2 (generation 3) to fire — the
+    // deferred-fire path: dedupe/staleness re-check passes, mint proceeds,
+    // callback invoked.
+    let mut heal2 = false;
+    for _ in 0..60 {
+        if heals
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|h| h.base_subscriber_id == base_id && h.generation == 3)
+        {
+            heal2 = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(
+        heal2,
+        "the deferred re-halt heal must fire once its backoff elapses (generation 3): {:?}",
+        heals.lock().unwrap()
+    );
+
+    event_bus.shutdown().await.expect("shutdown");
     drop_isolated_events_table(&pool, &table).await;
 }

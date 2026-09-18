@@ -42,8 +42,7 @@ use tokio::sync::Mutex;
 /// Lock ordering: this helper takes the projections mutex internally. Callers
 /// that also touch the registry must DROP the registry guard before calling —
 /// Phase 3's `unsubscribe` captures the `Vec` under the registry guard, drops
-/// that guard, then calls this helper — so no path ever holds both mutexes
-/// (spec 0031 Phase 2 review, cycle 1).
+/// that guard, then calls this helper — so no path ever holds both mutexes.
 pub(crate) async fn remove_captured_observers<D>(
     projections: &Projections<D>,
     captured: &[Arc<Mutex<dyn EventObserver<D>>>],
@@ -127,8 +126,13 @@ where
     hwm.lock().await.remove(subscriber_id);
     pending_delivered_sets.lock().await.remove(subscriber_id);
 
-    // (e) Resolve unresolved gap-timeout rows for this subscriber (R8).
-    let resolved = sqlx::query(
+    // (e) Resolve unresolved gap-timeout rows for this subscriber (R8),
+    // best-effort (matching the (f) advisory-lock-release pattern below): this
+    // UPDATE's only purpose is silencing zombie rebuild callbacks, so a
+    // transient failure here must not abort the removal with the in-memory
+    // state already gone from every other registry (the tombstone insert at
+    // (h) still runs regardless of this query's outcome).
+    match sqlx::query(
         r#"
         UPDATE epoch_event_bus_gap_timeouts
         SET resolved_at = NOW(),
@@ -141,12 +145,18 @@ where
     .bind(&config.events_table)
     .bind(subscriber_id)
     .execute(pool)
-    .await?;
-    if resolved.rows_affected() > 0 {
-        log::debug!(
+    .await
+    {
+        Ok(resolved) if resolved.rows_affected() > 0 => log::debug!(
             "unsubscribe: resolved {} gap-timeout row(s) for '{subscriber_id}'",
             resolved.rows_affected()
-        );
+        ),
+        Ok(_) => {}
+        Err(e) => warn!(
+            "unsubscribe: best-effort gap-timeout ledger resolve for '{subscriber_id}' \
+             failed (continuing; the id is still fully retired from every in-memory \
+             registry and tombstoned below): {e}",
+        ),
     }
 
     // (f) Coordinated mode: best-effort advisory-lock release (R10).

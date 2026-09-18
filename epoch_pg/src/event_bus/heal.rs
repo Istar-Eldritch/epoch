@@ -8,6 +8,7 @@ use super::config::{
 use super::unsubscribe::unsubscribe_core;
 use super::{Projections, SubscriberRegistry, panic_payload_message};
 use epoch_core::event::EventData;
+use epoch_core::prelude::EventObserver;
 use log::{error, warn};
 
 use futures::FutureExt;
@@ -41,6 +42,16 @@ struct HealFamilyState {
     retired: bool,
 }
 
+/// One id's registry handles, snapshotted at heal-defer time and re-checked
+/// by `Arc::ptr_eq` against the live registry when the backoff elapses (see
+/// [`run_heal_actor`]).
+type RegistrySnapshot<D> = Vec<Arc<Mutex<dyn EventObserver<D>>>>;
+
+/// A `HealRequest` deferred behind its family's re-halt backoff: the request
+/// itself, the instant its backoff elapses, and the registry snapshot taken
+/// when it was deferred.
+type DeferredHeal<D> = (HealRequest, tokio::time::Instant, RegistrySnapshot<D>);
+
 /// Splits a wedged subscriber id into its wedge-heal family base and the
 /// generation the id itself represents (spec 0031 R13).
 ///
@@ -70,16 +81,15 @@ pub(crate) fn wedge_family(subscriber_id: &str) -> (String, u32) {
 /// piece of state the fire site cannot reach — the per-family generation
 /// counters and the backoff schedule — and performs the actual
 /// unsubscribe/mint/callback work the fire site's gate only requests over the
-/// channel. Spawned by `start_listener` only when `on_wedge_retired` is
-/// configured; ends when its request-channel `rx` closes, which happens once
-/// every clone of the paired sender has dropped — the sender lives inside the
-/// listener task's own `async move` block, so it drops when that task itself
-/// returns on `shutdown()` (see [`PgEventBus::shutdown`](super::PgEventBus::shutdown)).
-///
-/// The bus-owned wedge-heal actor (spec 0031 Phase 4, R14). Receives
-/// `HealRequest`s from the fire-site gate and, per request: retires the wedged
-/// id (via the narrowed-handle [`unsubscribe_core`], never a bus clone), mints
-/// the fresh `{base}#gen{N}` id, invokes the application callback, and logs.
+/// channel. Receives `HealRequest`s from the fire-site gate and, per request:
+/// retires the wedged id (via the narrowed-handle [`unsubscribe_core`], never
+/// a bus clone), mints the fresh `{base}#gen{N}` id, invokes the application
+/// callback, and logs. Spawned by `start_listener` only when
+/// `on_wedge_retired` is configured; ends when its request-channel `rx`
+/// closes, which happens once every clone of the paired sender has dropped —
+/// the sender lives inside the listener task's own `async move` block, so it
+/// drops when that task itself returns on `shutdown()` (see
+/// [`PgEventBus::shutdown`](super::PgEventBus::shutdown)).
 ///
 /// Termination: the `shutdown_rx` watch channel (shared with the listener
 /// task) interrupts the loop immediately — including mid-backoff — and
@@ -105,14 +115,21 @@ pub(crate) async fn run_heal_actor<D>(
     D: EventData + Send + Sync + 'static,
 {
     let mut families: HashMap<String, HealFamilyState> = HashMap::new();
-    // Requests deferred behind a family's re-halt backoff: (request, due-at).
-    // Deferral keeps one family's backoff from serializing every other
-    // family's immediate boot-generation heal behind it (per-family policy,
-    // single actor).
-    let mut deferred: Vec<(HealRequest, tokio::time::Instant)> = Vec::new();
+    // Requests deferred behind a family's re-halt backoff: (request, due-at,
+    // registry snapshot at defer-time). Deferral keeps one family's backoff
+    // from serializing every other family's immediate boot-generation heal
+    // behind it (per-family policy, single actor). Deduped by `subscriber_id`:
+    // a second halt on an already-deferred id is ignored rather than pushing
+    // a second entry — two halts on one wedged id before its backoff elapses
+    // must mint at most one fresh generation and invoke the callback at most
+    // once. The snapshot is the id's registry handles at the moment it was deferred;
+    // it is re-checked by `Arc::ptr_eq` against the registry when the
+    // backoff fires, so a request whose id was retired or re-subscribed
+    // during the backoff window is dropped as stale rather than acted on.
+    let mut deferred: Vec<DeferredHeal<D>> = Vec::new();
 
     loop {
-        let next_due = deferred.iter().map(|(_, due)| *due).min();
+        let next_due = deferred.iter().map(|(_, due, _)| *due).min();
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 // Shutdown signalled (or the channel closed): stop now. Any
@@ -124,7 +141,18 @@ pub(crate) async fn run_heal_actor<D>(
                 match maybe_request {
                     None => break,
                     Some(request) => {
-                        match process_heal_request(
+                        if deferred
+                            .iter()
+                            .any(|(deferred_request, _, _)| {
+                                deferred_request.subscriber_id == request.subscriber_id
+                            })
+                        {
+                            log::debug!(
+                                "wedge heal: '{}' already deferred pending its re-halt \
+                                 backoff; ignoring this duplicate halt",
+                                request.subscriber_id
+                            );
+                        } else if let Some((delay, snapshot)) = process_heal_request(
                             request.clone(),
                             &mut families,
                             &policy,
@@ -140,10 +168,7 @@ pub(crate) async fn run_heal_actor<D>(
                         )
                         .await
                         {
-                            Some(delay) if !delay.is_zero() => {
-                                deferred.push((request, tokio::time::Instant::now() + delay));
-                            }
-                            _ => {}
+                            deferred.push((request, tokio::time::Instant::now() + delay, snapshot));
                         }
                     }
                 }
@@ -156,15 +181,43 @@ pub(crate) async fn run_heal_actor<D>(
                 }, if next_due.is_some() => {
                 let now = tokio::time::Instant::now();
                 let mut due_requests = Vec::new();
-                deferred.retain(|(req, due)| {
+                deferred.retain(|(req, due, snapshot)| {
                     if *due <= now {
-                        due_requests.push(req.clone());
+                        due_requests.push((req.clone(), snapshot.clone()));
                         false
                     } else {
                         true
                     }
                 });
-                for request in due_requests {
+                for (request, snapshot) in due_requests {
+                    // Re-validate against the registry before acting: if the
+                    // id was retired (no entry) or re-subscribed (a fresh set
+                    // of handles under the same id) during the backoff
+                    // window, this deferred request is stale — drop it
+                    // without acting rather than retiring/minting for a
+                    // subscription the fire site never observed wedged.
+                    let still_valid = {
+                        let registry = subscriber_modes.lock().await;
+                        match registry.get(&request.subscriber_id) {
+                            Some((_, handles)) => {
+                                handles.len() == snapshot.len()
+                                    && handles
+                                        .iter()
+                                        .zip(snapshot.iter())
+                                        .all(|(a, b)| Arc::ptr_eq(a, b))
+                            }
+                            None => false,
+                        }
+                    };
+                    if !still_valid {
+                        log::debug!(
+                            "wedge heal: deferred request for '{}' is stale (retired or \
+                             re-subscribed during the backoff window); dropping without \
+                             acting",
+                            request.subscriber_id
+                        );
+                        continue;
+                    }
                     // Re-processed with `from_deferred = true`: the backoff has
                     // elapsed, so the heal proceeds immediately (never
                     // re-defers — the backoff decision is skipped on this
@@ -192,9 +245,11 @@ pub(crate) async fn run_heal_actor<D>(
 
 /// Handles one heal request: family bookkeeping (generation floor from the
 /// wedged id's own generation, cap, retirement), the mint, the retirement,
-/// the callback, and the WARN. Returns `Some(backoff)` when the family must
-/// back off before this request can proceed (the caller defers it), `None`
-/// when the request was fully handled.
+/// the callback, and the WARN. Returns `Some((backoff, registry_snapshot))`
+/// when the family must back off before this request can proceed (the caller
+/// defers it; the snapshot is the id's current registry handles, captured
+/// here so the caller can re-validate against them when the backoff
+/// elapses), `None` when the request was fully handled.
 #[allow(clippy::too_many_arguments)]
 async fn process_heal_request<D>(
     request: HealRequest,
@@ -209,7 +264,7 @@ async fn process_heal_request<D>(
     pool: &PgPool,
     config: &ReliableDeliveryConfig,
     from_deferred: bool,
-) -> Option<Duration>
+) -> Option<(Duration, RegistrySnapshot<D>)>
 where
     D: EventData + Send + Sync + 'static,
 {
@@ -291,7 +346,13 @@ where
         d
     };
     if !delay.is_zero() {
-        return Some(delay);
+        let snapshot = subscriber_modes
+            .lock()
+            .await
+            .get(&request.subscriber_id)
+            .map(|(_, handles)| handles.clone())
+            .unwrap_or_default();
+        return Some((delay, snapshot));
     }
 
     let generation = family.next_generation;

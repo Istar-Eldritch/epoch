@@ -563,7 +563,7 @@ where
         // deliberately seeds neither `pending_checkpoints` nor `processed_any`:
         // the row was applied to the observer by the catch-up pass, not by
         // this wake, and its position bookkeeping is the promotion itself
-        // (spec 0031 R2, Phase 1 review cycle 1).
+        // (spec 0031 R2).
         if state.delivered_above_prefix.contains(&event_seq) {
             state.delivered_above_prefix.remove(&event_seq);
             state.processed_ahead.insert(event_seq);
@@ -1195,9 +1195,7 @@ where
         // `ReplayAlways` wedge (the heal gate's
         // subject) is exactly what this path
         // excludes, so the heal channel is
-        // never reachable here. (Review cycle
-        // 1: the threaded sender was dead
-        // plumbing.)
+        // never reachable here.
         heal_tx: None,
     };
 
@@ -2803,7 +2801,11 @@ where
                 // (interrupting any in-flight backoff immediately): queued
                 // requests that never started processing are dropped, not
                 // drained — retiring during shutdown is pointless. This join
-                // is bounded by the actor's break, never by a backoff delay.
+                // is never bounded by a backoff delay, but it is NOT bounded
+                // solely by the actor's break either: while `process_heal_request`
+                // awaits the app's `on_wedge_retired` callback, the shutdown
+                // signal is not polled, so this join can block for the
+                // duration of an arbitrary app callback.
                 if let Some(heal_actor_handle) = heal_actor_handle {
                     heal_actor_handle
                         .await
@@ -4279,9 +4281,9 @@ async fn advance_catchup_prefix(
 /// the delivered-above-prefix set can be handed off to the listener's
 /// one-time state seed (spec 0031 R1/R2, CLOUD-262 Part A).
 ///
-/// Amended R2 contract (spec 0031, amended 2026-09-17, Phase 1 review cycle
-/// 1): catch-up passes remain **at-least-once per pass** while the prefix
-/// stays pinned — this handoff guarantees only that the live wake loop adds
+/// R2 contract (spec 0031, amended 2026-09-17): catch-up passes remain
+/// **at-least-once per pass** while the prefix stays pinned — this handoff
+/// guarantees only that the live wake loop adds
 /// no further copies of what a pass delivered. A startup pass that delivers
 /// rows and then errors drops its partial handoff (the caller records the
 /// set only on success), and the live pass re-delivers that partial batch

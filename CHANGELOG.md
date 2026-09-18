@@ -83,14 +83,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     remain at-least-once per pass while the prefix stays pinned below the
     hole. Hole-free streams are unaffected; `Checkpointed` catch-up semantics
     and the `GapPolicy::Halt` default are unchanged.
-  - **CLOUD-259 coordination note**: catacloud's interim wedge-recovery code
-    at `integration/src/policy_projection_heal.rs` predates this epoch-side
-    heal and can be retired now that epoch retires-and-notifies natively —
-    that deletion is catacloud's move, to be made after a soak period, not
-    part of this change. For any window where both healers run concurrently,
-    catacloud should keep its two interim guards from paper 2 §8.2: the
-    stale-generation CAS, and the retired-check via the new
-    `SubscriberNotFound` readiness flip above.
 
 - **Sequence-burn resilience: opt-in `GapPolicy` for `ReplayAlways` subscribers**
   (`epoch_core`, `epoch_pg`, CLOUD-261, spec 0030 Part A) — a burned `global_sequence`
