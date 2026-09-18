@@ -210,6 +210,15 @@ pub(crate) async fn run_heal_actor<D>(
                         }
                     };
                     if !still_valid {
+                        // Roll back the defer-time increment: this request never
+                        // actually re-halted anything (its subscription was retired
+                        // or re-subscribed before the backoff elapsed), so counting
+                        // it would make `rehalt_count` walk the backoff schedule
+                        // faster than the family's real re-halt history.
+                        let (base, _) = wedge_family(&request.subscriber_id);
+                        if let Some(family) = families.get_mut(&base) {
+                            family.rehalt_count = family.rehalt_count.saturating_sub(1);
+                        }
                         log::debug!(
                             "wedge heal: deferred request for '{}' is stale (retired or \
                              re-subscribed during the backoff window); dropping without \

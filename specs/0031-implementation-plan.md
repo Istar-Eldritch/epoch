@@ -82,7 +82,7 @@ hole, across boots and listener restarts.
 
 **Cycle 1.2 — remaining pins** (each red→green against the cycle 1.1 code):
 
-- `test_listener_restart_over_open_burn_delivers_exactly_once` (R2 pass leg)
+- `test_listener_restart_over_open_burn_live_pass_adds_no_copies` (R2 pass leg)
 - `test_fresh_subscribe_hole_free_stream_unchanged`
 - `test_fresh_subscribe_position_still_pins_at_hole` (R3)
 - `test_fresh_subscribe_late_materialized_row_inside_catchup_range_delivered_once`
@@ -162,7 +162,7 @@ end-to-end on a live bus; tombstone makes removal cross-task-safe; races settled
 **Cycle 3.B — R6/R7 + gate** (tests first):
 
 - `test_retired_id_readiness_returns_subscriber_not_found`
-- `test_retired_id_does_not_pin_shared_floor`
+- `test_retiring_lagging_subscriber_does_not_disrupt_peer_and_flips_readiness`
 - `test_unsubscribe_wedged_subscriber_restores_all_caught_up_gate`
   (wedged `ReplayAlways`+`Halt` → gate false 3 rounds → unsubscribe → resolves)
 - Implement: green via (c) + registry-based readiness (Phase 2 carries this).

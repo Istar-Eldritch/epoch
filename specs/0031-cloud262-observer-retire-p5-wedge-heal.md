@@ -815,7 +815,8 @@ then implement to green, matching how spec 0030's phases were executed (tests in
     `test_unsubscribe_wedged_subscriber_restores_all_caught_up_gate` (report 3 B2
     turned into a test: wedged ReplayAlways+Halt registered → gate false 3 rounds;
     unsubscribe → gate resolves), `test_retired_id_readiness_returns_subscriber_not_found`
-    (R6), `test_retired_id_does_not_pin_shared_floor` (R7), and
+    (R6), `test_retiring_lagging_subscriber_does_not_disrupt_peer_and_flips_readiness`
+    (R7 — renamed post-review to match its actual coverage), and
     `test_unsubscribe_resolves_gap_ledger_rows_with_unsubscribe_marker` +
     `test_unsubscribe_retains_checkpoint_row_and_resubscribe_resumes` (R8),
     `test_unsubscribe_inline_bus` (R4), `test_unsubscribe_effect_at_next_wake` (R9
